@@ -64,11 +64,21 @@ detect_platform() {
         Linux)
             case "${arch}" in
                 x86_64)  target="x86_64-unknown-linux-musl" ;;
-                aarch64) target="aarch64-unknown-linux-musl" ;;
-                arm64)   target="aarch64-unknown-linux-musl" ;;
+                aarch64|arm64)
+                    err "Linux aarch64 is not supported by this installer in v0.1.0."
+                    err ""
+                    err "grith's supervisor hard-codes x86_64 register"
+                    err "names for syscall-arg extraction. aarch64 support"
+                    err "needs an arch backend port. Track progress at:"
+                    err "  https://github.com/${REPO}/issues"
+                    err ""
+                    err "If you have an x86_64 Linux machine or VM, you"
+                    err "can install there via this same one-liner."
+                    exit 1
+                    ;;
                 *)
                     err "Unsupported Linux architecture: ${arch}"
-                    err "Supported: x86_64, aarch64"
+                    err "Supported in v0.1.0: x86_64"
                     exit 1
                     ;;
             esac

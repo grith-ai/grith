@@ -2,7 +2,9 @@
 
 **Zero Trust for AI Agents** — a security-first local platform that secures AI agent tool calls through a multi-filter proxy and OS-level CLI supervisor.
 
-grith produces a single cross-platform binary: the grith daemon. It sits between AI tools and your operating system, evaluating every file access, network call, shell command, and process spawn against a scoring engine before allowing it to proceed.
+grith produces a single binary — the grith daemon — that sits between AI tools and your operating system, evaluating every file access, network call, shell command, and process spawn against a scoring engine before allowing it to proceed.
+
+> **v0.1.0 supports Linux x86_64 only.** macOS (via Endpoint Security), Windows (via ETW), and Linux aarch64 are tracked for v2.0.
 
 Two execution paths, one security proxy:
 
@@ -17,7 +19,7 @@ Both paths converge on the same proxy filters, scoring thresholds, audit log, an
 - **Secret scanning** with 1600+ regex patterns for API keys, tokens, and credentials
 - **Adaptive Bayesian scoring** that learns from human review decisions
 - **Per-call security evaluation** with profile-based access control
-- **CLI supervisor** with ptrace+seccomp (Linux, full syscall interception) and process lifecycle fallback (macOS — full Endpoint Security targeted for v2.0)
+- **CLI supervisor** with ptrace+seccomp (Linux x86_64, full syscall interception). macOS via Endpoint Security and Windows via ETW are targeted for v2.0; Linux aarch64 needs an arch-backend port.
 - **Process tree tracking** — follows forks, clones, and execs
 - **PTY forwarding** for transparent interactive tool sessions
 - **Human-in-the-loop digest** — queued operations freeze the process until approved
@@ -47,19 +49,20 @@ curl -fsSL https://grith.ai/install | sh -s -- --global           # install to /
 
 | Method | Command |
 |--------|---------|
-| Homebrew | `brew install grith-ai/tap/grith` |
 | From source | See [Build from Source](#build-from-source) below |
 | Manual | Download from [GitHub Releases](https://github.com/grith-ai/grith/releases) |
 
+> Homebrew, Scoop, and winget integrations are deferred until macOS and
+> Windows support land in v2.0.
+
 ### Supported platforms
 
-| Platform | Architecture | Binary |
+| Platform | Architecture | Status |
 |----------|-------------|--------|
-| Linux | x86_64 | Static musl binary |
-| Linux | aarch64 | Static musl binary |
-| macOS | Apple Silicon | Native darwin binary |
-| macOS | Intel | Native darwin binary |
-| Windows | x86_64 | MSVC binary (manual download or Scoop) |
+| Linux | x86_64 | ✅ supported (v0.1.0) |
+| Linux | aarch64 | ⏳ v2.0 — supervisor needs an aarch64 register backend |
+| macOS | Apple Silicon / Intel | ⏳ v2.0 — supervisor needs Endpoint Security port |
+| Windows | x86_64 | ⏳ v2.0 — supervisor needs ETW + a process-supervisor port |
 
 ## Build from Source
 
@@ -67,7 +70,7 @@ curl -fsSL https://grith.ai/install | sh -s -- --global           # install to /
 
 - **Rust** 1.88+ (stable)
 - **Node.js** 22+ (for the web dashboard)
-- **Linux** kernel 4.8+ or **macOS** 12+ (for CLI supervisor)
+- **Linux** x86_64 kernel 4.8+ (for the ptrace+seccomp CLI supervisor)
 
 ### Quick build
 

@@ -10,12 +10,16 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [0.1.0] - 2026-05-07
 
-First public OSS release. The repository is now mirrored to the public
-`grith-ai/grith` repo via `scripts/publish-oss.sh` (Phase 5 of the
-public-launch plan in `work/50-public-repo-open-core-report.md`).
+First public OSS release.
+
+**Platform scope:** Linux x86_64 only. The supervisor uses ptrace+seccomp
+which is Linux-specific, and the syscall-arg extraction hard-codes
+x86_64 register names. macOS (via Endpoint Security), Windows (via ETW),
+and Linux aarch64 are all tracked for v2.0; the installer prints a
+clear message + workaround pointer on those platforms.
 
 The full binary ships publicly with Pro/Enterprise features returning
-`403 FEATURE_GATED` for unlicensed users (B+Y decision, 2026-03-24).
+`403 FEATURE_GATED` for unlicensed users (open-core model).
 
 ### Added
 - Feature gate enforcement with upgrade metadata (C-01)

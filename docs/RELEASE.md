@@ -84,13 +84,18 @@ Defined in `.github/workflows/release.yml`. Triggered by pushing a `v*` tag.
 
 ### Build matrix
 
-| Target | Runner | Build tool |
-|--------|--------|------------|
-| `x86_64-unknown-linux-musl` | ubuntu-latest | `cross` |
-| `aarch64-unknown-linux-musl` | ubuntu-latest | `cross` |
-| `aarch64-apple-darwin` | macos-latest | `cargo` |
-| `x86_64-apple-darwin` | macos-latest | `cargo` |
-| `x86_64-pc-windows-msvc` | windows-latest | `cargo` |
+| Target | Runner | Build tool | Status |
+|--------|--------|------------|--------|
+| `x86_64-unknown-linux-musl` | ubuntu-latest | `cross` | ✅ v0.1.0 |
+| `aarch64-unknown-linux-musl` | ubuntu-latest | `cross` | ⏳ v2.0 (needs supervisor aarch64 register backend) |
+| `aarch64-apple-darwin` | macos-latest | `cargo` | ⏳ v2.0 (needs Endpoint Security port) |
+| `x86_64-apple-darwin` | macos-latest | `cargo` | ⏳ v2.0 (same) |
+| `x86_64-pc-windows-msvc` | windows-latest | `cargo` | ⏳ v2.0 (needs ETW + Windows supervisor) |
+
+The active matrix in `.github/workflows/release.yml` is currently
+**Linux x86_64 only**. Re-enable the other rows in the workflow (and
+add them back to this table's Status column) when each platform's
+supervisor backend lands.
 
 ### Steps per target
 
@@ -118,7 +123,10 @@ Homebrew (`Formula/grith.rb`) and Scoop (`dist/scoop/grith.json`) manifests exis
 curl -fsSL https://grith.ai/install | sh
 ```
 
-### Post-release hash update (when enabling Homebrew/Scoop)
+### Post-release hash update (when enabling Homebrew/Scoop after v2.0)
+
+Homebrew + Scoop are gated on macOS and Windows binaries shipping,
+which is v2.0 work. Until then these manifests are inert.
 
 After a GitHub Release is published, update the package manifests:
 
