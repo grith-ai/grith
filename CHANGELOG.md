@@ -8,6 +8,15 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-07
+
+First public OSS release. The repository is now mirrored to the public
+`grith-ai/grith` repo via `scripts/publish-oss.sh` (Phase 5 of the
+public-launch plan in `work/50-public-repo-open-core-report.md`).
+
+The full binary ships publicly with Pro/Enterprise features returning
+`403 FEATURE_GATED` for unlicensed users (B+Y decision, 2026-03-24).
+
 ### Added
 - Feature gate enforcement with upgrade metadata (C-01)
 - Config sync endpoints for multi-device settings (C-02)
