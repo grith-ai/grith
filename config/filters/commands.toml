@@ -1,0 +1,86 @@
+# Command structure analysis rules for the security proxy
+# Loaded by the command filter (Phase 2)
+
+[[rules]]
+id = "pipe-to-curl"
+pattern = "| curl"
+score = 4.0
+severity = "error"
+message = "Pipe output to curl (potential exfiltration)"
+
+[[rules]]
+id = "pipe-to-nc"
+pattern = "| nc"
+score = 4.0
+severity = "error"
+message = "Pipe output to netcat (potential exfiltration)"
+
+[[rules]]
+id = "pipe-to-wget"
+pattern = "| wget"
+score = 3.0
+severity = "warning"
+message = "Pipe output to wget"
+
+[[rules]]
+id = "base64-decode"
+pattern = "base64 -d"
+score = 2.0
+severity = "warning"
+message = "Base64 decode (potential encoded payload)"
+
+[[rules]]
+id = "sudo"
+pattern = "sudo"
+score = 3.0
+severity = "warning"
+message = "Privilege escalation via sudo"
+
+[[rules]]
+id = "chmod-suid"
+pattern = "chmod +s"
+score = 4.0
+severity = "error"
+message = "Setting SUID bit (privilege escalation)"
+
+[[rules]]
+id = "chown-root"
+pattern = "chown root"
+score = 3.0
+severity = "warning"
+message = "Changing file ownership to root"
+
+[[rules]]
+id = "crontab-edit"
+pattern = "crontab"
+score = 3.0
+severity = "warning"
+message = "Crontab modification"
+
+[[rules]]
+id = "systemctl"
+pattern = "systemctl"
+score = 2.0
+severity = "warning"
+message = "Systemd service modification"
+
+[[rules]]
+id = "bashrc-modification"
+pattern = ".bashrc"
+score = 3.0
+severity = "warning"
+message = "Shell profile modification"
+
+[[rules]]
+id = "zshrc-modification"
+pattern = ".zshrc"
+score = 3.0
+severity = "warning"
+message = "Shell profile modification"
+
+[[rules]]
+id = "bash-history"
+pattern = ".bash_history"
+score = 3.0
+severity = "warning"
+message = "Shell history access"

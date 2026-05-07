@@ -1,0 +1,61 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature. Please describe your use case clearly.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem does this solve? Why do you need it?
+      placeholder: "When I use grith to supervise X, I can't..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or alternatives have you tried?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "Security proxy / filters"
+        - "Supervisor / syscall interception"
+        - "CLI / TUI"
+        - "Dashboard"
+        - "Audit / logging"
+        - "Digest / quarantine"
+        - "Notifications"
+        - "LLM integration"
+        - "Supervisor profiles"
+        - "Configuration"
+        - "Analytics / reporting"
+        - "Documentation"
+        - "Other"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and feature requests
+          required: true

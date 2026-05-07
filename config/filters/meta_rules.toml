@@ -1,0 +1,38 @@
+# Composite meta-rules for the security proxy
+# These fire when specific filter combinations match
+
+[[meta_rules]]
+id = "ssh-key-access"
+score_override = 8.0
+message = "Direct SSH private key access"
+
+[[meta_rules.conditions]]
+filter = "path_match"
+rule_id = "ssh-private-key"
+matched = true
+
+[[meta_rules]]
+id = "npm-dependency-resolution"
+score_adjustment = -3.0
+message = "Routine NPM dependency resolution"
+
+[[meta_rules.conditions]]
+filter = "path_match"
+rule_id = "package-json"
+matched = true
+
+[[meta_rules.conditions]]
+call_type = "DirList"
+path_contains = "node_modules"
+
+[[meta_rules]]
+id = "env-exfiltration-risk"
+score_adjustment = 5.0
+message = "Potential credential exfiltration after .env read"
+
+[[meta_rules.conditions]]
+filter = "taint"
+taint_source = "env-file"
+
+[[meta_rules.conditions]]
+call_type = "HttpRequest"

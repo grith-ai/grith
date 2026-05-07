@@ -1,0 +1,24 @@
+{
+  "$comment": "Scoop distribution is deferred from the v1 launch. The placeholder hash must be replaced with the real SHA-256 from the GitHub Release Windows asset. See docs/RELEASE.md.",
+  "version": "0.1.0",
+  "description": "Zero Trust for AI Agents",
+  "homepage": "https://grith.ai",
+  "license": "MPL-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/grith-ai/grith/releases/download/v0.1.0/grith-0.1.0-x86_64-pc-windows-msvc.zip",
+      "hash": "PLACEHOLDER_SHA256_WINDOWS_X86_64"
+    }
+  },
+  "bin": "grith.exe",
+  "checkver": {
+    "github": "https://github.com/grith-ai/grith"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/grith-ai/grith/releases/download/v$version/grith-$version-x86_64-pc-windows-msvc.zip"
+      }
+    }
+  }
+}

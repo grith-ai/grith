@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node.js (dashboard)
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+dashboard/tsconfig.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.wasm
+!plugins/**/*.wasm
+
+# Audit data (local)
+*.db
+*.db-journal
+
+# OS
+Thumbs.db
+
+qa-runs/

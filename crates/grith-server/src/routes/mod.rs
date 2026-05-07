@@ -1,0 +1,1465 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) grith contributors
+
+//! REST API route definitions and shared request/response helpers.
+
+mod analytics;
+mod audit;
+mod audit_ipc;
+mod canary;
+mod config;
+mod digest;
+mod digest_ipc;
+mod events;
+mod health;
+mod notifications;
+mod policies;
+mod proxy;
+mod proxy_ipc;
+mod reputation_ipc;
+mod server;
+mod session_ipc;
+mod sync;
+
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, post, put};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::AppState;
+
+// --- Named Constants (audit task 26) ---
+
+/// Default pagination page size for list endpoints.
+pub(crate) const DEFAULT_PAGE_LIMIT: usize = 20;
+/// Maximum allowed pagination limit to prevent excessive queries.
+pub(crate) const MAX_PAGE_LIMIT: usize = 100;
+/// Default row limit for audit export.
+pub(crate) const DEFAULT_EXPORT_LIMIT: usize = 1000;
+/// Number of recent audit records examined for exfiltration stats.
+pub(crate) const EXFIL_STATS_RECENT_COUNT: usize = 500;
+/// Maximum number of top destinations returned in exfil stats.
+pub(crate) const TOP_DESTINATIONS_LIMIT: usize = 10;
+
+// --- Shared helpers ---
+
+#[derive(Serialize)]
+pub(crate) struct ApiError {
+    error: String,
+    code: String,
+}
+
+pub(crate) fn api_error(
+    status: StatusCode,
+    message: impl Into<String>,
+    code: impl Into<String>,
+) -> impl IntoResponse {
+    (
+        status,
+        Json(ApiError {
+            error: message.into(),
+            code: code.into(),
+        }),
+    )
+}
+
+/// Parse a UUID from a path segment, returning a 400 response on failure.
+#[allow(clippy::result_large_err)] // Response is axum's standard type; boxing adds no benefit here.
+pub(crate) fn parse_uuid_or_400(id: &str) -> Result<Uuid, axum::response::Response> {
+    Uuid::parse_str(id).map_err(|_| {
+        api_error(StatusCode::BAD_REQUEST, "invalid UUID", "INVALID_ID").into_response()
+    })
+}
+
+// --- Shared pagination types ---
+
+#[derive(Deserialize)]
+pub(crate) struct PaginationParams {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+impl PaginationParams {
+    /// Return the effective limit, capped at `MAX_PAGE_LIMIT`.
+    pub fn effective_limit(&self) -> usize {
+        self.limit.min(MAX_PAGE_LIMIT)
+    }
+}
+
+pub(crate) fn default_limit() -> usize {
+    DEFAULT_PAGE_LIMIT
+}
+
+// --- Feature gate helper ---
+
+/// Check a feature gate and return a rich 403 response with upgrade metadata
+/// if the feature is not allowed for the current plan tier.
+///
+/// Returns `None` if the feature is allowed, or `Some(Response)` with a JSON
+/// body containing `error`, `code`, `current_tier`, `required_tier`, and
+/// `upgrade_url` if gated.
+pub(crate) fn require_feature(
+    state: &crate::AppState,
+    feature: &str,
+    required_tier: &str,
+) -> Option<axum::response::Response> {
+    let (allowed, current_tier) = state
+        .feature_gate
+        .read()
+        .map(|gate| (gate.allows(feature), gate.tier.to_string()))
+        .unwrap_or_else(|_| (false, "community".to_string()));
+
+    if allowed {
+        return None;
+    }
+
+    let upgrade_url = state
+        .billing_portal_url
+        .as_deref()
+        .unwrap_or("https://grith.ai/pricing");
+
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("{feature} requires a {required_tier} subscription"),
+                "code": "FEATURE_GATED",
+                "feature": feature,
+                "current_tier": current_tier,
+                "required_tier": required_tier,
+                "upgrade_url": upgrade_url,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+// --- Sub-routers for per-bucket rate limiting ---
+
+/// Read-only / high-volume GET endpoints plus event ingestion.
+pub fn general_routes() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health::health))
+        .route("/tier", get(health::get_tier))
+        .route("/license/status", get(health::get_license_status))
+        .route("/digest", get(digest::list_digest))
+        .route("/canaries", get(canary::list_canaries))
+        .route("/audit", get(audit::list_audit))
+        .route("/audit/export", get(audit::export_audit))
+        .route("/audit/exfil-stats", get(audit::exfil_stats))
+        .route("/audit/:id", get(audit::get_audit))
+        .route("/proxy/status", get(proxy::proxy_status))
+        .route("/config", get(config::get_config))
+        .route(
+            "/notifications/channels",
+            get(notifications::list_notification_channels),
+        )
+        .route(
+            "/notifications/status",
+            get(notifications::notification_status),
+        )
+        .route(
+            "/analytics/summary",
+            get(analytics::analytics_summary),
+        )
+        .route("/analytics/cost", get(analytics::analytics_cost))
+        .route(
+            "/analytics/activity",
+            get(analytics::analytics_activity),
+        )
+        .route(
+            "/analytics/compliance",
+            get(analytics::analytics_compliance),
+        )
+        .route("/policies", get(policies::list_policies))
+        .route("/policies/:name", get(policies::get_policy))
+        .route("/sync/status", get(sync::sync_status))
+        .route("/sync/configs", get(sync::list_synced_configs))
+        // Event ingestion is POST but high-volume — group with general.
+        .route("/events", post(events::ingest_event))
+}
+
+/// IPC endpoints used by trusted local daemon clients.
+pub fn ipc_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/reputation/table",
+            get(reputation_ipc::get_reputation_table),
+        )
+        .route(
+            "/reputation/observe",
+            post(reputation_ipc::observe_reputation),
+        )
+        .route("/reputation/reset", post(reputation_ipc::reset_reputation))
+        .route("/reputation/save", post(reputation_ipc::save_reputation))
+        .route("/proxy/evaluate", post(proxy_ipc::evaluate_proxy))
+        .route("/proxy/status/full", get(proxy_ipc::proxy_status_full))
+        .route("/ipc/audit/ingest", post(audit_ipc::ingest_audit))
+        .route("/ipc/digest/items", post(digest_ipc::enqueue_digest))
+        .route("/ipc/digest/items/:id", get(digest_ipc::get_digest))
+        .route(
+            "/ipc/digest/items/:id/status",
+            post(digest_ipc::update_digest),
+        )
+        .route("/ipc/digest/expire", post(digest_ipc::expire_digest))
+        .route("/ipc/sessions", get(session_ipc::list_sessions))
+        .route("/ipc/sessions", post(session_ipc::register_session))
+        .route("/ipc/sessions/:id", get(session_ipc::get_session))
+        .route("/ipc/sessions/:id", put(session_ipc::update_session))
+        .route("/ipc/sessions/:id", delete(session_ipc::unregister_session))
+        .route("/ipc/sessions/:id/kill", post(session_ipc::kill_session))
+        .route("/ipc/events", post(events::ingest_event))
+}
+
+/// Mutation endpoints (POST/PUT/DELETE) except proxy test.
+pub fn write_routes() -> Router<AppState> {
+    Router::new()
+        .route("/digest/:id/approve", post(digest::approve_digest))
+        .route("/digest/:id/deny", post(digest::deny_digest))
+        .route("/digest/:id/learn", post(digest::learn_digest))
+        .route("/digest/:id/escalate", post(digest::escalate_digest))
+        .route(
+            "/digest/:id/unlock-egress",
+            post(digest::unlock_egress_digest),
+        )
+        .route(
+            "/digest/:id/deny-terminate",
+            post(digest::deny_terminate_digest),
+        )
+        .route(
+            "/digest/:id/allow-always",
+            post(digest::allow_always_digest),
+        )
+        .route(
+            "/digest/:id/webhook-review",
+            post(digest::webhook_review_digest),
+        )
+        .route("/canaries", post(canary::add_canary))
+        .route("/canaries/:id", delete(canary::remove_canary))
+        .route("/canaries/:id/rotate", post(canary::rotate_canary))
+        .route("/config", put(config::update_config))
+        .route(
+            "/notifications/test/:channel",
+            post(notifications::test_notification),
+        )
+        .route("/policies", post(policies::create_policy))
+        .route("/policies/:name", put(policies::update_policy))
+        .route("/policies/:name", delete(policies::delete_policy))
+        .route("/sync/apply", post(sync::apply_synced_configs))
+        .route("/server/shutdown", post(server::shutdown_server))
+}
+
+/// Proxy dry-run endpoint (separate bucket).
+pub fn proxy_test_routes() -> Router<AppState> {
+    Router::new().route("/proxy/test", post(proxy::proxy_test))
+}
+
+// --- Router ---
+
+/// Build the API router with all REST endpoints.
+///
+/// Composes the three sub-routers into a single router. Kept for backward
+/// compatibility with existing tests that mount `api_router()` directly.
+pub fn api_router() -> Router<AppState> {
+    general_routes()
+        .merge(write_routes())
+        .merge(proxy_test_routes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use grith_proxy::engine::SecurityProxy;
+    use grith_proxy::filters::FilterRegistry;
+    use grith_proxy::meta_rules::MetaRuleEngine;
+    use grith_proxy::scoring::ScoringConfig;
+    use grith_supervisor::config::SupervisorConfig;
+    use grith_supervisor::supervisor::SupervisorRegistry;
+    use std::sync::{Arc, Mutex};
+    use tower::util::ServiceExt;
+
+    fn make_state() -> AppState {
+        let audit = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let digest = Arc::new(grith_digest::DigestQueue::open_in_memory().unwrap());
+        let proxy = Arc::new(SecurityProxy::new(
+            FilterRegistry::new(),
+            ScoringConfig::default(),
+            MetaRuleEngine::new(vec![]),
+        ));
+        let registry = Arc::new(Mutex::new(SupervisorRegistry::new(
+            SupervisorConfig::default(),
+        )));
+        let containment = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::with_defaults(),
+        );
+        let correlation = Arc::new(grith_audit::CorrelationTracker::with_defaults());
+        let canary_registry = Arc::new(grith_proxy::filters::canary::CanaryRegistry::empty());
+        let notification_dispatcher = Arc::new(grith_notify::NotificationDispatcher::new(
+            grith_notify::ChannelRegistry::new(),
+            grith_notify::RoutingEngine::default(),
+            Arc::new(grith_digest::notification::CallbackNonceStore::new(
+                std::time::Duration::from_secs(300),
+            )),
+            grith_digest::notification::PlanTier::Community,
+            digest.clone(),
+            grith_notify::rate_limiter::RateLimiter::default(),
+            grith_notify::batcher::Batcher::default(),
+            std::time::Duration::from_secs(300),
+            grith_digest::types::ScoreSeverity::High,
+        ));
+        let (ws_tx, _) = tokio::sync::broadcast::channel(16);
+        let supervisor_tasks = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        AppState {
+            audit_storage: audit,
+            digest_queue: digest,
+            proxy,
+            supervisor_registry: registry,
+            supervisor_tasks,
+            containment_tracker: containment,
+            correlation_tracker: correlation,
+            canary_registry,
+            notification_dispatcher,
+            start_time: std::time::Instant::now(),
+            version: "0.1.0-test".into(),
+            ws_tx,
+            shutdown_tx: None,
+            plan_tier: "community".into(),
+            config_dir: std::env::temp_dir().join(format!("grith-test-{}", uuid::Uuid::new_v4())),
+            audit_db_path: std::env::temp_dir()
+                .join(format!("grith-test-{}", uuid::Uuid::new_v4()))
+                .join("audit.db"),
+            account_id: "local:test".into(),
+            auth_config: crate::auth::AuthConfig::default(),
+            feature_gate: std::sync::Arc::new(std::sync::RwLock::new(
+                grith_digest::notification::FeatureGate {
+                    tier: grith_digest::notification::PlanTier::Community,
+                    seats: 1,
+                },
+            )),
+            license_valid_until: None,
+            billing_portal_url: None,
+            refresh_state: std::sync::Arc::new(std::sync::RwLock::new(
+                grith_digest::notification::RefreshState::default(),
+            )),
+            dns_seed_domains: vec![],
+            reputation_table: std::sync::Arc::new(std::sync::Mutex::new(
+                grith_proxy::reputation::ReputationTable::new(),
+            )),
+            reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            sync_api_key: None,
+            sync_api_base_url: None,
+            ipc_token: String::new(),
+        }
+    }
+
+    fn make_router() -> Router {
+        let state = make_state();
+        api_router().with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "healthy");
+        assert!(json["uptime_seconds"].is_number());
+        // Subsystems should be objects with "status" field
+        let subsystems = json["subsystems"].as_object().unwrap();
+        assert_eq!(subsystems["audit"]["status"], "ok");
+        assert_eq!(subsystems["proxy"]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_list_digest_empty() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/digest").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 0);
+        assert!(json["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_audit_empty() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/audit").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_status() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/proxy/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_evaluations"], 0);
+        assert_eq!(json["auto_allow_threshold"], 3.0);
+        assert_eq!(json["auto_deny_threshold"], 8.0);
+        assert!(json["filters"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_audit_invalid_id() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::get("/audit/not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_audit_csv() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::get("/audit/export?format=csv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("csv"));
+    }
+
+    #[tokio::test]
+    async fn test_approve_digest_invalid_id() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::post("/digest/not-a-uuid/approve")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_escalate_digest_invalid_id() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::post("/digest/not-a-uuid/escalate")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_tier_community() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/tier").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tier"], "community");
+        assert_eq!(json["seats"], 1);
+        assert_eq!(json["max_sessions"], 2);
+        assert_eq!(json["renewal_date"], serde_json::Value::Null);
+        assert_eq!(json["billing_portal_url"], serde_json::Value::Null);
+        // Community tier: core features enabled, pro features disabled
+        assert_eq!(json["features"]["proxy"], true);
+        assert_eq!(json["features"]["dashboard"], true);
+        assert_eq!(json["features"]["adaptive_scoring"], false);
+        assert_eq!(json["features"]["policy_editor"], false);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_test_allow() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::post("/proxy/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tool_call": {
+                                "type": "FileRead",
+                                "path": "/tmp/test.txt"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["composite_score"].is_number());
+        assert!(json["action"].is_string());
+        assert!(json["filter_results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_test_invalid_tool_call() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::post("/proxy/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tool_call": { "type": "NonExistentType" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_test_legacy_tool_call_type_format() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::post("/proxy/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tool_call": {
+                                "tool_call_type": "fs.read",
+                                "arguments": {
+                                    "path": "/tmp/test.txt"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["composite_score"].is_number());
+        assert!(json["action"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_config() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["config_scope"]["local"].is_string());
+        assert!(json["config_scope"]["team"].is_string());
+        assert!(json["proxy"]["auto_allow_threshold"].is_number());
+        assert!(json["filters"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_put_config_empty() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::put("/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "saved");
+        assert_eq!(json["scope"], "local");
+        assert_eq!(json["filters_updated"], 0);
+        assert_eq!(json["proxy_updated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_persists_and_get_reflects_updates() {
+        let state = make_state();
+        let router = api_router().with_state(state);
+
+        let put_response = router
+            .clone()
+            .oneshot(
+                Request::put("/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "local",
+                            "proxy": {
+                                "auto_allow_threshold": 2.5,
+                                "auto_deny_threshold": 7.5
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let get_response = router
+            .oneshot(Request::get("/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["proxy"]["auto_allow_threshold"], 2.5);
+        assert_eq!(json["proxy"]["auto_deny_threshold"], 7.5);
+    }
+
+    // --- T8: Typed error status mapping tests ---
+
+    fn enqueue_test_item(state: &AppState) -> Uuid {
+        use grith_digest::types::{DigestItem, DigestStatus, ScoreSeverity};
+        let item = DigestItem {
+            id: Uuid::new_v4(),
+            created_at: chrono::Utc::now(),
+            session_id: None,
+            tool_call_type: "FileRead".into(),
+            arguments_summary: "/etc/shadow".into(),
+            composite_score: 5.0,
+            severity: ScoreSeverity::Medium,
+            filter_breakdown: vec![],
+            task_context: None,
+            plugin_id: "test".into(),
+            status: DigestStatus::Pending,
+            reviewed_at: None,
+            review_action: None,
+            reviewer_notes: None,
+            informational_only: false,
+            escalated_at: None,
+            escalated_by: None,
+        };
+        let id = item.id;
+        state.digest_queue.enqueue(&item).unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_escalate_not_found_returns_404() {
+        let state = make_state();
+        let router = api_router().with_state(state);
+        let fake_id = Uuid::new_v4();
+        let response = router
+            .oneshot(
+                Request::post(format!("/digest/{fake_id}/escalate"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_escalate_invalid_action_returns_409() {
+        let state = make_state();
+        let router = api_router().with_state(state.clone());
+        let id = enqueue_test_item(&state);
+        // First approve the item
+        state
+            .digest_queue
+            .update_status(
+                &id,
+                grith_digest::DigestStatus::Approved,
+                Some("approve"),
+                None,
+            )
+            .unwrap();
+
+        // Now try to escalate it — should get 409 (InvalidAction)
+        let response = router
+            .oneshot(
+                Request::post(format!("/digest/{id}/escalate"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_review_unknown_channel_returns_409() {
+        // The test channel registry has no "webhook" channel registered, so
+        // handle_callback returns ChannelNotFound which maps to 409 CONFLICT.
+        let state = make_state();
+        let router = api_router().with_state(state.clone());
+        let id = enqueue_test_item(&state);
+        let response = router
+            .oneshot(
+                Request::post(format!("/digest/{id}/webhook-review"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "action": "approve",
+                            "nonce": "some-nonce"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // --- Adaptive scoring endpoint tests ---
+
+    /// Build an AppState with Pro tier.
+    #[allow(dead_code)]
+    fn make_pro_state_with_tier() -> AppState {
+        let mut state = make_state();
+        state.plan_tier = "pro".into();
+        state.feature_gate = std::sync::Arc::new(std::sync::RwLock::new(
+            grith_digest::notification::FeatureGate {
+                tier: grith_digest::notification::PlanTier::Pro,
+                seats: 1,
+            },
+        ));
+        state
+    }
+
+    // --- Analytics endpoint tests ---
+
+    fn make_pro_state() -> AppState {
+        let mut state = make_state();
+        state.plan_tier = "pro".into();
+        state.feature_gate = std::sync::Arc::new(std::sync::RwLock::new(
+            grith_digest::notification::FeatureGate {
+                tier: grith_digest::notification::PlanTier::Pro,
+                seats: 1,
+            },
+        ));
+        state
+    }
+
+    fn make_enterprise_state() -> AppState {
+        let mut state = make_state();
+        state.plan_tier = "enterprise".into();
+        state.feature_gate = std::sync::Arc::new(std::sync::RwLock::new(
+            grith_digest::notification::FeatureGate {
+                tier: grith_digest::notification::PlanTier::Enterprise,
+                seats: 5,
+            },
+        ));
+        state
+    }
+
+    #[tokio::test]
+    async fn test_analytics_summary_community_forbidden() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(
+                Request::get("/analytics/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_analytics_summary_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(
+                Request::get("/analytics/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_evaluations"], 0);
+        assert_eq!(json["allow_count"], 0);
+        assert_eq!(json["queue_count"], 0);
+        assert_eq!(json["deny_count"], 0);
+        assert!(json["latency"].is_object());
+        assert!(json["top_filters"].is_array());
+        assert!(json["time_range"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_analytics_summary_empty_db() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(
+                Request::get("/analytics/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_evaluations"], 0);
+        assert_eq!(json["avg_score"], 0.0);
+        assert_eq!(json["latency"]["avg_ms"], 0.0);
+        assert_eq!(json["latency"]["p50_ms"], 0.0);
+        assert!(json["top_filters"].as_array().unwrap().is_empty());
+        assert_eq!(json["time_range"]["earliest"], serde_json::Value::Null);
+    }
+
+    // --- Policies endpoint tests ---
+
+    #[tokio::test]
+    async fn test_policies_community_forbidden() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(Request::get("/policies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_policies_enterprise_ok() {
+        let state = make_enterprise_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(Request::get("/policies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 0);
+        assert!(json["policies"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_policy_create_and_list() {
+        let state = make_enterprise_state();
+        let router = api_router().with_state(state);
+
+        // Create a policy
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/policies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "test-policy",
+                            "description": "A test policy",
+                            "rules": {
+                                "filters": {},
+                                "allowlists": {
+                                    "paths": ["/tmp"],
+                                    "commands": [],
+                                    "domains": []
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "test-policy");
+        assert_eq!(json["version"], 1);
+
+        // List policies — should have 1
+        let response = router
+            .clone()
+            .oneshot(Request::get("/policies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["policies"][0]["name"], "test-policy");
+    }
+
+    #[tokio::test]
+    async fn test_policy_update_increments_version() {
+        let state = make_enterprise_state();
+        let router = api_router().with_state(state);
+
+        // Create
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/policies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "versioned",
+                            "description": "v1",
+                            "rules": { "filters": {} }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Update
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put("/policies/versioned")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "description": "v2"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["description"], "v2");
+    }
+
+    #[tokio::test]
+    async fn test_policy_delete() {
+        let state = make_enterprise_state();
+        let router = api_router().with_state(state);
+
+        // Create
+        router
+            .clone()
+            .oneshot(
+                Request::post("/policies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "to-delete",
+                            "description": "",
+                            "rules": { "filters": {} }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Delete
+        let response = router
+            .clone()
+            .oneshot(
+                Request::delete("/policies/to-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Verify deleted
+        let response = router
+            .oneshot(
+                Request::get("/policies/to-delete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_policy_validation() {
+        let state = make_enterprise_state();
+        let router = api_router().with_state(state);
+
+        // Invalid name (spaces)
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/policies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "bad name",
+                            "description": "",
+                            "rules": { "filters": {} }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid thresholds (allow >= deny)
+        let response = router
+            .oneshot(
+                Request::post("/policies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "bad-thresholds",
+                            "description": "",
+                            "rules": {
+                                "proxy": {
+                                    "auto_allow_threshold": 8.0,
+                                    "auto_deny_threshold": 3.0
+                                },
+                                "filters": {}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- C-01: Feature gate enforcement tests ---
+
+    #[tokio::test]
+    async fn test_feature_gate_response_includes_upgrade_metadata() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(
+                Request::get("/analytics/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "FEATURE_GATED");
+        assert_eq!(json["current_tier"], "community");
+        assert_eq!(json["required_tier"], "Pro");
+        assert_eq!(json["feature"], "usage_analytics");
+        assert!(json["upgrade_url"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_notifications_channels_community_forbidden() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(
+                Request::get("/notifications/channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "FEATURE_GATED");
+        assert_eq!(json["feature"], "notification_channels");
+    }
+
+    #[tokio::test]
+    async fn test_notifications_status_community_forbidden() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(
+                Request::get("/notifications/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_notifications_test_community_forbidden() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(
+                Request::post("/notifications/test/slack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_notifications_channels_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(
+                Request::get("/notifications/channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["total"].is_number());
+        assert!(json["channels"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_notifications_status_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(
+                Request::get("/notifications/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // --- C-02: Sync endpoint tests ---
+
+    #[tokio::test]
+    async fn test_sync_status_community_forbidden() {
+        let router = make_router(); // Community tier
+        let response = router
+            .oneshot(Request::get("/sync/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "FEATURE_GATED");
+        assert_eq!(json["feature"], "cloud_sync");
+    }
+
+    #[tokio::test]
+    async fn test_sync_status_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(Request::get("/sync/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["policies_count"].is_number());
+        assert!(json["configs_count"].is_number());
+        assert!(json["provider_keys_count"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_sync_configs_community_forbidden() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/sync/configs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_sync_configs_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(Request::get("/sync/configs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 0); // no synced configs in test tmpdir
+        assert!(json["configs"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_sync_apply_community_forbidden() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::post("/sync/apply").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_sync_apply_pro_empty() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(Request::post("/sync/apply").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["configs_applied"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_apply_merges_json_to_team_config() {
+        let state = make_pro_state();
+        // Write a synced config JSON file into the test config_dir/configs/
+        let configs_dir = state.config_dir.join("configs");
+        std::fs::create_dir_all(&configs_dir).unwrap();
+        std::fs::write(
+            configs_dir.join("team-thresholds.json"),
+            serde_json::json!({
+                "proxy": {
+                    "auto_allow_threshold": 2.5,
+                    "auto_deny_threshold": 7.0
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let router = api_router().with_state(state.clone());
+        let response = router
+            .oneshot(Request::post("/sync/apply").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "applied");
+        assert_eq!(json["configs_applied"], 1);
+
+        // Verify team-config.toml was written with the merged content
+        let team_config =
+            std::fs::read_to_string(state.config_dir.join("team-config.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&team_config).unwrap();
+        let allow = parsed["proxy"]["auto_allow_threshold"].as_float().unwrap();
+        let deny = parsed["proxy"]["auto_deny_threshold"].as_float().unwrap();
+        assert!((allow - 2.5).abs() < f64::EPSILON);
+        assert!((deny - 7.0).abs() < f64::EPSILON);
+    }
+
+    // --- C-03: Analytics cost/activity/compliance endpoint tests ---
+
+    #[tokio::test]
+    async fn test_analytics_cost_community_forbidden() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/analytics/cost").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_analytics_cost_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(Request::get("/analytics/cost").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_cost_usd"], 0.0);
+        assert!(json["by_provider"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_analytics_activity_community_forbidden() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::get("/analytics/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_analytics_activity_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(
+                Request::get("/analytics/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["days"], 30);
+        assert!(json["daily"].is_array());
+        assert!(json["top_tool_call_types"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_analytics_compliance_community_forbidden() {
+        let router = make_router();
+        let response = router
+            .oneshot(
+                Request::get("/analytics/compliance")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_analytics_compliance_pro_ok() {
+        let state = make_pro_state();
+        let router = api_router().with_state(state);
+        let response = router
+            .oneshot(
+                Request::get("/analytics/compliance")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["score_distribution"].is_object());
+        assert_eq!(json["total_evaluations"], 0);
+        assert_eq!(json["deny_rate"], 0.0);
+        assert_eq!(json["allow_rate"], 0.0);
+    }
+}

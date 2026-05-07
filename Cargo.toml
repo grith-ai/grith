@@ -1,0 +1,141 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grith-core",
+    "crates/grith-llm",
+    "crates/grith-proxy",
+    "crates/grith-digest",
+    "crates/grith-audit",
+    "crates/grith-cli",
+    "crates/grith-server",
+    "crates/grith-supervisor",
+    "crates/grith-notify",
+    "crates/grith-tests",
+]
+default-members = [
+    "crates/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+rust-version = "1.88"
+repository = "https://github.com/grith-ai/grith"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "blocking"] }
+aho-corasick = "1"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+toml = "0.8"
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+async-trait = "0.1"
+futures = "0.3"
+nix = { version = "0.29", features = ["ptrace", "signal", "process", "fs", "term"] }
+portable-pty = "0.8"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+base64 = "0.22"
+dirs = "5"
+libc = "0.2"
+dashmap = "5"
+hmac = "0.12"
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+notify-rust = "4"
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "hostname"] }
+open = "5"
+tempfile = "3"
+vt100 = "0.15"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls-pemfile = "2"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Suppressed pedantic lints — too noisy for current codebase state.
+# Re-enable incrementally as the codebase matures.
+too_many_arguments = "allow"
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+float_cmp = "allow"
+similar_names = "allow"
+wildcard_imports = "allow"
+redundant_closure_for_method_calls = "allow"
+match_same_arms = "allow"
+match_wildcard_for_single_variants = "allow"
+match_bool = "allow"
+single_match_else = "allow"
+unnecessary_wraps = "allow"
+unused_async = "allow"
+unused_self = "allow"
+items_after_statements = "allow"
+struct_field_names = "allow"
+needless_pass_by_value = "allow"
+if_not_else = "allow"
+implicit_hasher = "allow"
+trivially_copy_pass_by_ref = "allow"
+uninlined_format_args = "allow"
+stable_sort_primitive = "allow"
+manual_let_else = "allow"
+used_underscore_binding = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+str_split_at_newline = "allow"
+option_if_let_else = "allow"
+bool_to_int_with_if = "allow"
+map_unwrap_or = "allow"
+manual_string_new = "allow"
+explicit_iter_loop = "allow"
+needless_lifetimes = "allow"
+no_effect_underscore_binding = "allow"
+unreadable_literal = "allow"
+manual_is_variant_and = "allow"
+unnecessary_literal_bound = "allow"
+needless_continue = "allow"
+ignored_unit_patterns = "allow"
+missing_fields_in_debug = "allow"
+to_string_trait_impl = "allow"
+unchecked_time_subtraction = "allow"
+format_push_string = "allow"
+doc_link_with_quotes = "allow"
+format_collect = "allow"
+ref_as_ptr = "allow"
+str_to_string = "allow"
+ignore_without_reason = "allow"
+needless_raw_string_hashes = "allow"
+unnested_or_patterns = "allow"
+single_char_pattern = "allow"
+assigning_clones = "allow"
+default_trait_access = "allow"
+field_reassign_with_default = "allow"
+manual_assert = "allow"
+unnecessary_get_then_check = "allow"
+wildcard_in_or_patterns = "allow"
+items_after_test_module = "allow"
+manual_is_multiple_of = "allow"

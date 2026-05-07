@@ -1,0 +1,1405 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) grith contributors
+
+//! Entry point for the grith daemon binary.
+//!
+//! Parses CLI arguments, loads configuration, initializes the daemon, and
+//! dispatches to the appropriate subcommand or interactive REPL.
+
+mod agent;
+mod commands;
+mod config;
+mod daemon;
+mod error;
+mod helpers;
+mod license;
+mod logging;
+mod profile_manifest;
+mod profile_updates;
+mod update_check;
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "grith", version, about = "Zero Trust for AI Agents")]
+struct Cli {
+    /// Path to configuration file
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+
+    /// Disable colored output
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    /// Override the project name (defaults to current directory name)
+    #[arg(long, global = true)]
+    project: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Execute a single task non-interactively
+    Run {
+        /// The task to execute
+        task: String,
+    },
+    /// Create default configuration
+    Init,
+    /// Show or modify configuration
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+    /// Browse audit logs
+    Audit {
+        #[command(subcommand)]
+        action: Option<AuditAction>,
+    },
+    /// Manage digest queue
+    Digest {
+        #[command(subcommand)]
+        action: Option<DigestAction>,
+    },
+    /// Manage canary tokens used for exfiltration trap detection
+    Canary {
+        #[command(subcommand)]
+        action: CanaryAction,
+    },
+    /// Security proxy commands
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
+    /// Supervise an external CLI tool with OS-level syscall interception
+    Exec {
+        /// Tool profile to use (e.g., claude-code, codex, aider, generic)
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Attach to an existing process by PID instead of spawning
+        #[arg(long)]
+        attach: Option<u32>,
+
+        /// Log every syscall request and decision to a file for post-session review
+        #[arg(long)]
+        syscall_log: Option<std::path::PathBuf>,
+
+        /// Write raw pre-filter syscall forensics records to a JSONL file
+        #[arg(long)]
+        trace_syscalls_jsonl: Option<std::path::PathBuf>,
+
+        /// The command and arguments to supervise (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// List or manage active supervisor sessions
+    Supervisor {
+        #[command(subcommand)]
+        action: Option<SupervisorAction>,
+    },
+    /// Manage the grith daemon (dashboard server + shared subsystems)
+    #[command(alias = "dashboard")]
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// Manage Pro plan: login, status, sync, activate, logout
+    Pro {
+        #[command(subcommand)]
+        action: ProAction,
+    },
+    /// Manage notification channels
+    Notifications {
+        #[command(subcommand)]
+        action: NotificationsAction,
+    },
+    /// View audit-backed session logs
+    Log {
+        /// Follow new log entries (tail mode)
+        #[arg(long)]
+        tail: bool,
+        /// Session filter: UUID session_id or session name (task context)
+        #[arg(long)]
+        session: Option<String>,
+        /// Max records to read per poll / view
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Manage supervisor profiles
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+    /// Manage the reputation system
+    Reputation {
+        #[command(subcommand)]
+        action: ReputationAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Set a configuration value
+    Set {
+        /// Configuration key (dot-separated, e.g. proxy.auto_deny_threshold)
+        key: String,
+        /// Value to set
+        value: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Export audit logs as JSON or CSV
+    Export {
+        /// Output format
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Number of records to skip (newest first)
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Maximum number of records to return
+        #[arg(long, default_value = "1000")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum DigestAction {
+    /// Interactive digest review
+    Review,
+}
+
+#[derive(Subcommand)]
+enum CanaryAction {
+    /// List registered canary tokens
+    List,
+    /// Add a canary token
+    Add {
+        /// Human-readable canary label
+        #[arg(long)]
+        label: String,
+        /// Canary value to detect (omit with --generate)
+        #[arg(long)]
+        value: Option<String>,
+        /// Generate a random canary value
+        #[arg(long)]
+        generate: bool,
+    },
+    /// Remove a canary token by ID
+    Remove {
+        /// Canary token ID
+        id: String,
+    },
+    /// Rotate a canary token by ID (keeps label, replaces value)
+    Rotate {
+        /// Canary token ID
+        id: String,
+        /// New canary value (omit with --generate)
+        #[arg(long)]
+        value: Option<String>,
+        /// Generate a random replacement value
+        #[arg(long)]
+        generate: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// Dry-run a tool call against the proxy.
+    ///
+    /// Exit codes: 0 = allow, 1 = queue, 2 = deny.
+    Test {
+        /// Tool call to test (JSON)
+        call: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (dashboard server + shared subsystems) as a background process
+    Start,
+    /// Stop the running daemon
+    Stop,
+    /// Check if the daemon is running
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ProAction {
+    /// Authenticate with grith.ai (device auth by default, API key optional)
+    Login {
+        /// API key from dashboard Settings (optional; when omitted, uses browser device auth)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Show plan status, license expiry, team info
+    Status,
+    /// Fetch and activate a fresh license
+    Activate,
+    /// Force an on-demand license refresh against grith.ai
+    Refresh,
+    /// Remove credentials and license
+    Logout,
+    /// Upload audit records to cloud and pull team policies
+    Sync,
+    /// Open the upgrade/pricing page in the default browser
+    Upgrade,
+    /// Show current plan and billing details; open billing portal in browser
+    Billing,
+}
+
+#[derive(Subcommand)]
+enum SupervisorAction {
+    /// List active supervisor sessions
+    List,
+    /// Show details of a specific session
+    Status {
+        /// Session ID (UUID)
+        session_id: String,
+    },
+    /// Terminate a supervisor session and detach from the process
+    Kill {
+        /// Session ID (UUID)
+        session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationsAction {
+    /// Show notification channel status and health
+    Status,
+    /// List all available notification channels
+    Channels,
+    /// Send a test notification to a specific channel
+    Test {
+        /// Channel ID to test (e.g., desktop, slack, telegram)
+        channel: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// Audit a forensic trace file against a profile
+    Audit {
+        /// Profile name to audit against (e.g., claude-code)
+        #[arg(long)]
+        profile: String,
+        /// Path to the JSONL trace file from --trace-syscalls-jsonl
+        #[arg(long)]
+        trace: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReputationAction {
+    /// Show the learned reputation table with trust scores
+    Show {
+        /// Filter by profile name
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Reset all learned reputation data
+    Reset {
+        /// Only reset reputation for a specific profile
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+fn command_supports_update_check(command: Option<&Command>) -> bool {
+    matches!(command, None | Some(Command::Run { .. }))
+}
+
+fn command_supports_profile_refresh(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        None | Some(Command::Run { .. }) | Some(Command::Exec { .. })
+    )
+}
+
+fn should_refresh_profiles(
+    command: Option<&Command>,
+    profile_update_check_enabled: bool,
+    env_disabled: bool,
+) -> bool {
+    profile_update_check_enabled && !env_disabled && command_supports_profile_refresh(command)
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn should_check_updates(
+    command: Option<&Command>,
+    stdin_is_tty: bool,
+    stderr_is_tty: bool,
+    update_check_enabled: bool,
+    env_disabled: bool,
+) -> bool {
+    update_check_enabled
+        && stdin_is_tty
+        && stderr_is_tty
+        && !env_disabled
+        && command_supports_update_check(command)
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let enable_color = helpers::color_enabled(cli.no_color);
+    let project_override = cli.project.clone();
+
+    if matches!(&cli.command, Some(Command::Init)) {
+        return cmd_init();
+    }
+
+    // Load configuration
+    let mut cfg = config::GrithConfig::load(cli.config.as_deref())?;
+
+    // CLI flag override for log level
+    if let Some(level) = &cli.log_level {
+        cfg.general.log_level = level.clone();
+    }
+
+    // Validate configuration
+    let issues = cfg.validate();
+    if !issues.is_empty() {
+        anyhow::bail!("configuration invalid:\n{}", issues.join("\n"));
+    }
+
+    // Initialize logging
+    logging::init(&cfg.general.log_level);
+
+    // Suppress tracing for `exec` sessions with a TTY so logs don't clutter
+    // the terminal while the supervised tool runs.
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let exec_quiet =
+        matches!(&cli.command, Some(Command::Exec { .. })) && stdout_is_tty && stdin_is_tty;
+    if !exec_quiet {
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "grith starting");
+    } else {
+        logging::suppress();
+    }
+
+    // Check for updates on REPL / `run` launches when interactive and enabled.
+    if should_check_updates(
+        cli.command.as_ref(),
+        stdin_is_tty,
+        stderr_is_tty,
+        cfg.general.update_check,
+        std::env::var_os("GRITH_NO_UPDATE_CHECK").is_some(),
+    ) && update_check::check_and_prompt(enable_color)?
+    {
+        return Ok(()); // user upgraded — exit so they re-run with new binary
+    }
+
+    // Check for remote profile overlay updates (silent, TTL-gated).
+    // Unlike binary updates, this has no TTY requirement and includes `exec`.
+    if should_refresh_profiles(
+        cli.command.as_ref(),
+        cfg.general.profile_update_check,
+        std::env::var_os("GRITH_NO_PROFILE_UPDATE").is_some(),
+    ) {
+        profile_updates::maybe_refresh();
+    }
+
+    // Handle commands that don't need daemon initialization
+    match &cli.command {
+        Some(Command::Config { action: None }) => {
+            println!("{}", cfg.to_toml()?);
+            return Ok(());
+        }
+        Some(Command::Config {
+            action: Some(ConfigAction::Set { key, value }),
+        }) => return cmd_config_set(&mut cfg, key, value),
+        Some(Command::Daemon {
+            action: DaemonAction::Stop,
+        }) => {
+            return commands::dashboard::cmd_dashboard_stop();
+        }
+        Some(Command::Daemon {
+            action: DaemonAction::Status,
+        }) => {
+            return commands::dashboard::cmd_dashboard_status();
+        }
+        Some(Command::Pro {
+            action: ProAction::Login { ref api_key },
+        }) => return commands::pro::cmd_pro_login(api_key.as_deref()),
+        Some(Command::Pro {
+            action: ProAction::Status,
+        }) => return commands::pro::cmd_pro_status(),
+        Some(Command::Pro {
+            action: ProAction::Activate,
+        }) => return commands::pro::cmd_pro_activate(),
+        Some(Command::Pro {
+            action: ProAction::Refresh,
+        }) => return commands::pro::cmd_pro_refresh(),
+        Some(Command::Pro {
+            action: ProAction::Logout,
+        }) => return commands::pro::cmd_pro_logout(),
+        Some(Command::Pro {
+            action: ProAction::Upgrade,
+        }) => return commands::pro::cmd_pro_upgrade(),
+        Some(Command::Pro {
+            action: ProAction::Billing,
+        }) => return commands::pro::cmd_pro_billing(),
+        Some(Command::Profile {
+            action:
+                ProfileAction::Audit {
+                    ref profile,
+                    ref trace,
+                },
+        }) => return commands::profile_audit::run_audit(profile, trace),
+        _ => {}
+    }
+
+    let thin_client_command = matches!(
+        cli.command,
+        Some(Command::Exec { .. })
+            | Some(Command::Supervisor { .. })
+            | Some(Command::Reputation { .. })
+    );
+    if thin_client_command && cfg.server.enabled {
+        let _ = commands::dashboard::ensure_dashboard_running_with_port(
+            cfg.server.port,
+            cli.config.as_deref(),
+        );
+        if let Some(daemon_client) = crate::daemon::client::DaemonClient::connect() {
+            match cli.command {
+                Some(Command::Exec {
+                    profile,
+                    attach,
+                    syscall_log,
+                    trace_syscalls_jsonl,
+                    command,
+                }) => {
+                    return commands::exec::cmd_exec_thin(
+                        &cfg,
+                        daemon_client,
+                        profile,
+                        attach,
+                        syscall_log,
+                        trace_syscalls_jsonl,
+                        command,
+                        project_override.as_deref(),
+                        cli.config.as_deref(),
+                    );
+                }
+                Some(Command::Supervisor { action }) => {
+                    return commands::supervisor::cmd_supervisor_remote(&daemon_client, action);
+                }
+                Some(Command::Reputation { action }) => {
+                    return cmd_reputation_remote(&daemon_client, action);
+                }
+                _ => {}
+            }
+        }
+        if matches!(cli.command, Some(Command::Exec { .. })) {
+            tracing::warn!(
+                "daemon unavailable after auto-start attempt — falling back to in-process exec"
+            );
+        }
+    }
+
+    // Initialize the daemon for commands that need subsystems
+    let init_result = daemon::Daemon::start(cfg)?;
+
+    for warning in &init_result.warnings {
+        tracing::warn!("{warning}");
+    }
+
+    let daemon = init_result.daemon;
+
+    // Handle `grith dashboard start` — run server in foreground (for background spawning).
+    if matches!(
+        cli.command,
+        Some(Command::Daemon {
+            action: DaemonAction::Start
+        })
+    ) {
+        return commands::dashboard::cmd_dashboard_start(&daemon);
+    }
+
+    // Auto-start the dashboard for commands that benefit from web UI monitoring.
+    // This includes `grith run`, `grith` (REPL), and `grith exec`.
+    let wants_dashboard = matches!(
+        cli.command,
+        None | Some(Command::Run { .. }) | Some(Command::Exec { .. })
+    );
+    let dashboard_url = if wants_dashboard && daemon.config.server.enabled {
+        commands::dashboard::ensure_dashboard_running(&daemon, cli.config.as_deref())
+    } else {
+        None
+    };
+
+    let wants_agent = matches!(cli.command, None | Some(Command::Run { .. }));
+    let wants_server = wants_agent && daemon.config.server.enabled && dashboard_url.is_none();
+
+    if wants_server {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+
+        let server_config = to_server_config(&daemon.config.server);
+        let sync_api_key = crate::license::load_credentials()
+            .ok()
+            .flatten()
+            .map(|creds| creds.api_key);
+        let sync_api_base_url = Some(crate::license::api_base_url());
+        let ipc_token = crate::daemon::token::generate_token();
+
+        let deps = grith_server::ServerDeps {
+            audit_storage: daemon.audit_storage.clone(),
+            digest_queue: daemon.digest_queue.clone(),
+            proxy: daemon.proxy.clone(),
+            supervisor_registry: daemon.supervisor_registry.clone(),
+            containment_tracker: daemon.containment_tracker.clone(),
+            correlation_tracker: daemon.correlation_tracker.clone(),
+            canary_registry: daemon.canary_registry.clone(),
+            notification_dispatcher: daemon.notification_dispatcher.clone(),
+            audit_db_path: helpers::expand_user_path(&daemon.config.general.audit_dir)
+                .join("audit.db"),
+            dns_seed_domains: daemon::config_loader::load_egress_policy_config()?.trusted_domains,
+            reputation_table: daemon.reputation_table.clone(),
+            reputation_config: daemon.config.reputation.to_proxy_config(),
+            sync_api_key: sync_api_key.clone(),
+            sync_api_base_url: sync_api_base_url.clone(),
+        };
+        let server = grith_server::GrithServer::new(
+            server_config,
+            deps,
+            env!("CARGO_PKG_VERSION"),
+            daemon.subscribe_shutdown(),
+        )
+        .with_plan_tier(&daemon.config.general.plan_tier)
+        .with_account_id(&daemon.account_id)
+        .with_feature_gate(daemon.feature_gate.clone())
+        .with_license_valid_until(daemon.license_valid_until.clone())
+        .with_billing_portal_url(daemon.billing_portal_url.clone())
+        .with_refresh_state(daemon.refresh_state.clone())
+        .with_ipc_token(ipc_token)
+        .with_sync_api(sync_api_key, sync_api_base_url);
+
+        let addr = server.address();
+        let ws_tx = server.ws_sender();
+
+        daemon.register_notification_channels(Some(ws_tx.clone()));
+
+        runtime.spawn(async move {
+            if let Err(e) = server.start().await {
+                tracing::error!(error = %e, "server failed");
+            }
+        });
+
+        let (license_handle, sync_handle, mut notification_handles) = runtime.block_on(async {
+            let license_handle = daemon.spawn_license_revalidation();
+            let sync_handle = if daemon.config.general.audit_sync {
+                daemon.spawn_audit_sync()
+            } else {
+                tracing::info!("audit sync disabled by configuration");
+                tokio::spawn(async {})
+            };
+            let notification_handles = daemon
+                .notification_dispatcher
+                .spawn_background_tasks(daemon.subscribe_shutdown());
+            (license_handle, sync_handle, notification_handles)
+        });
+
+        tracing::info!(address = %addr, "dashboard available at http://{}", addr);
+
+        let result = match cli.command {
+            None => commands::run::cmd_repl(
+                &daemon,
+                Some(ws_tx),
+                None,
+                project_override.as_deref(),
+                enable_color,
+            ),
+            Some(Command::Run { task }) => commands::run::cmd_run(
+                &daemon,
+                &task,
+                Some(ws_tx),
+                None,
+                project_override.as_deref(),
+                enable_color,
+            ),
+            _ => unreachable!(),
+        };
+
+        daemon.shutdown();
+
+        // Join background task handles to surface any panics rather than
+        // silently swallowing them.
+        runtime.block_on(async {
+            if let Err(e) = license_handle.await {
+                tracing::warn!(error = %e, "license revalidation task panicked");
+            }
+            if let Err(e) = sync_handle.await {
+                tracing::warn!(error = %e, "audit sync task panicked");
+            }
+            for handle in notification_handles.drain(..) {
+                if let Err(e) = handle.await {
+                    tracing::warn!(error = %e, "notification background task panicked");
+                }
+            }
+        });
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+        return result;
+    }
+
+    match cli.command {
+        None => commands::run::cmd_repl(
+            &daemon,
+            None,
+            dashboard_url.as_deref(),
+            project_override.as_deref(),
+            enable_color,
+        ),
+        Some(Command::Run { task }) => commands::run::cmd_run(
+            &daemon,
+            &task,
+            None,
+            dashboard_url.as_deref(),
+            project_override.as_deref(),
+            enable_color,
+        ),
+        Some(Command::Audit { action }) => commands::audit::cmd_audit(&daemon, action),
+        Some(Command::Digest { action }) => commands::digest::cmd_digest(&daemon, action),
+        Some(Command::Canary { action }) => commands::canary::cmd_canary(&daemon, action),
+        Some(Command::Proxy { action }) => commands::proxy::cmd_proxy(&daemon, action),
+        Some(Command::Exec {
+            profile,
+            attach,
+            syscall_log,
+            trace_syscalls_jsonl,
+            command,
+        }) => commands::exec::cmd_exec(
+            &daemon,
+            profile,
+            attach,
+            syscall_log,
+            trace_syscalls_jsonl,
+            command,
+            project_override.as_deref(),
+        ),
+        Some(Command::Supervisor { action }) => {
+            commands::supervisor::cmd_supervisor(&daemon, action)
+        }
+        Some(Command::Notifications { action }) => {
+            commands::notifications::cmd_notifications(&daemon, action)
+        }
+        Some(Command::Pro {
+            action: ProAction::Sync,
+        }) => commands::pro::cmd_pro_sync(&daemon),
+        Some(Command::Log {
+            tail,
+            session,
+            limit,
+        }) => commands::log::cmd_log(&daemon, tail, session.as_deref(), limit, enable_color),
+        Some(Command::Reputation { action }) => cmd_reputation(action),
+        // Already handled above
+        Some(Command::Init)
+        | Some(Command::Config { .. })
+        | Some(Command::Daemon { .. })
+        | Some(Command::Pro { .. })
+        | Some(Command::Profile { .. }) => {
+            unreachable!()
+        }
+    }
+}
+
+// --- Simple command handlers that don't need their own file ---
+
+fn cmd_init() -> anyhow::Result<()> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = home.join(".config").join("grith").join("config.toml");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let default_toml = {
+        let candidates = [
+            PathBuf::from("config/default.toml"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../")
+                .join("config/default.toml"),
+        ];
+        let mut last_error = String::new();
+        let mut content = None;
+        for candidate in &candidates {
+            if !candidate.exists() {
+                last_error = format!("{} does not exist", candidate.display());
+                continue;
+            }
+            match std::fs::read_to_string(candidate) {
+                Ok(raw) => {
+                    content = Some(raw);
+                    break;
+                }
+                Err(e) => last_error = format!("failed to read {}: {e}", candidate.display()),
+            }
+        }
+        content.ok_or_else(|| {
+            anyhow::anyhow!("required config/default.toml unavailable: {last_error}")
+        })?
+    };
+    std::fs::write(&path, default_toml)?;
+    println!("Created default config at {}", path.display());
+    Ok(())
+}
+
+fn cmd_config_set(cfg: &mut config::GrithConfig, key: &str, value: &str) -> anyhow::Result<()> {
+    let old = cfg.set_value(key, value)?;
+    let path = cfg.save_user_config()?;
+    println!("Set {key}: {old} -> {value}");
+    println!("Saved to {}", path.display());
+    Ok(())
+}
+
+// --- Config conversion helpers ---
+
+fn to_server_config(core: &config::ServerConfig) -> grith_server::ServerConfig {
+    grith_server::ServerConfig {
+        host: core.host.clone(),
+        port: core.port,
+        enabled: core.enabled,
+        dashboard_dir: core.dashboard_dir.clone(),
+        tls: core.tls.as_ref().map(|t| grith_server::TlsConfig {
+            cert_path: t.cert_path.clone(),
+            key_path: t.key_path.clone(),
+        }),
+        rate_limit: grith_server::RateLimitConfig {
+            enabled: core.rate_limit.enabled,
+            general_rps: core.rate_limit.general_rps,
+            write_rps: core.rate_limit.write_rps,
+            proxy_test_rps: core.rate_limit.proxy_test_rps,
+            ipc_rps: core.rate_limit.ipc_rps,
+        },
+    }
+}
+
+fn cmd_reputation(action: ReputationAction) -> anyhow::Result<()> {
+    let path = grith_proxy::reputation::default_reputation_path();
+
+    match action {
+        ReputationAction::Show { profile } => {
+            let table = grith_proxy::reputation::ReputationTable::load(&path);
+            if table.is_empty() {
+                println!("No reputation data. Data is learned from approve/deny decisions during grith exec sessions.");
+                return Ok(());
+            }
+
+            let mut entries: Vec<_> = table
+                .entries
+                .iter()
+                .filter(|(key, _)| {
+                    if let Some(ref p) = profile {
+                        key.starts_with(&format!("{p}|"))
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            entries.sort_by(|a, b| b.1.trust_score().partial_cmp(&a.1.trust_score()).unwrap());
+
+            println!("{:<60} {:>6} {:>6} {:>8}", "KEY", "TRUST", "OBS", "STATUS");
+            println!("{}", "-".repeat(84));
+            for (key, entry) in &entries {
+                let trust = entry.trust_score();
+                let obs = entry.observation_count();
+                let status = if trust >= 0.92 && obs >= 8.0 {
+                    "auto-allow"
+                } else if trust < 0.3 && obs >= 5.0 {
+                    "distrusted"
+                } else {
+                    "prompting"
+                };
+                let truncated = if key.len() > 58 {
+                    format!("{}...", &key[..55])
+                } else {
+                    (*key).clone()
+                };
+                println!(
+                    "{:<60} {:>5.0}% {:>6.1} {:>8}",
+                    truncated,
+                    trust * 100.0,
+                    obs,
+                    status
+                );
+            }
+            println!("\n{} entries total.", entries.len());
+        }
+        ReputationAction::Reset { profile } => {
+            let mut table = grith_proxy::reputation::ReputationTable::load(&path);
+            if let Some(ref p) = profile {
+                let before = table.len();
+                table
+                    .entries
+                    .retain(|key, _| !key.starts_with(&format!("{p}|")));
+                let removed = before - table.len();
+                table.save(&path)?;
+                println!("Reset {removed} reputation entries for profile '{p}'.");
+            } else {
+                table.reset();
+                table.save(&path)?;
+                println!("Reset all reputation data.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_reputation_remote(
+    daemon_client: &crate::daemon::client::DaemonClient,
+    action: ReputationAction,
+) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    match action {
+        ReputationAction::Show { profile } => {
+            let table = runtime.block_on(daemon_client.load_reputation_table())?;
+            if table.is_empty() {
+                println!("No reputation data. Data is learned from approve/deny decisions during grith exec sessions.");
+                return Ok(());
+            }
+
+            let mut entries: Vec<_> = table
+                .entries
+                .iter()
+                .filter(|(key, _)| {
+                    if let Some(ref p) = profile {
+                        key.starts_with(&format!("{p}|"))
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            entries.sort_by(|a, b| b.1.trust_score().partial_cmp(&a.1.trust_score()).unwrap());
+
+            println!("{:<60} {:>6} {:>6} {:>8}", "KEY", "TRUST", "OBS", "STATUS");
+            println!("{}", "-".repeat(84));
+            for (key, entry) in &entries {
+                let trust = entry.trust_score();
+                let obs = entry.observation_count();
+                let status = if trust >= 0.92 && obs >= 8.0 {
+                    "auto-allow"
+                } else if trust < 0.3 && obs >= 5.0 {
+                    "distrusted"
+                } else {
+                    "prompting"
+                };
+                let truncated = if key.len() > 58 {
+                    format!("{}...", &key[..55])
+                } else {
+                    (*key).clone()
+                };
+                println!(
+                    "{:<60} {:>5.0}% {:>6.1} {:>8}",
+                    truncated,
+                    trust * 100.0,
+                    obs,
+                    status
+                );
+            }
+            println!("\n{} entries total.", entries.len());
+        }
+        ReputationAction::Reset { profile } => {
+            runtime.block_on(daemon_client.reset_reputation(profile.as_deref()))?;
+            match profile {
+                Some(profile) => {
+                    println!("Reset daemon-owned reputation entries for profile '{profile}'.");
+                }
+                None => println!("Reset all daemon-owned reputation data."),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn to_runtime_supervisor_config(
+    core: &config::SupervisorCoreConfig,
+) -> grith_supervisor::config::SupervisorConfig {
+    grith_supervisor::config::SupervisorConfig {
+        enabled: core.enabled,
+        default_profile: core.default_profile.clone(),
+        freeze_timeout_seconds: core.freeze_timeout_seconds,
+        max_concurrent_sessions: core.max_concurrent_sessions,
+        pty_forwarding: core.pty_forwarding,
+        require_sandbox: core.require_sandbox,
+        platform: grith_supervisor::config::PlatformConfig {
+            linux_mechanism: core.platform.linux_mechanism.clone(),
+            macos_mechanism: core.platform.macos_mechanism.clone(),
+            seccomp_pre_filter: core.platform.seccomp_pre_filter,
+        },
+        noise_reduction: grith_supervisor::config::NoiseConfig {
+            ignore_read_only: core.noise_reduction.ignore_read_only,
+            batch_rapid_reads: core.noise_reduction.batch_rapid_reads,
+            batch_window_ms: core.noise_reduction.batch_window_ms,
+        },
+        dns_inspection: grith_supervisor::config::DnsInspectionConfig {
+            enabled: core.dns_inspection.enabled,
+            upstream_resolver: core.dns_inspection.upstream_resolver.clone(),
+        },
+        interactive_queue_action: grith_supervisor::config::InteractiveQueueAction::default(),
+        syscall_log_file: None,
+        trace_syscalls_jsonl_file: None,
+        reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+    }
+}
+
+#[cfg(test)]
+mod session_summary_tests {
+    use crate::agent::telemetry::*;
+    use crate::agent::tool_execution::{self, *};
+    use grith_audit::CorrelationTracker;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn shell_call(command: &str, args: &[&str]) -> grith_llm::ToolCall {
+        grith_llm::ToolCall {
+            id: "call_1".to_string(),
+            name: "shell_exec".to_string(),
+            arguments: serde_json::json!({
+                "command": command,
+                "args": args,
+            }),
+        }
+    }
+
+    #[test]
+    fn to_runtime_supervisor_config_maps_dns_inspection() {
+        let mut core = crate::config::SupervisorCoreConfig::default();
+        core.dns_inspection.enabled = false;
+        core.dns_inspection.upstream_resolver = Some("9.9.9.9".to_string());
+
+        let mapped = super::to_runtime_supervisor_config(&core);
+        assert!(!mapped.dns_inspection.enabled);
+        assert_eq!(
+            mapped.dns_inspection.upstream_resolver.as_deref(),
+            Some("9.9.9.9")
+        );
+    }
+
+    #[test]
+    fn update_check_only_runs_for_repl_and_run() {
+        let run = super::Command::Run {
+            task: "hello".to_string(),
+        };
+        let exec = super::Command::Exec {
+            profile: None,
+            attach: None,
+            syscall_log: None,
+            trace_syscalls_jsonl: None,
+            command: vec!["echo".to_string(), "hi".to_string()],
+        };
+        let config = super::Command::Config { action: None };
+
+        assert!(super::command_supports_update_check(None));
+        assert!(super::command_supports_update_check(Some(&run)));
+        assert!(!super::command_supports_update_check(Some(&exec)));
+        assert!(!super::command_supports_update_check(Some(&config)));
+    }
+
+    #[test]
+    fn update_check_requires_tty_config_and_env_gate() {
+        let run = super::Command::Run {
+            task: "hello".to_string(),
+        };
+
+        assert!(super::should_check_updates(
+            Some(&run),
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!super::should_check_updates(
+            Some(&run),
+            false,
+            true,
+            true,
+            false
+        ));
+        assert!(!super::should_check_updates(
+            Some(&run),
+            true,
+            false,
+            true,
+            false
+        ));
+        assert!(!super::should_check_updates(
+            Some(&run),
+            true,
+            true,
+            false,
+            false
+        ));
+        assert!(!super::should_check_updates(
+            Some(&run),
+            true,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_normalize_tool_call_label() {
+        assert_eq!(
+            crate::helpers::normalize_tool_call_type_label("FileRead(/tmp/demo.txt)"),
+            "file_read"
+        );
+        assert_eq!(
+            crate::helpers::normalize_tool_call_type_label("DirList(.)"),
+            "dir_list"
+        );
+    }
+
+    #[test]
+    fn test_classify_shell_tool_call() {
+        assert_eq!(
+            classify_shell_tool_call(&shell_call("cargo", &["test", "--workspace"])),
+            Some(ShellQualityKind::Test)
+        );
+        assert_eq!(
+            classify_shell_tool_call(&shell_call("cargo", &["check"])),
+            Some(ShellQualityKind::Build)
+        );
+    }
+
+    #[test]
+    fn test_tool_result_failure_detection() {
+        assert!(tool_result_is_failure(
+            "Operation denied by security proxy: blocked"
+        ));
+        assert!(tool_result_is_failure("stderr: panic\nExit code: 1"));
+        assert!(!tool_result_is_failure("stdout\nExit code: 0"));
+    }
+
+    #[test]
+    fn test_parse_shell_exec_args_from_string() {
+        let parsed = parse_shell_exec_args(Some(&serde_json::json!("-la README.md")));
+        assert_eq!(parsed, vec!["-la".to_string(), "README.md".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_tool_call_shell_exec_accepts_string_args() {
+        let tool_call = grith_llm::ToolCall {
+            id: "call_2".to_string(),
+            name: "shell_exec".to_string(),
+            arguments: serde_json::json!({
+                "command": "ls",
+                "args": "-la README.md",
+            }),
+        };
+
+        let parsed = parse_tool_call(&tool_call).expect("shell_exec should parse");
+        match parsed.0 {
+            grith_proxy::types::ToolCallType::ShellExec { command, args } => {
+                assert_eq!(command, "ls");
+                assert_eq!(args, vec!["-la".to_string(), "README.md".to_string()]);
+            }
+            other => panic!("expected shell exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_session_name_keeps_dashes() {
+        assert_eq!(
+            crate::helpers::sanitize_session_name("grith-website".to_string()),
+            "grith-website"
+        );
+        assert_eq!(
+            crate::helpers::sanitize_session_name("my weird repo".to_string()),
+            "my-weird-repo"
+        );
+    }
+
+    fn queue_everything_proxy() -> grith_proxy::engine::SecurityProxy {
+        let filters = grith_proxy::filters::FilterRegistry::new();
+        let scoring = grith_proxy::scoring::ScoringConfig {
+            auto_allow_threshold: -1.0,
+            auto_deny_threshold: 10.0,
+            cold_start_calls: 0,
+            cold_start_escalation_low: -1.0,
+            cold_start_escalation_high: 10.0,
+        };
+        let meta_rules = grith_proxy::meta_rules::MetaRuleEngine::new(vec![]);
+        grith_proxy::engine::SecurityProxy::new(filters, scoring, meta_rules)
+    }
+
+    fn test_dispatcher(
+        digest_queue: Arc<grith_digest::DigestQueue>,
+    ) -> Arc<grith_notify::NotificationDispatcher> {
+        Arc::new(grith_notify::NotificationDispatcher::new(
+            grith_notify::ChannelRegistry::new(),
+            grith_notify::RoutingEngine::default(),
+            Arc::new(grith_digest::notification::CallbackNonceStore::new(
+                Duration::from_secs(300),
+            )),
+            grith_digest::notification::PlanTier::Community,
+            digest_queue,
+            grith_notify::rate_limiter::RateLimiter::default(),
+            grith_notify::batcher::Batcher::default(),
+            Duration::from_secs(300),
+            grith_digest::types::ScoreSeverity::High,
+        ))
+    }
+
+    fn read_file_call(path: &std::path::Path) -> grith_llm::ToolCall {
+        grith_llm::ToolCall {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({
+                "path": path.display().to_string()
+            }),
+        }
+    }
+
+    async fn wait_for_pending_item(digest_queue: &Arc<grith_digest::DigestQueue>) -> uuid::Uuid {
+        let started = std::time::Instant::now();
+        loop {
+            let pending = digest_queue
+                .get_pending(1, 0)
+                .expect("failed to query pending digest items");
+            if let Some(item) = pending.first() {
+                return item.id;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "timed out waiting for queued digest item"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_pauses_and_resumes_after_inline_approval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("queued-inline.txt");
+        tokio::fs::write(&file_path, "inline-approved")
+            .await
+            .expect("write temp file");
+
+        let proxy = queue_everything_proxy();
+        let audit_storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().expect("audit storage"),
+        ));
+        let digest_queue =
+            Arc::new(grith_digest::DigestQueue::open_in_memory().expect("digest queue"));
+        let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+        let correlation_tracker = CorrelationTracker::with_defaults();
+        let containment_tracker = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::with_defaults(),
+        );
+        let notification_dispatcher = test_dispatcher(Arc::clone(&digest_queue));
+        let tool_call = read_file_call(&file_path);
+        let session_id = uuid::Uuid::new_v4();
+
+        let handle = tokio::spawn({
+            let audit_storage = Arc::clone(&audit_storage);
+            let digest_queue = Arc::clone(&digest_queue);
+            let notification_dispatcher = Arc::clone(&notification_dispatcher);
+            let containment_tracker = Arc::clone(&containment_tracker);
+            async move {
+                let mut call_seq = 0;
+                let mut ctx = tool_execution::ToolCallContext {
+                    proxy: &proxy,
+                    audit_storage: &audit_storage,
+                    digest_queue: &digest_queue,
+                    dlp_redactor: &dlp_redactor,
+                    correlation_tracker: &correlation_tracker,
+                    notification_dispatcher: &notification_dispatcher,
+                    containment_tracker: &containment_tracker,
+                    ws_tx: None,
+                    dashboard_url: None,
+                    session_id,
+                    session_name: "inline-test",
+                    policy_scope: None,
+                    call_seq: &mut call_seq,
+                    review_timeout: Duration::from_secs(5),
+                    tui_tx: None,
+                };
+                execute_tool_call(&tool_call, &mut ctx).await
+            }
+        });
+
+        let item_id = wait_for_pending_item(&digest_queue).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handle.is_finished(),
+            "queued tool call should pause while waiting for review"
+        );
+
+        {
+            let actions = grith_digest::actions::DigestActions::new(&digest_queue);
+            actions.approve(&item_id).expect("approve queued item");
+        }
+
+        let result = handle.await.expect("join execute_tool_call");
+        assert_eq!(result, "inline-approved");
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_pauses_and_resumes_after_remote_callback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("queued-remote.txt");
+        tokio::fs::write(&file_path, "remote-approved")
+            .await
+            .expect("write temp file");
+
+        let proxy = queue_everything_proxy();
+        let audit_storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().expect("audit storage"),
+        ));
+        let digest_queue =
+            Arc::new(grith_digest::DigestQueue::open_in_memory().expect("digest queue"));
+        let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+        let correlation_tracker = CorrelationTracker::with_defaults();
+        let containment_tracker = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::with_defaults(),
+        );
+        let notification_dispatcher = test_dispatcher(Arc::clone(&digest_queue));
+        let tool_call = read_file_call(&file_path);
+        let session_id = uuid::Uuid::new_v4();
+
+        let webhook_channel = grith_notify::channels::webhook::WebhookChannel::new(
+            grith_notify::channels::webhook::WebhookConfig {
+                url: "http://127.0.0.1:9".to_string(),
+                secret: "test-secret".to_string(),
+                callback_url: Some("http://localhost/callback".to_string()),
+                headers: vec![],
+                max_retries: 0,
+            },
+        );
+        notification_dispatcher.register_channel(Arc::new(webhook_channel), true);
+
+        let handle = tokio::spawn({
+            let audit_storage = Arc::clone(&audit_storage);
+            let digest_queue = Arc::clone(&digest_queue);
+            let notification_dispatcher = Arc::clone(&notification_dispatcher);
+            let containment_tracker = Arc::clone(&containment_tracker);
+            async move {
+                let mut call_seq = 0;
+                let mut ctx = tool_execution::ToolCallContext {
+                    proxy: &proxy,
+                    audit_storage: &audit_storage,
+                    digest_queue: &digest_queue,
+                    dlp_redactor: &dlp_redactor,
+                    correlation_tracker: &correlation_tracker,
+                    notification_dispatcher: &notification_dispatcher,
+                    containment_tracker: &containment_tracker,
+                    ws_tx: None,
+                    dashboard_url: None,
+                    session_id,
+                    session_name: "remote-test",
+                    policy_scope: None,
+                    call_seq: &mut call_seq,
+                    review_timeout: Duration::from_secs(5),
+                    tui_tx: None,
+                };
+                execute_tool_call(&tool_call, &mut ctx).await
+            }
+        });
+
+        let item_id = wait_for_pending_item(&digest_queue).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handle.is_finished(),
+            "queued tool call should pause while waiting for callback review"
+        );
+
+        let nonce = notification_dispatcher
+            .nonce_store()
+            .generate(item_id, "webhook");
+        let payload = grith_digest::notification::CallbackPayload {
+            item_id,
+            action: grith_digest::ReviewAction::Approve,
+            reviewer: "remote-reviewer".to_string(),
+            notes: Some("approved from remote callback".to_string()),
+            nonce,
+            channel_id: "webhook".to_string(),
+            user_id: None,
+        };
+        let action = notification_dispatcher
+            .handle_callback(&payload)
+            .await
+            .expect("handle callback");
+        assert_eq!(action, Some(grith_digest::ReviewAction::Approve));
+
+        let result = handle.await.expect("join execute_tool_call");
+        assert_eq!(result, "remote-approved");
+    }
+}
+
+#[cfg(test)]
+mod profile_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn exec_included_in_profile_refresh_gate() {
+        let cmd = Command::Exec {
+            profile: None,
+            attach: None,
+            syscall_log: None,
+            trace_syscalls_jsonl: None,
+            command: vec!["echo".into()],
+        };
+        assert!(command_supports_profile_refresh(Some(&cmd)));
+    }
+
+    #[test]
+    fn run_included_in_profile_refresh_gate() {
+        let cmd = Command::Run {
+            task: "test".into(),
+        };
+        assert!(command_supports_profile_refresh(Some(&cmd)));
+    }
+
+    #[test]
+    fn repl_included_in_profile_refresh_gate() {
+        assert!(command_supports_profile_refresh(None));
+    }
+
+    #[test]
+    fn config_excluded_from_profile_refresh_gate() {
+        let cmd = Command::Config { action: None };
+        assert!(!command_supports_profile_refresh(Some(&cmd)));
+    }
+
+    #[test]
+    fn daemon_excluded_from_profile_refresh_gate() {
+        let cmd = Command::Daemon {
+            action: DaemonAction::Status,
+        };
+        assert!(!command_supports_profile_refresh(Some(&cmd)));
+    }
+
+    #[test]
+    fn env_disables_profile_refresh() {
+        assert!(!should_refresh_profiles(None, true, true));
+    }
+
+    #[test]
+    fn config_disables_profile_refresh() {
+        assert!(!should_refresh_profiles(None, false, false));
+    }
+
+    #[test]
+    fn no_tty_still_refreshes() {
+        // Unlike binary update check, profile refresh has no TTY requirement.
+        assert!(should_refresh_profiles(None, true, false));
+    }
+}

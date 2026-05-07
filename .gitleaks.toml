@@ -1,0 +1,39 @@
+# gitleaks configuration
+# Run: gitleaks detect --source=. --redact
+# CI / pre-publish: scripts/check-oss-export.sh, docs/PUBLIC-LAUNCH-RUNBOOK.md
+#
+# This file extends the gitleaks default ruleset with allowlists for
+# paths and findings that are inherent to the product (regex banks,
+# test fixtures, canary token patterns, security-spec examples).
+#
+# Real secret detection still fires on anything outside these paths.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Product-internal regex banks, test fixtures, and security-spec examples — these locations contain marker strings BY DESIGN as part of grith's secret-detection feature."
+paths = [
+    # Regex bank — the file's purpose is to define detection patterns
+    # for ~1,620 secret types. Every entry here will look like a leak
+    # to gitleaks; that's what makes it useful at runtime.
+    '''config/filters/secrets\.toml''',
+
+    # Proxy filter source — references marker strings (BEGIN PRIVATE
+    # KEY, AWS access keys, etc.) as part of detection logic.
+    '''crates/grith-proxy/src/filters/.*\.rs''',
+
+    # Integration tests — exercise the security pipeline using fake
+    # but realistic-looking secrets as fixtures.
+    '''crates/grith-tests/tests/.*\.rs''',
+
+    # Canary token examples in fixtures and unit tests.
+    '''crates/grith-supervisor/tests/.*\.rs''',
+
+    # Internal security/notification specs — already excluded from the
+    # public mirror via .oss-paths, but allowlisted here so internal
+    # gitleaks runs are clean.
+    '''docs/NOTIFICATION-SPEC\.md''',
+    '''docs/SUPERVISOR-ONLY-SECURITY-ASSESSMENT\.md''',
+    '''docs/SUPERVISOR-ZERO-AUTHORITY-OPTIONS\.md''',
+]

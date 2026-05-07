@@ -1,0 +1,91 @@
+name: Bug Report
+description: Report a bug in grith
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill in the details below.
+
+        **Security vulnerabilities:** Do not use this form. See [SECURITY.md](https://github.com/grith-ai/grith/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: grith version
+      description: Output of `grith --version`
+      placeholder: "grith 0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Execution mode
+      description: How were you running grith?
+      options:
+        - "grith exec (supervisor)"
+        - "grith run (built-in agent)"
+        - "grith (REPL)"
+        - "Dashboard (localhost:3141)"
+        - "Other / N/A"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the bug
+      placeholder: |
+        1. Run `grith exec -- claude-code "task"`
+        2. Observe that...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste log output here. Use `RUST_LOG=debug` for verbose output.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Any relevant config (redact secrets). Output of `grith config` or relevant TOML.
+      render: toml
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I checked the [troubleshooting guide](https://docs.grith.ai/docs/guides/troubleshooting)
+          required: false

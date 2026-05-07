@@ -1,0 +1,35 @@
+[package]
+name = "grith-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Terminal CLI interface for grith"
+
+[lints]
+workspace = true
+
+[dependencies]
+grith-digest = { path = "../grith-digest" }
+grith-llm = { path = "../grith-llm" }
+grith-proxy = { path = "../grith-proxy" }
+grith-audit = { path = "../grith-audit" }
+grith-supervisor = { path = "../grith-supervisor" }
+
+crossterm.workspace = true
+ratatui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+futures.workspace = true
+dirs.workspace = true
+vt100.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

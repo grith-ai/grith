@@ -1,0 +1,17 @@
+[dlp]
+enabled = true
+
+# redact_and_allow | queue_for_review | deny
+# - redact_and_allow: mask secrets in logs/UI but allow the operation (low score)
+# - queue_for_review: queue the operation for human review (moderate score)
+# - deny: hard deny operations containing secrets (high score)
+policy = "queue_for_review"
+
+# High-confidence secret patterns for outbound DLP scanning.
+# These patterns are deliberately conservative to minimise false positives.
+# The built-in defaults are used when this section is omitted.
+#
+# [[dlp.patterns]]
+# id = "custom-secret"
+# regex = "CUSTOM_[A-Z0-9]{32}"
+# label = "custom-secret"

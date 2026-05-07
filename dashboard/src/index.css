@@ -1,0 +1,109 @@
+@import "tailwindcss";
+
+@theme {
+  /* Brand — matches grith-website design system */
+  --color-green: #00a85a;
+  --color-green-dark: #008548;
+  --color-green-light: #e6f9ef;
+  --color-green-border: #b4e6cc;
+
+  /* Backgrounds & surfaces */
+  --color-grith-bg: #ffffff;
+  --color-grith-surface: #f3f5f8;
+  --color-grith-surface-alt: #eaecf1;
+
+  /* Borders */
+  --color-grith-border: #e2e6eb;
+  --color-grith-border-hover: #d0d5dc;
+
+  /* Text */
+  --color-grith-text: #0d1117;
+  --color-grith-text-bright: #0d1117;
+  --color-grith-muted: #57606a;
+  --color-grith-dim: #8b949e;
+
+  /* Status — semantic colours shared with website */
+  --color-status-allow-green: #00a85a;
+  --color-status-queue-amber: #bf8700;
+  --color-status-deny-red: #d1242f;
+
+  /* Status light backgrounds */
+  --color-status-allow-light: #e6f9ef;
+  --color-status-queue-light: #fff8e1;
+  --color-status-deny-light: #fef1f2;
+
+  /* Accent — green (matches brand) */
+  --color-accent: #00a85a;
+  --color-accent-hover: #008548;
+  --color-accent-light: #e6f9ef;
+
+  /* Info / purple */
+  --color-info: #0969da;
+  --color-info-light: #edf5ff;
+  --color-purple: #8250df;
+  --color-purple-light: #f3eeff;
+
+  /* Terminal (dark code blocks) */
+  --color-terminal-bg: #0d1117;
+  --color-terminal-text: #e6edf3;
+  --color-terminal-border: #21262d;
+
+  /* Radius — slightly larger to match website */
+  --radius-card: 12px;
+  --radius-input: 8px;
+
+  /* Typography — Inter + JetBrains Mono */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Base styles — light mode */
+html {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-grith-bg text-grith-text;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background-color: rgba(0, 168, 90, 0.15);
+  color: #0d1117;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-grith-surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-grith-border-hover);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-grith-dim);
+}
+
+/* Score bar gradients */
+.score-bar {
+  background: linear-gradient(
+    to right,
+    var(--color-status-allow-green) 0%,
+    var(--color-status-queue-amber) 37.5%,
+    var(--color-status-deny-red) 100%
+  );
+}
+
+/* Monospace text */
+.font-mono {
+  font-feature-settings: "liga" 0;
+}

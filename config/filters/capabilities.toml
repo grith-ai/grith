@@ -1,0 +1,20 @@
+# Capability grants for plugin permission enforcement.
+#
+# Each [[grants]] entry grants a plugin a set of capability tokens.
+# When any grants are defined, the CapabilityFilter switches from permissive
+# mode to enforcement mode — plugins without explicit grants are denied.
+#
+# Capability format: "category:action"
+#   fs:read, fs:write, fs:delete, fs:list
+#   shell:exec
+#   net:http, net:connect, net:listen
+#   *  (wildcard — grants everything)
+#
+# Example:
+# [[grants]]
+# plugin = "file-ops"
+# capabilities = ["fs:read", "fs:write"]
+#
+# [[grants]]
+# plugin = "web-fetcher"
+# capabilities = ["net:http"]

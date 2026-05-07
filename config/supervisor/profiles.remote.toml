@@ -1,0 +1,71 @@
+# Remote overlay source of truth.
+#
+# This file defines the OTA-eligible remote overlay entries for supervisor
+# profiles. Only the five allowlist vectors below are permitted per profile.
+# Structural changes (launch_contract, extends, overlays, exec roots,
+# listen addresses) must go through profiles.toml and require a binary release.
+#
+# Changes to this file are signed offline with the profile signing key and
+# distributed via the grith API at ${API_BASE_URL}/v1/profiles/latest.
+#
+# CI validates this file on every PR. The signing tool rejects invalid entries.
+
+schema_version = 1
+min_grith_version = "0.1.0"
+changelog = "Initial remote overlay — empty baseline"
+
+[profiles.claude-code]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.codex]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.aider]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.goose]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.copilot]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.cursor]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.cline]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []
+
+[profiles.openclaw]
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+readonly_paths = []
+readonly_path_patterns = []

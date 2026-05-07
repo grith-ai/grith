@@ -1,0 +1,1767 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) grith contributors
+
+//! Pre-built supervisor profiles for known AI coding tools.
+//!
+//! Each profile defines the expected "routine" behaviour of a specific tool:
+//! which paths it normally reads/writes, which commands it spawns, and which
+//! network destinations it contacts. These are used to auto-generate proxy
+//! allowlist entries so that common operations pass through at low scores,
+//! while unusual behaviour gets flagged.
+//!
+//! Profiles can be loaded from TOML files or auto-detected from the command
+//! being supervised.
+
+use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// Bundled profile config embedded at compile time.
+/// Used as fallback when no filesystem profiles.toml is found.
+const BUNDLED_PROFILES_TOML: &str = include_str!("../../../config/supervisor/profiles.toml");
+const DEV_PROFILE_OVERRIDE_ENV: &str = "GRITH_DEV_PROFILE_OVERRIDE";
+
+/// A supervisor profile describing the expected behaviour of a specific tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProfile {
+    /// Machine-readable profile identifier (e.g., "claude-code").
+    pub name: String,
+    /// Human-readable display name (e.g., "Claude Code").
+    pub display_name: String,
+    /// Optional explanation of what this profile is for.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// Optional parent profile name for layered inheritance.
+    ///
+    /// When set, the parent profile's entries are merged after the child's
+    /// own entries (child takes priority). The parent is resolved recursively,
+    /// and `[defaults]` are applied last.
+    ///
+    /// Stripped from the final resolved profile used at runtime.
+    #[serde(default, skip_serializing)]
+    pub extends: Option<String>,
+    /// Glob patterns for paths the tool routinely accesses.
+    /// These generate low-score allowlist entries in the proxy.
+    pub routine_paths: Vec<String>,
+    /// Commands the tool routinely spawns (e.g., "git", "npm", "node").
+    pub routine_commands: Vec<String>,
+    /// Network destinations the tool routinely contacts
+    /// (e.g., "api.anthropic.com", "registry.npmjs.org").
+    pub routine_destinations: Vec<String>,
+    /// Listener bind addresses the tool may use without prompting.
+    #[serde(default)]
+    pub routine_listen_addresses: Vec<String>,
+    /// Trusted executable root directories for process-spawn allowlisting.
+    ///
+    /// Binaries under these roots are auto-allowed for process spawns if they
+    /// pass provenance verification (ownership, permissions). This is separate
+    /// from `routine_paths` which applies to file I/O — exec roots only affect
+    /// `ProcessSpawn` matching via `exec-prefix:` session allowlist entries.
+    ///
+    /// Example: `["/usr/lib/git-core/", "${HOME}/.local/share/claude/versions/"]`
+    #[serde(default)]
+    pub routine_exec_roots: Vec<String>,
+    /// Paths trusted for read-only access only.
+    ///
+    /// Unlike `routine_paths` which allow all file I/O (reads and writes),
+    /// `readonly_paths` only allow `FileRead` operations. Writes, appends,
+    /// deletes, renames, and chmod operations on these paths still go through
+    /// the full proxy pipeline.
+    ///
+    /// Uses **exact match only** (no prefix/glob matching) to prevent
+    /// accidental trust widening in sensitive directories.
+    ///
+    /// Session allowlist entries use the `ro:` namespace (e.g., `ro:/home/user/.ssh/config`).
+    ///
+    /// Example: `["${HOME}/.ssh/config", "${HOME}/.ssh/known_hosts"]`
+    #[serde(default)]
+    pub readonly_paths: Vec<String>,
+    /// Glob patterns for read-only path matching.
+    ///
+    /// Unlike `readonly_paths` (exact match only), these support simple glob
+    /// patterns with `*` as a single-segment wildcard. Used for SSH public keys
+    /// and certificates where the filenames vary per user.
+    ///
+    /// Session allowlist entries use the `ro-glob:` namespace.
+    ///
+    /// Example: `["${HOME}/.ssh/*.pub", "${HOME}/.ssh/*-cert"]`
+    #[serde(default)]
+    pub readonly_path_patterns: Vec<String>,
+    /// Launch contract: args that must be present when running under grith.
+    ///
+    /// If specified, `grith exec` will auto-inject these args if they are
+    /// not already present in the user's command line.
+    #[serde(default)]
+    pub launch_contract: Option<LaunchContract>,
+}
+
+/// Launch requirements enforced by `grith exec` before spawning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LaunchContract {
+    /// Args that must be present (as a contiguous sequence) or will be
+    /// auto-injected at the start of the arg list.
+    ///
+    /// Example: `["--sandbox", "disabled"]` for Cursor CLI.
+    #[serde(default)]
+    pub required_args: Vec<String>,
+}
+
+/// A launcher overlay adds small, context-specific trust when a tool is
+/// launched from a known IDE terminal (e.g., VS Code, Cursor).
+///
+/// Overlays are additive only and restricted to low-risk entries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LauncherOverlay {
+    /// Overlay identifier (e.g., "vscode-terminal").
+    pub name: String,
+    /// Parent process basenames that trigger this overlay.
+    #[serde(default)]
+    pub detect_parent_names: Vec<String>,
+    /// Environment variable checks (format: `KEY=value`).
+    #[serde(default)]
+    pub detect_env: Vec<String>,
+    /// Additional commands to trust (e.g., "code").
+    #[serde(default)]
+    pub routine_commands: Vec<String>,
+    /// Additional paths to trust.
+    #[serde(default)]
+    pub routine_paths: Vec<String>,
+}
+
+/// A provider overlay adds LLM provider network destinations.
+///
+/// Used by the grith REPL when the active provider is known.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderOverlay {
+    /// Overlay identifier (e.g., "openai", "anthropic").
+    pub name: String,
+    /// Network destinations to trust for this provider.
+    #[serde(default)]
+    pub routine_destinations: Vec<String>,
+}
+
+/// Complete parsed profile configuration including overlays.
+#[derive(Debug)]
+pub struct ProfileConfig {
+    pub profiles: Vec<SupervisorProfile>,
+    pub launcher_overlays: Vec<LauncherOverlay>,
+    pub provider_overlays: Vec<ProviderOverlay>,
+}
+
+/// Fully resolved session policy: base profile + optional overlays.
+#[derive(Debug, Clone)]
+pub struct EffectivePolicy {
+    /// Name of the base static profile.
+    pub base_profile_name: String,
+    /// Applied launcher overlay, if any.
+    pub launcher_overlay_name: Option<String>,
+    /// Applied provider overlay, if any.
+    pub provider_overlay_name: Option<String>,
+    /// Fully merged profile (base + overlays).
+    pub merged_profile: SupervisorProfile,
+    /// Stable key for learned-rule scoping (e.g., "codex+launcher:vscode-terminal").
+    pub scope_key: String,
+}
+
+impl SupervisorProfile {
+    /// Load profiles from a TOML file.
+    ///
+    /// The TOML file should contain an array of profiles under the
+    /// `[[profiles]]` key:
+    ///
+    /// ```toml
+    /// [[profiles]]
+    /// name = "claude-code"
+    /// display_name = "Claude Code"
+    /// rationale = "Claude Code routine profile"
+    /// routine_paths = ["**/*.rs", "**/*.ts"]
+    /// routine_commands = ["git", "npm", "node"]
+    /// routine_destinations = ["api.anthropic.com"]
+    /// routine_listen_addresses = ["127.0.0.1"]
+    /// ```
+    pub fn load_from_toml(path: impl AsRef<Path>) -> Result<Vec<SupervisorProfile>> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
+            Error::ProfileError(format!(
+                "failed to read profile file '{}': {e}",
+                path.as_ref().display()
+            ))
+        })?;
+        Self::parse_toml(&content)
+    }
+
+    /// Parse profiles from a TOML string with layered resolution.
+    ///
+    /// Resolution order for each profile:
+    /// 1. Child profile entries (highest priority)
+    /// 2. Parent profile entries (if `extends` is set, resolved recursively)
+    /// 3. `[defaults]` entries (lowest priority)
+    ///
+    /// Duplicates are skipped at each layer. Inheritance cycles, self-references,
+    /// unknown parent profiles, and duplicate names are hard errors.
+    fn parse_toml(content: &str) -> Result<Vec<SupervisorProfile>> {
+        Self::parse_toml_full(content).map(|cfg| cfg.profiles)
+    }
+
+    /// Parse the complete profile config including overlays.
+    fn parse_toml_full(content: &str) -> Result<ProfileConfig> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct ProfileDefaults {
+            routine_paths: Vec<String>,
+            routine_commands: Vec<String>,
+            routine_destinations: Vec<String>,
+            routine_listen_addresses: Vec<String>,
+            routine_exec_roots: Vec<String>,
+            readonly_paths: Vec<String>,
+            readonly_path_patterns: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct ProfileFile {
+            #[serde(default)]
+            defaults: ProfileDefaults,
+            profiles: Vec<SupervisorProfile>,
+            #[serde(default)]
+            launcher_overlays: Vec<LauncherOverlay>,
+            #[serde(default)]
+            provider_overlays: Vec<ProviderOverlay>,
+        }
+
+        let file: ProfileFile = toml::from_str(content)
+            .map_err(|e| Error::ProfileError(format!("failed to parse profiles TOML: {e}")))?;
+
+        // Reject duplicate profile names explicitly.
+        let mut raw_map = std::collections::HashMap::new();
+        for p in &file.profiles {
+            if raw_map.insert(p.name.clone(), p).is_some() {
+                return Err(Error::ProfileError(format!(
+                    "duplicate profile name: '{}'",
+                    p.name
+                )));
+            }
+        }
+
+        // Reject duplicate launcher overlay names.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for o in &file.launcher_overlays {
+                if !seen.insert(&o.name) {
+                    return Err(Error::ProfileError(format!(
+                        "duplicate launcher overlay name: '{}'",
+                        o.name
+                    )));
+                }
+            }
+        }
+
+        // Reject duplicate provider overlay names.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for o in &file.provider_overlays {
+                if !seen.insert(&o.name) {
+                    return Err(Error::ProfileError(format!(
+                        "duplicate provider overlay name: '{}'",
+                        o.name
+                    )));
+                }
+            }
+        }
+
+        // Cache for resolved profiles (without defaults yet).
+        let mut resolved_cache: std::collections::HashMap<String, SupervisorProfile> =
+            std::collections::HashMap::new();
+
+        // Resolve a profile by name, merging parent chain.
+        fn resolve<'a>(
+            name: &str,
+            raw_map: &std::collections::HashMap<String, &SupervisorProfile>,
+            cache: &'a mut std::collections::HashMap<String, SupervisorProfile>,
+            stack: &mut Vec<String>,
+        ) -> Result<&'a SupervisorProfile> {
+            if cache.contains_key(name) {
+                return Ok(&cache[name]);
+            }
+
+            let profile = raw_map
+                .get(name)
+                .ok_or_else(|| Error::ProfileError(format!("unknown profile: '{name}'")))?;
+
+            // Check for cycles.
+            if stack.contains(&name.to_string()) {
+                stack.push(name.to_string());
+                return Err(Error::ProfileError(format!(
+                    "inheritance cycle detected: {}",
+                    stack.join(" -> ")
+                )));
+            }
+
+            let mut merged = (*profile).clone();
+
+            if let Some(ref parent_name) = profile.extends {
+                // Self-reference check.
+                if parent_name == name {
+                    return Err(Error::ProfileError(format!(
+                        "profile '{name}' cannot extend itself"
+                    )));
+                }
+
+                stack.push(name.to_string());
+                resolve(parent_name, raw_map, cache, stack)?;
+                stack.pop();
+
+                let parent = &cache[parent_name];
+                merge_vec(&mut merged.routine_paths, &parent.routine_paths);
+                merge_vec(&mut merged.routine_commands, &parent.routine_commands);
+                merge_vec(
+                    &mut merged.routine_destinations,
+                    &parent.routine_destinations,
+                );
+                merge_vec(
+                    &mut merged.routine_listen_addresses,
+                    &parent.routine_listen_addresses,
+                );
+                merge_vec(&mut merged.routine_exec_roots, &parent.routine_exec_roots);
+                merge_vec(&mut merged.readonly_paths, &parent.readonly_paths);
+                merge_vec(
+                    &mut merged.readonly_path_patterns,
+                    &parent.readonly_path_patterns,
+                );
+            }
+
+            merged.extends = None;
+            cache.insert(name.to_string(), merged);
+            Ok(&cache[name])
+        }
+
+        let names: Vec<String> = file.profiles.iter().map(|p| p.name.clone()).collect();
+        for name in &names {
+            let mut stack = Vec::new();
+            resolve(name, &raw_map, &mut resolved_cache, &mut stack)?;
+        }
+
+        // Apply defaults as the final layer.
+        let d = &file.defaults;
+        let has_defaults = !d.routine_paths.is_empty()
+            || !d.routine_commands.is_empty()
+            || !d.routine_destinations.is_empty()
+            || !d.routine_listen_addresses.is_empty()
+            || !d.routine_exec_roots.is_empty()
+            || !d.readonly_paths.is_empty()
+            || !d.readonly_path_patterns.is_empty();
+
+        let mut profiles: Vec<SupervisorProfile> = Vec::with_capacity(names.len());
+        for name in names {
+            let mut p = resolved_cache.remove(&name).ok_or_else(|| {
+                Error::ProfileError(format!("internal error: resolved profile '{name}' missing"))
+            })?;
+            if has_defaults {
+                merge_vec(&mut p.routine_paths, &d.routine_paths);
+                merge_vec(&mut p.routine_commands, &d.routine_commands);
+                merge_vec(&mut p.routine_destinations, &d.routine_destinations);
+                merge_vec(&mut p.routine_listen_addresses, &d.routine_listen_addresses);
+                merge_vec(&mut p.routine_exec_roots, &d.routine_exec_roots);
+                merge_vec(&mut p.readonly_paths, &d.readonly_paths);
+                merge_vec(&mut p.readonly_path_patterns, &d.readonly_path_patterns);
+            }
+            profiles.push(p);
+        }
+
+        Ok(ProfileConfig {
+            profiles,
+            launcher_overlays: file.launcher_overlays,
+            provider_overlays: file.provider_overlays,
+        })
+    }
+
+    /// Load profiles from the effective configuration source.
+    ///
+    /// By default this returns the embedded bundled profiles. A repo-local
+    /// filesystem override is only consulted when
+    /// `GRITH_DEV_PROFILE_OVERRIDE=1` (or another truthy value) is set.
+    pub fn load_from_config() -> Result<Vec<SupervisorProfile>> {
+        Self::load_config().map(|cfg| cfg.profiles)
+    }
+
+    /// Load the full profile configuration including overlays.
+    ///
+    /// The embedded bundled copy is authoritative by default. A repo-local
+    /// filesystem override is only enabled for explicit developer workflows
+    /// via `GRITH_DEV_PROFILE_OVERRIDE`.
+    pub fn load_config() -> Result<ProfileConfig> {
+        if !developer_override_enabled() {
+            return Self::load_bundled_config();
+        }
+
+        let relative_path = "config/supervisor/profiles.toml";
+        let candidates = [
+            std::path::PathBuf::from(relative_path),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../")
+                .join(relative_path),
+        ];
+
+        for path in &candidates {
+            if !path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(path).map_err(|e| {
+                Error::ProfileError(format!(
+                    "failed to read profile file '{}': {e}",
+                    path.display()
+                ))
+            })?;
+            // If a filesystem file exists but fails to parse, that is a hard
+            // error — do NOT silently fall back to embedded content.
+            return Self::parse_toml_full(&content);
+        }
+
+        // No filesystem override found — use embedded bundled profiles.
+        Self::load_bundled_config()
+    }
+
+    /// Parse the embedded bundled profile config without filesystem lookup.
+    ///
+    /// Used by callers that need a known-good baseline (e.g. to validate
+    /// that remote overlay profile names exist in the bundled set).
+    pub fn load_bundled_config() -> Result<ProfileConfig> {
+        Self::parse_toml_full(BUNDLED_PROFILES_TOML)
+    }
+
+    /// Auto-detect the appropriate profile name from a command string.
+    ///
+    /// Inspects the command basename to identify known tools:
+    /// - "claude" or "claude-code" -> "claude-code"
+    /// - "codex" -> "codex"
+    /// - "aider" -> "aider"
+    /// - "openclaw" -> "openclaw"
+    ///
+    /// Returns `None` if the command does not match any known profile.
+    pub fn detect_profile(command: &str) -> Option<String> {
+        // Extract the basename from the command path
+        let basename = Path::new(command)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(command);
+
+        match basename {
+            "claude" | "claude-code" => Some("claude-code".into()),
+            "codex" => Some("codex".into()),
+            "aider" => Some("aider".into()),
+            "openclaw" => Some("openclaw".into()),
+            "goose" => Some("goose".into()),
+            "copilot" | "copilot-cli" => Some("copilot".into()),
+            "cursor-agent" => Some("cursor".into()),
+            "cline" => Some("cline".into()),
+            _ => None,
+        }
+    }
+
+    /// Build the session allowlist `HashSet` from this profile's configuration.
+    ///
+    /// The returned set contains entries in the namespaced format expected by
+    /// the supervisor event handler:
+    /// - bare paths for file I/O prefix matching (globs stripped)
+    /// - `exec:<resolved_path>` for routine commands
+    /// - `exec-prefix:<root/>` for trusted executable root directories
+    /// - `net:<domain>` for routine destinations and listen addresses
+    pub fn build_session_allowlist(&self) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+
+        let mut allowed = HashSet::<String>::new();
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let project_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+
+        for pattern in &self.routine_paths {
+            let expanded = pattern
+                .replace("${HOME}", &home)
+                .replace("${PROJECT_DIR}", &project_dir)
+                .trim_end_matches("/**")
+                .trim_end_matches("/*")
+                .trim_end_matches('*')
+                .to_string();
+            if !expanded.is_empty() {
+                allowed.insert(expanded);
+            }
+        }
+
+        for cmd in &self.routine_commands {
+            if let Some(path) = find_in_path(cmd) {
+                // Also insert the canonical path so symlinks are matched.
+                if let Ok(canonical) = std::fs::canonicalize(&path) {
+                    if let Some(s) = canonical.to_str() {
+                        if s != path {
+                            allowed.insert(format!("exec:{s}"));
+                        }
+                    }
+                }
+                allowed.insert(format!("exec:{path}"));
+            } else {
+                allowed.insert(format!("exec:{cmd}"));
+            }
+        }
+
+        for addr in &self.routine_listen_addresses {
+            allowed.insert(format!("net:{addr}"));
+        }
+
+        for dest in &self.routine_destinations {
+            allowed.insert(format!("net:{dest}"));
+        }
+
+        // Read-only trusted paths — auto-allow FileRead only, not writes.
+        // Uses `ro:` namespace with exact match (no prefix matching).
+        for path in &self.readonly_paths {
+            let expanded = path
+                .replace("${HOME}", &home)
+                .replace("${PROJECT_DIR}", &project_dir);
+            if let Some(canonical) = canonicalize_readonly_path(&expanded) {
+                allowed.insert(format!("ro:{canonical}"));
+            }
+        }
+
+        // Read-only glob patterns — auto-allow FileRead for files matching
+        // these patterns. Uses `ro-glob:` namespace with simple glob matching.
+        for pattern in &self.readonly_path_patterns {
+            let expanded = pattern
+                .replace("${HOME}", &home)
+                .replace("${PROJECT_DIR}", &project_dir);
+            if !expanded.is_empty() {
+                allowed.insert(format!("ro-glob:{expanded}"));
+            }
+        }
+
+        // Trusted executable root directories — auto-allow process spawns
+        // for binaries under these roots (e.g., git helpers, bundled tools).
+        // Uses `exec-prefix:` namespace to keep exec trust separate from
+        // filesystem path trust.
+        for root in &self.routine_exec_roots {
+            let expanded = root
+                .replace("${HOME}", &home)
+                .replace("${PROJECT_DIR}", &project_dir);
+            let normalized = if expanded.ends_with('/') {
+                expanded
+            } else {
+                format!("{expanded}/")
+            };
+            if !normalized.is_empty() {
+                allowed.insert(format!("exec-prefix:{normalized}"));
+            }
+        }
+
+        allowed
+    }
+
+    /// Convert this profile's routine entries into proxy allowlist entries.
+    ///
+    /// Returns a list of human-readable allowlist rule strings that can be
+    /// fed into the proxy's allowlist filter configuration. Format:
+    /// - `path:<glob>` for routine paths
+    /// - `cmd:<command>` for routine commands
+    /// - `dest:<host>` for routine network destinations
+    pub fn to_allowlist_entries(&self) -> Vec<String> {
+        let mut entries = Vec::new();
+        for path in &self.routine_paths {
+            entries.push(format!("path:{path}"));
+        }
+        for cmd in &self.routine_commands {
+            entries.push(format!("cmd:{cmd}"));
+        }
+        for dest in &self.routine_destinations {
+            entries.push(format!("dest:{dest}"));
+        }
+        for addr in &self.routine_listen_addresses {
+            entries.push(format!("listen:{addr}"));
+        }
+        for root in &self.routine_exec_roots {
+            entries.push(format!("exec-root:{root}"));
+        }
+        for path in &self.readonly_paths {
+            entries.push(format!("ro:{path}"));
+        }
+        entries
+    }
+}
+
+fn developer_override_enabled() -> bool {
+    env_flag_enabled(std::env::var_os(DEV_PROFILE_OVERRIDE_ENV).as_deref())
+}
+
+fn env_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.to_string_lossy();
+        !value.is_empty()
+            && value != "0"
+            && !value.eq_ignore_ascii_case("false")
+            && !value.eq_ignore_ascii_case("no")
+    })
+}
+
+impl ProfileConfig {
+    /// Build the fully resolved effective policy for a session.
+    ///
+    /// Merges the base profile with optional provider and launcher overlays,
+    /// and computes a stable scope key for learned-rule isolation.
+    pub fn build_effective_policy(
+        &self,
+        profile_name: &str,
+        launcher_override: Option<&str>,
+        provider_override: Option<&str>,
+    ) -> Result<EffectivePolicy> {
+        let base = self
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .ok_or_else(|| {
+                Error::ProfileError(format!("no supervisor profile '{profile_name}' found"))
+            })?
+            .clone();
+
+        // Launcher: explicit override > auto-detection > none.
+        let launcher_name = if let Some(name) = launcher_override {
+            if !self.launcher_overlays.iter().any(|o| o.name == name) {
+                return Err(Error::ProfileError(format!(
+                    "unknown launcher overlay: '{name}'"
+                )));
+            }
+            Some(name.to_string())
+        } else {
+            detect_launcher(&self.launcher_overlays)
+        };
+
+        // Provider: explicit only (no auto-detection in v1).
+        let provider_name = if let Some(name) = provider_override {
+            if !self.provider_overlays.iter().any(|o| o.name == name) {
+                return Err(Error::ProfileError(format!(
+                    "unknown provider overlay: '{name}'"
+                )));
+            }
+            Some(name.to_string())
+        } else {
+            None
+        };
+
+        let mut merged = base;
+
+        // Apply provider overlay (destinations only).
+        if let Some(ref name) = provider_name {
+            if let Some(overlay) = self.provider_overlays.iter().find(|o| o.name == *name) {
+                merge_vec(
+                    &mut merged.routine_destinations,
+                    &overlay.routine_destinations,
+                );
+            }
+        }
+
+        // Apply launcher overlay (commands + paths only).
+        if let Some(ref name) = launcher_name {
+            if let Some(overlay) = self.launcher_overlays.iter().find(|o| o.name == *name) {
+                merge_vec(&mut merged.routine_commands, &overlay.routine_commands);
+                merge_vec(&mut merged.routine_paths, &overlay.routine_paths);
+            }
+        }
+
+        // Build scope key: "profile+provider:X+launcher:Y"
+        let mut scope_key = profile_name.to_string();
+        if let Some(ref name) = provider_name {
+            scope_key.push_str(&format!("+provider:{name}"));
+        }
+        if let Some(ref name) = launcher_name {
+            scope_key.push_str(&format!("+launcher:{name}"));
+        }
+
+        Ok(EffectivePolicy {
+            base_profile_name: profile_name.to_string(),
+            launcher_overlay_name: launcher_name,
+            provider_overlay_name: provider_name,
+            merged_profile: merged,
+            scope_key,
+        })
+    }
+}
+
+fn validate_launch_contract_conflicts(args: &[String], required_args: &[String]) -> Result<()> {
+    if required_args.len() != 2 {
+        return Ok(());
+    }
+
+    let flag = &required_args[0];
+    let required_value = &required_args[1];
+    if !flag.starts_with('-') || required_value.starts_with('-') {
+        return Ok(());
+    }
+
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == flag {
+            match args.get(idx + 1) {
+                Some(value) if value == required_value => {}
+                Some(value) => {
+                    return Err(Error::ProfileError(format!(
+                        "launch contract conflict: expected '{flag} {required_value}' but command already contains '{flag} {value}'"
+                    )));
+                }
+                None => {
+                    return Err(Error::ProfileError(format!(
+                        "launch contract conflict: expected '{flag} {required_value}' but command ends after '{flag}'"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Enforce a profile's launch contract by injecting required args if missing.
+///
+/// Returns `true` if args were modified. The `args` slice should be the
+/// tool arguments (not including the command name itself).
+pub fn enforce_launch_contract(args: &mut Vec<String>, contract: &LaunchContract) -> Result<bool> {
+    if contract.required_args.is_empty() {
+        return Ok(false);
+    }
+
+    let req = &contract.required_args;
+    validate_launch_contract_conflicts(args, req)?;
+
+    // Check if the required sequence already appears contiguously in args.
+    let found = args
+        .windows(req.len())
+        .any(|window| window == req.as_slice());
+
+    if found {
+        return Ok(false);
+    }
+
+    // Inject at the beginning of the arg list.
+    for (i, arg) in req.iter().enumerate() {
+        args.insert(i, arg.clone());
+    }
+    Ok(true)
+}
+
+/// Auto-detect the launcher environment from parent process and env vars.
+///
+/// This is best-effort — it is not a security boundary. Unknown launchers
+/// fall back to no overlay.
+pub fn detect_launcher(overlays: &[LauncherOverlay]) -> Option<String> {
+    // 1. Check parent process name.
+    if let Some(parent_name) = get_parent_process_name() {
+        for overlay in overlays {
+            if overlay.detect_parent_names.contains(&parent_name) {
+                return Some(overlay.name.clone());
+            }
+        }
+    }
+
+    // 2. Check environment variables as supporting evidence.
+    for overlay in overlays {
+        for env_spec in &overlay.detect_env {
+            if let Some((key, value)) = env_spec.split_once('=') {
+                if std::env::var(key).ok().as_deref() == Some(value) {
+                    return Some(overlay.name.clone());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Read the parent process name from /proc on Linux.
+#[cfg(target_os = "linux")]
+fn get_parent_process_name() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let ppid = status
+        .lines()
+        .find(|l| l.starts_with("PPid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u32>()
+        .ok()?;
+    std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_parent_process_name() -> Option<String> {
+    None
+}
+
+/// Append default entries to a profile's list, skipping duplicates.
+fn merge_vec(profile: &mut Vec<String>, defaults: &[String]) {
+    for item in defaults {
+        if !profile.contains(item) {
+            profile.push(item.clone());
+        }
+    }
+}
+
+fn canonicalize_readonly_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+
+    std::fs::canonicalize(path)
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+}
+
+/// Resolve a command name to its absolute path via `$PATH` lookup.
+fn find_in_path(cmd: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path_var = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(cmd);
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    // ── detect_profile ─────────────────────────────────────────────
+
+    #[test]
+    fn detect_claude_code() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("claude-code"),
+            Some("claude-code".into())
+        );
+    }
+
+    #[test]
+    fn detect_claude_bare() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("claude"),
+            Some("claude-code".into())
+        );
+    }
+
+    #[test]
+    fn detect_claude_full_path() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("/usr/local/bin/claude-code"),
+            Some("claude-code".into())
+        );
+    }
+
+    #[test]
+    fn detect_codex() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("codex"),
+            Some("codex".into())
+        );
+    }
+
+    #[test]
+    fn detect_codex_full_path() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("/home/user/.local/bin/codex"),
+            Some("codex".into())
+        );
+    }
+
+    #[test]
+    fn detect_aider() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("aider"),
+            Some("aider".into())
+        );
+    }
+
+    #[test]
+    fn detect_openclaw() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("openclaw"),
+            Some("openclaw".into())
+        );
+        assert_eq!(
+            SupervisorProfile::detect_profile("/usr/local/bin/openclaw"),
+            Some("openclaw".into())
+        );
+    }
+
+    #[test]
+    fn detect_goose() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("goose"),
+            Some("goose".into())
+        );
+    }
+
+    #[test]
+    fn detect_goose_full_path() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("/home/user/.local/bin/goose"),
+            Some("goose".into())
+        );
+    }
+
+    #[test]
+    fn detect_copilot() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("copilot"),
+            Some("copilot".into())
+        );
+    }
+
+    #[test]
+    fn detect_copilot_cli() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("copilot-cli"),
+            Some("copilot".into())
+        );
+    }
+
+    #[test]
+    fn detect_copilot_full_path() {
+        assert_eq!(
+            SupervisorProfile::detect_profile(
+                "/home/user/.local/share/mise/installs/copilot/1.0/copilot"
+            ),
+            Some("copilot".into())
+        );
+    }
+
+    #[test]
+    fn detect_cursor_agent() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("cursor-agent"),
+            Some("cursor".into())
+        );
+    }
+
+    #[test]
+    fn detect_cursor_agent_full_path() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("/home/user/.local/bin/cursor-agent"),
+            Some("cursor".into())
+        );
+    }
+
+    #[test]
+    fn detect_cline() {
+        assert_eq!(
+            SupervisorProfile::detect_profile("cline"),
+            Some("cline".into())
+        );
+    }
+
+    #[test]
+    fn detect_cline_full_path() {
+        assert_eq!(
+            SupervisorProfile::detect_profile(
+                "/home/user/.local/share/mise/installs/cline/2.8/cline"
+            ),
+            Some("cline".into())
+        );
+    }
+
+    #[test]
+    fn detect_bare_agent_returns_none() {
+        // "agent" is too generic — Cursor uses it but other tools may too.
+        assert_eq!(SupervisorProfile::detect_profile("agent"), None);
+    }
+
+    #[test]
+    fn detect_unknown_returns_none() {
+        assert_eq!(SupervisorProfile::detect_profile("vim"), None);
+        assert_eq!(SupervisorProfile::detect_profile("python3"), None);
+        assert_eq!(SupervisorProfile::detect_profile("/usr/bin/bash"), None);
+    }
+
+    // ── load_from_config ────────────────────────────────────────────
+
+    #[test]
+    fn load_from_config_finds_profiles() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        assert!(
+            profiles.len() >= 10,
+            "profiles.toml should have at least 10 profiles, found {}",
+            profiles.len()
+        );
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"generic"));
+        assert!(names.contains(&"generic-cli"));
+        assert!(names.contains(&"grith-repl"));
+        assert!(names.contains(&"claude-code"));
+        assert!(names.contains(&"codex"));
+        assert!(names.contains(&"aider"));
+        assert!(names.contains(&"goose"));
+        assert!(names.contains(&"copilot"));
+        assert!(names.contains(&"cursor"));
+        assert!(names.contains(&"cline"));
+        assert!(names.contains(&"openclaw"));
+    }
+
+    #[test]
+    fn claude_code_profile_has_expected_commands() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        let claude = profiles.iter().find(|p| p.name == "claude-code").unwrap();
+        assert!(claude.routine_commands.contains(&"git".into()));
+        assert!(claude.routine_commands.contains(&"cargo".into()));
+        assert!(claude.routine_commands.contains(&"node".into()));
+    }
+
+    #[test]
+    fn generic_profile_is_strict_no_destinations() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        let generic = profiles.iter().find(|p| p.name == "generic").unwrap();
+        // generic is the strict fallback — no outbound destinations.
+        // Defaults no longer include destinations (moved to generic-cli).
+        assert!(
+            generic.routine_destinations.is_empty(),
+            "generic profile should have no destinations"
+        );
+    }
+
+    #[test]
+    fn generic_cli_inherits_generic_and_defaults() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        let generic_cli = profiles.iter().find(|p| p.name == "generic-cli").unwrap();
+        // generic-cli inherits generic's routine_paths (${PROJECT_DIR}/**)
+        assert!(
+            generic_cli
+                .routine_paths
+                .iter()
+                .any(|p| p.contains("PROJECT_DIR")),
+            "generic-cli should inherit PROJECT_DIR from generic"
+        );
+        // generic-cli adds GitHub destinations
+        assert!(
+            generic_cli
+                .routine_destinations
+                .iter()
+                .any(|d| d == "github.com"),
+            "generic-cli should have github.com"
+        );
+        // generic-cli inherits defaults commands (git, ssh, etc.)
+        assert!(
+            generic_cli.routine_commands.iter().any(|c| c == "git"),
+            "generic-cli should inherit git from defaults"
+        );
+    }
+
+    #[test]
+    fn tool_profile_inherits_generic_and_defaults() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        let goose = profiles.iter().find(|p| p.name == "goose").unwrap();
+        // Goose extends generic (not generic-cli).
+        // Should have: goose-specific paths + generic PROJECT_DIR + defaults /proc
+        assert!(
+            goose.routine_paths.iter().any(|p| p.contains("goose")),
+            "goose should have goose-specific paths"
+        );
+        assert!(
+            goose
+                .routine_paths
+                .iter()
+                .any(|p| p.contains("PROJECT_DIR")),
+            "goose should inherit PROJECT_DIR from generic"
+        );
+        assert!(
+            goose.routine_paths.iter().any(|p| p == "/proc"),
+            "goose should inherit /proc from defaults"
+        );
+        // Should have git from defaults
+        assert!(
+            goose.routine_commands.iter().any(|c| c == "git"),
+            "goose should inherit git from defaults"
+        );
+    }
+
+    // ── to_allowlist_entries ───────────────────────────────────────
+
+    #[test]
+    fn to_allowlist_entries_format() {
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            display_name: "Test".into(),
+            rationale: Some("test rationale".into()),
+            extends: None,
+            routine_paths: vec!["**/*.rs".into()],
+            routine_commands: vec!["git".into()],
+            routine_destinations: vec!["example.com".into()],
+            routine_listen_addresses: vec!["0.0.0.0".into()],
+            routine_exec_roots: vec!["/usr/lib/git-core/".into()],
+            readonly_paths: vec!["/home/test/.ssh/config".into()],
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+        };
+        let entries = profile.to_allowlist_entries();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[0], "path:**/*.rs");
+        assert_eq!(entries[1], "cmd:git");
+        assert_eq!(entries[2], "dest:example.com");
+        assert_eq!(entries[3], "listen:0.0.0.0");
+        assert_eq!(entries[4], "exec-root:/usr/lib/git-core/");
+        assert_eq!(entries[5], "ro:/home/test/.ssh/config");
+    }
+
+    #[test]
+    fn to_allowlist_entries_empty_profile() {
+        let profile = SupervisorProfile {
+            name: "empty".into(),
+            display_name: "Empty".into(),
+            rationale: None,
+            extends: None,
+            routine_paths: Vec::new(),
+            routine_commands: Vec::new(),
+            routine_destinations: Vec::new(),
+            routine_listen_addresses: Vec::new(),
+            routine_exec_roots: Vec::new(),
+            readonly_paths: Vec::new(),
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+        };
+        assert!(profile.to_allowlist_entries().is_empty());
+    }
+
+    #[test]
+    fn to_allowlist_entries_counts() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        let claude = profiles.iter().find(|p| p.name == "claude-code").unwrap();
+        let entries = claude.to_allowlist_entries();
+        let path_count = entries.iter().filter(|e| e.starts_with("path:")).count();
+        let cmd_count = entries.iter().filter(|e| e.starts_with("cmd:")).count();
+        let dest_count = entries.iter().filter(|e| e.starts_with("dest:")).count();
+        let listen_count = entries.iter().filter(|e| e.starts_with("listen:")).count();
+        let exec_root_count = entries
+            .iter()
+            .filter(|e| e.starts_with("exec-root:"))
+            .count();
+        assert_eq!(path_count, claude.routine_paths.len());
+        assert_eq!(cmd_count, claude.routine_commands.len());
+        assert_eq!(dest_count, claude.routine_destinations.len());
+        assert_eq!(listen_count, claude.routine_listen_addresses.len());
+        assert_eq!(exec_root_count, claude.routine_exec_roots.len());
+        let ro_count = entries.iter().filter(|e| e.starts_with("ro:")).count();
+        assert_eq!(ro_count, claude.readonly_paths.len());
+    }
+
+    // ── TOML parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_toml_valid() {
+        let toml = r#"
+[[profiles]]
+name = "test-tool"
+display_name = "Test Tool"
+rationale = "Used in tests"
+routine_paths = ["**/*.py"]
+routine_commands = ["python"]
+routine_destinations = ["api.example.com"]
+routine_listen_addresses = ["0.0.0.0"]
+
+[[profiles]]
+name = "other-tool"
+display_name = "Other Tool"
+rationale = "Also used in tests"
+routine_paths = []
+routine_commands = ["bash"]
+routine_destinations = []
+routine_listen_addresses = []
+"#;
+        let profiles = SupervisorProfile::parse_toml(toml).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "test-tool");
+        assert_eq!(profiles[0].display_name, "Test Tool");
+        assert_eq!(profiles[0].routine_paths, vec!["**/*.py"]);
+        assert_eq!(profiles[0].routine_listen_addresses, vec!["0.0.0.0"]);
+        assert_eq!(profiles[1].name, "other-tool");
+        assert_eq!(profiles[1].routine_commands, vec!["bash"]);
+    }
+
+    #[test]
+    fn parse_toml_invalid_returns_error() {
+        let bad_toml = "this is not valid toml [[[";
+        let result = SupervisorProfile::parse_toml(bad_toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_from_toml_nonexistent_file_returns_error() {
+        let result = SupervisorProfile::load_from_toml("/nonexistent/path/profiles.toml");
+        assert!(result.is_err());
+    }
+
+    // ── Serde roundtrip ────────────────────────────────────────────
+
+    #[test]
+    fn serde_json_roundtrip() {
+        let profile = SupervisorProfile {
+            name: "roundtrip".into(),
+            display_name: "Roundtrip Test".into(),
+            rationale: Some("roundtrip".into()),
+            extends: None,
+            routine_paths: vec!["**/*.rs".into()],
+            routine_commands: vec!["cargo".into()],
+            routine_destinations: vec!["crates.io".into()],
+            routine_listen_addresses: vec!["127.0.0.1".into()],
+            routine_exec_roots: vec!["/usr/lib/git-core/".into()],
+            readonly_paths: vec!["${HOME}/.ssh/config".into()],
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let parsed: SupervisorProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "roundtrip");
+        assert_eq!(parsed.routine_paths, vec!["**/*.rs"]);
+        assert_eq!(parsed.routine_listen_addresses, vec!["127.0.0.1"]);
+        assert_eq!(parsed.routine_exec_roots, vec!["/usr/lib/git-core/"]);
+    }
+
+    #[test]
+    fn build_session_allowlist_skips_missing_readonly_paths() {
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            display_name: "Test".into(),
+            rationale: None,
+            extends: None,
+            routine_paths: Vec::new(),
+            routine_commands: Vec::new(),
+            routine_destinations: Vec::new(),
+            routine_listen_addresses: Vec::new(),
+            routine_exec_roots: Vec::new(),
+            readonly_paths: vec!["/definitely/missing/grith-readonly-path".into()],
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+        };
+
+        let allowed = profile.build_session_allowlist();
+        assert!(
+            !allowed.iter().any(|entry| entry.starts_with("ro:")),
+            "missing readonly paths must not be trusted by raw string path"
+        );
+    }
+
+    // ── Layered inheritance error cases ─────────────────────────────
+
+    #[test]
+    fn extends_unknown_profile_returns_error() {
+        let toml = r#"
+[[profiles]]
+name = "child"
+display_name = "Child"
+extends = "nonexistent"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+"#;
+        let result = SupervisorProfile::parse_toml(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("nonexistent"),
+            "error should mention the unknown profile name: {msg}"
+        );
+    }
+
+    #[test]
+    fn extends_self_returns_error() {
+        let toml = r#"
+[[profiles]]
+name = "self-ref"
+display_name = "Self Ref"
+extends = "self-ref"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+"#;
+        let result = SupervisorProfile::parse_toml(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cannot extend itself"),
+            "error should mention self-reference: {msg}"
+        );
+    }
+
+    #[test]
+    fn extends_cycle_returns_error() {
+        let toml = r#"
+[[profiles]]
+name = "a"
+display_name = "A"
+extends = "b"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+
+[[profiles]]
+name = "b"
+display_name = "B"
+extends = "a"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+"#;
+        let result = SupervisorProfile::parse_toml(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cycle"),
+            "error should mention inheritance cycle: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_toml_with_defaults_and_parent_profile() {
+        let toml = r#"
+[defaults]
+routine_commands = ["git", "ssh"]
+routine_paths = ["/proc"]
+
+[[profiles]]
+name = "base"
+display_name = "Base"
+routine_paths = ["/base"]
+routine_commands = ["cargo"]
+routine_destinations = ["base.com"]
+
+[[profiles]]
+name = "child"
+display_name = "Child"
+extends = "base"
+routine_paths = ["/child"]
+routine_commands = ["node"]
+routine_destinations = ["child.com"]
+"#;
+        let profiles = SupervisorProfile::parse_toml(toml).unwrap();
+        let child = profiles.iter().find(|p| p.name == "child").unwrap();
+
+        // Child entries come first, then parent, then defaults.
+        assert_eq!(child.routine_paths[0], "/child");
+        assert!(child.routine_paths.contains(&"/base".to_string()));
+        assert!(child.routine_paths.contains(&"/proc".to_string()));
+
+        assert_eq!(child.routine_commands[0], "node");
+        assert!(child.routine_commands.contains(&"cargo".to_string()));
+        assert!(child.routine_commands.contains(&"git".to_string()));
+
+        assert!(child
+            .routine_destinations
+            .contains(&"child.com".to_string()));
+        assert!(child.routine_destinations.contains(&"base.com".to_string()));
+    }
+
+    #[test]
+    fn resolved_profiles_are_fully_merged_in_load_from_config() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        // Every profile that extends another should have its extends field cleared.
+        for p in &profiles {
+            assert!(
+                p.extends.is_none(),
+                "profile '{}' should have extends=None after resolution",
+                p.name
+            );
+        }
+        // Copilot extends generic -> defaults.
+        // It should have git (from defaults) and github.com (from its own destinations).
+        let copilot = profiles.iter().find(|p| p.name == "copilot").unwrap();
+        assert!(copilot.routine_commands.contains(&"git".to_string()));
+        assert!(
+            copilot
+                .routine_destinations
+                .contains(&"github.com".to_string()),
+            "copilot should have github.com in its own destinations"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_session_allowlist_canonicalizes_readonly_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, "ok").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            display_name: "Test".into(),
+            rationale: None,
+            extends: None,
+            routine_paths: Vec::new(),
+            routine_commands: Vec::new(),
+            routine_destinations: Vec::new(),
+            routine_listen_addresses: Vec::new(),
+            routine_exec_roots: Vec::new(),
+            readonly_paths: vec![link.to_string_lossy().into_owned()],
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+        };
+
+        let allowed = profile.build_session_allowlist();
+        let canonical = std::fs::canonicalize(&target).unwrap();
+        let canonical = canonical.to_string_lossy().into_owned();
+
+        assert!(allowed.contains(&format!("ro:{canonical}")));
+        assert!(!allowed.contains(&format!("ro:{}", link.to_string_lossy())));
+    }
+
+    // ── Duplicate name detection ──────────────────────────────────
+
+    #[test]
+    fn duplicate_profile_names_rejected() {
+        let toml = r#"
+[[profiles]]
+name = "dup"
+display_name = "Dup 1"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+
+[[profiles]]
+name = "dup"
+display_name = "Dup 2"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+"#;
+        let result = SupervisorProfile::parse_toml(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("duplicate"), "error: {msg}");
+    }
+
+    #[test]
+    fn duplicate_launcher_overlay_names_rejected() {
+        let toml = r#"
+[[profiles]]
+name = "base"
+display_name = "Base"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+
+[[launcher_overlays]]
+name = "vscode"
+detect_parent_names = ["code"]
+
+[[launcher_overlays]]
+name = "vscode"
+detect_parent_names = ["codium"]
+"#;
+        let result = SupervisorProfile::parse_toml_full(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("duplicate launcher"), "error: {msg}");
+    }
+
+    #[test]
+    fn duplicate_provider_overlay_names_rejected() {
+        let toml = r#"
+[[profiles]]
+name = "base"
+display_name = "Base"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+
+[[provider_overlays]]
+name = "openai"
+routine_destinations = ["openai.com"]
+
+[[provider_overlays]]
+name = "openai"
+routine_destinations = ["api.openai.com"]
+"#;
+        let result = SupervisorProfile::parse_toml_full(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("duplicate provider"), "error: {msg}");
+    }
+
+    // ── Overlay parsing and effective policy ─────────────────────
+
+    #[test]
+    fn parse_overlays_from_toml() {
+        let toml = r#"
+[[profiles]]
+name = "test"
+display_name = "Test"
+routine_paths = []
+routine_commands = ["git"]
+routine_destinations = ["example.com"]
+
+[[launcher_overlays]]
+name = "vscode-terminal"
+detect_parent_names = ["code"]
+detect_env = ["TERM_PROGRAM=vscode"]
+routine_commands = ["code"]
+
+[[provider_overlays]]
+name = "openai"
+routine_destinations = ["openai.com", "api.openai.com"]
+"#;
+        let cfg = SupervisorProfile::parse_toml_full(toml).unwrap();
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.launcher_overlays.len(), 1);
+        assert_eq!(cfg.launcher_overlays[0].name, "vscode-terminal");
+        assert_eq!(cfg.provider_overlays.len(), 1);
+        assert_eq!(cfg.provider_overlays[0].name, "openai");
+    }
+
+    #[test]
+    fn effective_policy_merges_provider_overlay() {
+        let toml = r#"
+[[profiles]]
+name = "test"
+display_name = "Test"
+routine_paths = []
+routine_commands = ["git"]
+routine_destinations = ["example.com"]
+
+[[provider_overlays]]
+name = "openai"
+routine_destinations = ["openai.com", "api.openai.com"]
+"#;
+        let cfg = SupervisorProfile::parse_toml_full(toml).unwrap();
+        let policy = cfg
+            .build_effective_policy("test", None, Some("openai"))
+            .unwrap();
+
+        assert_eq!(policy.scope_key, "test+provider:openai");
+        assert!(policy
+            .merged_profile
+            .routine_destinations
+            .contains(&"example.com".to_string()));
+        assert!(policy
+            .merged_profile
+            .routine_destinations
+            .contains(&"openai.com".to_string()));
+    }
+
+    #[test]
+    fn effective_policy_merges_launcher_overlay() {
+        let toml = r#"
+[[profiles]]
+name = "test"
+display_name = "Test"
+routine_paths = []
+routine_commands = ["git"]
+routine_destinations = []
+
+[[launcher_overlays]]
+name = "vscode-terminal"
+detect_parent_names = ["code"]
+routine_commands = ["code"]
+"#;
+        let cfg = SupervisorProfile::parse_toml_full(toml).unwrap();
+        let policy = cfg
+            .build_effective_policy("test", Some("vscode-terminal"), None)
+            .unwrap();
+
+        assert_eq!(policy.scope_key, "test+launcher:vscode-terminal");
+        assert!(policy
+            .merged_profile
+            .routine_commands
+            .contains(&"code".to_string()));
+        assert!(policy
+            .merged_profile
+            .routine_commands
+            .contains(&"git".to_string()));
+    }
+
+    #[test]
+    fn effective_policy_unknown_launcher_errors() {
+        let toml = r#"
+[[profiles]]
+name = "test"
+display_name = "Test"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+"#;
+        let cfg = SupervisorProfile::parse_toml_full(toml).unwrap();
+        let result = cfg.build_effective_policy("test", Some("nonexistent"), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn effective_policy_unknown_provider_errors() {
+        let toml = r#"
+[[profiles]]
+name = "test"
+display_name = "Test"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+"#;
+        let cfg = SupervisorProfile::parse_toml_full(toml).unwrap();
+        let result = cfg.build_effective_policy("test", None, Some("nonexistent"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn effective_policy_full_scope_key() {
+        let toml = r#"
+[[profiles]]
+name = "repl"
+display_name = "Repl"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+
+[[launcher_overlays]]
+name = "vscode-terminal"
+detect_parent_names = ["code"]
+
+[[provider_overlays]]
+name = "openai"
+routine_destinations = ["openai.com"]
+"#;
+        let cfg = SupervisorProfile::parse_toml_full(toml).unwrap();
+        let policy = cfg
+            .build_effective_policy("repl", Some("vscode-terminal"), Some("openai"))
+            .unwrap();
+        assert_eq!(
+            policy.scope_key,
+            "repl+provider:openai+launcher:vscode-terminal"
+        );
+    }
+
+    // ── Launch contract enforcement ─────────────────────────────
+
+    #[test]
+    fn enforce_launch_contract_injects_missing_args() {
+        let contract = LaunchContract {
+            required_args: vec!["--sandbox".into(), "disabled".into()],
+        };
+        let mut args = vec!["task".into()];
+        let modified = enforce_launch_contract(&mut args, &contract).unwrap();
+        assert!(modified);
+        assert_eq!(args, vec!["--sandbox", "disabled", "task"]);
+    }
+
+    #[test]
+    fn enforce_launch_contract_noop_when_present() {
+        let contract = LaunchContract {
+            required_args: vec!["--sandbox".into(), "disabled".into()],
+        };
+        let mut args = vec!["--sandbox".into(), "disabled".into(), "task".into()];
+        let modified = enforce_launch_contract(&mut args, &contract).unwrap();
+        assert!(!modified);
+        assert_eq!(args, vec!["--sandbox", "disabled", "task"]);
+    }
+
+    #[test]
+    fn enforce_launch_contract_empty_is_noop() {
+        let contract = LaunchContract::default();
+        let mut args = vec!["task".into()];
+        let modified = enforce_launch_contract(&mut args, &contract).unwrap();
+        assert!(!modified);
+    }
+
+    #[test]
+    fn enforce_launch_contract_rejects_conflicting_value() {
+        let contract = LaunchContract {
+            required_args: vec!["--sandbox".into(), "disabled".into()],
+        };
+        let mut args = vec!["--sandbox".into(), "enabled".into(), "task".into()];
+        let err = enforce_launch_contract(&mut args, &contract).unwrap_err();
+        assert!(err.to_string().contains("launch contract conflict"));
+    }
+
+    #[test]
+    fn load_config_returns_full_profile_config() {
+        let cfg = SupervisorProfile::load_config().unwrap();
+        assert!(!cfg.profiles.is_empty());
+        // Should have overlays if profiles.toml defines them.
+    }
+
+    #[test]
+    fn named_profiles_extend_generic_not_generic_cli() {
+        let profiles = SupervisorProfile::load_from_config().unwrap();
+        // After T-01, named tool profiles should extend generic, not generic-cli.
+        // They should NOT inherit generic-cli's VS Code destinations unless
+        // they explicitly list them.
+        let goose = profiles.iter().find(|p| p.name == "goose").unwrap();
+        assert!(
+            !goose
+                .routine_destinations
+                .iter()
+                .any(|d| d == "visualstudio.com"),
+            "goose should not inherit VS Code destinations"
+        );
+        // But goose should still have git from defaults.
+        assert!(goose.routine_commands.iter().any(|c| c == "git"));
+    }
+
+    // ── embedded bundled fallback ──────────────────────────────────
+
+    #[test]
+    fn bundled_profiles_toml_parses_successfully() {
+        let config = SupervisorProfile::parse_toml_full(BUNDLED_PROFILES_TOML)
+            .expect("embedded BUNDLED_PROFILES_TOML should parse");
+        assert!(
+            !config.profiles.is_empty(),
+            "bundled config should contain at least one profile"
+        );
+    }
+
+    #[test]
+    fn bundled_profiles_have_required_fields() {
+        let config = SupervisorProfile::parse_toml_full(BUNDLED_PROFILES_TOML).unwrap();
+        for profile in &config.profiles {
+            assert!(!profile.name.is_empty(), "profile name must not be empty");
+            assert!(
+                !profile.display_name.is_empty(),
+                "profile {} must have a display_name",
+                profile.name
+            );
+        }
+    }
+
+    #[test]
+    fn load_bundled_config_returns_valid_config() {
+        let config =
+            SupervisorProfile::load_bundled_config().expect("load_bundled_config should succeed");
+        assert!(!config.profiles.is_empty());
+        // Should contain known profiles.
+        let names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.contains(&"claude-code"),
+            "missing claude-code profile"
+        );
+        assert!(names.contains(&"generic"), "missing generic profile");
+    }
+
+    #[test]
+    fn developer_override_disabled_by_default() {
+        assert!(!env_flag_enabled(None));
+        assert!(!env_flag_enabled(Some(std::ffi::OsStr::new(""))));
+        assert!(!env_flag_enabled(Some(std::ffi::OsStr::new("0"))));
+        assert!(!env_flag_enabled(Some(std::ffi::OsStr::new("false"))));
+        assert!(!env_flag_enabled(Some(std::ffi::OsStr::new("no"))));
+    }
+
+    #[test]
+    fn developer_override_truthy_values_enable_override() {
+        for value in ["1", "true", "yes"] {
+            assert!(env_flag_enabled(Some(std::ffi::OsStr::new(value))));
+        }
+    }
+}

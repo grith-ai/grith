@@ -1,0 +1,11 @@
+# Air-gapped / no network preset
+# Local-only execution, no cloud LLM providers
+
+[llm]
+default_provider = "ollama"
+
+[llm.routing]
+strategy = "rule"
+
+[server]
+enabled = false

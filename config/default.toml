@@ -1,0 +1,128 @@
+# Grith default configuration
+# See docs/grith-SPEC.md for full reference
+
+[general]
+log_level = "info"
+audit_dir = "~/.local/share/grith/audit"
+plan_tier = "community"  # "community", "pro", or "enterprise"
+audit_sync = true         # set to false to keep audit records local-only; license checks still use grith.ai
+
+[proxy]
+auto_allow_threshold = 3.0
+auto_deny_threshold = 8.0
+cold_start_calls = 0
+cold_start_escalation_low = 2.0
+cold_start_escalation_high = 10.0
+review_timeout_seconds = 300  # auto-deny queued calls after 5 minutes
+
+[proxy.filters.reputation]
+enabled = true
+domains_file = "config/filters/domains.toml"
+unknown_domain_score = 1.0
+malicious_domain_score = 4.0
+safe_domain_score = -1.0
+ip_address_score = 2.0
+
+[proxy.filters.behavioural]
+enabled = true
+min_calls_for_baseline = 200
+mild_deviation_score = 1.0
+significant_deviation_score = 3.0
+
+[proxy.filters.taint]
+enabled = true
+sensitive_paths = [".env", ".env.local", "credentials.json", "secrets.yaml", "id_rsa", "id_ed25519"]
+high_risk_sinks = ["network", "shell"]
+medium_risk_sinks = ["file_write"]
+
+[proxy.filters.rate_limit]
+enabled = true
+file_writes_per_minute = 30
+shell_execs_per_minute = 20
+network_requests_per_minute = 60
+burst_multiplier = 3.0
+cooldown_seconds = 30
+
+[proxy.filters.semantic]
+enabled = false  # Stub in v1.5, requires local embedding model
+model = "all-MiniLM-L6-v2"
+
+[proxy.filters.egress]
+enabled = true
+config_file = "config/filters/egress.toml"
+
+[proxy.filters.session_containment]
+enabled = true
+config_file = "config/filters/containment.toml"
+
+[reputation]
+enabled = true
+decay_lambda = 0.98
+deny_weight = 3.0
+auto_allow_trust = 0.92
+auto_allow_min_observations = 8
+max_score_reduction = 4.0
+ceiling_filter_threshold = 5.0
+max_auto_allow_raw_score = 7.0
+save_interval_seconds = 300
+
+[digest]
+interval_active = "30m"
+interval_idle = "24h"
+delivery = "cli"
+max_queue_size = 100
+
+[llm]
+default_provider = "ollama"
+
+[llm.ollama]
+base_url = "http://localhost:11434"
+model = "llama3.1:8b"
+
+[llm.openai]
+model = "gpt-4o-mini"
+
+[llm.anthropic]
+model = "claude-sonnet-4-5-20250514"
+
+[llm.openrouter]
+model = "anthropic/claude-sonnet-4-5-20250514"
+
+[supervisor]
+enabled = true
+default_profile = "generic"
+freeze_timeout_seconds = 300
+max_concurrent_sessions = 4
+pty_forwarding = true
+require_sandbox = false
+
+[supervisor.platform]
+linux_mechanism = "ptrace"
+macos_mechanism = "endpoint-security"
+seccomp_pre_filter = false
+
+[supervisor.noise_reduction]
+ignore_read_only = true
+batch_rapid_reads = true
+batch_window_ms = 50
+
+[supervisor.dns_inspection]
+enabled = true
+
+[server]
+enabled = true
+host = "127.0.0.1"
+port = 3141
+dashboard_dir = "dashboard/dist"
+
+# [server.tls]
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"
+# Uncomment to enable native TLS. Alternatively, use a reverse proxy (nginx, Caddy)
+# for TLS termination. See docs/REVERSE-PROXY.md
+
+[server.rate_limit]
+enabled = true
+general_rps = 100
+write_rps = 10
+proxy_test_rps = 20

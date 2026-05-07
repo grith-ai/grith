@@ -1,0 +1,52 @@
+name: Profile Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Profile name to audit (e.g., claude-code, codex)'
+        required: true
+        default: 'claude-code'
+      trace_artifact:
+        description: 'Name of the trace artifact to download (from a prior capture run)'
+        required: false
+
+  schedule:
+    # Run weekly on Monday at 06:00 UTC.
+    - cron: '0 6 * * 1'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build grith
+        run: cargo build -p grith-core --bin grith
+
+      - name: Download trace artifact
+        if: ${{ github.event.inputs.trace_artifact }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.trace_artifact }}
+          path: /tmp/trace/
+
+      - name: Run profile audit
+        if: ${{ github.event.inputs.trace_artifact }}
+        run: |
+          TRACE_FILE=$(find /tmp/trace/ -name '*.jsonl' | head -1)
+          if [ -z "$TRACE_FILE" ]; then
+            echo "No .jsonl trace file found in artifact"
+            exit 1
+          fi
+          cargo run -p grith-core --bin grith -- \
+            profile audit \
+            --profile "${{ github.event.inputs.profile }}" \
+            --trace "$TRACE_FILE"
+
+      - name: Run profile tests
+        run: cargo test -p grith-core -- profile_audit

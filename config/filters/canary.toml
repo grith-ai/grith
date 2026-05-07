@@ -1,0 +1,12 @@
+[canary]
+enabled = true
+
+# Optional pre-seeded canary tokens.
+# Runtime canary management is also available via:
+# - CLI: `grith canary ...`
+# - API: `/api/canaries`
+#
+# [[canary.tokens]]
+# id = "11111111-1111-1111-1111-111111111111"
+# label = "trap-api-key"
+# value = "grith-canary-example-token"

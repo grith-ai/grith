@@ -1,0 +1,60 @@
+[egress]
+enabled = true
+
+# monitor | review | enforce
+# - monitor: low score, informational
+# - review: score into queue range for risky egress
+# - enforce: score into deny range for blocked egress
+mode = "review"
+
+# Trusted destinations reduce risk slightly.
+trusted_domains = [
+  "github.com",
+  "api.github.com",
+  "registry.npmjs.org",
+  "pypi.org",
+  "crates.io",
+  "static.crates.io",
+  "files.pythonhosted.org",
+  "objects.githubusercontent.com",
+  "anthropic.com",
+  "api.anthropic.com",
+  "claude.ai",
+  "sentry.io",
+  "statsig.com",
+  "statsigapi.net",
+  "datadoghq.com",
+  "googleapis.com",
+  "storage.googleapis.com",
+]
+
+# Explicit destination denies.
+blocked_domains = []
+
+# Protocol and port controls.
+blocked_schemes = ["ftp", "sftp", "tftp", "gopher", "file", "data"]
+review_schemes = ["smtp", "dns", "ws", "wss"]
+
+blocked_ports = [21, 23, 25]
+review_ports = [53, 110, 143, 445, 587, 2525]
+
+# Local development often uses localhost services.
+allow_private_ip = true
+
+# If true, unknown destinations score into review range.
+review_unknown_destinations = true
+
+# Command token heuristics for outbound/exfil style invocations.
+blocked_command_tokens = ["nslookup ", " dig ", "ftp ", "sftp "]
+review_command_tokens = ["curl ", "wget ", "nc ", "netcat ", "scp "]
+
+# Protocol-specific risk signals.
+# Shannon entropy threshold (bits/char) for flagging URL/arg segments.
+entropy_threshold = 4.5
+# Minimum contiguous base64-alphabet run length to flag.
+base64_min_chunk_len = 40
+# URL/arg lengths above these thresholds are flagged.
+suspicious_url_length = 2000
+suspicious_arg_length = 4000
+# Non-standard ports commonly associated with C2, reverse shells, or tunneling.
+unusual_ports = [4444, 5555, 6666, 6667, 6697, 8443, 8888, 9090, 9999, 1337, 31337]

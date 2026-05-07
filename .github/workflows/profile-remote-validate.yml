@@ -1,0 +1,33 @@
+name: Validate Remote Profile Overlay
+
+on:
+  pull_request:
+    paths:
+      - 'config/supervisor/profiles.remote.toml'
+      - 'config/supervisor/profiles.toml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build signing tool
+        run: cargo build -p grith-core --bin sign-profiles
+
+      - name: Validate remote overlay schema
+        run: |
+          # Validate the actual TOML source through the same restricted schema
+          # and profile-name checks used by the offline signing flow.
+          printf '%064d\n' 0 > /tmp/profile-signing.key
+          ./target/debug/sign-profiles \
+            --input config/supervisor/profiles.remote.toml \
+            --output /tmp/profiles.latest.json \
+            --version 0 \
+            --key-file /tmp/profile-signing.key
+          test -s /tmp/profiles.latest.json
+          echo "Remote overlay validation passed"

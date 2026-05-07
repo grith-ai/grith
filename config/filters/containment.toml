@@ -1,0 +1,40 @@
+[containment]
+enabled = true
+
+# After sensitive reads, keep the session in a stricter outbound mode.
+containment_window_seconds = 600
+
+# Paths/keywords that arm containment when read.
+sensitive_sources = [
+  ".env",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube/config",
+  "id_rsa",
+  "id_ed25519",
+  "credentials",
+  "secrets",
+  "passwd",
+  "shadow",
+  "keychain",
+  "sam",
+]
+
+# Outbound shell command heuristics while containment is active.
+outbound_command_tokens = [
+  "curl ",
+  "wget ",
+  "nc ",
+  "netcat ",
+  "scp ",
+  "ftp ",
+  "sftp ",
+  "nslookup ",
+  " dig ",
+]
+
+# Score contributions while containment is active.
+network_score = 4.5
+process_score = 4.0
+shell_score = 3.5

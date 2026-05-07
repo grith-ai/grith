@@ -1,0 +1,39 @@
+[package]
+name = "grith-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "CLI supervisor for grith — OS-level syscall interception for external tools"
+
+[lints]
+workspace = true
+
+[dependencies]
+grith-proxy = { path = "../grith-proxy" }
+grith-audit = { path = "../grith-audit" }
+grith-digest = { path = "../grith-digest" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+toml.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+
+portable-pty.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

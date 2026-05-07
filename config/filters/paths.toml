@@ -1,0 +1,114 @@
+# Default path matching rules for the security proxy
+# Loaded by the path_match filter (Phase 2)
+
+[[rules]]
+id = "ssh-private-key"
+pattern = "~/.ssh/id_*"
+operations = ["read", "write", "delete"]
+score = 5.0
+severity = "critical"
+message = "Access to SSH private key"
+
+[[rules]]
+id = "ssh-dir"
+pattern = "~/.ssh/*"
+operations = ["write", "delete", "list"]
+score = 3.0
+severity = "warning"
+message = "Access to SSH directory"
+
+[[rules]]
+id = "gnupg"
+pattern = "~/.gnupg/*"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to GnuPG keyring"
+
+[[rules]]
+id = "aws-credentials"
+pattern = "~/.aws/*"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to AWS credentials"
+
+[[rules]]
+id = "gcloud-config"
+pattern = "~/.config/gcloud/*"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to Google Cloud configuration"
+
+[[rules]]
+id = "pem-files"
+pattern = "*.pem"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to PEM certificate/key file"
+
+[[rules]]
+id = "key-files"
+pattern = "*.key"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to private key file"
+
+[[rules]]
+id = "env-file"
+pattern = ".env"
+operations = ["read", "write", "delete"]
+score = 3.0
+severity = "warning"
+message = "Access to environment file"
+
+[[rules]]
+id = "env-file-variants"
+pattern = ".env.*"
+operations = ["read", "write", "delete"]
+score = 3.0
+severity = "warning"
+message = "Access to environment file variant"
+
+[[rules]]
+id = "terraform-state"
+pattern = "*.tfstate"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to Terraform state file"
+
+[[rules]]
+id = "credentials-file"
+pattern = "*credentials*"
+operations = ["read", "write", "delete"]
+score = 3.0
+severity = "warning"
+message = "Access to credentials file"
+
+[[rules]]
+id = "secrets-file"
+pattern = "*secrets*"
+operations = ["read", "write", "delete"]
+score = 3.0
+severity = "warning"
+message = "Access to secrets file"
+
+[[rules]]
+id = "etc-shadow"
+pattern = "/etc/shadow"
+operations = ["read", "write"]
+score = 5.0
+severity = "critical"
+message = "Access to /etc/shadow (password hashes)"
+
+[[rules]]
+id = "etc-system-write"
+pattern = "/etc/*"
+operations = ["write", "delete"]
+score = 3.0
+severity = "warning"
+message = "Write/delete to system config directory"

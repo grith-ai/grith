@@ -1,0 +1,62 @@
+[package]
+name = "grith-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Core daemon binary for the grith AI agent security platform"
+
+[[bin]]
+name = "grith"
+path = "src/main.rs"
+
+[[bin]]
+name = "sign-profiles"
+path = "src/bin/sign_profiles.rs"
+
+[dependencies]
+grith-cli = { path = "../grith-cli" }
+grith-server = { path = "../grith-server" }
+grith-llm = { path = "../grith-llm" }
+grith-audit = { path = "../grith-audit" }
+grith-proxy = { path = "../grith-proxy" }
+grith-digest = { path = "../grith-digest" }
+grith-supervisor = { path = "../grith-supervisor" }
+grith-notify = { path = "../grith-notify" }
+
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+crossterm.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
+hex.workspace = true
+dirs.workspace = true
+sha2.workspace = true
+open.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring = "3"
+
+[dev-dependencies]
+tempfile.workspace = true

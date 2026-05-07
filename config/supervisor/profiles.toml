@@ -1,0 +1,617 @@
+# Supervisor profiles — pre-built allowlist templates for common CLI tools.
+# These reduce noise by auto-allowing routine operations that are expected
+# for each tool. Non-routine operations still go through the full proxy pipeline.
+#
+# Variable expansion: ${PROJECT_DIR} and ${HOME} are resolved at runtime.
+#
+# Resolution model:
+#   1. Static profile chain (child → parent via `extends` → [defaults])
+#   2. Optional provider overlay (additive destinations only)
+#   3. Optional launcher overlay (additive commands/paths only)
+#
+# Named tool profiles extend `generic` (not `generic-cli`) and list their own
+# destinations explicitly. `generic-cli` is available for manual `--profile`
+# opt-in only.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Defaults — merged into every profile (universal, local-only settings)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[defaults]
+
+routine_paths = [
+    # System introspection (read-only, world-readable)
+    "/proc",
+    "/etc/profile.d",
+]
+
+routine_commands = [
+    # Shells and environment
+    "bash", "sh", "env",
+    # File inspection
+    "cat", "ls", "find", "grep", "rg", "fd", "head", "tail", "wc",
+    "diff", "patch", "file",
+    # File manipulation
+    "mkdir", "cp", "mv", "rm", "touch", "chmod", "stat", "ln",
+    "readlink", "realpath", "dirname", "basename",
+    # Text processing
+    "tr", "cut", "sort", "uniq", "sed", "awk", "xargs", "tee", "jq",
+    # System info
+    "which", "uname", "id", "whoami", "date",
+    # Output and control flow
+    "test", "true", "false", "echo", "printf",
+    # Terminal
+    "stty", "tput",
+    # System utilities
+    "getopt", "getconf", "lsb_release", "dpkg-query", "dpkg", "ps",
+    # Git and SCM
+    "git", "ssh",
+]
+
+# No shared destinations in defaults — outbound trust belongs in
+# per-tool profiles or explicit opt-in profiles.
+routine_destinations = []
+
+routine_exec_roots = [
+    # Git helper binaries (git-remote-http, git-credential-*, etc.)
+    "/usr/lib/git-core/",
+]
+
+# Read-only trusted paths — auto-allow reads only, not writes.
+readonly_paths = [
+    # SSH metadata needed for git operations — NOT private keys
+    "${HOME}/.ssh/config",
+    "${HOME}/.ssh/known_hosts",
+    "${HOME}/.ssh/known_hosts2",
+    # Git config (read-only — writes still reviewed)
+    "${HOME}/.gitconfig",
+    "${HOME}/.config/git/config",
+]
+
+readonly_path_patterns = [
+    # SSH public keys and certificates — NOT secret material.
+    "${HOME}/.ssh/*.pub",
+    "${HOME}/.ssh/*-cert",
+    "${HOME}/.ssh/*-cert.pub",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Base profiles — generic (strict fallback) and generic-cli (manual opt-in)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[profiles]]
+name = "generic"
+display_name = "Generic Tool"
+rationale = "Generic is intentionally narrow and only allows basic project-local file inspection and low-risk commands by default. This is the shipped fallback/default profile."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+]
+
+routine_commands = []
+routine_destinations = []
+routine_listen_addresses = []
+
+[[profiles]]
+name = "generic-cli"
+display_name = "Generic CLI Tool"
+extends = "generic"
+rationale = "Opt-in shared profile for local developer CLI tools that routinely use git, GitHub, and VS Code / Microsoft infrastructure but do not have a dedicated named profile. Use via --profile generic-cli. NOT the default parent for named tool profiles."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+]
+
+routine_commands = [
+    "code",
+]
+
+routine_destinations = [
+    # GitHub
+    "github.com", "api.github.com",
+    "githubusercontent.com", "raw.githubusercontent.com",
+    # VS Code / Microsoft tooling
+    "visualstudio.com", "vsassets.io", "microsoft.com",
+]
+
+routine_listen_addresses = []
+
+[[profiles]]
+name = "grith-repl"
+display_name = "Grith REPL"
+extends = "generic"
+rationale = "Built-in Grith REPL policy base. Used with provider overlays to scope proxy and reputation behavior for interactive sessions."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+]
+
+routine_commands = []
+routine_destinations = []
+routine_listen_addresses = []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Named tool profiles — extend generic, list own destinations explicitly
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[profiles]]
+name = "claude-code"
+display_name = "Claude Code"
+extends = "generic"
+rationale = "Claude Code routinely reads project files, shells out to local build and SCM tools, and contacts Anthropic plus package and repository infrastructure."
+launch_contract = { required_args = ["--dangerously-skip-permissions"] }
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    # Claude Code application state
+    "${HOME}/.config/claude-code/**",
+    "${HOME}/.claude/**",
+    "${HOME}/.local/state/claude/**",
+    "${HOME}/.cache/claude-cli-nodejs/**",
+    "${HOME}/.cache/claude/**",
+    "/tmp/claude-*",
+    # Node.js ecosystem
+    "${HOME}/.npm/**",
+    "${HOME}/.node_modules/**",
+    # VS Code application state (Claude Code integrates with VS Code)
+    "${HOME}/.config/Code/**",
+    "${HOME}/.vscode/**",
+    "${HOME}/.vscode-server/**",
+]
+
+routine_commands = [
+    # Node.js
+    "node", "npm", "npx",
+    # SCM extensions
+    "gh",
+    # Rust toolchain
+    "cargo", "rustc",
+    # Python
+    "python", "python3", "pip", "pip3",
+    # JavaScript tooling
+    "tsc", "eslint", "prettier",
+    # Additional text processing
+    "envsubst", "gettext",
+    # Network
+    "curl",
+    # Archive / compression
+    "tar", "gzip", "gunzip", "unzip",
+    # System utilities
+    "tmux", "seq", "yes", "timeout", "nproc",
+    # VS Code CLI (extension listing, editor integration)
+    "code",
+]
+
+routine_destinations = [
+    # Anthropic — base domain for subdomain matching in session allowlist
+    "anthropic.com",
+    # Anthropic — specific subdomains for DNS forward cache seeding
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+    "cdn.anthropic.com",
+    # Claude web and platform
+    "claude.ai",
+    "claude.com",
+    # GitHub (gh command integration)
+    "github.com", "api.github.com",
+    "githubusercontent.com", "raw.githubusercontent.com",
+    # npm
+    "npmjs.org",
+    "registry.npmjs.org",
+    # Rust packages
+    "crates.io",
+    "static.crates.io",
+    # Python packages
+    "pypi.org",
+    "files.pythonhosted.org",
+    # Telemetry
+    "datadoghq.com",
+    "sentry.io",
+    # Statsig
+    "statsig.com",
+    "statsigapi.net",
+    # Google Cloud Storage (update checks / asset downloads)
+    "storage.googleapis.com",
+    "googleapis.com",
+    # VS Code marketplace/CDN
+    "vscode.dev",
+    "visualstudio.com",
+    "vsassets.io",
+    "microsoft.com",
+]
+
+routine_listen_addresses = []
+
+routine_exec_roots = [
+    # Claude-bundled helper binaries (rg, etc.) — reviewed, provenance-verified.
+    # Justification: Claude Code bundles its own rg under this tree. Needed for
+    # code search functionality. Ownership is user-only, permissions verified.
+    "${HOME}/.local/share/claude/versions/",
+    # VS Code system helpers
+    "/usr/share/code/",
+    # Version manager roots — node/python installed by nvm, mise, etc.
+    # Justification: Claude Code spawns node/python from these managed roots.
+    # Ownership verified, provenance checked at runtime.
+    # TODO(T-09): re-review after executable-attestation model lands (work/44).
+    "${HOME}/.nvm/versions/",
+    "${HOME}/.local/share/mise/",
+    "${HOME}/.local/share/nvm/",
+]
+
+[[profiles]]
+name = "codex"
+display_name = "OpenAI Codex CLI"
+extends = "generic"
+rationale = "Codex routinely reads project and local CLI state, shells out to common development tools, and contacts OpenAI and repository infrastructure."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    "${HOME}/.codex/**",
+    "${HOME}/.config/codex/**",
+    "${HOME}/.npm/**",
+    "/tmp/codex-*",
+]
+
+routine_commands = [
+    "node", "npm", "npx",
+    "cargo", "rustc",
+    "python", "python3", "pip", "pip3",
+    "tmux", "curl",
+    # JavaScript tooling
+    "tsc", "eslint", "prettier",
+    # SCM extensions
+    "gh",
+    # Archive / compression
+    "tar", "gzip", "gunzip", "unzip",
+    # System utilities
+    "seq", "nproc", "timeout", "yes",
+]
+
+routine_destinations = [
+    # OpenAI
+    "api.openai.com",
+    "openai.com",
+    "auth.openai.com",
+    "chatgpt.com",
+    # GitHub (gh command integration)
+    "github.com", "api.github.com",
+    "githubusercontent.com", "raw.githubusercontent.com",
+    # npm
+    "npmjs.org",
+    "registry.npmjs.org",
+    # Rust packages
+    "crates.io",
+    "static.crates.io",
+    # Python packages
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+
+# Changed from ["0.0.0.0"] — investigation confirmed no default Codex
+# behaviour needs wildcard bind. Loopback is auto-allowed by grith.
+routine_listen_addresses = []
+
+[[profiles]]
+name = "aider"
+display_name = "Aider"
+extends = "generic"
+rationale = "Aider is primarily a git- and Python-centric coding workflow with access to common LLM provider endpoints."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    "${HOME}/.aider*",
+    "${HOME}/.config/aider/**",
+    "${HOME}/.streamlit/**",
+    "/tmp/aider-*",
+]
+
+routine_commands = [
+    "python", "python3", "pip", "pip3",
+    "cargo",
+    "node", "npm",
+    "curl",
+    # Python tooling
+    "flake8",
+    # Streamlit browser mode
+    "streamlit",
+]
+
+routine_destinations = [
+    # LLM providers
+    "api.openai.com",
+    "api.anthropic.com",
+    "api.deepseek.com",
+    "openrouter.ai",
+    # Python packages (daily version check)
+    "pypi.org",
+    # PostHog analytics (opt-in, 10% sample)
+    "us.i.posthog.com",
+    # Tokenizer data
+    "huggingface.co",
+]
+
+routine_listen_addresses = []
+
+[[profiles]]
+name = "goose"
+display_name = "Goose"
+extends = "generic"
+rationale = "Goose is a Rust-native AI coding agent by Block. It reads project files, shells out to standard development tools, and contacts user-configured LLM providers. It has no built-in sandbox, so grith provides the sole security boundary."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    "${HOME}/.config/goose/**",
+    "${HOME}/.local/share/goose/**",
+    "${HOME}/.local/state/goose/**",
+    "/tmp/goose-*",
+]
+
+routine_commands = [
+    # Build tools
+    "cargo", "rustc",
+    "python", "python3", "pip", "pip3",
+    "node", "npm", "npx",
+    # Network
+    "curl",
+    # Archive / compression
+    "tar", "gzip", "gunzip", "unzip",
+]
+
+routine_destinations = [
+    # Anthropic
+    "anthropic.com", "api.anthropic.com",
+    # OpenAI
+    "openai.com", "api.openai.com",
+    # OpenRouter
+    "openrouter.ai",
+    # Telemetry
+    "statsig.com", "statsigapi.net",
+]
+
+routine_listen_addresses = []
+
+[[profiles]]
+name = "copilot"
+display_name = "GitHub Copilot CLI"
+extends = "generic"
+rationale = "Copilot CLI is GitHub's agentic coding assistant. It reads project files, shells out to standard development tools, and contacts GitHub Copilot API infrastructure. It bundles its own ripgrep binary and uses Node.js as its runtime."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    "${HOME}/.copilot/**",
+    "${HOME}/.npm/**",
+    "/tmp/copilot-*",
+]
+
+routine_commands = [
+    "node", "npm", "npx", "gh",
+    "cargo", "rustc",
+    "python", "python3", "pip", "pip3",
+    "tsc", "eslint", "prettier",
+    "curl",
+    "tar", "gzip", "gunzip", "unzip",
+    "seq", "nproc", "timeout",
+]
+
+routine_destinations = [
+    # GitHub — Copilot is a GitHub product
+    "github.com", "api.github.com",
+    "githubusercontent.com", "raw.githubusercontent.com",
+    # Copilot infrastructure
+    "githubcopilot.com", "api.githubcopilot.com",
+    "copilot.github.com",
+    # Telemetry (Application Insights via visualstudio.com)
+    "visualstudio.com",
+    # npm
+    "npmjs.org", "registry.npmjs.org",
+    # Rust packages
+    "crates.io", "static.crates.io",
+    # Python packages
+    "pypi.org", "files.pythonhosted.org",
+    # Statsig (feature flags)
+    "statsigcdn.com", "api.statsigcdn.com",
+    "statsigapi.net",
+]
+
+routine_listen_addresses = []
+
+readonly_paths = [
+    # Legacy gh copilot extension OAuth credentials (read-only)
+    "${HOME}/.config/github-copilot/apps.json",
+]
+
+[[profiles]]
+name = "cursor"
+display_name = "Cursor CLI"
+extends = "generic"
+rationale = "Cursor CLI (by Anysphere) is an agentic coding assistant. It reads project files, shells out to standard development tools, and contacts Cursor API endpoints. It bundles Node.js, ripgrep, and a sandbox binary. Under grith supervision, Cursor's built-in sandbox must be disabled to avoid ptrace conflict."
+launch_contract = { required_args = ["--sandbox", "disabled"] }
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    "${HOME}/.cursor/**",
+    "${HOME}/.cache/cursor-compile-cache/**",
+    "/tmp/cursor-*",
+]
+
+routine_commands = [
+    "node", "npm", "npx", "gh",
+    "cargo", "rustc",
+    "python", "python3", "pip", "pip3",
+    "tsc", "eslint", "prettier",
+    "curl",
+    "tar", "gzip", "gunzip", "unzip",
+    "seq", "nproc", "timeout",
+]
+
+routine_destinations = [
+    # GitHub (gh command integration)
+    "github.com", "api.github.com",
+    "githubusercontent.com", "raw.githubusercontent.com",
+    # Cursor API
+    "cursor.sh", "api2.cursor.sh",
+    "cursor.com", "api.cursor.com",
+    "cursorapi.com", "marketplace.cursorapi.com",
+    # npm
+    "npmjs.org", "registry.npmjs.org",
+    # Rust packages
+    "crates.io", "static.crates.io",
+    # Python packages
+    "pypi.org", "files.pythonhosted.org",
+    # Feature flags (Statsig)
+    "statsigcdn.com", "api.statsigcdn.com",
+    "statsigapi.net",
+    "featureassets.org",
+]
+
+routine_listen_addresses = []
+
+readonly_paths = [
+    # Auth credentials (read-only — writes should go through proxy)
+    "${HOME}/.config/cursor/auth.json",
+]
+
+[[profiles]]
+name = "cline"
+display_name = "Cline CLI"
+extends = "generic"
+rationale = "Cline CLI (formerly Claude Dev) is an agentic coding assistant. It reads project files, shells out to standard development tools, and contacts user-configured LLM providers plus Cline platform endpoints for telemetry. It bundles ripgrep and uses Node.js as its runtime."
+
+routine_paths = [
+    "${PROJECT_DIR}/**",
+    "${HOME}/.cline/**",
+    "/tmp/cline-*",
+]
+
+routine_commands = [
+    "node", "npm", "npx",
+    "cargo", "rustc",
+    "python", "python3", "pip", "pip3",
+    "tsc", "eslint", "prettier",
+    "curl",
+    "tar", "gzip", "gunzip", "unzip",
+]
+
+routine_destinations = [
+    # Cline platform
+    "cline.bot", "api.cline.bot", "app.cline.bot",
+    "data.cline.bot", "otel.cline.bot",
+    # Anthropic
+    "anthropic.com", "api.anthropic.com",
+    # OpenAI
+    "openai.com", "api.openai.com",
+    # OpenRouter
+    "openrouter.ai",
+    # npm
+    "npmjs.org", "registry.npmjs.org",
+]
+
+routine_listen_addresses = []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Standalone profiles — not extending generic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[profiles]]
+name = "openclaw"
+display_name = "OpenClaw"
+rationale = "OpenClaw is a local AI agent platform (Node.js) that orchestrates browser automation via Chromium/Chrome, messaging integrations via signal-cli and other helpers, and sandboxed code execution via Docker. It contacts multiple LLM providers and messaging platform APIs."
+
+routine_paths = [
+    "${HOME}/.openclaw/**",
+    "${HOME}/.config/openclaw/**",
+    "${HOME}/.local/share/openclaw/**",
+    "${HOME}/.cache/openclaw/**",
+    "/tmp/openclaw-*",
+    "${PROJECT_DIR}/**",
+]
+
+routine_commands = [
+    # OpenClaw runtime
+    "node", "npm", "npx", "pnpm", "openclaw",
+    # Browser automation
+    "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+    # Messaging helpers
+    "signal-cli",
+    # Container execution
+    "docker", "docker-compose",
+    # Python tooling (for helper scripts / plugins)
+    "python3", "pip3",
+    # Additional utilities
+    "tmux", "curl",
+]
+
+routine_destinations = [
+    # LLM providers
+    "anthropic.com",
+    "api.anthropic.com",
+    "openai.com",
+    "api.openai.com",
+    "openrouter.ai",
+    "ollama.ai",
+    # Messaging platform APIs (base domains for subdomain matching)
+    "telegram.org",
+    "api.telegram.org",
+    "slack.com",
+    "slack-edge.com",
+    "discord.com",
+    "discordapp.com",
+    "whatsapp.com",
+    "web.whatsapp.com",
+    "signal.org",
+    "storage.signal.org",
+    "chat.google.com",
+    "hangouts.google.com",
+    "matrix.org",
+    "mattermost.com",
+    "irc.libera.chat",
+    # Package management
+    "registry.npmjs.org",
+    # Asset delivery
+    "storage.googleapis.com",
+]
+
+routine_listen_addresses = [
+    # Loopback only — Node.js gateway binds locally; 0.0.0.0 is intentionally excluded.
+    "127.0.0.1",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Launcher overlays — small, additive, context-specific trust
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[launcher_overlays]]
+name = "vscode-terminal"
+detect_parent_names = ["code", "code-insiders", "codium"]
+detect_env = ["TERM_PROGRAM=vscode"]
+routine_commands = ["code"]
+routine_paths = []
+
+[[launcher_overlays]]
+name = "cursor-terminal"
+detect_parent_names = ["cursor"]
+detect_env = []
+routine_commands = []
+routine_paths = []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Provider overlays — LLM provider network destinations for grith REPL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[provider_overlays]]
+name = "openai"
+routine_destinations = [
+    "openai.com", "api.openai.com", "auth.openai.com", "chatgpt.com",
+]
+
+[[provider_overlays]]
+name = "anthropic"
+routine_destinations = [
+    "anthropic.com", "api.anthropic.com", "claude.ai", "claude.com",
+]
+
+[[provider_overlays]]
+name = "openrouter"
+routine_destinations = [
+    "openrouter.ai",
+]

@@ -1,0 +1,17 @@
+# High-security preset
+# Lower thresholds = more calls escalated to human review
+
+[general]
+log_level = "debug"
+
+[proxy]
+auto_allow_threshold = 1.5
+auto_deny_threshold = 6.0
+cold_start_calls = 500
+cold_start_escalation_low = 1.0
+cold_start_escalation_high = 8.0
+review_timeout_seconds = 600  # 10 minutes for strict mode
+
+[digest]
+interval_active = "15m"
+max_queue_size = 50

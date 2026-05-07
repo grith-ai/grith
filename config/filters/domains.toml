@@ -1,0 +1,73 @@
+# Domain reputation database for grith's reputation filter
+# Categories: known_safe, known_malicious, suspicious
+
+[known_safe]
+domains = [
+    # Code hosting
+    "github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "gitlab.com",
+    "bitbucket.org",
+    # Package registries
+    "npmjs.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "rubygems.org",
+    "maven.org",
+    "nuget.org",
+    "pkg.go.dev",
+    "jsr.io",
+    # Container registries
+    "hub.docker.com",
+    "registry.hub.docker.com",
+    # Documentation & community
+    "docs.rs",
+    "developer.mozilla.org",
+    "stackoverflow.com",
+    # Cloud providers & CDNs
+    "google.com",
+    "googleapis.com",
+    "microsoft.com",
+    "cloudflare.com",
+    "amazonaws.com",
+    # Language ecosystem
+    "rust-lang.org",
+]
+
+[known_malicious]
+domains = [
+    # Common C2 / tunneling / malware-hosting services
+    "ngrok.io",
+    "serveo.net",
+    "localhost.run",
+    "burpcollaborator.net",
+    "interact.sh",
+    "oastify.com",
+    "canarytokens.com",
+    "requestbin.net",
+    "pipedream.net",
+    "webhook.site",
+    # Known paste/exfil services commonly abused
+    "paste.ee",
+    "transfer.sh",
+    "file.io",
+]
+# Patterns that indicate suspicion regardless of domain
+patterns = [
+    "*.onion",
+    "*.bit",
+    "*.i2p",
+]
+
+[suspicious]
+# Characteristics that increase suspicion score
+indicators = [
+    "raw IP addresses (no domain)",
+    "newly registered domains (< 30 days)",
+    "domains with excessive subdomains (> 4 levels)",
+    "punycode/IDN homograph domains",
+]

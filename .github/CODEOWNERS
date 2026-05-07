@@ -1,0 +1,23 @@
+# Global fallback — all changes require review from a maintainer
+* @grith-ai/maintainers
+
+# Security-critical paths — require security team review
+crates/grith-proxy/src/filters/     @grith-ai/security
+crates/grith-proxy/src/engine.rs    @grith-ai/security
+crates/grith-proxy/src/scoring.rs   @grith-ai/security
+crates/grith-supervisor/            @grith-ai/security
+crates/grith-audit/                 @grith-ai/security
+config/filters/                     @grith-ai/security
+config/supervisor/                  @grith-ai/security
+SECURITY.md                         @grith-ai/security
+
+# Release and CI
+.github/workflows/                  @grith-ai/maintainers
+Formula/                            @grith-ai/maintainers
+dist/                               @grith-ai/maintainers
+scripts/                            @grith-ai/maintainers
+deny.toml                           @grith-ai/maintainers
+
+# Documentation
+docs/                               @grith-ai/maintainers
+README.md                           @grith-ai/maintainers

@@ -1,0 +1,35 @@
+[package]
+name = "grith-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Integration test helpers and fixtures for grith"
+
+[lints]
+workspace = true
+
+[dependencies]
+grith-proxy = { path = "../grith-proxy" }
+grith-audit = { path = "../grith-audit" }
+grith-digest = { path = "../grith-digest" }
+grith-server = { path = "../grith-server" }
+grith-llm = { path = "../grith-llm" }
+grith-cli = { path = "../grith-cli" }
+grith-supervisor = { path = "../grith-supervisor" }
+grith-notify = { path = "../grith-notify" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tower.workspace = true
+http = "1"
+toml.workspace = true

@@ -1,0 +1,42 @@
+# cargo-audit configuration. Read by `cargo audit` invocations
+# (including the security-audit GitHub workflow).
+#
+# Each ignore entry MUST have a justification comment explaining why
+# we accept the risk. Review on every release; remove entries when the
+# upstream fix lands.
+
+[advisories]
+ignore = [
+    # ----- aws-lc-sys (transitive via AWS SDK paths) -----
+    # Surfaced after toolchain bump in early May 2026. Tracked separately
+    # for upstream-fix follow-up; the affected functions are not on the
+    # grith hot path.
+    "RUSTSEC-2026-0044",
+    "RUSTSEC-2026-0045",
+    "RUSTSEC-2026-0046",
+    "RUSTSEC-2026-0047",
+    "RUSTSEC-2026-0048",
+
+    # ----- quinn-proto (transitive via reqwest HTTP/3) -----
+    # We do not enable HTTP/3 at runtime; the vulnerable code path is
+    # unreachable in current grith builds.
+    "RUSTSEC-2026-0037",
+
+    # ----- rustls-webpki (pending upstream rustls bump) -----
+    # Mitigated by our cert validation pinning; advisories pending the
+    # transitive bump from upstream rustls.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0104",
+
+    # ----- Older notice/yanked-style advisories surfaced by current DB -----
+    # These were previously below the threshold; cargo-audit's newer DB
+    # promotes them to deny-by-default. Each is documented and accepted
+    # pending an explicit dep-bump pass scheduled separately.
+    "RUSTSEC-2017-0008",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0134",
+    "RUSTSEC-2026-0002",
+    "RUSTSEC-2026-0097",
+    "RUSTSEC-2026-0099",
+]

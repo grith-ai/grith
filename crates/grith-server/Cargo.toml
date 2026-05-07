@@ -1,0 +1,38 @@
+[package]
+name = "grith-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "HTTP/WebSocket server for grith dashboard"
+
+[lints]
+workspace = true
+
+[dependencies]
+grith-digest = { path = "../grith-digest" }
+grith-audit = { path = "../grith-audit" }
+grith-proxy = { path = "../grith-proxy" }
+grith-supervisor = { path = "../grith-supervisor" }
+grith-notify = { path = "../grith-notify" }
+
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+axum-server.workspace = true
+rustls-pemfile.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

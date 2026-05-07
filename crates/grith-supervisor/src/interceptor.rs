@@ -1,0 +1,744 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (c) grith contributors
+
+//! Platform-agnostic syscall interception abstraction.
+//!
+//! This module defines the core types and trait that every platform backend
+//! (Linux ptrace, macOS Endpoint Security, etc.) must implement. The
+//! [`SyscallInterceptor`] trait provides a uniform async interface for:
+//!
+//! - Attaching to running processes or spawning new ones under supervision.
+//! - Receiving classified [`SyscallEvent`]s as they occur.
+//! - Allowing, denying, freezing, or thawing individual processes.
+//! - Detaching cleanly when supervision ends.
+//!
+//! All types in this module are serialisable so that events can be forwarded to
+//! the audit log and digest queue via grith-audit / grith-digest.
+
+use async_trait::async_trait;
+
+use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Syscall event types
+// ---------------------------------------------------------------------------
+
+/// A single intercepted syscall event from a supervised process.
+///
+/// Every OS-level operation that passes through the supervisor is wrapped in
+/// this struct before being routed to grith-proxy for evaluation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyscallEvent {
+    /// Process ID that issued the syscall.
+    pub pid: u32,
+    /// Thread ID (may equal `pid` on single-threaded processes).
+    pub tid: u32,
+    /// Wall-clock time at which the event was captured.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// High-level classification of the syscall.
+    pub kind: SyscallKind,
+    /// Raw platform syscall number (e.g., `__NR_openat` on Linux).
+    pub raw_syscall_nr: i64,
+    /// Tracee memory address of the sockaddr struct for CONNECT/SENDTO syscalls.
+    /// Used by the DNS proxy to rewrite the destination port via PTRACE_POKEDATA.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sockaddr_addr: Option<u64>,
+}
+
+/// Classification of intercepted syscalls into grith-proxy-compatible
+/// categories.
+///
+/// Each variant carries the decoded arguments so that downstream filters can
+/// evaluate the call without touching raw register values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SyscallKind {
+    /// `open` / `openat` — file being opened.
+    FileOpen {
+        /// Resolved absolute path.
+        path: String,
+        /// Decoded open flags.
+        flags: OpenFlags,
+    },
+    /// `write` / `pwrite64` — data written to a file descriptor.
+    FileWrite {
+        /// File descriptor number.
+        fd: i32,
+        /// Resolved path if the fd-to-path mapping is known.
+        path: Option<String>,
+    },
+    /// `read` / `pread64` — data read from a file descriptor.
+    FileRead {
+        /// File descriptor number.
+        fd: i32,
+        /// Resolved path if the fd-to-path mapping is known.
+        path: Option<String>,
+    },
+    /// `unlink` / `unlinkat` — file deletion.
+    FileDelete {
+        /// Resolved absolute path of the file being removed.
+        path: String,
+    },
+    /// `rename` / `renameat2` — file or directory rename.
+    FileRename {
+        /// Original path.
+        old_path: String,
+        /// Destination path.
+        new_path: String,
+    },
+    /// `chmod` / `fchmodat` — permission change.
+    FileChmod {
+        /// Target path.
+        path: String,
+        /// New permission mode bits.
+        mode: u32,
+    },
+    /// `mkdir` / `mkdirat` — directory creation.
+    DirCreate {
+        /// Path of the new directory.
+        path: String,
+        /// Permission mode bits.
+        mode: u32,
+    },
+    /// `getdents64` — directory listing.
+    DirList {
+        /// Directory being listed.
+        path: String,
+    },
+    /// `execve` / `execveat` — process execution.
+    ProcessExec {
+        /// Executable path.
+        path: String,
+        /// Argument vector (argv).
+        args: Vec<String>,
+    },
+    /// `fork` / `clone` — child process creation.
+    ProcessFork {
+        /// PID of the newly created child.
+        child_pid: u32,
+    },
+    /// `connect` — outbound network connection.
+    NetConnect {
+        /// Remote address (IP or hostname).
+        address: String,
+        /// Remote port number.
+        port: u16,
+        /// Protocol family.
+        protocol: NetProtocol,
+    },
+    /// `bind` — socket bind (server listen).
+    NetBind {
+        /// Local address being bound.
+        address: String,
+        /// Local port number.
+        port: u16,
+        /// Protocol family.
+        protocol: NetProtocol,
+    },
+    /// `sendto` — datagram sent to a specific address.
+    NetSendTo {
+        /// Destination address.
+        address: String,
+        /// Destination port.
+        port: u16,
+    },
+    /// `pipe` / `pipe2` — anonymous pipe creation.
+    PipeCreate,
+    /// `socketpair` — paired socket creation.
+    SocketPair,
+    /// `io_uring_setup` / `io_uring_enter` / `io_uring_register` — attempt to
+    /// create or operate on an io_uring ring.
+    ///
+    /// io_uring submissions bypass the normal per-syscall ptrace stop model:
+    /// file I/O and network operations queued in the ring buffer execute
+    /// without individual ptrace entry stops. These are denied unconditionally
+    /// so that supervised processes cannot obtain invisible I/O channels.
+    /// Node.js/libuv falls back to epoll + standard syscalls transparently.
+    IoUringSetup,
+    /// `socket(domain, type, protocol)` — creation of a raw-socket endpoint.
+    ///
+    /// Emitted only when `domain` is `AF_PACKET` (17) or `AF_NETLINK` (16).
+    /// These families bypass the normal IP stack and can capture or inject
+    /// arbitrary link-layer frames, or manipulate kernel subsystems directly.
+    /// Normal socket families (AF_INET, AF_INET6, AF_UNIX) are filtered out
+    /// in classify_syscall — they are already intercepted at connect()/bind().
+    ///
+    /// Denied unconditionally before proxy evaluation (same pattern as
+    /// `IoUringSetup`): no legitimate supervised AI tool needs raw sockets.
+    RawSocketCreate {
+        /// Socket address family (AF_PACKET=17, AF_NETLINK=16).
+        domain: i32,
+        /// Socket type flags (SOCK_RAW, SOCK_DGRAM, etc.).
+        socket_type: i32,
+        /// Protocol number (e.g. ETH_P_ALL=3 for AF_PACKET).
+        protocol: i32,
+    },
+}
+
+/// Decoded file-open flags.
+///
+/// The supervisor maps platform-specific `O_*` constants into this portable
+/// enum so that filters do not need platform-aware logic.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum OpenFlags {
+    /// `O_RDONLY`
+    ReadOnly,
+    /// `O_WRONLY`
+    WriteOnly,
+    /// `O_RDWR`
+    ReadWrite,
+    /// `O_APPEND`
+    Append,
+    /// `O_CREAT`
+    Create,
+    /// `O_TRUNC`
+    Truncate,
+}
+
+/// Network protocol family.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum NetProtocol {
+    /// TCP (SOCK_STREAM, AF_INET / AF_INET6).
+    Tcp,
+    /// UDP (SOCK_DGRAM, AF_INET / AF_INET6).
+    Udp,
+    /// Unix domain socket (AF_UNIX).
+    Unix,
+}
+
+// ---------------------------------------------------------------------------
+// Syscall response
+// ---------------------------------------------------------------------------
+
+/// The action the supervisor should take in response to an intercepted syscall.
+///
+/// This is the supervisor-internal decision — it is derived from the
+/// [`grith_proxy::types::ProxyAction`] returned by the proxy pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallResponse {
+    /// Let the syscall proceed normally.
+    Allow,
+    /// Inject an `EPERM` error return and skip the syscall.
+    Deny,
+    /// Freeze the process (SIGSTOP) pending human approval via the digest.
+    Freeze,
+}
+
+// ---------------------------------------------------------------------------
+// Platform trait
+// ---------------------------------------------------------------------------
+
+/// Platform abstraction for OS-level syscall interception.
+///
+/// Implementors provide the low-level mechanism for trapping syscalls (e.g.,
+/// `ptrace` on Linux, Endpoint Security on macOS) while the supervisor
+/// orchestrator handles proxy evaluation, freeze/thaw policy, and audit
+/// logging.
+///
+/// # Lifecycle
+///
+/// 1. Create an instance via the platform-specific constructor.
+/// 2. Call [`attach`](Self::attach) or [`spawn_supervised`](Self::spawn_supervised).
+/// 3. Loop on [`next_event`](Self::next_event), calling [`allow`](Self::allow),
+///    [`deny`](Self::deny), or [`freeze`](Self::freeze) for each event.
+/// 4. Call [`detach`](Self::detach) or [`detach_all`](Self::detach_all) to
+///    release processes.
+#[async_trait]
+pub trait SyscallInterceptor: Send + Sync {
+    /// Attach to an existing process by PID.
+    ///
+    /// The process will be stopped and syscall tracing enabled. Returns an
+    /// error if attachment fails (e.g., insufficient privileges, process does
+    /// not exist).
+    async fn attach(&mut self, pid: u32) -> Result<()>;
+
+    /// Spawn a new process under supervision.
+    ///
+    /// The child is created with syscall tracing active from the first
+    /// instruction. Returns the child's PID.
+    async fn spawn_supervised(
+        &mut self,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<u32>;
+
+    /// Wait for the next syscall event from any supervised process.
+    ///
+    /// Returns `None` when all supervised processes have exited.
+    async fn next_event(&mut self) -> Result<Option<SyscallEvent>>;
+
+    /// Allow a previously intercepted syscall to proceed.
+    async fn allow(&mut self, pid: u32) -> Result<()>;
+
+    /// Deny a previously intercepted syscall.
+    ///
+    /// The process receives `EPERM` as the syscall's return value and continues
+    /// execution.
+    async fn deny(&mut self, pid: u32) -> Result<()>;
+
+    /// Freeze (pause) a process.
+    ///
+    /// On Unix this sends `SIGSTOP`. The process remains stopped until
+    /// [`thaw`](Self::thaw) is called.
+    async fn freeze(&mut self, pid: u32) -> Result<()>;
+
+    /// Thaw (resume) a previously frozen process.
+    ///
+    /// On Unix this sends `SIGCONT`.
+    async fn thaw(&mut self, pid: u32) -> Result<()>;
+
+    /// Detach from a single supervised process, allowing it to run unsupervised.
+    async fn detach(&mut self, pid: u32) -> Result<()>;
+
+    /// Detach from all supervised processes.
+    async fn detach_all(&mut self) -> Result<()>;
+
+    /// Return the list of PIDs currently under supervision.
+    fn supervised_pids(&self) -> Vec<u32>;
+
+    /// Check whether the underlying platform mechanism is available at runtime.
+    ///
+    /// For example, Linux ptrace requires `CAP_SYS_PTRACE` or `YAMA`
+    /// configured to allow non-root tracing.
+    fn is_available() -> bool
+    where
+        Self: Sized;
+
+    /// Spawn a new process under supervision inside a pseudo-terminal.
+    ///
+    /// Returns `(pid, pty_reader, pty_writer)`. The reader/writer are the
+    /// master side of the PTY — the caller forwards bytes between these
+    /// and the user's terminal.
+    ///
+    /// Not all platforms support PTY spawning. The default implementation
+    /// returns an error.
+    async fn spawn_supervised_pty(
+        &mut self,
+        _command: &str,
+        _args: &[String],
+        _env: &[(String, String)],
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(
+        u32,
+        Box<dyn std::io::Read + Send>,
+        Box<dyn std::io::Write + Send>,
+    )> {
+        Err(Error::PlatformNotSupported(
+            "PTY spawning not supported on this platform".into(),
+        ))
+    }
+
+    /// Rewrite the port field in a tracee's sockaddr struct.
+    ///
+    /// Used by the DNS inspection proxy to redirect port-53 traffic to the
+    /// local DNS proxy. Implementations may also rewrite the address to a
+    /// loopback proxy endpoint depending on socket family.
+    ///
+    /// Default implementation is a no-op (for mock/unsupported platforms).
+    async fn rewrite_sockaddr_port(
+        &mut self,
+        _pid: u32,
+        _sockaddr_addr: u64,
+        _new_port: u16,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Human-readable name of the interception mechanism (e.g., `"ptrace"`,
+    /// `"endpoint-security"`).
+    fn mechanism_name(&self) -> &str;
+}
+
+// ---------------------------------------------------------------------------
+// Display implementations
+// ---------------------------------------------------------------------------
+
+impl std::fmt::Display for SyscallKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileOpen { path, flags } => write!(f, "FileOpen({path}, {flags:?})"),
+            Self::FileWrite { fd, path } => {
+                if let Some(p) = path {
+                    write!(f, "FileWrite(fd={fd}, {p})")
+                } else {
+                    write!(f, "FileWrite(fd={fd})")
+                }
+            }
+            Self::FileRead { fd, path } => {
+                if let Some(p) = path {
+                    write!(f, "FileRead(fd={fd}, {p})")
+                } else {
+                    write!(f, "FileRead(fd={fd})")
+                }
+            }
+            Self::FileDelete { path } => write!(f, "FileDelete({path})"),
+            Self::FileRename { old_path, new_path } => {
+                write!(f, "FileRename({old_path} -> {new_path})")
+            }
+            Self::FileChmod { path, mode } => write!(f, "FileChmod({path}, {mode:o})"),
+            Self::DirCreate { path, mode } => write!(f, "DirCreate({path}, {mode:o})"),
+            Self::DirList { path } => write!(f, "DirList({path})"),
+            Self::ProcessExec { path, args } => {
+                write!(f, "ProcessExec({path} {})", args.join(" "))
+            }
+            Self::ProcessFork { child_pid } => write!(f, "ProcessFork(child={child_pid})"),
+            Self::NetConnect {
+                address,
+                port,
+                protocol,
+            } => write!(f, "NetConnect({protocol:?} {address}:{port})"),
+            Self::NetBind {
+                address,
+                port,
+                protocol,
+            } => write!(f, "NetBind({protocol:?} {address}:{port})"),
+            Self::NetSendTo { address, port } => write!(f, "NetSendTo({address}:{port})"),
+            Self::PipeCreate => write!(f, "PipeCreate"),
+            Self::SocketPair => write!(f, "SocketPair"),
+            Self::IoUringSetup => write!(f, "IoUringSetup"),
+            Self::RawSocketCreate {
+                domain,
+                socket_type,
+                protocol,
+            } => write!(
+                f,
+                "RawSocketCreate(domain={domain}, type={socket_type}, proto={protocol})"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for SyscallResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allow => write!(f, "allow"),
+            Self::Deny => write!(f, "deny"),
+            Self::Freeze => write!(f, "freeze"),
+        }
+    }
+}
+
+impl std::fmt::Display for NetProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+            Self::Unix => write!(f, "unix"),
+        }
+    }
+}
+
+impl std::fmt::Display for OpenFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadOnly => write!(f, "O_RDONLY"),
+            Self::WriteOnly => write!(f, "O_WRONLY"),
+            Self::ReadWrite => write!(f, "O_RDWR"),
+            Self::Append => write!(f, "O_APPEND"),
+            Self::Create => write!(f, "O_CREAT"),
+            Self::Truncate => write!(f, "O_TRUNC"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Helper to build a test event with sensible defaults.
+    fn make_event(kind: SyscallKind) -> SyscallEvent {
+        SyscallEvent {
+            pid: 1000,
+            tid: 1000,
+            timestamp: Utc::now(),
+            kind,
+            raw_syscall_nr: 0,
+            sockaddr_addr: None,
+        }
+    }
+
+    // -- SyscallEvent construction --
+
+    #[test]
+    fn syscall_event_file_open() {
+        let event = make_event(SyscallKind::FileOpen {
+            path: "/etc/passwd".into(),
+            flags: OpenFlags::ReadOnly,
+        });
+        assert_eq!(event.pid, 1000);
+        if let SyscallKind::FileOpen { path, flags } = &event.kind {
+            assert_eq!(path, "/etc/passwd");
+            assert_eq!(*flags, OpenFlags::ReadOnly);
+        } else {
+            panic!("expected FileOpen");
+        }
+    }
+
+    #[test]
+    fn syscall_event_process_exec() {
+        let event = make_event(SyscallKind::ProcessExec {
+            path: "/usr/bin/curl".into(),
+            args: vec!["-s".into(), "https://evil.com".into()],
+        });
+        if let SyscallKind::ProcessExec { path, args } = &event.kind {
+            assert_eq!(path, "/usr/bin/curl");
+            assert_eq!(args.len(), 2);
+        } else {
+            panic!("expected ProcessExec");
+        }
+    }
+
+    #[test]
+    fn syscall_event_net_connect() {
+        let event = make_event(SyscallKind::NetConnect {
+            address: "93.184.216.34".into(),
+            port: 443,
+            protocol: NetProtocol::Tcp,
+        });
+        if let SyscallKind::NetConnect {
+            address,
+            port,
+            protocol,
+        } = &event.kind
+        {
+            assert_eq!(address, "93.184.216.34");
+            assert_eq!(*port, 443);
+            assert_eq!(*protocol, NetProtocol::Tcp);
+        } else {
+            panic!("expected NetConnect");
+        }
+    }
+
+    #[test]
+    fn syscall_event_file_rename() {
+        let event = make_event(SyscallKind::FileRename {
+            old_path: "/tmp/a.txt".into(),
+            new_path: "/tmp/b.txt".into(),
+        });
+        if let SyscallKind::FileRename { old_path, new_path } = &event.kind {
+            assert_eq!(old_path, "/tmp/a.txt");
+            assert_eq!(new_path, "/tmp/b.txt");
+        } else {
+            panic!("expected FileRename");
+        }
+    }
+
+    #[test]
+    fn syscall_event_pipe_and_socketpair() {
+        let pipe = make_event(SyscallKind::PipeCreate);
+        assert_eq!(pipe.kind, SyscallKind::PipeCreate);
+
+        let pair = make_event(SyscallKind::SocketPair);
+        assert_eq!(pair.kind, SyscallKind::SocketPair);
+    }
+
+    // -- Serde round-trips --
+
+    #[test]
+    fn serde_roundtrip_syscall_kind() {
+        let variants: Vec<SyscallKind> = vec![
+            SyscallKind::FileOpen {
+                path: "/foo".into(),
+                flags: OpenFlags::Create,
+            },
+            SyscallKind::FileWrite {
+                fd: 3,
+                path: Some("/bar".into()),
+            },
+            SyscallKind::FileRead { fd: 0, path: None },
+            SyscallKind::FileDelete {
+                path: "/baz".into(),
+            },
+            SyscallKind::FileRename {
+                old_path: "/a".into(),
+                new_path: "/b".into(),
+            },
+            SyscallKind::FileChmod {
+                path: "/x".into(),
+                mode: 0o755,
+            },
+            SyscallKind::DirCreate {
+                path: "/d".into(),
+                mode: 0o755,
+            },
+            SyscallKind::DirList {
+                path: "/tmp".into(),
+            },
+            SyscallKind::ProcessExec {
+                path: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo hi".into()],
+            },
+            SyscallKind::ProcessFork { child_pid: 9999 },
+            SyscallKind::NetConnect {
+                address: "1.2.3.4".into(),
+                port: 80,
+                protocol: NetProtocol::Tcp,
+            },
+            SyscallKind::NetBind {
+                address: "0.0.0.0".into(),
+                port: 8080,
+                protocol: NetProtocol::Tcp,
+            },
+            SyscallKind::NetSendTo {
+                address: "10.0.0.1".into(),
+                port: 53,
+            },
+            SyscallKind::PipeCreate,
+            SyscallKind::SocketPair,
+        ];
+        for variant in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let parsed: SyscallKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, variant);
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_open_flags() {
+        let flags = vec![
+            OpenFlags::ReadOnly,
+            OpenFlags::WriteOnly,
+            OpenFlags::ReadWrite,
+            OpenFlags::Append,
+            OpenFlags::Create,
+            OpenFlags::Truncate,
+        ];
+        for flag in &flags {
+            let json = serde_json::to_string(flag).unwrap();
+            let parsed: OpenFlags = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, flag);
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_net_protocol() {
+        let protos = vec![NetProtocol::Tcp, NetProtocol::Udp, NetProtocol::Unix];
+        for proto in &protos {
+            let json = serde_json::to_string(proto).unwrap();
+            let parsed: NetProtocol = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, proto);
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_full_event() {
+        let event = make_event(SyscallKind::ProcessExec {
+            path: "/usr/bin/git".into(),
+            args: vec!["push".into(), "origin".into(), "main".into()],
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: SyscallEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pid, event.pid);
+        assert_eq!(parsed.tid, event.tid);
+        assert_eq!(parsed.kind, event.kind);
+        assert_eq!(parsed.raw_syscall_nr, event.raw_syscall_nr);
+    }
+
+    // -- Display implementations --
+
+    #[test]
+    fn display_syscall_kind_file_open() {
+        let kind = SyscallKind::FileOpen {
+            path: "/etc/shadow".into(),
+            flags: OpenFlags::ReadOnly,
+        };
+        assert_eq!(kind.to_string(), "FileOpen(/etc/shadow, ReadOnly)");
+    }
+
+    #[test]
+    fn display_syscall_kind_file_write_with_path() {
+        let kind = SyscallKind::FileWrite {
+            fd: 5,
+            path: Some("/tmp/out.log".into()),
+        };
+        assert_eq!(kind.to_string(), "FileWrite(fd=5, /tmp/out.log)");
+    }
+
+    #[test]
+    fn display_syscall_kind_file_write_without_path() {
+        let kind = SyscallKind::FileWrite { fd: 1, path: None };
+        assert_eq!(kind.to_string(), "FileWrite(fd=1)");
+    }
+
+    #[test]
+    fn display_syscall_kind_process_exec() {
+        let kind = SyscallKind::ProcessExec {
+            path: "/bin/ls".into(),
+            args: vec!["-la".into(), "/tmp".into()],
+        };
+        assert_eq!(kind.to_string(), "ProcessExec(/bin/ls -la /tmp)");
+    }
+
+    #[test]
+    fn display_syscall_kind_net_connect() {
+        let kind = SyscallKind::NetConnect {
+            address: "8.8.8.8".into(),
+            port: 53,
+            protocol: NetProtocol::Udp,
+        };
+        assert_eq!(kind.to_string(), "NetConnect(Udp 8.8.8.8:53)");
+    }
+
+    #[test]
+    fn display_syscall_kind_pipe_and_socketpair() {
+        assert_eq!(SyscallKind::PipeCreate.to_string(), "PipeCreate");
+        assert_eq!(SyscallKind::SocketPair.to_string(), "SocketPair");
+    }
+
+    #[test]
+    fn display_syscall_response() {
+        assert_eq!(SyscallResponse::Allow.to_string(), "allow");
+        assert_eq!(SyscallResponse::Deny.to_string(), "deny");
+        assert_eq!(SyscallResponse::Freeze.to_string(), "freeze");
+    }
+
+    #[test]
+    fn display_net_protocol() {
+        assert_eq!(NetProtocol::Tcp.to_string(), "tcp");
+        assert_eq!(NetProtocol::Udp.to_string(), "udp");
+        assert_eq!(NetProtocol::Unix.to_string(), "unix");
+    }
+
+    #[test]
+    fn display_open_flags() {
+        assert_eq!(OpenFlags::ReadOnly.to_string(), "O_RDONLY");
+        assert_eq!(OpenFlags::WriteOnly.to_string(), "O_WRONLY");
+        assert_eq!(OpenFlags::ReadWrite.to_string(), "O_RDWR");
+        assert_eq!(OpenFlags::Append.to_string(), "O_APPEND");
+        assert_eq!(OpenFlags::Create.to_string(), "O_CREAT");
+        assert_eq!(OpenFlags::Truncate.to_string(), "O_TRUNC");
+    }
+
+    // -- Equality checks --
+
+    #[test]
+    fn syscall_response_equality() {
+        assert_eq!(SyscallResponse::Allow, SyscallResponse::Allow);
+        assert_ne!(SyscallResponse::Allow, SyscallResponse::Deny);
+        assert_ne!(SyscallResponse::Deny, SyscallResponse::Freeze);
+    }
+
+    #[test]
+    fn open_flags_equality() {
+        assert_eq!(OpenFlags::ReadOnly, OpenFlags::ReadOnly);
+        assert_ne!(OpenFlags::ReadOnly, OpenFlags::WriteOnly);
+    }
+
+    #[test]
+    fn net_protocol_equality() {
+        assert_eq!(NetProtocol::Tcp, NetProtocol::Tcp);
+        assert_ne!(NetProtocol::Tcp, NetProtocol::Udp);
+    }
+
+    // -- Trait bounds --
+
+    #[test]
+    fn event_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SyscallEvent>();
+        assert_send_sync::<SyscallKind>();
+        assert_send_sync::<SyscallResponse>();
+    }
+}
