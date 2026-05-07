@@ -22,6 +22,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # v0.1.0 is Linux-only. The supervisor uses ptrace+seccomp which
+        # is Linux-specific; macOS Endpoint Security and Windows ETW
+        # parity are tracked for v2.0 (work/31, work/32 in the private
+        # repo). Re-add the macOS/Windows entries when those land.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
@@ -29,15 +33,6 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             ext: ""
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            ext: ""
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            ext: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
 

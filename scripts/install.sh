@@ -74,25 +74,27 @@ detect_platform() {
             esac
             ;;
         Darwin)
-            case "${arch}" in
-                x86_64)  target="x86_64-apple-darwin" ;;
-                aarch64) target="aarch64-apple-darwin" ;;
-                arm64)   target="aarch64-apple-darwin" ;;
-                *)
-                    err "Unsupported macOS architecture: ${arch}"
-                    err "Supported: x86_64, arm64 (Apple Silicon)"
-                    exit 1
-                    ;;
-            esac
+            err "macOS is not supported by this installer in v0.1.0."
+            err ""
+            err "grith's supervisor relies on Linux ptrace + seccomp."
+            err "macOS support (via Endpoint Security) is targeted for"
+            err "v2.0. Track progress at:"
+            err "  https://github.com/${REPO}/issues"
+            err ""
+            err "If you have a Linux machine or VM, you can install"
+            err "there via this same one-liner."
+            exit 1
             ;;
         CYGWIN*|MINGW*|MSYS*|Windows*)
-            err "Windows is not supported by this installer."
+            err "Windows is not supported by this installer in v0.1.0."
             err ""
-            err "Please install grith on Windows using one of these methods:"
-            err "  1. Download the .zip from GitHub Releases:"
-            err "     https://github.com/${REPO}/releases"
-            err "  2. Use winget: winget install grith-ai.grith"
-            err "  3. Use scoop:  scoop install grith"
+            err "grith's supervisor relies on Linux ptrace + seccomp."
+            err "Windows support (via ETW + a process supervisor) is"
+            err "targeted for v2.0. Track progress at:"
+            err "  https://github.com/${REPO}/issues"
+            err ""
+            err "If you have a Linux machine, VM, or WSL2, you can"
+            err "install there via this same one-liner."
             exit 1
             ;;
         *)
