@@ -7,9 +7,9 @@
 //! Outputs four JSON files into `--out-dir`:
 //!   - `config.json` — parsed from `config/default.toml`
 //!   - `filters.json` — scanned from `crates/grith-proxy/src/filters/`,
-//!                      enriched from `crates/grith-docgen/data/filters.toml`
+//!     enriched from `crates/grith-docgen/data/filters.toml`
 //!   - `cli.json`    — parsed from `crates/grith-core/src/main.rs` (best-effort
-//!                      regex extraction of clap derives)
+//!     regex extraction of clap derives)
 //!   - `api.json`    — enriched from `crates/grith-docgen/data/api.toml` (curated)
 
 mod api;
@@ -116,11 +116,20 @@ fn default_grith_root() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-fn write(out_dir: &std::path::Path, name: &str, value: &serde_json::Value, dry_run: bool) -> Result<()> {
+fn write(
+    out_dir: &std::path::Path,
+    name: &str,
+    value: &serde_json::Value,
+    dry_run: bool,
+) -> Result<()> {
     let path = out_dir.join(name);
     let body = serde_json::to_string_pretty(value)? + "\n";
     if dry_run {
-        println!("  [dry-run] would write {} ({} bytes)", path.display(), body.len());
+        println!(
+            "  [dry-run] would write {} ({} bytes)",
+            path.display(),
+            body.len()
+        );
     } else {
         std::fs::write(&path, &body).with_context(|| format!("write {}", path.display()))?;
         println!("  wrote {} ({} bytes)", path.display(), body.len());

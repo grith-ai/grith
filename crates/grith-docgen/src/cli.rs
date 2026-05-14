@@ -31,8 +31,8 @@ struct CommandEntry {
 
 pub fn emit(grith_root: &Path) -> Result<Value> {
     let main_rs = grith_root.join("crates/grith-core/src/main.rs");
-    let raw = std::fs::read_to_string(&main_rs)
-        .with_context(|| format!("read {}", main_rs.display()))?;
+    let raw =
+        std::fs::read_to_string(&main_rs).with_context(|| format!("read {}", main_rs.display()))?;
 
     let commands = extract_command_variants(&raw);
 

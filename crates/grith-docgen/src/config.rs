@@ -38,8 +38,7 @@ struct Key {
 
 pub fn emit(grith_root: &Path) -> Result<Value> {
     let path = grith_root.join("config/default.toml");
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
 
     let parsed: toml::Value = toml::from_str(&raw).context("parse default.toml")?;
     let comments = harvest_comments(&raw);
@@ -168,7 +167,9 @@ impl CommentIndex {
         self.sections.get(path).cloned()
     }
     fn for_key(&self, section: &str, key: &str) -> Option<String> {
-        self.keys.get(&(section.to_string(), key.to_string())).cloned()
+        self.keys
+            .get(&(section.to_string(), key.to_string()))
+            .cloned()
     }
 }
 
@@ -191,7 +192,10 @@ fn harvest_comments(raw: &str) -> CommentIndex {
             continue;
         }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let name = trimmed.trim_start_matches('[').trim_end_matches(']').to_string();
+            let name = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
             if !pending.is_empty() {
                 sections.insert(name.clone(), pending.join(" "));
             }
@@ -203,9 +207,8 @@ fn harvest_comments(raw: &str) -> CommentIndex {
             let key_name = trimmed[..eq_pos].trim().to_string();
             // Inline comment on the same line takes priority over block comment above.
             let inline = trimmed[eq_pos + 1..]
-                .splitn(2, '#')
-                .nth(1)
-                .map(|s| s.trim().to_string());
+                .split_once('#')
+                .map(|(_, after)| after.trim().to_string());
             let desc = inline.or_else(|| {
                 if pending.is_empty() {
                     None

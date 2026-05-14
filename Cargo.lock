@@ -1301,6 +1301,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "grith-docgen"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "regex",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "grith-llm"
 version = "0.1.1"
 dependencies = [

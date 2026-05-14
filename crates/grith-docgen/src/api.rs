@@ -43,8 +43,7 @@ struct ApiFile {
 
 pub fn emit(grith_root: &Path) -> Result<Value> {
     let path = grith_root.join("crates/grith-docgen/data/api.toml");
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let api: ApiFile = toml::from_str(&raw).context("parse api.toml")?;
 
     let out = ApiOutput {

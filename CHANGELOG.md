@@ -8,6 +8,16 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- New `grith-docgen` workspace crate (`crates/grith-docgen`). Build-time
+  tool that emits structured JSON describing the grith product surface
+  (`config.json`, `filters.json`, `cli.json`, `api.json`) for the public
+  documentation site `grith-docs` to consume. Excluded from
+  `default-members` so `cargo build --workspace` doesn't pay its build
+  cost; invoke via `cargo run -p grith-docgen` to regenerate the doc
+  data.
+
 ## [0.1.1] - 2026-05-14
 
 ### Fixed

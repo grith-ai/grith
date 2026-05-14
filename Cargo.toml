@@ -11,9 +11,24 @@ members = [
     "crates/grith-supervisor",
     "crates/grith-notify",
     "crates/grith-tests",
+    "crates/grith-docgen",
 ]
+# grith-docgen is excluded from default-members because it is a build-time
+# tool (regenerates JSON for the grith-docs site) rather than a runtime
+# binary. Devs running `cargo build --workspace` shouldn't pay its build
+# cost; the docs-regen flow invokes it explicitly via
+# `cargo run -p grith-docgen`.
 default-members = [
-    "crates/*",
+    "crates/grith-core",
+    "crates/grith-llm",
+    "crates/grith-proxy",
+    "crates/grith-digest",
+    "crates/grith-audit",
+    "crates/grith-cli",
+    "crates/grith-server",
+    "crates/grith-supervisor",
+    "crates/grith-notify",
+    "crates/grith-tests",
 ]
 
 [workspace.package]
