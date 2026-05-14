@@ -21,7 +21,10 @@
 //!
 //! Works with any tool (Claude Code, Codex, Aider, vim, etc.).
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -247,7 +250,11 @@ pub fn run_exec_tui(
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Enable mouse capture so we receive wheel/click events from the host
+    // terminal as escape sequences (otherwise terminals in alternate-screen
+    // mode translate wheel to arrow keys, which Claude Code rejects with
+    // "Scroll wheel is sending arrow keys").
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     // No explicit clear needed — the first terminal.draw() call performs a full
@@ -257,7 +264,11 @@ pub fn run_exec_tui(
     let result = exec_event_loop(&mut terminal, &mut state, &event_rx, &pty_tx);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     #[cfg(unix)]
@@ -563,6 +574,9 @@ fn exec_event_loop(
                         let _ = pty_tx.send(PtyInput::Bytes(bytes));
                     }
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse_event(state, pty_tx, mouse, &mut dirty);
+                }
                 Event::Resize(cols, rows) => {
                     state.vterm_cols = cols;
                     let vterm_rows = rows.saturating_sub(MINIMAL_CHROME_ROWS).max(4);
@@ -631,6 +645,173 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
             Some(format!("\x1b[{code}~").into_bytes())
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mouse handling — route wheel/click events to the PTY or local scrollback
+// ---------------------------------------------------------------------------
+
+/// y-offset of the terminal panel: titlebar(1) + subheader(2).
+const TERMINAL_PANEL_Y: u16 = 3;
+
+/// Lines scrolled per wheel tick when falling back to local scrollback.
+const LOCAL_SCROLL_STEP: usize = 3;
+
+fn handle_mouse_event(
+    state: &mut ExecState,
+    pty_tx: &mpsc::Sender<PtyInput>,
+    mouse: MouseEvent,
+    dirty: &mut bool,
+) {
+    // Swallow mouse events while the permission dialog or log panel are focused —
+    // they don't use mouse, and forwarding to the PTY would surprise the user.
+    if state.permission_dialog.is_some() || state.log_focused {
+        return;
+    }
+
+    let term_y_start = TERMINAL_PANEL_Y;
+    let term_y_end = term_y_start + state.vterm_rows;
+    let log_y_start = term_y_end;
+    let log_y_end = log_y_start + LOG_PANEL_ROWS;
+
+    if mouse.row >= term_y_start && mouse.row < term_y_end {
+        let mode = state.vterm.screen().mouse_protocol_mode();
+        if mode != vt100::MouseProtocolMode::None {
+            let encoding = state.vterm.screen().mouse_protocol_encoding();
+            if let Some(bytes) = encode_mouse_for_pty(mouse, term_y_start, encoding, mode) {
+                if state.scroll_offset > 0 {
+                    state.scroll_offset = 0;
+                    state.vterm.set_scrollback(0);
+                    *dirty = true;
+                }
+                let _ = pty_tx.send(PtyInput::Bytes(bytes));
+            }
+            return;
+        }
+        // Inner tool doesn't want mouse — provide local scrollback so the
+        // wheel still does something useful (the same scrollback that
+        // Shift+PgUp/PgDn drives).
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.scroll_offset = state.scroll_offset.saturating_add(LOCAL_SCROLL_STEP);
+                state.vterm.set_scrollback(state.scroll_offset);
+                *dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                state.scroll_offset = state.scroll_offset.saturating_sub(LOCAL_SCROLL_STEP);
+                state.vterm.set_scrollback(state.scroll_offset);
+                *dirty = true;
+            }
+            _ => {}
+        }
+    } else if mouse.row >= log_y_start && mouse.row < log_y_end {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.log_scroll_up();
+                *dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                state.log_scroll_down();
+                *dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Encode a crossterm mouse event back into the escape sequence the inner
+/// tool expects, based on the mouse protocol it requested via DECSET.
+fn encode_mouse_for_pty(
+    event: MouseEvent,
+    panel_y_start: u16,
+    encoding: vt100::MouseProtocolEncoding,
+    mode: vt100::MouseProtocolMode,
+) -> Option<Vec<u8>> {
+    let pty_col = u32::from(event.column) + 1;
+    let pty_row = u32::from(event.row.saturating_sub(panel_y_start)) + 1;
+
+    let mut mods: u32 = 0;
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        mods += 4;
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        mods += 8;
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        mods += 16;
+    }
+
+    let motion = matches!(
+        mode,
+        vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion
+    );
+
+    let (button_code, is_release) = match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => (0, false),
+        MouseEventKind::Down(MouseButton::Middle) => (1, false),
+        MouseEventKind::Down(MouseButton::Right) => (2, false),
+        MouseEventKind::Up(MouseButton::Left) => (0, true),
+        MouseEventKind::Up(MouseButton::Middle) => (1, true),
+        MouseEventKind::Up(MouseButton::Right) => (2, true),
+        MouseEventKind::Drag(btn) if motion => {
+            let base = match btn {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+            };
+            (32 + base, false)
+        }
+        MouseEventKind::Moved if matches!(mode, vt100::MouseProtocolMode::AnyMotion) => (35, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        _ => return None,
+    };
+
+    if is_release && matches!(mode, vt100::MouseProtocolMode::Press) {
+        return None;
+    }
+
+    let code = button_code + mods;
+
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let ch = if is_release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{code};{pty_col};{pty_row}{ch}").into_bytes())
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            // X10-style code with release encoded as 3 + mods, payload as UTF-8.
+            let cb = if is_release { 3 + mods } else { code };
+            let mut buf = b"\x1b[M".to_vec();
+            push_utf8(&mut buf, cb + 32);
+            push_utf8(&mut buf, pty_col + 32);
+            push_utf8(&mut buf, pty_row + 32);
+            Some(buf)
+        }
+        vt100::MouseProtocolEncoding::Default => {
+            let cb = if is_release { 3 + mods } else { code };
+            if cb + 32 > 223 || pty_col + 32 > 223 || pty_row + 32 > 223 {
+                return None;
+            }
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                (cb + 32) as u8,
+                (pty_col + 32) as u8,
+                (pty_row + 32) as u8,
+            ])
+        }
+    }
+}
+
+fn push_utf8(buf: &mut Vec<u8>, val: u32) {
+    if let Some(c) = char::from_u32(val) {
+        let mut tmp = [0u8; 4];
+        let s = c.encode_utf8(&mut tmp);
+        buf.extend_from_slice(s.as_bytes());
     }
 }
 
@@ -1090,6 +1271,47 @@ mod tests {
             key_to_bytes(KeyCode::Backspace, KeyModifiers::NONE),
             Some(vec![0x7f])
         );
+    }
+
+    #[test]
+    fn mouse_wheel_encodes_sgr_when_inner_tool_requests_mouse() {
+        // Wheel-up event over the second row of the terminal panel.
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: TERMINAL_PANEL_Y + 1, // → pty_row = 2
+            modifiers: KeyModifiers::NONE,
+        };
+        let bytes = encode_mouse_for_pty(
+            event,
+            TERMINAL_PANEL_Y,
+            vt100::MouseProtocolEncoding::Sgr,
+            vt100::MouseProtocolMode::PressRelease,
+        )
+        .expect("should encode wheel-up");
+        // SGR mouse: CSI < 64 ; col+1 ; row+1 M
+        assert_eq!(bytes, b"\x1b[<64;11;2M".to_vec());
+    }
+
+    #[test]
+    fn mouse_wheel_local_scrollback_when_no_mouse_mode() {
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        let (pty_tx, _pty_rx) = mpsc::channel();
+        // Inner tool didn't request mouse → mode is None.
+        assert_eq!(
+            state.vterm.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        let mut dirty = false;
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: TERMINAL_PANEL_Y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse_event(&mut state, &pty_tx, event, &mut dirty);
+        assert_eq!(state.scroll_offset, LOCAL_SCROLL_STEP);
+        assert!(dirty);
     }
 
     #[test]

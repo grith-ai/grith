@@ -8,6 +8,22 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-14
+
+### Fixed
+
+- `grith exec` now forwards mouse wheel and click events from the host
+  terminal to the supervised tool's PTY, so Claude Code, Codex, and other
+  mouse-aware tools can scroll their own content windows. Previously the
+  host terminal translated wheel events into arrow keys (the default
+  behaviour in alternate-screen mode), which Claude Code rejected with
+  "Scroll wheel is sending arrow keys · use PgUp/PgDn to scroll". The
+  exec TUI now enables mouse capture and re-encodes crossterm
+  `MouseEvent`s using the SGR / UTF-8 / X10 protocol the inner tool
+  requested (detected via vt100's `mouse_protocol_mode`). When the inner
+  tool hasn't requested mouse, wheel events fall back to local vterm
+  scrollback so the wheel still does something useful.
+
 ### Added
 
 - New `grith-docgen` workspace crate (`crates/grith-docgen`). Build-time

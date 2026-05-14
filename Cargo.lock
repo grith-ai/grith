@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "grith-audit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "grith-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "grith-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "grith-digest"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "grith-docgen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "grith-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "grith-notify"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "grith-proxy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "grith-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "grith-supervisor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "grith-tests"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
