@@ -33,6 +33,7 @@ axum-server.workspace = true
 rustls-pemfile.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
+include_dir = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

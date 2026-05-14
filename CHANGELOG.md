@@ -8,6 +8,23 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-14
+
+### Fixed
+
+- The React dashboard is now baked into the binary at build time via
+  `include_dir!` (same pattern as the embedded `config/` tree from v0.1.1).
+  Previously `static_files.rs` read the dashboard from a runtime filesystem
+  path (`dashboard/dist/`), which doesn't exist on a machine that
+  installed grith via `install.sh` — so opening `http://localhost:3141`
+  just showed the "Dashboard has not been built yet" placeholder. Release
+  binaries now ship with the dashboard embedded so it works out of the
+  box. A `dashboard_dir` config pointing at an existing on-disk `dist/`
+  still wins, so dashboard development with hot reload is unaffected. A
+  `crates/grith-server/build.rs` step seeds a placeholder
+  `dashboard/dist/index.html` so `cargo build` works on a fresh checkout
+  without first running `npm run build`.
+
 ## [0.1.2] - 2026-05-14
 
 ### Fixed
