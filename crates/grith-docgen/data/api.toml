@@ -1,0 +1,146 @@
+# Curated inventory of grith-server REST routes.
+# Future revisions will introspect the axum router directly; for v0.1 this is
+# the canonical reference. When you add a route in `crates/grith-server/src/
+# routes/`, mirror it here.
+
+# ---------------------------------------------------------------- health-and-tier
+
+[[groups]]
+name = "Health & tier"
+description = "Liveness checks and license / plan-tier reporting."
+routes = [
+    { method = "GET",  path = "/health",         summary = "Server liveness probe.",                              auth = "none" },
+    { method = "GET",  path = "/tier",           summary = "Current plan tier and license expiry.",               auth = "none" },
+    { method = "GET",  path = "/license/status", summary = "License validity and refresh state.",                 auth = "none" },
+    { method = "GET",  path = "/config",         summary = "Read the active configuration.",                      auth = "local" },
+    { method = "PUT",  path = "/config",         summary = "Update configuration values at runtime.",             auth = "local" },
+]
+
+# ---------------------------------------------------------------- audit
+
+[[groups]]
+name = "Audit"
+description = "Persisted audit log of every filter decision."
+routes = [
+    { method = "GET",  path = "/audit",                 summary = "List audit events (paginated)." },
+    { method = "GET",  path = "/audit/export",          summary = "Export audit events as JSON or CSV." },
+    { method = "GET",  path = "/audit/exfil-stats",     summary = "Aggregate exfiltration analytics over the recent window." },
+    { method = "GET",  path = "/audit/{id}",            summary = "Fetch one audit record." },
+    { method = "POST", path = "/ipc/audit/ingest",      summary = "Internal IPC: ingest a batch of audit records.", ipc_only = true },
+]
+
+# ---------------------------------------------------------------- digest
+
+[[groups]]
+name = "Digest"
+description = "The quarantine queue: ambiguous calls awaiting human review."
+routes = [
+    { method = "GET",  path = "/digest",                          summary = "List queued items." },
+    { method = "GET",  path = "/ipc/digest/items/{id}",           summary = "Fetch one digest item with full forensics.",       ipc_only = true },
+    { method = "POST", path = "/digest/{id}/approve",             summary = "Approve and execute." },
+    { method = "POST", path = "/digest/{id}/deny",                summary = "Deny and block." },
+    { method = "POST", path = "/digest/{id}/learn",               summary = "Approve and train the reputation system." },
+    { method = "POST", path = "/digest/{id}/escalate",            summary = "Escalate to team (Pro).",                          tier = "pro" },
+    { method = "POST", path = "/digest/{id}/unlock-egress",       summary = "Approve and whitelist the destination for this session." },
+    { method = "POST", path = "/digest/{id}/deny-terminate",      summary = "Deny and kill the originating process tree." },
+    { method = "POST", path = "/digest/{id}/allow-always",        summary = "Permanent allowlist for this call shape (Pro).",  tier = "pro" },
+    { method = "POST", path = "/digest/{id}/webhook-review",      summary = "Apply a decision delivered via webhook callback." },
+]
+
+# ---------------------------------------------------------------- proxy
+
+[[groups]]
+name = "Proxy"
+description = "Filter pipeline state and dry-run evaluation."
+routes = [
+    { method = "GET",  path = "/proxy/status",       summary = "Filter stats, thresholds, and queue depth." },
+    { method = "POST", path = "/proxy/test",         summary = "Dry-run a tool call shape. Returns the would-be decision." },
+    { method = "POST", path = "/proxy/evaluate",     summary = "Internal IPC: evaluate a real syscall request.",         ipc_only = true },
+    { method = "GET",  path = "/proxy/status/full",  summary = "Internal IPC: extended state including per-filter scores.", ipc_only = true },
+]
+
+# ---------------------------------------------------------------- supervisor
+
+[[groups]]
+name = "Supervisor sessions"
+description = "Active supervised sessions and their lifecycle (IPC only)."
+routes = [
+    { method = "GET",    path = "/ipc/sessions",            summary = "List active supervisor sessions.",      ipc_only = true },
+    { method = "POST",   path = "/ipc/sessions",            summary = "Register a new session.",               ipc_only = true },
+    { method = "GET",    path = "/ipc/sessions/{id}",       summary = "Fetch session details.",                ipc_only = true },
+    { method = "PUT",    path = "/ipc/sessions/{id}",       summary = "Update session metadata.",              ipc_only = true },
+    { method = "DELETE", path = "/ipc/sessions/{id}",       summary = "Unregister a session.",                 ipc_only = true },
+    { method = "POST",   path = "/ipc/sessions/{id}/kill",  summary = "Terminate a session and its process tree.", ipc_only = true },
+]
+
+# ---------------------------------------------------------------- canaries
+
+[[groups]]
+name = "Canaries"
+description = "Registered trap tokens that prove exfiltration if observed leaving the box."
+routes = [
+    { method = "GET",    path = "/canaries",             summary = "List registered canary tokens." },
+    { method = "POST",   path = "/canaries",             summary = "Add a new canary token." },
+    { method = "DELETE", path = "/canaries/{id}",        summary = "Remove a canary token." },
+    { method = "POST",   path = "/canaries/{id}/rotate", summary = "Rotate the canary value while keeping its identity." },
+]
+
+# ---------------------------------------------------------------- notifications
+
+[[groups]]
+name = "Notifications"
+description = "Channel configuration and delivery health."
+routes = [
+    { method = "GET",  path = "/notifications/channels",        summary = "List configured channels and their states." },
+    { method = "GET",  path = "/notifications/status",          summary = "Per-channel delivery health and recent failures." },
+    { method = "POST", path = "/notifications/test/{channel}",  summary = "Send a synthetic notification to verify a channel." },
+]
+
+# ---------------------------------------------------------------- analytics
+
+[[groups]]
+name = "Analytics"
+description = "Aggregated usage, cost, and activity. Pro feature."
+routes = [
+    { method = "GET",  path = "/analytics/summary",     summary = "Top-line stats: call volume, decisions split, cost.",  tier = "pro" },
+    { method = "GET",  path = "/analytics/cost",        summary = "Provider cost breakdown by model and user.",           tier = "pro" },
+    { method = "GET",  path = "/analytics/activity",    summary = "Call volume trends and per-session timelines.",        tier = "pro" },
+    { method = "GET",  path = "/analytics/compliance",  summary = "Compliance-ready reporting bundles.",                  tier = "enterprise" },
+]
+
+# ---------------------------------------------------------------- sync
+
+[[groups]]
+name = "Sync & policies"
+description = "Cloud-sourced team policies and shared filter configs. Pro feature."
+routes = [
+    { method = "GET",    path = "/sync/status",         summary = "Cloud sync state and last successful pull.",                 tier = "pro" },
+    { method = "GET",    path = "/sync/configs",        summary = "List synced team configs.",                                  tier = "pro" },
+    { method = "POST",   path = "/sync/configs",        summary = "Apply a synced config bundle to this device.",               tier = "pro" },
+    { method = "GET",    path = "/policies",            summary = "List custom policies.",                                      tier = "pro" },
+    { method = "GET",    path = "/policies/{name}",     summary = "Fetch one policy.",                                          tier = "pro" },
+    { method = "POST",   path = "/policies",            summary = "Create a policy.",                                           tier = "pro" },
+    { method = "PUT",    path = "/policies/{name}",     summary = "Update a policy.",                                           tier = "pro" },
+    { method = "DELETE", path = "/policies/{name}",     summary = "Delete a policy.",                                           tier = "pro" },
+]
+
+# ---------------------------------------------------------------- reputation
+
+[[groups]]
+name = "Reputation"
+description = "Read and reset the adaptive trust table (IPC only)."
+routes = [
+    { method = "GET",  path = "/reputation/table",   summary = "Dump the current trust table.",                ipc_only = true },
+    { method = "POST", path = "/reputation/observe", summary = "Record a single observation.",                 ipc_only = true },
+    { method = "POST", path = "/reputation/reset",   summary = "Wipe learned trust (start over).",             ipc_only = true },
+    { method = "POST", path = "/reputation/save",    summary = "Force-flush the trust table to disk.",         ipc_only = true },
+]
+
+# ---------------------------------------------------------------- websocket
+
+[[groups]]
+name = "WebSocket"
+description = "Real-time event stream for the dashboard."
+routes = [
+    { method = "GET",  path = "/events", summary = "Upgrade to a WebSocket. Streams digest, session, audit, and notification events." },
+]

@@ -34,9 +34,14 @@ GLOBAL_INSTALL=false
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-info()  { printf "\033[1;34m[info]\033[0m  %s\n" "$*"; }
-ok()    { printf "\033[1;32m[ok]\033[0m    %s\n" "$*"; }
-warn()  { printf "\033[1;33m[warn]\033[0m  %s\n" "$*"; }
+# Log helpers write to stderr so functions like `resolve_version` that
+# emit their data result on stdout don't get their captured value polluted
+# by progress messages. Without this, `VERSION="$(resolve_version)"` ends
+# up capturing both the "Fetching latest version..." info line and the
+# version string itself, breaking the download URL.
+info()  { printf "\033[1;34m[info]\033[0m  %s\n" "$*" >&2; }
+ok()    { printf "\033[1;32m[ok]\033[0m    %s\n" "$*" >&2; }
+warn()  { printf "\033[1;33m[warn]\033[0m  %s\n" "$*" >&2; }
 err()   { printf "\033[1;31m[error]\033[0m %s\n" "$*" >&2; }
 
 need_cmd() {

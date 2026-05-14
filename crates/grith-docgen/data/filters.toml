@@ -1,0 +1,153 @@
+# Canonical metadata for the 17 grith filters.
+# Source-of-truth for the docs site. Keep this in sync with
+# crates/grith-proxy/src/filters/. grith-docgen will warn when a filter
+# source module exists without a matching entry here.
+
+[[filters]]
+ordinal = 1
+module = "operation_risk"
+name = "Operation risk scoring"
+phase = "static"
+score_range = [1.0, 3.0]
+summary = "Assigns a baseline risk score based on the call's operation class (file_read, file_write, shell, network, etc)."
+
+[[filters]]
+ordinal = 2
+module = "path_match"
+name = "Static path matching"
+phase = "static"
+score_range = [2.0, 5.0]
+config_file = "config/filters/paths.toml"
+summary = "Aho-Corasick scan of paths against curated denylists and allowlists. Hot — runs against every fs operation."
+
+[[filters]]
+ordinal = 3
+module = "sensitive_path"
+name = "Sensitive path heuristic"
+phase = "static"
+score_range = [1.0, 4.0]
+summary = "Detects access to known-sensitive files: .env*, id_rsa, id_ed25519, credentials.json, .aws/, .ssh/, .kube/, and similar."
+
+[[filters]]
+ordinal = 4
+module = "allowlist"
+name = "Allowlist / denylist"
+phase = "static"
+score_range = [-1.0, 3.0]
+summary = "User-managed allow and deny rules. Approved entries lower the score; explicit denies raise it. Edited from the digest review UI."
+
+[[filters]]
+ordinal = 5
+module = "argument"
+name = "Argument length & structure"
+phase = "static"
+score_range = [0.0, 2.0]
+summary = "Flags suspicious argument shapes: encoded payloads, oversized strings, shell metacharacters in unexpected positions."
+
+[[filters]]
+ordinal = 6
+module = "capability"
+name = "Capability enforcement"
+phase = "static"
+score_range = [0.0, 99.0]
+config_file = "config/filters/capabilities.toml"
+summary = "Hard gate: enforces per-profile capability grants. Returns DENY when the active supervisor profile does not permit this operation class."
+
+[[filters]]
+ordinal = 7
+module = "secret_scan"
+name = "Secret / credential scanning"
+phase = "pattern"
+score_range = [3.0, 5.0]
+config_file = "config/filters/secrets.toml"
+summary = "Scans content for embedded credentials. 1,600+ regex patterns covering provider API keys, tokens, private keys, and bespoke credential formats."
+
+[[filters]]
+ordinal = 8
+module = "command"
+name = "Command structure analysis"
+phase = "pattern"
+score_range = [2.0, 4.0]
+config_file = "config/filters/commands.toml"
+summary = "Parses shell commands. Catches dangerous patterns: piped curl-to-sh, sudo with arbitrary scripts, fork-bombs, base64-encoded payloads in subshells."
+
+[[filters]]
+ordinal = 9
+module = "egress_policy"
+name = "Egress policy"
+phase = "pattern"
+score_range = [-1.0, 5.0]
+config_file = "config/filters/egress.toml"
+summary = "Network destination policy. Allowlisted hosts lower the score; denylisted or unknown hosts raise it. Plays with the reputation filter for adaptive trust."
+
+[[filters]]
+ordinal = 10
+module = "dlp_gate"
+name = "DLP gate"
+phase = "pattern"
+score_range = [3.0, 5.0]
+config_file = "config/filters/dlp.toml"
+summary = "Scans outbound network payloads for sensitive data leaving the box: credentials, PII, large file contents bundled into POST bodies."
+
+[[filters]]
+ordinal = 11
+module = "canary"
+name = "Canary secret detection"
+phase = "pattern"
+score_range = [99.0, 99.0]
+config_file = "config/filters/canary.toml"
+summary = "Hard DENY. Detects registered canary tokens (fake secrets seeded in your repo) reaching any outbound sink — definitive proof of exfiltration."
+
+[[filters]]
+ordinal = 12
+module = "reputation"
+name = "Destination reputation"
+phase = "context"
+score_range = [-1.0, 4.0]
+config_file = "config/filters/domains.toml"
+summary = "Per-destination trust accumulated over time. Established trusted hosts get a discount; suspicious or unfamiliar ones get a markup."
+
+[[filters]]
+ordinal = 13
+module = "behavioural"
+name = "Behavioural anomaly"
+phase = "context"
+score_range = [1.0, 3.0]
+summary = "Compares the current call against the session's historical baseline (default 200-call minimum). Sudden bursts, unusual destinations, or out-of-pattern operations contribute score."
+
+[[filters]]
+ordinal = 14
+module = "taint"
+name = "Taint tracking"
+phase = "context"
+score_range = [0.0, 5.0]
+summary = "Tracks data flow from sensitive sources (e.g. a .env read) through subsequent operations. Network calls or shell execs after a sensitive read inherit taint."
+
+[[filters]]
+ordinal = 15
+module = "session_containment"
+name = "Session containment"
+phase = "context"
+score_range = [0.0, 5.0]
+config_file = "config/filters/containment.toml"
+summary = "Enforces per-session isolation zones. A session bound to project A cannot reach project B's files or network without explicit cross-zone approval."
+
+[[filters]]
+ordinal = 16
+module = "rate_limit"
+name = "Rate limiting"
+phase = "pattern"
+score_range = [0.0, 99.0]
+summary = "Per-minute caps on file writes (default 30), shell execs (20), and network requests (60). Bursts trigger queue; sustained violations trigger DENY."
+
+[[filters]]
+ordinal = 17
+module = "semantic"
+name = "Semantic analysis"
+phase = "pattern"
+score_range = [0.0, 0.0]
+summary = "Stub for v0.1. Local embedding-based intent classification. Disabled by default; full implementation planned for v1.5."
+
+# Note: `egress_rate` exists as a module but is internally a sibling helper to
+# rate_limit (filter 16), not a separately-numbered filter. It will surface as
+# `unmapped: true` in filters.json, which is the intended drift signal.

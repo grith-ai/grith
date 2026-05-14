@@ -1,0 +1,24 @@
+[package]
+name = "grith-docgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Generates structured JSON for the grith-docs site (CLI, config, API, filters)"
+publish = false
+
+[[bin]]
+name = "grith-docgen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+regex.workspace = true
+
+[lints]
+workspace = true
