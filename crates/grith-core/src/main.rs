@@ -734,7 +734,7 @@ fn cmd_init() -> anyhow::Result<()> {
                 .join("config/default.toml"),
         ];
         let mut last_error = String::new();
-        let mut content = None;
+        let mut content: Option<String> = None;
         for candidate in &candidates {
             if !candidate.exists() {
                 last_error = format!("{} does not exist", candidate.display());
@@ -746,6 +746,19 @@ fn cmd_init() -> anyhow::Result<()> {
                     break;
                 }
                 Err(e) => last_error = format!("failed to read {}: {e}", candidate.display()),
+            }
+        }
+        // Final fallback: read the default.toml baked into the binary
+        // at build time. Normal path for users installing via
+        // `curl https://grith.ai/install | sh` who have no source
+        // checkout on disk.
+        if content.is_none() {
+            static EMBEDDED: include_dir::Dir<'_> =
+                include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../config");
+            if let Some(file) = EMBEDDED.get_file("default.toml") {
+                if let Some(s) = file.contents_utf8() {
+                    content = Some(s.to_string());
+                }
             }
         }
         content.ok_or_else(|| {

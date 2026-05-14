@@ -104,6 +104,25 @@ pub(crate) enum CapabilityGrantsLoad {
 // TOML file loading from candidate paths
 // ---------------------------------------------------------------------------
 
+/// Entire `config/` tree, baked into the binary at build time. Used as
+/// the final fallback when neither the cwd-relative nor repo-relative
+/// disk path exists — which is the normal case for users who install
+/// via `curl https://grith.ai/install | sh` and don't have a source
+/// checkout. The path passed to `include_dir!` MUST be a build-time
+/// directory; the contents are captured then.
+static EMBEDDED_CONFIG: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../config");
+
+fn embedded_config_contents(repo_relative: &str) -> Option<&'static str> {
+    // Strip the `config/` prefix because EMBEDDED_CONFIG is rooted at
+    // the config dir itself, but call sites pass repo-relative paths
+    // like "config/filters/paths.toml".
+    let inside_config = repo_relative.strip_prefix("config/")?;
+    EMBEDDED_CONFIG
+        .get_file(inside_config)
+        .and_then(|f| f.contents_utf8())
+}
+
 pub(crate) fn load_toml_from_candidates<T>(relative_path: &str) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
@@ -128,6 +147,12 @@ where
                 last_error = format!("failed to read {}: {e}", path.display());
             }
         }
+    }
+
+    // Final fallback: load from the embedded config bundle.
+    if let Some(content) = embedded_config_contents(relative_path) {
+        return toml::from_str::<T>(content)
+            .map_err(|e| format!("failed to parse embedded {relative_path}: {e}"));
     }
 
     Err(last_error)

@@ -8,6 +8,19 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-14
+
+### Fixed
+
+- `grith init` and the daemon's base-config load both bake
+  `config/default.toml` (and the rest of the `config/` tree) into the
+  binary via `include_dir`. v0.1.0 only looked for these files at
+  cwd-relative or build-time paths, so users installing via the curl
+  one-liner hit `required config/default.toml unavailable:
+  /project/crates/grith-core/../../config/default.toml does not
+  exist`. The embedded copy is the final fallback after the existing
+  disk-based lookup so source checkouts still pick up local edits.
+
 ## [0.1.0] - 2026-05-07
 
 First public OSS release.

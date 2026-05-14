@@ -1081,9 +1081,31 @@ fn load_required_base_config() -> Result<GrithConfig, crate::error::Error> {
         }
     }
 
+    // Final fallback: parse the embedded default.toml bundled into the
+    // binary at build time. This is the normal path for users who
+    // installed via `curl https://grith.ai/install | sh`.
+    if let Some(content) = embedded_default_toml() {
+        return toml::from_str(content).map_err(|e| {
+            crate::error::Error::Config(format!(
+                "failed to parse embedded config/default.toml: {e}"
+            ))
+        });
+    }
+
     Err(crate::error::Error::Config(format!(
         "required config/default.toml unavailable: {last_error}"
     )))
+}
+
+/// Returns the bytes of `config/default.toml` baked into the binary.
+/// Used as a fallback when no disk copy is present. Kept colocated
+/// here so the lookup logic stays next to the disk-candidate logic.
+fn embedded_default_toml() -> Option<&'static str> {
+    static EMBEDDED: include_dir::Dir<'_> =
+        include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../config");
+    EMBEDDED
+        .get_file("default.toml")
+        .and_then(|f| f.contents_utf8())
 }
 
 /// Merge two configs via TOML-level deep merge.
