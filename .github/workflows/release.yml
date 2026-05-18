@@ -7,6 +7,11 @@ on:
 
 permissions:
   contents: write
+  # cosign keyless signing and SLSA build-provenance attestation both
+  # need the workflow to be able to request a short-lived OIDC token
+  # from GitHub and write to the attestations API.
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -22,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v0.1.0 is Linux x86_64 only. The supervisor uses ptrace+seccomp
+        # v0.1.x is Linux x86_64 only. The supervisor uses ptrace+seccomp
         # which is Linux-specific (macOS via Endpoint Security and
         # Windows via ETW are v2.0 — work/31, work/32). Within Linux,
         # the supervisor's syscall-arg extraction hard-codes x86_64
@@ -115,6 +120,56 @@ jobs:
           $hash = (Get-FileHash "${{ env.ARCHIVE_NAME }}" -Algorithm SHA256).Hash.ToLower()
           "$hash  ${{ env.ARCHIVE_NAME }}" | Out-File -FilePath "${{ env.ARCHIVE_NAME }}.sha256" -NoNewline
 
+      # ---------------------------------------------------------------
+      # Supply-chain artefacts: SBOM + cosign signatures + SLSA attestation.
+      # See docs/RELEASE.md for the verification commands users should run.
+      # ---------------------------------------------------------------
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOM (Unix)
+        if: matrix.ext == ''
+        run: |
+          # Emit a CycloneDX 1.5 JSON SBOM rooted at grith-core (the
+          # binary's entrypoint crate). The output describes the full
+          # transitive dependency tree as resolved in Cargo.lock.
+          cargo cyclonedx -p grith-core --format json --target ${{ matrix.target }}
+          # cargo-cyclonedx writes to crates/grith-core/<name>.cdx.json
+          # by default — rename to match the archive for easy pairing.
+          SBOM_SRC=$(find crates/grith-core -maxdepth 1 -name "*.cdx.json" -print -quit)
+          if [ -z "$SBOM_SRC" ]; then
+            echo "cargo-cyclonedx did not produce an SBOM"; exit 1
+          fi
+          cp "$SBOM_SRC" "${{ env.ARCHIVE_NAME }}.cdx.json"
+
+      - name: Sign tarball with cosign (Unix, keyless via GitHub OIDC)
+        if: matrix.ext == ''
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob \
+            --bundle "${{ env.ARCHIVE_NAME }}.cosign.bundle" \
+            "${{ env.ARCHIVE_NAME }}"
+
+      - name: Sign SBOM with cosign (Unix)
+        if: matrix.ext == ''
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob \
+            --bundle "${{ env.ARCHIVE_NAME }}.cdx.json.cosign.bundle" \
+            "${{ env.ARCHIVE_NAME }}.cdx.json"
+
+      - name: Generate SLSA build-provenance attestation (Unix)
+        if: matrix.ext == ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ARCHIVE_NAME }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -122,6 +177,9 @@ jobs:
           path: |
             ${{ env.ARCHIVE_NAME }}
             ${{ env.ARCHIVE_NAME }}.sha256
+            ${{ env.ARCHIVE_NAME }}.cdx.json
+            ${{ env.ARCHIVE_NAME }}.cosign.bundle
+            ${{ env.ARCHIVE_NAME }}.cdx.json.cosign.bundle
           if-no-files-found: error
 
   release:

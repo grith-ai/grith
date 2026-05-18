@@ -70,7 +70,7 @@ detect_platform() {
             case "${arch}" in
                 x86_64)  target="x86_64-unknown-linux-musl" ;;
                 aarch64|arm64)
-                    err "Linux aarch64 is not supported by this installer in v0.1.0."
+                    err "Linux aarch64 is not yet supported by this installer."
                     err ""
                     err "grith's supervisor hard-codes x86_64 register"
                     err "names for syscall-arg extraction. aarch64 support"
@@ -83,13 +83,13 @@ detect_platform() {
                     ;;
                 *)
                     err "Unsupported Linux architecture: ${arch}"
-                    err "Supported in v0.1.0: x86_64"
+                    err "Currently supported: x86_64"
                     exit 1
                     ;;
             esac
             ;;
         Darwin)
-            err "macOS is not supported by this installer in v0.1.0."
+            err "macOS is not yet supported by this installer."
             err ""
             err "grith's supervisor relies on Linux ptrace + seccomp."
             err "macOS support (via Endpoint Security) is targeted for"
@@ -101,7 +101,7 @@ detect_platform() {
             exit 1
             ;;
         CYGWIN*|MINGW*|MSYS*|Windows*)
-            err "Windows is not supported by this installer in v0.1.0."
+            err "Windows is not yet supported by this installer."
             err ""
             err "grith's supervisor relies on Linux ptrace + seccomp."
             err "Windows support (via ETW + a process supervisor) is"
@@ -148,7 +148,7 @@ resolve_version() {
 
     if [ -z "${response}" ]; then
         err "Failed to fetch latest version from GitHub."
-        err "Try specifying a version: --version 0.1.0"
+        err "Try specifying one explicitly: --version <X.Y.Z> (see releases on grith-ai/grith)"
         exit 1
     fi
 

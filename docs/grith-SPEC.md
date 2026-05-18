@@ -1093,7 +1093,7 @@ src/
 
 ```
 $ grith
-grith v0.1.0 | model: ollama/llama3.1:8b | proxy: active (6 filters)
+grith v0.1.4 | model: ollama/llama3.1:8b | proxy: active (6 filters)
 Type /help for commands, /quit to exit
 
 > Fix the type error in src/main.rs

@@ -21,17 +21,28 @@ export function SettingsPage() {
         if (response.ok) {
           setSaveMessage("Configuration saved.");
         } else if (response.status === 404) {
+          // The current daemon ships PUT /api/config (registered in
+          // crates/grith-server/src/routes/mod.rs). A 404 here means
+          // the daemon predates that route — i.e. an old binary is
+          // running against a newer dashboard bundle.
           setSaveMessage(
-            "Configuration save not yet available. The config API endpoint is not implemented on the running daemon.",
+            "Your running grith daemon doesn't support live config saves. Upgrade grith, or edit ~/.config/grith/config.toml directly.",
           );
         } else {
-          setSaveMessage(
-            `Failed to save configuration: ${response.status} ${response.statusText}`,
-          );
+          let detail = `${response.status} ${response.statusText}`;
+          try {
+            const body = await response.json();
+            if (body && typeof body.message === "string") {
+              detail = body.message;
+            }
+          } catch {
+            // body wasn't JSON — keep the status-line fallback
+          }
+          setSaveMessage(`Failed to save configuration: ${detail}`);
         }
       } catch {
         setSaveMessage(
-          "Configuration save not yet available. Could not reach the grith daemon.",
+          "Could not reach the grith daemon. Is the dashboard server running (`grith dashboard status`)?",
         );
       }
       // Auto-dismiss after 5 seconds

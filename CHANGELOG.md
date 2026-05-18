@@ -8,6 +8,22 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Signed releases + SBOMs.** The release workflow now publishes four
+  supply-chain artefacts alongside each archive:
+  - `<archive>.cosign.bundle` — Sigstore signature, keyless, anchored
+    in the Rekor transparency log; signing identity bound to the
+    GitHub-hosted release workflow + tag.
+  - `<archive>.cdx.json` — CycloneDX 1.5 SBOM listing every
+    transitive Rust dependency resolved at build time.
+  - `<archive>.cdx.json.cosign.bundle` — signature over the SBOM.
+  - SLSA v1 build-provenance attestation via GitHub&apos;s first-party
+    `actions/attest-build-provenance` (retrieve with
+    `gh attestation verify`).
+  Verification recipes are documented in `docs/RELEASE.md`. This takes
+  effect on the next tag.
+
 ## [0.1.4] - 2026-05-18
 
 ### Fixed

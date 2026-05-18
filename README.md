@@ -4,7 +4,7 @@
 
 grith produces a single binary — the grith daemon — that sits between AI tools and your operating system, evaluating every file access, network call, shell command, and process spawn against a scoring engine before allowing it to proceed.
 
-> **v0.1.0 supports Linux x86_64 only.** macOS (via Endpoint Security), Windows (via ETW), and Linux aarch64 are tracked for v2.0.
+> **Currently supports Linux x86_64 only.** macOS (via Endpoint Security), Windows (via ETW), and Linux aarch64 are tracked for v2.0.
 
 Two execution paths, one security proxy:
 
@@ -59,7 +59,7 @@ curl -fsSL https://grith.ai/install | sh -s -- --global           # install to /
 
 | Platform | Architecture | Status |
 |----------|-------------|--------|
-| Linux | x86_64 | ✅ supported (v0.1.0) |
+| Linux | x86_64 | ✅ supported |
 | Linux | aarch64 | ⏳ v2.0 — supervisor needs an aarch64 register backend |
 | macOS | Apple Silicon / Intel | ⏳ v2.0 — supervisor needs Endpoint Security port |
 | Windows | x86_64 | ⏳ v2.0 — supervisor needs ETW + a process-supervisor port |
@@ -336,11 +336,11 @@ batch_rapid_reads = true
 batch_window_ms = 50
 ```
 
-Set `general.audit_sync = false`, run `grith config set general.audit_sync false`, or export `GRITH_AUDIT_SYNC=false` to disable audit uploads and keep audit records local-only. This does not disable license validation traffic — see [`docs/LICENSE-REFRESH.md`](docs/LICENSE-REFRESH.md) for the refresh cadence, offline behaviour, and air-gapped deployment path.
+Set `general.audit_sync = false`, run `grith config set general.audit_sync false`, or export `GRITH_AUDIT_SYNC=false` to disable audit uploads and keep audit records local-only. This does not disable license validation traffic — see the [Licence lifecycle](https://docs.grith.ai/docs/pro/license-lifecycle) page on docs.grith.ai for the refresh cadence, offline behaviour, and air-gapped deployment path.
 
 For production network exposure, terminate TLS either with `[server.tls]` or
-through a reverse proxy. See `docs/REVERSE-PROXY.md` for nginx and Caddy
-examples.
+through a reverse proxy. See the [Reverse proxy + TLS guide](https://docs.grith.ai/docs/guides/reverse-proxy-tls)
+on docs.grith.ai for nginx and Caddy examples.
 
 Pre-built configuration examples are in `config/examples/`:
 - `strict.toml` — low thresholds, high security
@@ -429,7 +429,7 @@ grith exec --profile claude-code -- node my-agent.js
 
 Profile paths support `${PROJECT_DIR}` and `${HOME}` variable expansion.
 
-For a per-profile reference of what is auto-allowed and why, see [docs/SUPERVISOR-PROFILES.md](docs/SUPERVISOR-PROFILES.md).
+For an overview of what each built-in profile auto-allows, see the [Supervisor profiles](https://docs.grith.ai/docs/concepts/supervisor-profiles) page on docs.grith.ai.
 
 ## Syscall Logging
 

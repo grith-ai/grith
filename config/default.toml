@@ -119,7 +119,7 @@ dashboard_dir = "dashboard/dist"
 # cert_path = "/path/to/cert.pem"
 # key_path = "/path/to/key.pem"
 # Uncomment to enable native TLS. Alternatively, use a reverse proxy (nginx, Caddy)
-# for TLS termination. See docs/REVERSE-PROXY.md
+# for TLS termination. See https://docs.grith.ai/docs/guides/reverse-proxy-tls
 
 [server.rate_limit]
 enabled = true

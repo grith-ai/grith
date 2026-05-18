@@ -98,8 +98,11 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
           `Score: ${result.composite_score ?? "N/A"} | Action: ${result.action ?? "N/A"} | Filters evaluated: ${result.filters_evaluated ?? "N/A"}`,
         );
       } else if (response.status === 404) {
+        // POST /proxy/test is registered (see crates/grith-server/src/
+        // routes/mod.rs:258). A 404 means the running daemon predates
+        // that route — i.e. an old binary against a newer dashboard.
         setTestError(
-          "Proxy test endpoint not yet available. Start the grith daemon with the proxy enabled to use live evaluation.",
+          "Your running grith daemon doesn't expose the live proxy-test endpoint. Upgrade grith and try again.",
         );
       } else {
         const body = await response.text().catch(() => "");
@@ -107,7 +110,7 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
       }
     } catch {
       setTestError(
-        "Proxy test endpoint not yet available. Could not reach the grith daemon.",
+        "Could not reach the grith daemon. Is the dashboard server running (`grith dashboard status`)?",
       );
     }
   }

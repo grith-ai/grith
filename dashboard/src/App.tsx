@@ -84,15 +84,20 @@ export function App() {
   const [stopping, setStopping] = useState(false);
   const [activeSessions, setActiveSessions] = useState(0);
   const [serverReachable, setServerReachable] = useState(true);
+  // Daemon version, fetched from /api/health on first poll. Empty until
+  // the first successful response — the sidebar chip stays blank
+  // rather than showing a stale hardcoded number.
+  const [daemonVersion, setDaemonVersion] = useState("");
 
   useEffect(() => {
     async function poll() {
       try {
-        const [, audit] = await Promise.all([
+        const [health, audit] = await Promise.all([
           getHealth(),
           getAuditRecords({ limit: 20, offset: 0 }),
         ]);
         setServerReachable(true);
+        setDaemonVersion(health.version);
         // Count distinct session_ids with activity in the last 30 seconds.
         const cutoff = Date.now() - 30_000;
         const recentIds = new Set(
@@ -140,7 +145,7 @@ export function App() {
               grith
             </span>
             <span className="text-[10px] text-grith-dim font-mono ml-auto">
-              v0.1.0
+              {daemonVersion ? `v${daemonVersion}` : ""}
             </span>
           </div>
         </div>
