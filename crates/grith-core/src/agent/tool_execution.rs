@@ -765,8 +765,17 @@ pub async fn execute_operation(
             {
                 Ok(mut file) => {
                     use tokio::io::AsyncWriteExt;
+                    // `tokio::fs::File::write_all` buffers internally, so the
+                    // bytes aren't guaranteed visible to subsequent readers
+                    // until `flush()` awaits the OS write. Without this,
+                    // callers (or tests) that read the file immediately
+                    // after this returns can race the flush on a stressed
+                    // runtime.
                     match file.write_all(content.as_bytes()).await {
-                        Ok(()) => format!("Appended {} bytes to {path}", content.len()),
+                        Ok(()) => match file.flush().await {
+                            Ok(()) => format!("Appended {} bytes to {path}", content.len()),
+                            Err(e) => format!("Error flushing {path}: {e}"),
+                        },
                         Err(e) => format!("Error appending to {path}: {e}"),
                     }
                 }

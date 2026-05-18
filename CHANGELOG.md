@@ -8,6 +8,23 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-18
+
+### Fixed
+
+- `agent::tool_execution::FileAppend` now explicitly flushes the file
+  before reporting success. The previous code relied on implicit
+  close-on-drop to flush `tokio::fs::File`'s internal buffer, which
+  races a fast reader on a stressed runtime. The race manifested as
+  an intermittent test failure on the public CI runner
+  (`grith-ai/grith`) for
+  `execute_operation_file_append_rename_delete_dir_create` — the
+  assertion read back an empty file immediately after a successful
+  append. Same source passed consistently on the private CI and
+  locally; the public-mirror runner happened to hit the timing
+  window. The explicit `flush()` closes the race for all callers,
+  not just tests.
+
 ## [0.1.3] - 2026-05-14
 
 ### Fixed
