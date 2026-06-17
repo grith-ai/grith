@@ -61,6 +61,18 @@ pub struct SupervisorProfile {
     /// Example: `["/usr/lib/git-core/", "${HOME}/.local/share/claude/versions/"]`
     #[serde(default)]
     pub routine_exec_roots: Vec<String>,
+    /// Directory prefixes whose write/append/delete churn is exempt from the
+    /// proxy's rate-limit *burst* counter (and only that — every other filter
+    /// still runs). Tools like Claude Code / Codex extract and rewrite large
+    /// numbers of files under their XDG cache on startup (`~/.cache/.tmpXXXX/`,
+    /// node code-cache, package staging), tripping the burst threshold and
+    /// queueing routine work. Declaring those roots here suppresses the false
+    /// positive without trusting the paths for anything else.
+    ///
+    /// Same expansion as `routine_exec_roots`: `~/`, `${HOME}`, `${PROJECT_DIR}`
+    /// and globs. Example: `["~/.cache", "${HOME}/.npm/_cacache"]`.
+    #[serde(default)]
+    pub scratch_roots: Vec<String>,
     /// Paths trusted for read-only access only.
     ///
     /// Unlike `routine_paths` which allow all file I/O (reads and writes),
@@ -93,6 +105,82 @@ pub struct SupervisorProfile {
     /// not already present in the user's command line.
     #[serde(default)]
     pub launch_contract: Option<LaunchContract>,
+    /// PR 5 Phase B: declared local-only listener policy.
+    ///
+    /// Lists ports the tool routinely binds for local IPC. A loopback
+    /// bind on a declared `(port, family)` allows silently; a wildcard
+    /// bind (`0.0.0.0` / `::`) on a declared port can be opportunistically
+    /// clamped to loopback at the syscall-argument level when
+    /// `allow_clamp = true` AND the binary lives under a routine root
+    /// (gated by Phase D). Wildcard binds without a declaration
+    /// queue/deny via the standard egress-policy path.
+    ///
+    /// `routine_listen_addresses` (the legacy field) is reserved for
+    /// loopback-only string entries. Schema validation rejects
+    /// `0.0.0.0` / `::` from that field — wildcard binds need an
+    /// explicit `local_listener_policy` entry, never an unconditional
+    /// allowlist.
+    #[serde(default)]
+    pub local_listener_policy: Vec<LocalListenerEntry>,
+    /// PR 6 Phase C: binaries permitted to invoke namespace primitives
+    /// (`unshare(2)` / `setns(2)`) silently when spawned from a
+    /// profile-declared `routine_exec_root`.
+    ///
+    /// Tools like `bwrap` / `bubblewrap` / `firejail` / `nsenter`
+    /// legitimately need `unshare(CLONE_NEWUSER | CLONE_NEWNS | …)`
+    /// to set up their sandboxes. Without this carveout the routine
+    /// `bwrap` invocation Codex makes at startup would QUEUE every
+    /// time. Each entry is a canonical absolute path (e.g.
+    /// `/usr/bin/bwrap`); the supervisor resolves the calling binary's
+    /// canonical path via PR 4's `SpawnProvenance` and matches against
+    /// this list.
+    ///
+    /// Entries NOT in a `routine_exec_root` are queued/denied even
+    /// when their canonical path matches — the carveout requires
+    /// **both** conditions (matched_routine_root AND name in
+    /// namespace_users) for fail-safe behaviour. See PR 6 work doc
+    /// "Category 3" for the threat model.
+    #[serde(default)]
+    pub namespace_users: Vec<String>,
+}
+
+/// PR 5 Phase B: a declared local-IPC listener entry on a profile.
+/// One row per `(port, family)` the supervised tool binds during
+/// normal operation. See [`SupervisorProfile::local_listener_policy`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalListenerEntry {
+    /// Port the tool binds. `0` means "any ephemeral port" — used for
+    /// dynamically-allocated MCP / IPC sockets that the tool requests
+    /// the kernel pick.
+    pub port: u16,
+    /// Address family the entry covers.
+    #[serde(default)]
+    pub family: ListenerFamily,
+    /// Human-readable description (audit log + dashboard surfacing).
+    /// Empty string is allowed but discouraged.
+    #[serde(default)]
+    pub desc: String,
+    /// PR 5 Phase D: opt-in clamp/rewrite. When `true` AND the binding
+    /// binary lives in a routine_exec_root, a wildcard bind on this
+    /// `(port, family)` is rewritten to the loopback address at the
+    /// syscall-argument level (before the kernel processes the bind).
+    /// Audit-logged with original + rewritten addresses. Default
+    /// `false` — operators must explicitly opt in.
+    #[serde(default)]
+    pub allow_clamp: bool,
+}
+
+/// PR 5 Phase B: address family scope for a [`LocalListenerEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerFamily {
+    /// IPv4 only (`127.0.0.1`).
+    V4,
+    /// IPv6 only (`::1`).
+    V6,
+    /// Either v4 or v6 — matches whichever the tool binds.
+    #[default]
+    Any,
 }
 
 /// Launch requirements enforced by `grith exec` before spawning.
@@ -212,6 +300,7 @@ impl SupervisorProfile {
             routine_destinations: Vec<String>,
             routine_listen_addresses: Vec<String>,
             routine_exec_roots: Vec<String>,
+            scratch_roots: Vec<String>,
             readonly_paths: Vec<String>,
             readonly_path_patterns: Vec<String>,
         }
@@ -238,6 +327,32 @@ impl SupervisorProfile {
                     "duplicate profile name: '{}'",
                     p.name
                 )));
+            }
+        }
+
+        // PR 5 Phase B (B4): reject wildcard addresses in
+        // `routine_listen_addresses`. Wildcard binds must go through
+        // `local_listener_policy`, not the silent-allow shortcut.
+        {
+            let defaults_offending =
+                validate_routine_listen_addresses(&file.defaults.routine_listen_addresses);
+            if !defaults_offending.is_empty() {
+                return Err(Error::ProfileError(format!(
+                    "wildcard address(es) in [defaults].routine_listen_addresses: {}. \
+                     Wildcard binds require an explicit local_listener_policy entry.",
+                    defaults_offending.join(", ")
+                )));
+            }
+            for p in &file.profiles {
+                let offending = validate_routine_listen_addresses(&p.routine_listen_addresses);
+                if !offending.is_empty() {
+                    return Err(Error::ProfileError(format!(
+                        "wildcard address(es) in profile '{}'.routine_listen_addresses: {}. \
+                         Wildcard binds require an explicit local_listener_policy entry.",
+                        p.name,
+                        offending.join(", ")
+                    )));
+                }
             }
         }
 
@@ -321,10 +436,18 @@ impl SupervisorProfile {
                     &parent.routine_listen_addresses,
                 );
                 merge_vec(&mut merged.routine_exec_roots, &parent.routine_exec_roots);
+                merge_vec(&mut merged.scratch_roots, &parent.scratch_roots);
                 merge_vec(&mut merged.readonly_paths, &parent.readonly_paths);
                 merge_vec(
                     &mut merged.readonly_path_patterns,
                     &parent.readonly_path_patterns,
+                );
+                // PR 5 Phase B: inherit declared local listener entries
+                // from the parent profile. Entries dedupe by full
+                // PartialEq comparison.
+                merge_local_listener_policy(
+                    &mut merged.local_listener_policy,
+                    &parent.local_listener_policy,
                 );
             }
 
@@ -346,6 +469,7 @@ impl SupervisorProfile {
             || !d.routine_destinations.is_empty()
             || !d.routine_listen_addresses.is_empty()
             || !d.routine_exec_roots.is_empty()
+            || !d.scratch_roots.is_empty()
             || !d.readonly_paths.is_empty()
             || !d.readonly_path_patterns.is_empty();
 
@@ -360,6 +484,7 @@ impl SupervisorProfile {
                 merge_vec(&mut p.routine_destinations, &d.routine_destinations);
                 merge_vec(&mut p.routine_listen_addresses, &d.routine_listen_addresses);
                 merge_vec(&mut p.routine_exec_roots, &d.routine_exec_roots);
+                merge_vec(&mut p.scratch_roots, &d.scratch_roots);
                 merge_vec(&mut p.readonly_paths, &d.readonly_paths);
                 merge_vec(&mut p.readonly_path_patterns, &d.readonly_path_patterns);
             }
@@ -538,17 +663,39 @@ impl SupervisorProfile {
         // for binaries under these roots (e.g., git helpers, bundled tools).
         // Uses `exec-prefix:` namespace to keep exec trust separate from
         // filesystem path trust.
+        //
+        // Entries containing glob meta-characters (`*`, `?`, `[`) are walked
+        // via `glob` and each matching directory produces its own
+        // `exec-prefix:` entry — see `expand_routine_exec_roots` for the
+        // resolution model. Literal entries fall back to the legacy
+        // substitute-and-trailing-slash path so existing profiles keep
+        // working even if a directory is not yet present on disk.
         for root in &self.routine_exec_roots {
-            let expanded = root
-                .replace("${HOME}", &home)
-                .replace("${PROJECT_DIR}", &project_dir);
-            let normalized = if expanded.ends_with('/') {
-                expanded
+            let substituted = substitute_path_vars(root, &home, &project_dir);
+            if substituted.is_empty() {
+                continue;
+            }
+            let has_meta = substituted.chars().any(|c| matches!(c, '*' | '?' | '['));
+            if has_meta {
+                for resolved in expand_glob_or_literal(&substituted) {
+                    let normalised = match std::fs::canonicalize(&resolved) {
+                        Ok(p) => p.to_string_lossy().into_owned(),
+                        Err(_) => continue,
+                    };
+                    let with_slash = if normalised.ends_with('/') {
+                        normalised
+                    } else {
+                        format!("{normalised}/")
+                    };
+                    allowed.insert(format!("exec-prefix:{with_slash}"));
+                }
             } else {
-                format!("{expanded}/")
-            };
-            if !normalized.is_empty() {
-                allowed.insert(format!("exec-prefix:{normalized}"));
+                let normalised = if substituted.ends_with('/') {
+                    substituted
+                } else {
+                    format!("{substituted}/")
+                };
+                allowed.insert(format!("exec-prefix:{normalised}"));
             }
         }
 
@@ -584,6 +731,158 @@ impl SupervisorProfile {
         }
         entries
     }
+
+    /// PR 4 Phase B: expand `routine_exec_roots` into concrete absolute
+    /// path prefixes for provenance/inventory use.
+    ///
+    /// Each profile entry goes through three stages:
+    ///   1. Variable substitution — `${HOME}` and `${PROJECT_DIR}`, and a
+    ///      leading `~/` shorthand resolved against `$HOME`.
+    ///   2. Glob expansion — entries containing `*`, `?`, or `[` are walked
+    ///      via `glob::glob()` so patterns like
+    ///      `~/.nvm/versions/node/*/lib/node_modules/@openai/codex` resolve
+    ///      to one entry per installed Node version.
+    ///   3. Canonicalisation + slash-normalisation — each surviving path is
+    ///      canonicalised (drops symlinks, normalises `..`) and given a
+    ///      trailing `/` so prefix matches behave correctly. Entries that
+    ///      fail to canonicalise are dropped silently (the directory just
+    ///      isn't installed on this machine).
+    ///
+    /// The returned set is de-duplicated. Empty patterns are skipped.
+    ///
+    /// **Glob semantics:** uses the `glob` crate's default options
+    /// (case-sensitive on Linux, doesn't match hidden files unless the
+    /// pattern starts with `.`). Bracket expressions `[...]` are
+    /// supported; `**` is supported for recursive matching but should
+    /// be used sparingly given that this output is later walked by the
+    /// session-pinned inventory (Phase C, bounded depth).
+    pub fn expand_routine_exec_roots(&self) -> Vec<String> {
+        use std::collections::BTreeSet;
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let project_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+
+        let mut out = BTreeSet::<String>::new();
+        for root in &self.routine_exec_roots {
+            let substituted = substitute_path_vars(root, &home, &project_dir);
+            if substituted.is_empty() {
+                continue;
+            }
+            for resolved in expand_glob_or_literal(&substituted) {
+                let normalised = match std::fs::canonicalize(&resolved) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                };
+                let with_slash = if normalised.ends_with('/') {
+                    normalised
+                } else {
+                    format!("{normalised}/")
+                };
+                out.insert(with_slash);
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Expand `scratch_roots` into concrete absolute path prefixes for the
+    /// rate-limit burst exemption (Fix #2). Same variable/glob substitution as
+    /// [`expand_routine_exec_roots`], but a non-canonicalisable entry is kept
+    /// as its substituted literal rather than dropped: scratch directories are
+    /// frequently created and destroyed, so a declared root that doesn't exist
+    /// at session start should still match writes that create it. Each entry
+    /// is trailing-slashed for prefix matching; the result is de-duplicated.
+    pub fn expand_scratch_roots(&self) -> Vec<String> {
+        use std::collections::BTreeSet;
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let project_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+
+        let mut out = BTreeSet::<String>::new();
+        for root in &self.scratch_roots {
+            let substituted = substitute_path_vars(root, &home, &project_dir);
+            if substituted.is_empty() {
+                continue;
+            }
+            for resolved in expand_glob_or_literal(&substituted) {
+                let normalised = std::fs::canonicalize(&resolved)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(resolved);
+                let with_slash = if normalised.ends_with('/') {
+                    normalised
+                } else {
+                    format!("{normalised}/")
+                };
+                out.insert(with_slash);
+            }
+        }
+        out.into_iter().collect()
+    }
+}
+
+/// PR 4 Phase B: substitute `${HOME}`, `${PROJECT_DIR}`, and a leading
+/// `~/` in a profile path entry. Returns the substituted string.
+/// Empty inputs round-trip as empty.
+fn substitute_path_vars(input: &str, home: &str, project_dir: &str) -> String {
+    let with_vars = input
+        .replace("${HOME}", home)
+        .replace("${PROJECT_DIR}", project_dir);
+    if let Some(rest) = with_vars.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else if with_vars == "~" {
+        home.to_string()
+    } else {
+        with_vars
+    }
+}
+
+/// PR 4 Phase B: expand a (post-substitution) pattern into concrete
+/// paths. If the pattern contains a glob meta-character, walks the FS
+/// via `glob::glob`. Otherwise returns the literal path as a single
+/// entry. Malformed patterns return an empty vec.
+///
+/// Caps glob expansion at `GLOB_MAX_MATCHES_PER_PATTERN` matches.
+/// Beyond that we stop iterating and emit a `tracing::warn`, so an
+/// operator who ships `~/.cache/**` doesn't explode the allowlist or
+/// Phase C's session-pinned inventory walk.
+fn expand_glob_or_literal(pattern: &str) -> Vec<String> {
+    const GLOB_MAX_MATCHES_PER_PATTERN: usize = 1024;
+    let has_meta = pattern.chars().any(|c| matches!(c, '*' | '?' | '['));
+    if !has_meta {
+        return vec![pattern.to_string()];
+    }
+    let mut out = Vec::new();
+    if let Ok(entries) = glob::glob(pattern) {
+        let mut truncated = false;
+        for entry in entries.flatten() {
+            if out.len() >= GLOB_MAX_MATCHES_PER_PATTERN {
+                truncated = true;
+                break;
+            }
+            match entry.to_str() {
+                Some(s) => out.push(s.to_string()),
+                None => tracing::debug!(
+                    target: "grith_supervisor::profiles",
+                    path = ?entry,
+                    "dropping non-UTF8 path from routine_exec_roots glob expansion",
+                ),
+            }
+        }
+        if truncated {
+            tracing::warn!(
+                target: "grith_supervisor::profiles",
+                pattern,
+                cap = GLOB_MAX_MATCHES_PER_PATTERN,
+                "routine_exec_roots glob exceeded match cap; truncating",
+            );
+        }
+    }
+    out
 }
 
 fn developer_override_enabled() -> bool {
@@ -799,6 +1098,60 @@ fn merge_vec(profile: &mut Vec<String>, defaults: &[String]) {
             profile.push(item.clone());
         }
     }
+}
+
+/// PR 5 Phase B: union local_listener_policy entries from a parent into a
+/// child profile. Dedupes by full PartialEq comparison — two entries are
+/// considered duplicate only when port, family, desc, and allow_clamp all
+/// match. This means child profiles that override `allow_clamp` for the
+/// same `(port, family)` keep their own entry alongside the parent's.
+fn merge_local_listener_policy(
+    profile: &mut Vec<LocalListenerEntry>,
+    defaults: &[LocalListenerEntry],
+) {
+    for entry in defaults {
+        if !profile.contains(entry) {
+            profile.push(entry.clone());
+        }
+    }
+}
+
+/// PR 5 Phase B (B4): reject wildcard addresses in `routine_listen_addresses`.
+///
+/// The legacy field was sometimes mis-used to add `0.0.0.0`/`::` to the
+/// silent-allow set, which would expose listeners on every interface
+/// without review. PR 5's design splits this responsibility:
+/// `routine_listen_addresses` is loopback-only; wildcard binds must go
+/// through `local_listener_policy` (which audits and optionally clamps).
+///
+/// Returns the offending entries when validation fails so the error
+/// message can name them. Empty result = OK.
+pub(crate) fn validate_routine_listen_addresses(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|addr| {
+            // Localhost is OK; parse anything else and reject wildcard.
+            if addr.eq_ignore_ascii_case("localhost") {
+                return false;
+            }
+            match addr.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    if ip.is_unspecified() {
+                        return true;
+                    }
+                    // IPv4-mapped IPv6 wildcard is also forbidden.
+                    if let std::net::IpAddr::V6(v6) = ip {
+                        if let Some(v4) = v6.to_ipv4_mapped() {
+                            return v4.is_unspecified();
+                        }
+                    }
+                    false
+                }
+                Err(_) => false, // junk is the caller's problem; we only veto wildcards.
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 fn canonicalize_readonly_path(path: &str) -> Option<String> {
@@ -1105,9 +1458,12 @@ mod tests {
             routine_destinations: vec!["example.com".into()],
             routine_listen_addresses: vec!["0.0.0.0".into()],
             routine_exec_roots: vec!["/usr/lib/git-core/".into()],
+            scratch_roots: Vec::new(),
             readonly_paths: vec!["/home/test/.ssh/config".into()],
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
         let entries = profile.to_allowlist_entries();
         assert_eq!(entries.len(), 6);
@@ -1131,9 +1487,12 @@ mod tests {
             routine_destinations: Vec::new(),
             routine_listen_addresses: Vec::new(),
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
         assert!(profile.to_allowlist_entries().is_empty());
     }
@@ -1172,7 +1531,7 @@ rationale = "Used in tests"
 routine_paths = ["**/*.py"]
 routine_commands = ["python"]
 routine_destinations = ["api.example.com"]
-routine_listen_addresses = ["0.0.0.0"]
+routine_listen_addresses = ["127.0.0.1"]
 
 [[profiles]]
 name = "other-tool"
@@ -1188,7 +1547,9 @@ routine_listen_addresses = []
         assert_eq!(profiles[0].name, "test-tool");
         assert_eq!(profiles[0].display_name, "Test Tool");
         assert_eq!(profiles[0].routine_paths, vec!["**/*.py"]);
-        assert_eq!(profiles[0].routine_listen_addresses, vec!["0.0.0.0"]);
+        // PR 5 Phase B: routine_listen_addresses is loopback-only —
+        // wildcard binds need an explicit local_listener_policy entry.
+        assert_eq!(profiles[0].routine_listen_addresses, vec!["127.0.0.1"]);
         assert_eq!(profiles[1].name, "other-tool");
         assert_eq!(profiles[1].routine_commands, vec!["bash"]);
     }
@@ -1220,9 +1581,12 @@ routine_listen_addresses = []
             routine_destinations: vec!["crates.io".into()],
             routine_listen_addresses: vec!["127.0.0.1".into()],
             routine_exec_roots: vec!["/usr/lib/git-core/".into()],
+            scratch_roots: Vec::new(),
             readonly_paths: vec!["${HOME}/.ssh/config".into()],
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
         let json = serde_json::to_string(&profile).unwrap();
         let parsed: SupervisorProfile = serde_json::from_str(&json).unwrap();
@@ -1244,9 +1608,12 @@ routine_listen_addresses = []
             routine_destinations: Vec::new(),
             routine_listen_addresses: Vec::new(),
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: vec!["/definitely/missing/grith-readonly-path".into()],
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1408,9 +1775,12 @@ routine_destinations = ["child.com"]
             routine_destinations: Vec::new(),
             routine_listen_addresses: Vec::new(),
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: vec![link.to_string_lossy().into_owned()],
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1722,6 +2092,64 @@ routine_destinations = ["openai.com"]
         );
     }
 
+    /// PR 70: the codex profile auto-injects
+    /// `--dangerously-bypass-approvals-and-sandbox` because grith is the
+    /// supervising security layer. Without this, codex prompts the user
+    /// for every shell command — those prompts bypass grith's audit
+    /// trail and confuse "who is asking what."
+    #[test]
+    fn codex_profile_auto_injects_bypass_flag() {
+        let config = SupervisorProfile::parse_toml_full(BUNDLED_PROFILES_TOML).unwrap();
+        let codex = config
+            .profiles
+            .iter()
+            .find(|p| p.name == "codex")
+            .expect("codex profile must exist in bundled config");
+        let contract = codex
+            .launch_contract
+            .as_ref()
+            .expect("codex profile must declare a launch_contract");
+        assert!(
+            contract
+                .required_args
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "codex launch_contract must include --dangerously-bypass-approvals-and-sandbox; \
+             without it codex's own approval/sandbox flow runs in parallel with grith and \
+             prompts the user, bypassing the audit trail. Required args were: {:?}",
+            contract.required_args,
+        );
+    }
+
+    /// PR 69 Change 3: the codex profile must declare the MCP transport
+    /// listener policy with `allow_clamp = true` so PR 5 rewrites
+    /// codex's `bind(0.0.0.0, 0)` to loopback instead of denying it.
+    /// Regression guard against the entry being deleted or rephrased.
+    #[test]
+    fn codex_profile_has_mcp_listener_policy() {
+        let config = SupervisorProfile::parse_toml_full(BUNDLED_PROFILES_TOML).unwrap();
+        let codex = config
+            .profiles
+            .iter()
+            .find(|p| p.name == "codex")
+            .expect("codex profile must exist in bundled config");
+        let mcp_entry = codex
+            .local_listener_policy
+            .iter()
+            .find(|e| e.port == 0)
+            .expect(
+                "codex profile must declare a local_listener_policy entry for port 0 \
+                 (the kernel-assigned MCP transport port) — without it PR 5 denies \
+                 every wildcard bind and the MCP handshake fails",
+            );
+        assert!(
+            mcp_entry.allow_clamp,
+            "codex MCP transport entry must set allow_clamp = true so the supervisor \
+             rewrites the wildcard bind to loopback"
+        );
+        assert_eq!(mcp_entry.family, ListenerFamily::V4);
+    }
+
     #[test]
     fn bundled_profiles_have_required_fields() {
         let config = SupervisorProfile::parse_toml_full(BUNDLED_PROFILES_TOML).unwrap();
@@ -1763,5 +2191,337 @@ routine_destinations = ["openai.com"]
         for value in ["1", "true", "yes"] {
             assert!(env_flag_enabled(Some(std::ffi::OsStr::new(value))));
         }
+    }
+
+    // ---- PR 5 Phase B: local_listener_policy schema + validation ----
+
+    #[test]
+    fn validate_routine_listen_addresses_rejects_ipv4_wildcard() {
+        let offending = validate_routine_listen_addresses(&["127.0.0.1".into(), "0.0.0.0".into()]);
+        assert_eq!(offending, vec!["0.0.0.0".to_string()]);
+    }
+
+    #[test]
+    fn validate_routine_listen_addresses_rejects_ipv6_wildcard() {
+        let offending = validate_routine_listen_addresses(&[
+            "::1".into(),
+            "::".into(),
+            "0:0:0:0:0:0:0:0".into(),
+        ]);
+        assert!(offending.contains(&"::".to_string()));
+        assert!(offending.contains(&"0:0:0:0:0:0:0:0".to_string()));
+    }
+
+    #[test]
+    fn validate_routine_listen_addresses_rejects_ipv4_mapped_wildcard() {
+        let offending = validate_routine_listen_addresses(&["::ffff:0.0.0.0".into()]);
+        assert_eq!(offending, vec!["::ffff:0.0.0.0".to_string()]);
+    }
+
+    #[test]
+    fn validate_routine_listen_addresses_accepts_loopback_and_specific_ip() {
+        let offending = validate_routine_listen_addresses(&[
+            "127.0.0.1".into(),
+            "::1".into(),
+            "localhost".into(),
+            "192.168.1.10".into(),
+            "::ffff:127.0.0.1".into(),
+        ]);
+        assert!(
+            offending.is_empty(),
+            "expected no rejections: {offending:?}"
+        );
+    }
+
+    #[test]
+    fn parse_toml_rejects_wildcard_in_routine_listen_addresses() {
+        let toml = r#"
+[[profiles]]
+name = "bad"
+display_name = "Bad"
+rationale = ""
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+routine_listen_addresses = ["0.0.0.0"]
+"#;
+        let err = SupervisorProfile::parse_toml(toml).expect_err("must reject 0.0.0.0");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0.0.0.0"),
+            "expected error to name 0.0.0.0: {msg}"
+        );
+        assert!(
+            msg.contains("local_listener_policy"),
+            "should suggest the alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_toml_accepts_local_listener_policy_entry() {
+        let toml = r#"
+[[profiles]]
+name = "with-local-listener"
+display_name = "With Local Listener"
+rationale = ""
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+routine_listen_addresses = ["127.0.0.1"]
+
+[[profiles.local_listener_policy]]
+port = 41234
+family = "any"
+desc = "MCP local server"
+allow_clamp = true
+
+[[profiles.local_listener_policy]]
+port = 0
+family = "v4"
+desc = "ephemeral IPC"
+"#;
+        let profiles = SupervisorProfile::parse_toml(toml).unwrap();
+        assert_eq!(profiles.len(), 1);
+        let p = &profiles[0];
+        assert_eq!(p.local_listener_policy.len(), 2);
+        assert_eq!(p.local_listener_policy[0].port, 41234);
+        assert_eq!(p.local_listener_policy[0].family, ListenerFamily::Any);
+        assert!(p.local_listener_policy[0].allow_clamp);
+        assert_eq!(p.local_listener_policy[1].port, 0);
+        assert_eq!(p.local_listener_policy[1].family, ListenerFamily::V4);
+        // Default for allow_clamp is false.
+        assert!(!p.local_listener_policy[1].allow_clamp);
+    }
+
+    #[test]
+    fn local_listener_policy_inherits_from_parent_via_extends() {
+        let toml = r#"
+[[profiles]]
+name = "parent"
+display_name = "Parent"
+rationale = ""
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+routine_listen_addresses = []
+
+[[profiles.local_listener_policy]]
+port = 5555
+family = "any"
+desc = "inherited entry"
+
+[[profiles]]
+name = "child"
+display_name = "Child"
+rationale = ""
+extends = "parent"
+routine_paths = []
+routine_commands = []
+routine_destinations = []
+routine_listen_addresses = []
+"#;
+        let profiles = SupervisorProfile::parse_toml(toml).unwrap();
+        let child = profiles
+            .iter()
+            .find(|p| p.name == "child")
+            .expect("child profile");
+        assert_eq!(child.local_listener_policy.len(), 1);
+        assert_eq!(child.local_listener_policy[0].port, 5555);
+        assert_eq!(child.local_listener_policy[0].desc, "inherited entry");
+    }
+
+    // ---- PR 4 Phase B: routine_exec_roots glob expansion ----
+
+    #[test]
+    fn substitute_path_vars_handles_home_project_and_tilde() {
+        let out = substitute_path_vars("${HOME}/.local/bin", "/h", "/p");
+        assert_eq!(out, "/h/.local/bin");
+        let out = substitute_path_vars("${PROJECT_DIR}/src", "/h", "/p");
+        assert_eq!(out, "/p/src");
+        let out = substitute_path_vars("~/.config", "/h", "/p");
+        assert_eq!(out, "/h/.config");
+        let out = substitute_path_vars("~", "/h", "/p");
+        assert_eq!(out, "/h");
+        // Leading tilde without slash is NOT expanded (matches glob semantics).
+        let out = substitute_path_vars("~tmp", "/h", "/p");
+        assert_eq!(out, "~tmp");
+    }
+
+    #[test]
+    fn expand_glob_or_literal_passes_through_literals() {
+        let out = expand_glob_or_literal("/usr/bin/sh");
+        assert_eq!(out, vec!["/usr/bin/sh"]);
+    }
+
+    #[test]
+    fn expand_glob_or_literal_walks_filesystem_for_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join("c/b")).unwrap();
+        // d intentionally has no b subdir — must not appear in output.
+        std::fs::create_dir_all(root.join("d")).unwrap();
+
+        let pattern = format!("{}/*/b", root.display());
+        let out = expand_glob_or_literal(&pattern);
+        assert_eq!(out.len(), 2, "expected two matches, got {out:?}");
+        assert!(out.iter().any(|p| p.ends_with("/a/b")));
+        assert!(out.iter().any(|p| p.ends_with("/c/b")));
+    }
+
+    #[test]
+    fn expand_routine_exec_roots_canonicalises_and_adds_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            extends: None,
+            display_name: "Test".into(),
+            rationale: None,
+            routine_paths: vec![],
+            routine_commands: vec![],
+            routine_destinations: vec![],
+            routine_listen_addresses: vec![],
+            routine_exec_roots: vec![real.to_string_lossy().into_owned()],
+            scratch_roots: Vec::new(),
+            readonly_paths: vec![],
+            readonly_path_patterns: vec![],
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+        };
+        let out = profile.expand_routine_exec_roots();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with('/'), "expected trailing slash: {}", out[0]);
+        assert!(out[0].contains("real"));
+    }
+
+    #[test]
+    fn expand_scratch_roots_canonicalises_and_keeps_missing_as_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            extends: None,
+            display_name: "Test".into(),
+            rationale: None,
+            routine_paths: vec![],
+            routine_commands: vec![],
+            routine_destinations: vec![],
+            routine_listen_addresses: vec![],
+            routine_exec_roots: vec![],
+            // One existing dir + one that doesn't exist yet (scratch dirs are
+            // created/destroyed, so missing entries are kept as literals — the
+            // key difference from expand_routine_exec_roots).
+            scratch_roots: vec![
+                real.to_string_lossy().into_owned(),
+                "/this/scratch/does/not/exist/yet".into(),
+            ],
+            readonly_paths: vec![],
+            readonly_path_patterns: vec![],
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+        };
+        let out = profile.expand_scratch_roots();
+        assert_eq!(out.len(), 2, "both roots retained: {out:?}");
+        assert!(
+            out.iter().all(|p| p.ends_with('/')),
+            "all trailing-slashed: {out:?}"
+        );
+        assert!(out.iter().any(|p| p.contains("real")));
+        assert!(out
+            .iter()
+            .any(|p| p.starts_with("/this/scratch/does/not/exist/yet")));
+    }
+
+    #[test]
+    fn expand_routine_exec_roots_drops_missing_dirs() {
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            extends: None,
+            display_name: "Test".into(),
+            rationale: None,
+            routine_paths: vec![],
+            routine_commands: vec![],
+            routine_destinations: vec![],
+            routine_listen_addresses: vec![],
+            routine_exec_roots: vec!["/this/path/definitely/does/not/exist/pr4".into()],
+            scratch_roots: Vec::new(),
+            readonly_paths: vec![],
+            readonly_path_patterns: vec![],
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+        };
+        assert!(profile.expand_routine_exec_roots().is_empty());
+    }
+
+    #[test]
+    fn expand_routine_exec_roots_expands_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("v1/lib/node_modules/x")).unwrap();
+        std::fs::create_dir_all(root.join("v2/lib/node_modules/x")).unwrap();
+
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            extends: None,
+            display_name: "Test".into(),
+            rationale: None,
+            routine_paths: vec![],
+            routine_commands: vec![],
+            routine_destinations: vec![],
+            routine_listen_addresses: vec![],
+            routine_exec_roots: vec![format!("{}/*/lib/node_modules/x", root.display())],
+            scratch_roots: Vec::new(),
+            readonly_paths: vec![],
+            readonly_path_patterns: vec![],
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+        };
+        let out = profile.expand_routine_exec_roots();
+        assert_eq!(out.len(), 2, "expected two glob matches: {out:?}");
+        assert!(out.iter().all(|p| p.ends_with('/')));
+    }
+
+    #[test]
+    fn build_session_allowlist_expands_glob_exec_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("v1/lib/node_modules/x")).unwrap();
+        std::fs::create_dir_all(root.join("v2/lib/node_modules/x")).unwrap();
+
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            extends: None,
+            display_name: "Test".into(),
+            rationale: None,
+            routine_paths: vec![],
+            routine_commands: vec![],
+            routine_destinations: vec![],
+            routine_listen_addresses: vec![],
+            routine_exec_roots: vec![format!("{}/*/lib/node_modules/x", root.display())],
+            scratch_roots: Vec::new(),
+            readonly_paths: vec![],
+            readonly_path_patterns: vec![],
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+        };
+        let allowed = profile.build_session_allowlist();
+        let exec_prefix_count = allowed
+            .iter()
+            .filter(|e| e.starts_with("exec-prefix:"))
+            .count();
+        assert_eq!(
+            exec_prefix_count, 2,
+            "expected two exec-prefix entries from glob, got: {allowed:?}"
+        );
     }
 }

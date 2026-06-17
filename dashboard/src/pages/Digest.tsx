@@ -160,6 +160,74 @@ function DigestCard({
   );
 }
 
+/** Confirmation modal for a destructive/bulk action. */
+function ConfirmDialog({
+  kind,
+  count,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  kind: "approve" | "deny";
+  count: number;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  // Close on Escape.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onCancel, busy]);
+
+  const isApprove = kind === "approve";
+  const verb = isApprove ? "Approve" : "Deny";
+  const confirmClass = isApprove
+    ? "bg-status-allow-green text-white hover:bg-status-allow-green/90"
+    : "bg-status-deny-red text-white hover:bg-status-deny-red/90";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+      onClick={busy ? undefined : onCancel}
+    >
+      <div
+        className="bg-white border border-grith-border rounded-xl shadow-2xl max-w-md w-full p-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-base font-semibold text-grith-text mb-1.5">
+          {verb} {count} pending item{count !== 1 ? "s" : ""}?
+        </h2>
+        <p className="text-sm text-grith-muted mb-5">
+          {isApprove
+            ? "Every pending item in the queue will be approved and its tool call allowed. This cannot be undone."
+            : "Every pending item in the queue will be denied and its tool call blocked. This cannot be undone."}
+          {" "}Escalated items are not affected.
+        </p>
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-60 ${confirmClass}`}
+          >
+            {busy ? `${verb}ing…` : `${verb} all ${count}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function severityLabel(score: number): string {
   if (score >= 8) return "critical";
   if (score >= 5) return "high";
@@ -168,10 +236,29 @@ function severityLabel(score: number): string {
 }
 
 export function DigestPage() {
-  const { items, pendingCount, escalatedCount, loading, error, approve, deny, learn, escalate, refresh } =
-    useDigest();
+  const {
+    items,
+    pendingCount,
+    escalatedCount,
+    loading,
+    error,
+    approve,
+    deny,
+    learn,
+    escalate,
+    approveMany,
+    denyMany,
+    bulkBusy,
+    refresh,
+  } = useDigest();
   const [canEscalate, setCanEscalate] = useState(false);
-  const { lastEvent } = useWebSocket();
+  // Captured at the moment the bulk action is requested, so the confirmation
+  // count stays stable while items clear out of the list.
+  const [confirmBulk, setConfirmBulk] = useState<null | {
+    kind: "approve" | "deny";
+    ids: string[];
+  }>(null);
+  const { lastEvent, liveFeedUnavailable } = useWebSocket();
   const permissionRequested = useRef(false);
 
   // Request browser notification permission once on mount.
@@ -221,6 +308,18 @@ export function DigestPage() {
     void fetchTier();
   }, [fetchTier]);
 
+  // Bulk actions operate on pending items only — escalated items are awaiting
+  // a separate senior-review workflow and are intentionally left untouched.
+  const pendingItems = items.filter((i) => i.status === "pending");
+
+  const runBulk = async () => {
+    if (!confirmBulk) return;
+    const { kind, ids } = confirmBulk;
+    if (kind === "approve") await approveMany(ids);
+    else await denyMany(ids);
+    setConfirmBulk(null);
+  };
+
   return (
     <div className="p-6 max-w-4xl">
       <div className="flex items-center justify-between mb-6">
@@ -238,14 +337,53 @@ export function DigestPage() {
               {escalatedCount} escalated
             </span>
           )}
+          {liveFeedUnavailable && (
+            <span
+              title="Re-open the dashboard using the URL grith printed on startup (it carries a one-time #token=…) to restore live updates."
+              className="inline-flex items-center gap-1 h-5 px-1.5 text-xs font-medium rounded-full bg-status-queue-amber/20 text-status-queue-amber"
+            >
+              live feed offline
+            </span>
+          )}
         </div>
-        <button
-          onClick={() => void refresh()}
-          disabled={loading}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50"
-        >
-          {loading ? "Loading..." : "Refresh"}
-        </button>
+        <div className="flex items-center gap-2">
+          {pendingItems.length > 1 && (
+            <>
+              <button
+                onClick={() =>
+                  setConfirmBulk({
+                    kind: "approve",
+                    ids: pendingItems.map((i) => i.id),
+                  })
+                }
+                disabled={bulkBusy}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-status-allow-green/15 text-status-allow-green hover:bg-status-allow-green/25 transition-colors disabled:opacity-50"
+              >
+                Approve all
+              </button>
+              <button
+                onClick={() =>
+                  setConfirmBulk({
+                    kind: "deny",
+                    ids: pendingItems.map((i) => i.id),
+                  })
+                }
+                disabled={bulkBusy}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-status-deny-red/15 text-status-deny-red hover:bg-status-deny-red/25 transition-colors disabled:opacity-50"
+              >
+                Deny all
+              </button>
+              <span className="w-px h-5 bg-grith-border mx-1" />
+            </>
+          )}
+          <button
+            onClick={() => void refresh()}
+            disabled={loading}
+            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50"
+          >
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -276,6 +414,16 @@ export function DigestPage() {
           />
         ))}
       </div>
+
+      {confirmBulk && (
+        <ConfirmDialog
+          kind={confirmBulk.kind}
+          count={confirmBulk.ids.length}
+          busy={bulkBusy}
+          onConfirm={() => void runBulk()}
+          onCancel={() => setConfirmBulk(null)}
+        />
+      )}
     </div>
   );
 }

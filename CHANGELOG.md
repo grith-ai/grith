@@ -8,6 +8,176 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+### Removed
+
+- **Cold-start scoring removed entirely.** The proxy no longer widens its
+  allow/deny thresholds for the first N calls of a session. Every tool call is
+  now evaluated against the same fixed thresholds (`auto_allow_threshold`,
+  `auto_deny_threshold`), so the first call in a session is filtered identically
+  to the thousandth and an early destructive/exfiltrating operation is never
+  under-scored. The `cold_start_calls`, `cold_start_escalation_low`, and
+  `cold_start_escalation_high` config keys are gone (silently ignored if still
+  present in a config file); the `proxy/status` and `proxy/test` dashboard API
+  responses no longer carry `cold_start_remaining` / `cold_start`. The
+  behavioural filter's own profiling-baseline period is unaffected (a separate
+  mechanism). Operators who relied on cold-start widening should set the fixed
+  thresholds to the values they want applied uniformly.
+
+### Fixed
+
+- **Own-credential outbound false positive in taint scoring (FP research §5.2).**
+  Reading a credential and then running an outbound-capable tool that uses it
+  (`git push`, `aws s3 ls`, `npm publish`) no longer QUEUEs on its own. The
+  data-flow taint rule's condition 4 (outbound-capable binary under taint) was a
+  standalone trigger; it is now gated behind
+  `proxy.spawn.taint_outbound_requires_data_flow` (default `true`), so an
+  outbound binary under taint fires only when the spawn actually references the
+  tainted data (argv path/env, pipe/redirect, or shell-pattern). Genuine exfil
+  still fires — `aws s3 cp <tainted-file> s3://…` and `curl -d @<tainted>` are
+  caught by conditions 1–3, and outbound-to-untrusted-destination is
+  independently scored by the egress filter. Operators can set the flag `false`
+  to restore the standalone fire.
+
+- **Secret-scan false positives on benign token shapes (FP research §5.11).**
+  The secret scanner now suppresses matches whose value is a provably-benign
+  shape, so routine development no longer trips the 1,620-pattern corpus: bare
+  git/SHA hex digests not in an assignment context (`git show <sha>`, file
+  checksums), npm/yarn lockfile integrity hashes (`sha512-…`), JWTs (`eyJ…`),
+  RFC-4122 UUIDs, and Stripe-style `_test_` placeholder keys. Implemented as a
+  post-match layer (lazily compiling only patterns that actually fire, so
+  startup is unchanged); every carve-out is paired with a guard ensuring real
+  secrets in the same context still fire (a 40-hex value assigned to
+  `aws_secret_access_key=` fires, `sk_live_`/real-shaped keys fire, a non-JWT
+  base64 blob fires). AWS's documented example key (`AKIAIOSFODNN7EXAMPLE`) is
+  intentionally still flagged — it is a real-format key, not an unambiguous test
+  prefix. Additionally, reads of low-signal assets (under `node_modules`, or
+  `.min.js`/`.min.css`/`.map` minified bundles) **down-weight** the generic
+  keyword-assignment heuristics (`generic-*`) below the queue threshold so
+  linting/reading minified code no longer escalates — while specific
+  vendor/format keys (AWS, GitHub, Stripe, …) keep full weight, so a real
+  credential embedded in a package still fires.
+
+- **Egress false positive on cloud object-storage URIs.** The egress filter
+  extracted any `scheme://…` token from a shell command as a network
+  destination, so a routine `aws s3 rm s3://staging/obj` (or `gsutil ls
+  gs://…`) parsed the *bucket name* as an unknown host and queued for review.
+  Object-storage bucket URIs (`s3://`, `gs://`, `gcs://`, `wasb(s)://`,
+  `abfs(s)://`, `adl(s)://`, `b2://`, `r2://`, `oss://`, `cos://`, `swift://`,
+  `minio://`) are no longer treated as network destinations — they reference a
+  bucket/object, and the real egress to the provider API is still
+  policy-checked at connect time. Exfil to an attacker bucket via the provider
+  endpoint (`https://bucket.s3.amazonaws.com/…`) continues to flag
+  `unknown-destination` (regression-guarded).
+
+### Security
+
+- **IPC-delegated authority: control-socket + authority-delegating-spawn
+  detection (H2, Options 2 & 4, audit-only).** Connects to control-injection
+  IPC sockets (tmux/screen panes, X11, the session D-Bus bus) now emit
+  `event = "control_socket_connect"`, and spawns of authority-delegating
+  binaries (docker/podman/kubectl/tmux/screen/systemctl/systemd-run/dbus-send/
+  gdbus/busctl/at/crontab/flatpak/nsenter/machinectl/loginctl) emit
+  `event = "authority_delegating_spawn"`. Both are **audit-only** (the
+  operation is still allowed) to measure the false-positive budget before
+  enforcing; ssh-agent/gpg-agent sockets are already routed through the proxy
+  separately. This completes the H2 IPC-delegated-authority mitigations
+  (disclosure + Options 1–4); enforce modes are documented follow-ups.
+
+- **IPC-delegated authority: PTY-ownership detection (H2, Option 1).** A write
+  to a `/dev/pts/N` that is not the supervised tool's own controlling terminal
+  (the `echo cmd > /dev/pts/<sibling-pane>` injection vector) is now detected
+  and forensically logged (`event = "foreign_pts_write"`). Default is
+  **audit-only** (the write is still allowed) to measure the false-positive
+  budget; setting `supervisor.pty_ownership_enforce = true` denies it. The
+  tool's own terminal I/O is unaffected; reads and non-pts paths are not
+  flagged; an unresolvable controlling terminal fails open (no flag).
+
+- **IPC-delegated authority: disclosure + container-escalation scoring (H2,
+  Option 3).** Documented the structural limit of process-tree-scoped
+  supervision in `SECURITY.md` ("Known Limitations" → IPC-delegated authority):
+  actions the supervised tool *delegates* to a more-privileged peer (docker
+  daemon, `tmux send-keys`, ssh-agent, D-Bus, X11) execute outside the
+  supervised tree. As the first mitigation, the destructive-action filter now
+  scores `docker`/`podman run`/`create` invocations that escalate to host
+  authority — a writable bind-mount of a sensitive host path (`-v /etc:…:rw`),
+  the docker control socket, `--privileged`, or `--pid=host` — and freezes them
+  for review (the public Codex `docker run -v /etc:/host-etc:rw` escape).
+  Benign container use (read-only/named-volume mounts, `docker build`/`ps`) is
+  unaffected. Control-socket gating and PTY-ownership enforcement for the tmux
+  vector are tracked as follow-ups.
+
+- **Destructive-action coverage (work item 68).** A new default-on
+  `destructive-action` proxy filter (Phase 2) brings the shipped ruleset in line
+  with the destructive-action threat model. It **hard-denies** catastrophic
+  host/storage destruction (filesystem format, raw block-device overwrite,
+  signature wipe, `rm --no-preserve-root`, recursive removal of a system root or
+  database data directory) and **escalates destructive operations directed at
+  production** — managed-DB endpoints (`*.rds.amazonaws.com`,
+  `*.sql.googleapis.com`, `*.database.windows.net`, `*.documents.azure.com`,
+  `*.cache.amazonaws.com`, `*.redshift.amazonaws.com`) and `prod`/`production`/
+  `live`-tagged resources — from QUEUE to DENY. Non-production destructive
+  operations queue for review; scoped development operations (`rm -rf` of project
+  directories, single-object staging deletes, read-only queries) are not flagged.
+  Configurable via `[proxy.destructive_action] enabled` (default `true`). The
+  pipeline is now 18 filters.
+
+- **Dashboard token handoff no longer prints the secret.** The dashboard token
+  was rendered in the `grith exec` TUI header and `dashboard status`, leaking
+  the bearer secret into screenshots, screen-shares, and scrollback. The token
+  is now handed to the browser out-of-band:
+  - `server.auto_open_dashboard` (default true; `GRITH_AUTO_OPEN_DASHBOARD`;
+    auto-skipped on headless/SSH) opens the browser on startup with the handoff
+    in the URL fragment — never printed.
+  - The fragment now carries a **single-use pairing code**, not the raw token.
+    The SPA exchanges it at the loopback `POST /api/dashboard/pair` for the
+    real token; the code is consumed on first use, so a later screenshot of the
+    URL is inert. `grith dashboard pair` mints a fresh code to (re-)authorise a
+    browser (new browser, cleared storage, second machine).
+  - The persistent dashboard token still survives restarts, so a once-paired
+    browser needs no re-pairing on a daemon restart.
+
+- **Dashboard localhost auth & CSRF hardening.** The embedded dashboard
+  HTTP/WS API was previously gated only by the loopback bind — any local
+  process or browser tab that could reach `127.0.0.1:3141` could read audit
+  data and drive mutating endpoints (approve queued calls, lower proxy
+  thresholds, kill supervisor sessions). Five layered controls now close that:
+  - Browser-facing mutations require a non-simple `x-grith-csrf` header,
+    forcing a CORS preflight the locked-origin layer rejects for drive-by
+    pages (no-body POSTs included).
+  - A per-server `dashboard.token` (`~/.config/grith/dashboard.token`, `0600`,
+    distinct from the daemon IPC token) is minted on every launch and
+    constant-time-verified on writes; the open `/api/events` injection route
+    was removed.
+  - WebSocket handshakes (`/ws/live`, `/ws/supervisor/:id`) are origin-vs-host
+    checked and token-gated.
+  - Sensitive reads (audit list/detail/export, digest, canaries, config,
+    analytics, policies, inventory, listener-rewrites, supervisor session
+    detail) are gated on the dashboard token when one is configured; low-
+    sensitivity status (`/health`, `/tier`, `/proxy/status`, `/license/status`,
+    `/sync/status`) stays open for zero-config dev.
+
+### Changed
+
+- **Documentation accuracy pass.** In-repo docs reconciled with the current
+  daemon: filter counts corrected to 18 everywhere, the secret-pattern count
+  standardised to 1,620, a README feature bullet added for destructive-action
+  coverage, and "Compliance-ready" softened to "designed to support compliance"
+  with an explicit note that grith is not certified against any framework.
+  (Audit-record sync to grith servers, and the `audit_sync = false` local-only
+  option, were already documented honestly.)
+
+- **BREAKING (dashboard API): mutating dashboard endpoints now require the
+  per-server dashboard token by default, and sensitive reads require it too.**
+  The CLI flows the token automatically — `grith dashboard start` /
+  `grith run` print a `#token=…` launch URL the SPA captures into
+  `localStorage`, so the interactive experience is unchanged. **Scripts that
+  PO/PUT/DELETE against the dashboard API, or scrape audit/digest/config, must
+  now send `x-grith-csrf: <token>`.** Same-UID scripts can read the token from
+  `~/.config/grith/dashboard.token` (written by the background dashboard
+  server). This is a deliberate default flip from the previous open-on-loopback
+  posture; pre-1.0 so no SemVer-major bump, but operators scripting the open
+  API must adapt. See `work/futurework/dashboard-localhost-auth-csrf.md`.
+
 ### Added
 
 - **Signed releases + SBOMs.** The release workflow now publishes four

@@ -11,7 +11,11 @@ fn verify_audit_chain(daemon: &daemon::Daemon) -> anyhow::Result<()> {
         .audit_storage
         .lock()
         .map_err(|_| anyhow::anyhow!("audit storage lock poisoned"))?;
-    match storage.verify_chain()? {
+    // Use the cached/incremental verify so post-retention prunes (where
+    // chain_sequence no longer starts at 1) still verify correctly via
+    // the persisted checkpoint. Operators wanting a full revalidation
+    // can call `storage.verify_chain()` directly.
+    match storage.cached_verify_chain()? {
         grith_audit::ChainVerification::Valid { .. } | grith_audit::ChainVerification::Empty => {
             Ok(())
         }

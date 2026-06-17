@@ -15,8 +15,9 @@ Both paths converge on the same proxy filters, scoring thresholds, audit log, an
 
 ## Features
 
-- **Multi-phase security proxy** with 17 filters across 3 phases (static, pattern, context)
-- **Secret scanning** with 1600+ regex patterns for API keys, tokens, and credentials
+- **Multi-phase security proxy** with 18 filters across 3 phases (static, pattern, context)
+- **Secret scanning** with 1,620+ regex patterns for API keys, tokens, and credentials
+- **Destructive-action coverage** — hard-denies catastrophic host/storage destruction (filesystem format, raw block-device overwrite, recursive removal of a system root or database data directory) and escalates destructive operations against production targets
 - **Adaptive Bayesian scoring** that learns from human review decisions
 - **Per-call security evaluation** with profile-based access control
 - **CLI supervisor** with ptrace+seccomp (Linux x86_64, full syscall interception). macOS via Endpoint Security and Windows via ETW are targeted for v2.0; Linux aarch64 needs an arch-backend port.
@@ -366,7 +367,7 @@ Every tool call — whether from the built-in agent or an intercepted syscall �
 
 **Phase 1 — Static (<0.1ms):** Path matching (Aho-Corasick), allowlist/denylist, profile allowlists, argument structure validation.
 
-**Phase 2 — Pattern (1-3ms):** Secret scanning (1600+ regex patterns for API keys, tokens, credentials), command structure analysis.
+**Phase 2 — Pattern (1-3ms):** Secret scanning (1,620+ regex patterns for API keys, tokens, credentials), command structure analysis, destructive-action coverage.
 
 **Phase 3 — Context:** Reputation scoring, behavioral profiling, taint tracking, rate limiting.
 

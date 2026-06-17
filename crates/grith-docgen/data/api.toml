@@ -105,7 +105,7 @@ routes = [
     { method = "GET",  path = "/analytics/summary",     summary = "Top-line stats: call volume, decisions split, cost.",  tier = "pro" },
     { method = "GET",  path = "/analytics/cost",        summary = "Provider cost breakdown by model and user.",           tier = "pro" },
     { method = "GET",  path = "/analytics/activity",    summary = "Call volume trends and per-session timelines.",        tier = "pro" },
-    { method = "GET",  path = "/analytics/compliance",  summary = "Compliance-ready reporting bundles.",                  tier = "enterprise" },
+    { method = "GET",  path = "/analytics/compliance",  summary = "Structured evidence bundles designed to support compliance reporting (grith is not certified).", tier = "enterprise" },
 ]
 
 # ---------------------------------------------------------------- sync

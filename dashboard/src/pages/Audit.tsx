@@ -1,21 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import type { AuditRecord, AuditListResponse, ProxyActionSummary } from "@/types/api";
+import type { AuditRecord, AuditListResponse } from "@/types/api";
 import { getAuditRecords, exportAudit } from "@/lib/api";
-
-function ActionBadge({ action }: { action: ProxyActionSummary }) {
-  const styles: Record<ProxyActionSummary, string> = {
-    allow: "text-status-allow-green bg-status-allow-green/10",
-    queue: "text-status-queue-amber bg-status-queue-amber/10",
-    deny: "text-status-deny-red bg-status-deny-red/10",
-  };
-  return (
-    <span
-      className={`inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-mono font-medium uppercase ${styles[action]}`}
-    >
-      {action}
-    </span>
-  );
-}
+import { ActionBadge, AuditDetailModal } from "@/components/AuditDetailModal";
 
 export function AuditPage() {
   const [records, setRecords] = useState<AuditRecord[]>([]);
@@ -23,6 +9,8 @@ export function AuditPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
+  const [selected, setSelected] = useState<AuditRecord | null>(null);
+  const [showRoutine, setShowRoutine] = useState(false);
   const limit = 50;
 
   const fetchRecords = useCallback(async () => {
@@ -31,6 +19,7 @@ export function AuditPage() {
       const data: AuditListResponse = await getAuditRecords({
         limit,
         offset,
+        include: showRoutine ? "all" : "full",
       });
       setRecords(data.records);
       setTotal(data.total);
@@ -42,7 +31,12 @@ export function AuditPage() {
     } finally {
       setLoading(false);
     }
-  }, [offset]);
+  }, [offset, showRoutine]);
+
+  // Reset to first page when the toggle changes so pagination stays sane.
+  useEffect(() => {
+    setOffset(0);
+  }, [showRoutine]);
 
   useEffect(() => {
     void fetchRecords();
@@ -75,7 +69,19 @@ export function AuditPage() {
         <h1 className="text-xl font-semibold text-grith-text">
           Live Audit
         </h1>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-3">
+          <label
+            className="flex items-center gap-2 text-xs text-grith-muted cursor-pointer select-none"
+            title="Include compact rows from session-allowed short-circuits and noise-path filters. Server must be running with audit.completeness >= spawns for these to exist."
+          >
+            <input
+              type="checkbox"
+              checked={showRoutine}
+              onChange={(e) => setShowRoutine(e.target.checked)}
+              className="accent-status-allow-green"
+            />
+            <span>Show routine activity</span>
+          </label>
           <button
             onClick={() => void handleExport("json")}
             className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors"
@@ -127,34 +133,51 @@ export function AuditPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-grith-border">
-              {records.map((rec) => (
-                <tr
-                  key={rec.id}
-                  className="hover:bg-grith-surface transition-colors"
-                >
-                  <td className="px-4 py-3 text-xs text-grith-muted font-mono whitespace-nowrap">
-                    {new Date(rec.timestamp).toLocaleTimeString()}
-                  </td>
-                  <td className="px-4 py-3 text-xs font-mono text-green">
-                    {rec.tool_call_type}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-grith-text">
-                    {rec.supervised_tool ?? rec.source}
-                  </td>
-                  <td className="px-4 py-3 text-xs font-mono text-grith-text">
-                    {rec.composite_score.toFixed(1)}
-                  </td>
-                  <td className="px-4 py-3">
-                    <ActionBadge action={rec.proxy_action} />
-                  </td>
-                  <td className="px-4 py-3 text-xs text-grith-muted font-mono">
-                    {rec.evaluation_time_ms.toFixed(2)}ms
-                  </td>
-                  <td className="px-4 py-3 text-xs text-grith-muted max-w-xs truncate">
-                    {rec.arguments_summary}
-                  </td>
-                </tr>
-              ))}
+              {records.map((rec) => {
+                const isCompact = rec.record_type === "compact";
+                return (
+                  <tr
+                    key={rec.id}
+                    onClick={() => setSelected(rec)}
+                    className={`hover:bg-grith-surface transition-colors cursor-pointer ${
+                      isCompact ? "text-grith-muted/80" : ""
+                    }`}
+                    title="Click to see full details"
+                  >
+                    <td className="px-4 py-3 text-xs text-grith-muted font-mono whitespace-nowrap">
+                      {new Date(rec.timestamp).toLocaleTimeString()}
+                    </td>
+                    <td
+                      className={`px-4 py-3 text-xs font-mono max-w-md truncate ${
+                        isCompact ? "text-grith-muted" : "text-green"
+                      }`}
+                      title={rec.tool_call_type}
+                    >
+                      {isCompact && (
+                        <span className="inline-block mr-1.5 px-1 py-px text-[9px] font-medium rounded bg-grith-border/40 text-grith-muted uppercase tracking-wider align-middle">
+                          routine
+                        </span>
+                      )}
+                      {rec.tool_call_type}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-grith-text">
+                      {rec.supervised_tool ?? rec.source}
+                    </td>
+                    <td className="px-4 py-3 text-xs font-mono text-grith-text">
+                      {isCompact ? "—" : rec.composite_score.toFixed(1)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <ActionBadge action={rec.proxy_action} />
+                    </td>
+                    <td className="px-4 py-3 text-xs text-grith-muted font-mono">
+                      {isCompact ? "—" : `${rec.evaluation_time_ms.toFixed(2)}ms`}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-grith-muted max-w-xs truncate">
+                      {rec.arguments_summary}
+                    </td>
+                  </tr>
+                );
+              })}
               {!loading && records.length === 0 && (
                 <tr>
                   <td
@@ -194,6 +217,10 @@ export function AuditPage() {
           </div>
         )}
       </div>
+
+      {selected && (
+        <AuditDetailModal record={selected} onClose={() => setSelected(null)} />
+      )}
     </div>
   );
 }

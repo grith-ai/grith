@@ -16,6 +16,13 @@ pub struct PathRule {
     pub score: f64,
     pub severity: String,
     pub message: String,
+    /// FP §5.7: file BASENAMES that exempt a path from this rule even though
+    /// `pattern` matched — e.g. the `env-file` rule matches `.env` but excludes
+    /// the basename `.env.example` (template scaffolding). Matched basename-
+    /// exact (not a path substring), so `.env.example.bak` is NOT exempt.
+    /// Default empty.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// Path matching filter using linear substring scanning.
@@ -56,6 +63,11 @@ impl PathMatchFilter {
             ToolCallType::NetListen { .. } => "http",
             ToolCallType::ProcessSpawn { .. } => "exec",
             ToolCallType::DnsQuery { .. } => "dns",
+            // PR 6 Phase B: category-2 syscalls.
+            ToolCallType::OwnershipChange { .. } => "write",
+            ToolCallType::FilesystemMutation { .. } => "write",
+            ToolCallType::CrossProcessAccess { .. } => "process",
+            ToolCallType::NamespaceOp { .. } => "namespace",
         }
     }
 }
@@ -109,9 +121,18 @@ impl SecurityFilter for PathMatchFilter {
         // with batch scanning.
         let mut best_match: Option<&PathRule> = None;
 
+        // FP §5.7: the file's basename, for the exclude check below.
+        let basename = path.rsplit('/').next().unwrap_or(path);
         for (i, rule) in self.rules.iter().enumerate() {
             if path.contains(self.normalized[i].as_str())
                 && rule.operations.iter().any(|op| op == operation)
+                // FP §5.7: skip when the file's BASENAME exactly equals one of
+                // the rule's exclude entries (e.g. `.env` rule excludes the
+                // basename `.env.example`). Basename-exact, NOT a path substring:
+                // a substring check would over-exclude `.env.example.bak` (a
+                // backup that may hold real values) or a real `.env` inside a
+                // directory named `.env.example/`.
+                && !rule.exclude.iter().any(|ex| basename == ex.as_str())
             {
                 match &best_match {
                     Some(current) if current.score >= rule.score => {}
@@ -155,6 +176,7 @@ mod tests {
                 score: 5.0,
                 severity: "critical".into(),
                 message: "Access to SSH private key".into(),
+                exclude: vec![],
             },
             PathRule {
                 id: "ssh-dir".into(),
@@ -163,6 +185,7 @@ mod tests {
                 score: 3.0,
                 severity: "warning".into(),
                 message: "Access to SSH directory".into(),
+                exclude: vec![],
             },
             PathRule {
                 id: "env-file".into(),
@@ -171,6 +194,7 @@ mod tests {
                 score: 3.0,
                 severity: "warning".into(),
                 message: "Access to environment file".into(),
+                exclude: vec![],
             },
             PathRule {
                 id: "pem-files".into(),
@@ -179,6 +203,7 @@ mod tests {
                 score: 4.0,
                 severity: "error".into(),
                 message: "Access to PEM file".into(),
+                exclude: vec![],
             },
         ]
     }
@@ -193,6 +218,46 @@ mod tests {
         assert!(result.matched);
         assert_eq!(result.rule_id, "ssh-private-key");
         assert_eq!(result.score, 5.0);
+    }
+
+    // FP §5.7: `exclude` is matched basename-EXACT, so it exempts `.env.example`
+    // but NOT `.env.example.bak` (a backup that may hold real values) and NOT a
+    // real `.env` whose parent dir happens to be named `.env.example/`.
+    #[tokio::test]
+    async fn exclude_is_basename_exact_not_substring() {
+        let rules = vec![PathRule {
+            id: "env-file".into(),
+            pattern: ".env".into(),
+            operations: vec!["read".into()],
+            score: 3.0,
+            severity: "warning".into(),
+            message: "env".into(),
+            exclude: vec![".env.example".into(), ".env.sample".into()],
+        }];
+        let filter = PathMatchFilter::new(rules);
+        let read = |p: &str| make_ctx(ToolCallType::FileRead { path: p.into() });
+
+        // Exempt: exact template basenames.
+        for p in ["/home/u/proj/.env.example", "/home/u/proj/.env.sample"] {
+            assert!(
+                !filter.evaluate(&read(p)).await.unwrap().matched,
+                "{p} (template) must be exempt"
+            );
+        }
+        // NOT exempt (over-exclusion guards): backup, overlay, and a real .env
+        // inside a directory named after the template.
+        for p in [
+            "/home/u/proj/.env",
+            "/home/u/proj/.env.production",
+            "/home/u/proj/.env.example.bak",
+            "/home/u/proj/.env.example.local",
+            "/home/u/proj/.env.example/.env",
+        ] {
+            assert!(
+                filter.evaluate(&read(p)).await.unwrap().matched,
+                "{p} must still fire env-file"
+            );
+        }
     }
 
     #[tokio::test]
@@ -237,6 +302,33 @@ mod tests {
         assert!(result.matched);
         assert_eq!(result.rule_id, "pem-files");
         assert_eq!(result.score, 4.0);
+    }
+
+    #[tokio::test]
+    async fn test_pr6_ownership_change_path_matches() {
+        let filter = PathMatchFilter::new(default_rules());
+        let ctx = make_ctx(ToolCallType::OwnershipChange {
+            target: "/home/user/.ssh/id_ed25519".into(),
+            new_uid: 1000,
+            new_gid: 1000,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "ssh-private-key");
+    }
+
+    #[tokio::test]
+    async fn test_pr6_filesystem_mutation_path_matches() {
+        let filter = PathMatchFilter::new(default_rules());
+        let ctx = make_ctx(ToolCallType::FilesystemMutation {
+            op: "mount".into(),
+            source: Some("/dev/sda1".into()),
+            target: "/project/.env.mount".into(),
+            fstype: Some("ext4".into()),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "env-file");
     }
 
     #[tokio::test]

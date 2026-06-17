@@ -79,6 +79,11 @@ pub async fn execute_tool_call(
         source_taint: grith_proxy::types::TaintLevel::None,
         profile_name: policy_scope.map(|s| s.to_string()),
         conversation_id: None,
+        session_scope: Some(grith_proxy::types::SessionScopeKey::from_session_id(
+            session_id,
+        )),
+        spawn_provenance: None,
+        listener_policy_match: None,
     };
 
     let decision = proxy.evaluate(&ctx).await;
@@ -881,20 +886,38 @@ pub async fn execute_operation(
         grith_proxy::types::ToolCallType::DnsQuery { domain, query_type } => {
             format!("DNS query not directly executable: {domain} ({query_type})")
         }
+        // PR 6 Phase B: category-2 syscalls. These are supervisor-side
+        // (syscall-interception) shapes, not LLM-driven; the agent
+        // path never produces them. Return a placeholder rather than
+        // attempting execution.
+        grith_proxy::types::ToolCallType::OwnershipChange { .. }
+        | grith_proxy::types::ToolCallType::FilesystemMutation { .. }
+        | grith_proxy::types::ToolCallType::CrossProcessAccess { .. }
+        | grith_proxy::types::ToolCallType::NamespaceOp { .. } => {
+            "PR 6 syscall-interception shape not executable from the agent path".into()
+        }
     }
 }
 
 /// Forward a proxy evaluation event to the dashboard server via HTTP POST.
 /// This is used when the dashboard runs as a separate process (no in-process ws_tx).
+///
+/// Posts to the bearer-authed `/api/ipc/events` endpoint (not the
+/// browser-facing surface) using the daemon IPC token written by the dashboard
+/// process to `~/.config/grith/daemon.token`, mirroring the supervisor's
+/// `DaemonClient::forward_event`. Without the token the server rejects the
+/// injection, so the dashboard has no unauthenticated event-injection route.
 pub async fn forward_event_to_dashboard(dashboard_url: &str, event: &serde_json::Value) {
-    let url = format!("{dashboard_url}/api/events");
+    let url = format!("{dashboard_url}/api/ipc/events");
     let client = reqwest::Client::new();
-    let _ = client
+    let mut request = client
         .post(&url)
         .json(event)
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await;
+        .timeout(std::time::Duration::from_secs(2));
+    if let Some(token) = crate::daemon::token::read_token() {
+        request = request.bearer_auth(token);
+    }
+    let _ = request.send().await;
 }
 
 #[cfg(test)]

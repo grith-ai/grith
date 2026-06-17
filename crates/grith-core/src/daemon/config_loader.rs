@@ -351,6 +351,10 @@ pub(crate) fn to_supervisor_config(
         max_concurrent_sessions: core.max_concurrent_sessions,
         pty_forwarding: core.pty_forwarding,
         require_sandbox: core.require_sandbox,
+        attach_mode: match core.attach_mode {
+            crate::config::AttachMode::Traceme => grith_supervisor::config::AttachMode::Traceme,
+            crate::config::AttachMode::Seize => grith_supervisor::config::AttachMode::Seize,
+        },
         platform: grith_supervisor::config::PlatformConfig {
             linux_mechanism: core.platform.linux_mechanism.clone(),
             macos_mechanism: core.platform.macos_mechanism.clone(),
@@ -369,6 +373,19 @@ pub(crate) fn to_supervisor_config(
         syscall_log_file: None,
         trace_syscalls_jsonl_file: None,
         reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+        // PR 6 Phase F: map core CoverageConfig → supervisor CoverageConfig.
+        coverage: grith_supervisor::config::CoverageConfig {
+            category1_hard_deny: core.coverage.category1_hard_deny,
+            category2_proxy: core.coverage.category2_proxy,
+            category3_namespace: core.coverage.category3_namespace,
+            category4_arch_priv: core.coverage.category4_arch_priv,
+        },
+        // Default tier — callers that need an audit-completeness setting
+        // should reach for `to_runtime_supervisor_config_with_audit`
+        // instead. This loader-side path is used for legacy/test sites
+        // and inherits today's "Spawns" default.
+        audit_completeness: grith_supervisor::config::AuditCompletenessLevel::default(),
+        pty_ownership_enforce: core.pty_ownership_enforce,
     }
 }
 

@@ -61,11 +61,12 @@
 #![cfg(target_os = "linux")]
 
 mod child;
+pub(crate) mod clamp;
 mod classify;
 mod events;
 pub(crate) mod seccomp;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // x86_64 syscall number constants
@@ -124,6 +125,8 @@ pub(crate) mod syscall_nr {
     pub const UNLINK: i64 = 87;
     /// `chmod(pathname, mode)` -- change file permissions.
     pub const CHMOD: i64 = 90;
+    /// `fchmod(fd, mode)` -- change file permissions by fd.
+    pub const FCHMOD: i64 = 91;
     /// `getdents64(fd, dirp, count)` -- read directory entries.
     pub const GETDENTS64: i64 = 217;
     /// `openat(dirfd, pathname, flags, mode)` -- open a file relative to a directory fd.
@@ -173,7 +176,120 @@ pub(crate) mod syscall_nr {
     /// used by glibc's `fexecve()`. Must be intercepted alongside `execve` to
     /// prevent bypassing exec provenance checks.
     pub const EXECVEAT: i64 = 322;
+    /// PR 6 Phase A: kernel-module load. Loads an ELF module from a
+    /// user-space buffer into the running kernel — has no legitimate
+    /// use in supervised AI tools.
+    pub const INIT_MODULE: i64 = 175;
+    /// PR 6 Phase A: kernel-module load from a file descriptor.
+    /// Sibling of `init_module`; equally privileged.
+    pub const FINIT_MODULE: i64 = 313;
+    /// PR 6 Phase A: kernel-module unload. Symmetric to `init_module`
+    /// — supervised tools should not be removing kernel modules.
+    pub const DELETE_MODULE: i64 = 176;
+    /// PR 6 Phase A: replace the running kernel with a new image at
+    /// the next reboot. The "atomic boot kit" syscall — no legitimate
+    /// use in dev tools.
+    pub const KEXEC_LOAD: i64 = 246;
+    /// PR 6 Phase A: kexec from a file descriptor. Sibling of
+    /// `kexec_load`.
+    pub const KEXEC_FILE_LOAD: i64 = 320;
+
+    // ── PR 6 Phase B: ownership change family ──
+    /// `chown(path, uid, gid)` — change file owner/group by path.
+    pub const CHOWN: i64 = 92;
+    /// `fchown(fd, uid, gid)` — change file owner/group by fd.
+    pub const FCHOWN: i64 = 93;
+    /// `lchown(path, uid, gid)` — like `chown` but doesn't follow symlinks.
+    pub const LCHOWN: i64 = 94;
+    /// `fchownat(dirfd, path, uid, gid, flags)` — change owner/group
+    /// relative to a directory fd.
+    pub const FCHOWNAT: i64 = 260;
+
+    // ── PR 6 Phase B: filesystem mutation family ──
+    /// `mount(src, target, fstype, flags, data)` — mount a filesystem.
+    pub const MOUNT: i64 = 165;
+    /// `umount2(target, flags)` — unmount with flags. x86_64 has no
+    /// separate `umount`; `umount2` covers both shapes.
+    pub const UMOUNT2: i64 = 166;
+    /// `pivot_root(new_root, put_old)` — change the root filesystem.
+    pub const PIVOT_ROOT: i64 = 155;
+    /// `chroot(path)` — change the process root directory.
+    pub const CHROOT: i64 = 161;
+    /// `open_tree(dfd, filename, flags)` — clone/open a mount tree.
+    pub const OPEN_TREE: i64 = 428;
+    /// `move_mount(from_dfd, from_pathname, to_dfd, to_pathname, flags)`.
+    pub const MOVE_MOUNT: i64 = 429;
+    /// `fsopen(fs_name, flags)` — create a new filesystem context.
+    pub const FSOPEN: i64 = 430;
+    /// `fsconfig(fd, cmd, key, value, aux)` — configure a filesystem context.
+    pub const FSCONFIG: i64 = 431;
+    /// `fsmount(fd, flags, ms_flags)` — create a mount from a filesystem context.
+    pub const FSMOUNT: i64 = 432;
+    /// `fspick(dfd, path, flags)` — select a mount for reconfiguration.
+    pub const FSPICK: i64 = 433;
+    /// `mount_setattr(dfd, path, flags, attr, size)` — change mount attributes.
+    pub const MOUNT_SETATTR: i64 = 442;
+
+    // ── PR 6 Phase B: cross-process access family ──
+    /// `ptrace(request, pid, addr, data)` — attach/detach/read/write
+    /// memory of another process.
+    pub const PTRACE: i64 = 101;
+    /// `process_vm_readv(pid, local_iov, ..., remote_iov, ...)` — read
+    /// memory directly from another process.
+    pub const PROCESS_VM_READV: i64 = 310;
+    /// `process_vm_writev(pid, local_iov, ..., remote_iov, ...)` —
+    /// write memory directly into another process.
+    pub const PROCESS_VM_WRITEV: i64 = 311;
+
+    // ── PR 6 Phase C: namespace primitives ──
+    /// `unshare(flags)` — disassociate parts of the caller's execution
+    /// context (mount/uts/pid/net/user/ipc/cgroup namespaces).
+    pub const UNSHARE: i64 = 272;
+    /// `setns(fd, nstype)` — re-associate the caller with the namespace
+    /// referred to by `fd`.
+    pub const SETNS: i64 = 308;
+
+    // ── PR 6 Phase D: architecture-specific privileged ops ──
+    // All hard-denied unconditionally. Each represents a host-wide
+    // authority change that no supervised AI tool has any reason to
+    // attempt; if a tool is calling these, it's either a bug or an
+    // exploit. The supervisor blocks at the source.
+
+    /// `sethostname(name, len)` — set the system hostname. Global
+    /// identity change visible to every other process on the host.
+    pub const SETHOSTNAME: i64 = 170;
+    /// `setdomainname(name, len)` — set the NIS domain name.
+    /// Same shape as `sethostname`.
+    pub const SETDOMAINNAME: i64 = 171;
+    /// `iopl(level)` — set the I/O privilege level (x86 only).
+    /// Grants direct access to all I/O ports. Hard-deny.
+    pub const IOPL: i64 = 172;
+    /// `ioperm(from, num, turn_on)` — toggle access to specific
+    /// I/O ports (x86 only). Same threat as `iopl`.
+    pub const IOPERM: i64 = 173;
+    /// `swapon(path, flags)` — bring a swap area online.
+    /// Kernel resource-management; no dev-tool use.
+    pub const SWAPON: i64 = 167;
+    /// `swapoff(path)` — disable a swap area.
+    pub const SWAPOFF: i64 = 168;
+    /// `reboot(magic1, magic2, cmd, arg)` — reboot, halt, or change
+    /// reboot semantics. Obvious hard-deny.
+    pub const REBOOT: i64 = 169;
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// PR 6 Phase C: CLONE_NEW* flag bits (must match Linux uapi).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Bitmask covering every `CLONE_NEW*` namespace-creation flag.
+/// A `flags` argument intersecting any bit here is a namespace
+/// primitive (regardless of which syscall delivered it).
+///
+/// Currently used only by tests; the production
+/// `unshare`/`setns` arms in classify.rs forward the full flag
+/// word to the proxy and let downstream code interpret it.
+#[allow(dead_code)]
+pub(crate) const CLONE_NEW_NS_MASK: u64 = 0x0000_0000_7E02_0000;
 
 /// The complete set of syscall numbers that grith classifies as
 /// security-relevant. Used by [`is_security_relevant`] for fast lookup.
@@ -201,6 +317,7 @@ pub(crate) const SECURITY_RELEVANT: &[i64] = &[
     syscall_nr::MKDIR,
     syscall_nr::UNLINK,
     syscall_nr::CHMOD,
+    syscall_nr::FCHMOD,
     syscall_nr::GETDENTS64,
     syscall_nr::OPENAT,
     syscall_nr::MKDIRAT,
@@ -231,6 +348,67 @@ pub(crate) const SECURITY_RELEVANT: &[i64] = &[
     // execveat(322): like execve but relative to a directory fd. Used by
     // glibc fexecve(). Must be intercepted to prevent exec provenance bypass.
     syscall_nr::EXECVEAT,
+    // PR 6 Phase A: kernel-module load/unload + kexec replacement.
+    // No legitimate use in supervised AI tools. Hard-denied in
+    // event_handler.rs before proxy evaluation, mirroring io_uring.
+    syscall_nr::INIT_MODULE,
+    syscall_nr::FINIT_MODULE,
+    syscall_nr::DELETE_MODULE,
+    syscall_nr::KEXEC_LOAD,
+    syscall_nr::KEXEC_FILE_LOAD,
+    // PR 6 Phase B: ownership change (chown family). LLM-escapable
+    // path to make a file owner-writable by itself. Proxy-evaluated
+    // with +5.0 baseline → QUEUE by default.
+    syscall_nr::CHOWN,
+    syscall_nr::FCHOWN,
+    syscall_nr::LCHOWN,
+    syscall_nr::FCHOWNAT,
+    // PR 6 Phase B: filesystem mutation. mount/umount2/pivot_root
+    // can reshape the supervised process's filesystem view to bypass
+    // path-based filters.
+    syscall_nr::MOUNT,
+    syscall_nr::UMOUNT2,
+    syscall_nr::PIVOT_ROOT,
+    syscall_nr::CHROOT,
+    syscall_nr::OPEN_TREE,
+    syscall_nr::MOVE_MOUNT,
+    syscall_nr::FSOPEN,
+    syscall_nr::FSCONFIG,
+    syscall_nr::FSMOUNT,
+    syscall_nr::FSPICK,
+    syscall_nr::MOUNT_SETATTR,
+    // PR 6 Phase B: cross-process access. ptrace + process_vm_*
+    // bypass file/network filters by reading/writing sibling-process
+    // memory directly. process_vm_* against self (target_pid == own
+    // PID) is filtered out in classify so the supervisor's own use
+    // doesn't trip.
+    syscall_nr::PTRACE,
+    syscall_nr::PROCESS_VM_READV,
+    syscall_nr::PROCESS_VM_WRITEV,
+    // PR 6 Phase C: namespace primitives. `unshare`/`setns` are
+    // proxy-evaluated unless the calling binary lives in a routine
+    // root AND its canonical path is in the profile's
+    // `namespace_users` list (bwrap/bubblewrap/firejail by default).
+    // `clone` is already in this list as a ProcessFork producer;
+    // clone-with-CLONE_NEW* flag detection is intentionally deferred
+    // (would require parsing the flags argument inside the existing
+    // clone arm and routing the namespace-flagged variant
+    // separately).
+    syscall_nr::UNSHARE,
+    syscall_nr::SETNS,
+    // PR 6 Phase D: architecture-specific privileged ops. All hard-
+    // denied unconditionally in event_handler.rs before proxy
+    // evaluation, mirroring the io_uring / kernel-module pattern.
+    // iopl/ioperm are x86-only but the syscall numbers exist on the
+    // x86_64 ABI we target; on other architectures the entries are
+    // simply never reached by classify_syscall.
+    syscall_nr::SETHOSTNAME,
+    syscall_nr::SETDOMAINNAME,
+    syscall_nr::IOPL,
+    syscall_nr::IOPERM,
+    syscall_nr::SWAPON,
+    syscall_nr::SWAPOFF,
+    syscall_nr::REBOOT,
 ];
 
 /// Returns `true` if the given raw syscall number is one grith wants to
@@ -307,6 +485,43 @@ pub struct PtraceSupervisor {
     /// attached). When this process exits, the supervisor loop terminates
     /// immediately — orphaned children are cleaned up via `PTRACE_O_EXITKILL`.
     pub(crate) root_pid: Option<u32>,
+
+    /// Wedge-detection bookkeeping: timestamp of the most recent ptrace
+    /// event we've recorded for each supervised tid. Used by `wedge_scan`
+    /// to identify tracees that have gone silent. Updated at every event
+    /// boundary in `next_event` and at every `allow`/`deny`/`detach`.
+    pub(crate) last_event_at: HashMap<u32, std::time::Instant>,
+
+    /// Wedge-detection bookkeeping: short label of the last event recorded
+    /// for each supervised tid (e.g. `"seccomp"`, `"stopped"`,
+    /// `"ptrace-event:3"`). Carried into `WedgedTracee` forensic dumps so
+    /// the investigator sees what we last saw the tracee do.
+    pub(crate) last_event_kind: HashMap<u32, String>,
+
+    /// Attach mechanism for spawned tracees. `Traceme` is the shipped path;
+    /// `Seize` is scaffolded but not yet implemented (the spawn path returns
+    /// a clear error for it). Set from config via `set_attach_mode` before
+    /// the first spawn. See `work/futurework/ptrace-seize-migration.md`.
+    pub(crate) attach_mode: crate::config::AttachMode,
+
+    /// Wedge forensics: the ptrace resume primitive last issued for each tid —
+    /// `"CONT"` (PTRACE_CONT, seccomp path) or `"SYSCALL"` (PTRACE_SYSCALL,
+    /// fallback/attach path). Recorded in `resume_tracee`; surfaced in
+    /// `WedgedTracee`. Discriminates the clone-child wrong-primitive race: a
+    /// wedged freshly-cloned child showing `"SYSCALL"` was resumed before its
+    /// seccomp membership was registered (the H1 fingerprint).
+    pub(crate) last_resume_primitive: HashMap<u32, &'static str>,
+
+    /// True when the supervised root was spawned with a TSYNC'd seccomp-BPF
+    /// filter (the `grith exec` path). Because TSYNC propagates the filter to
+    /// every thread and `fork`/`clone` child, ALL tracees in such a session
+    /// must be resumed with `PTRACE_CONT`, not `PTRACE_SYSCALL`. Resuming a
+    /// per-tid decision on `seccomp_tracees` set-membership races the clone
+    /// window (a child's own stop can be handled before its parent's CLONE
+    /// event registers it), which wedged clone children on `PTRACE_SYSCALL`.
+    /// `false` for attach-without-seccomp sessions, which keep the
+    /// `PTRACE_SYSCALL` fallback path.
+    pub(crate) seccomp_session: bool,
 }
 
 impl PtraceSupervisor {
@@ -319,6 +534,11 @@ impl PtraceSupervisor {
             seccomp_tracees: HashSet::new(),
             sigchld: None,
             root_pid: None,
+            last_event_at: HashMap::new(),
+            last_event_kind: HashMap::new(),
+            attach_mode: crate::config::AttachMode::Traceme,
+            last_resume_primitive: HashMap::new(),
+            seccomp_session: false,
         }
     }
 

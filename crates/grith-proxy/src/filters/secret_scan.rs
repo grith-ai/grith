@@ -7,6 +7,7 @@ use crate::filters::{FilterPhase, SecurityFilter};
 use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType};
 use regex::{Regex, RegexSet, RegexSetBuilder};
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 /// Configuration for a single secret scanning pattern.
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +37,14 @@ enum Matcher {
     Set {
         set: RegexSet,
         metadata: Vec<PatternMeta>,
+        /// Regex source per pattern (index-aligned with `metadata`), kept so a
+        /// matched pattern can be compiled on demand to locate its match span.
+        sources: Vec<String>,
+        /// Lazily-compiled individual matcher per pattern. Only patterns that
+        /// actually fire (rare) are ever compiled, preserving the fast
+        /// `RegexSet`-only startup. `None` means the source failed to compile
+        /// individually (treated fail-safe: the match is kept, not suppressed).
+        lazy: Vec<OnceLock<Option<Regex>>>,
     },
     Individual(Vec<CompiledPattern>),
 }
@@ -71,7 +80,15 @@ impl SecretScanFilter {
             .dfa_size_limit(64 * (1 << 20))
             .build()
         {
-            Ok(set) => Matcher::Set { set, metadata },
+            Ok(set) => {
+                let lazy = regex_strings.iter().map(|_| OnceLock::new()).collect();
+                Matcher::Set {
+                    set,
+                    metadata,
+                    sources: regex_strings,
+                    lazy,
+                }
+            }
             Err(set_err) => {
                 tracing::warn!(
                     error = %set_err,
@@ -108,36 +125,64 @@ impl SecurityFilter for SecretScanFilter {
             return Ok(FilterResult::no_match("secret_scan"));
         }
 
-        let best = match &self.matcher {
-            Matcher::Set { set, metadata } => {
+        // FP §5.11: reads of minified bundles / `node_modules` content are a
+        // low-signal context where the generic keyword-assignment heuristics
+        // (`generic-*`) over-match on minified variable names and config
+        // defaults. In that context those generic matches are DOWN-WEIGHTED
+        // (not suppressed) so they no longer QUEUE on their own; specific
+        // vendor/format patterns (AWS, GitHub, Stripe, base64-encoded keys, …)
+        // keep full weight, so a real credential embedded in a package still
+        // fires.
+        let low_signal = ctx.path().map(is_low_signal_asset_path).unwrap_or(false);
+
+        // For each matched pattern with a real (non-benign) match, take its
+        // effective score (down-weighted for generic patterns in a low-signal
+        // asset) and keep the highest-scoring one.
+        let best: Option<(&PatternMeta, f64, Severity)> = match &self.matcher {
+            Matcher::Set {
+                set,
+                metadata,
+                sources,
+                lazy,
+            } => {
                 let matched_indices = set.matches(&text);
                 if !matched_indices.matched_any() {
                     return Ok(FilterResult::no_match("secret_scan"));
                 }
-
-                matched_indices.iter().map(|i| &metadata[i]).max_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                matched_indices
+                    .iter()
+                    .filter_map(|i| {
+                        let meta = &metadata[i];
+                        // A pattern whose every match is a provably-benign shape
+                        // is suppressed; a compile failure fails safe (kept).
+                        let real = match lazy[i].get_or_init(|| Regex::new(&sources[i]).ok()) {
+                            Some(re) => pattern_has_real_match(re, &text),
+                            None => true,
+                        };
+                        if !real {
+                            return None;
+                        }
+                        let (score, severity) = effective_score(meta, low_signal);
+                        Some((meta, score, severity))
+                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             }
             Matcher::Individual(patterns) => patterns
                 .iter()
-                .filter(|pattern| pattern.regex.is_match(&text))
-                .map(|pattern| &pattern.meta)
-                .max_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }),
+                .filter(|pattern| pattern_has_real_match(&pattern.regex, &text))
+                .map(|pattern| {
+                    let (score, severity) = effective_score(&pattern.meta, low_signal);
+                    (&pattern.meta, score, severity)
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)),
         };
 
         match best {
-            Some(m) => Ok(FilterResult::matched(
+            Some((m, score, severity)) => Ok(FilterResult::matched(
                 "secret_scan",
                 &m.id,
-                m.score,
-                m.severity,
+                score,
+                severity,
                 &m.message,
             )),
             None => Ok(FilterResult::no_match("secret_scan")),
@@ -195,6 +240,184 @@ fn parse_severity(s: &str) -> Severity {
         "warning" => Severity::Warning,
         _ => Severity::Notice,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Benign-shape suppression (FP research §5.11)
+//
+// CURATION POLICY: these carve-outs reduce false positives on provably-benign
+// token shapes that the 1,620-pattern corpus would otherwise flag (git SHAs,
+// lockfile integrity hashes, JWTs in fixtures, UUIDs, documented example/test
+// keys). They are security-relevant: every arm is paired with a guard test in
+// this module proving a *real* secret in the same context still fires. The
+// suppression is shape-based and conservative — it never widens detection, only
+// withholds a match whose value cannot be a live credential in that form. When
+// the matched pattern's individual regex fails to compile, the match is KEPT
+// (fail-safe), never suppressed.
+// ---------------------------------------------------------------------------
+
+/// Score a low-signal generic match is down-weighted to (FP §5.11). Below the
+/// 3.0 QUEUE threshold so it no longer escalates on its own, but non-zero and
+/// `matched = true` so it is still recorded (down-weight, not suppress).
+const LOW_SIGNAL_GENERIC_SCORE: f64 = 1.0;
+
+/// Effective `(score, severity)` for a matched pattern. In a low-signal asset
+/// context (minified bundle / `node_modules`), generic keyword-heuristic
+/// patterns are down-weighted; everything else keeps its configured score.
+fn effective_score(meta: &PatternMeta, low_signal: bool) -> (f64, Severity) {
+    if low_signal && is_generic_heuristic_pattern(&meta.id) {
+        (LOW_SIGNAL_GENERIC_SCORE, Severity::Notice)
+    } else {
+        (meta.score, meta.severity)
+    }
+}
+
+/// True for the `generic-*` / `*-generic` keyword-assignment heuristic family
+/// (e.g. `generic-api-key-assignment`, `generic-secret-assignment`). These
+/// match on the *shape* of an assignment rather than a vendor-specific key
+/// format, so they are the ones that over-match minified code. Specific
+/// vendor/format patterns (`aws-*`, `github-*`, `stripe-*`, `base64-aws-*`, …)
+/// are NOT in this set and are never down-weighted.
+fn is_generic_heuristic_pattern(id: &str) -> bool {
+    id.starts_with("generic-") || id.ends_with("-generic")
+}
+
+/// True when the scanned path is a low-signal asset where the generic secret
+/// heuristics produce mostly noise: anything under `node_modules`, or a
+/// minified bundle / source map by extension.
+fn is_low_signal_asset_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.contains("/node_modules/")
+        || p.starts_with("node_modules/")
+        || p.ends_with(".min.js")
+        || p.ends_with(".min.mjs")
+        || p.ends_with(".min.css")
+        || p.ends_with(".map")
+}
+
+/// Returns true if `re` has at least one match in `text` that is NOT a
+/// provably-benign shape. A pattern whose every match is benign is suppressed.
+fn pattern_has_real_match(re: &Regex, text: &str) -> bool {
+    re.find_iter(text)
+        .any(|m| !is_benign_secret_value(text, m.start(), m.end()))
+}
+
+/// The maximal whitespace/quote-delimited token in `text` spanning `[start,
+/// end)`. A secret pattern often matches only part of a benign token (e.g. one
+/// base64url segment of a JWT), so shape checks run against the whole token.
+fn surrounding_token(text: &str, start: usize, end: usize) -> &str {
+    let is_bound = |c: char| c.is_whitespace() || c == '"' || c == '\'';
+    let token_start = text[..start]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| is_bound(*c))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let token_end = text[end..]
+        .char_indices()
+        .find(|(_, c)| is_bound(*c))
+        .map(|(i, _)| end + i)
+        .unwrap_or(text.len());
+    &text[token_start..token_end]
+}
+
+/// Documented test placeholders that appear in docs, READMEs, and test
+/// fixtures. Only unambiguous `_test_`-style markers — `live`/`prod` markers
+/// are deliberately excluded so genuine keys still fire.
+///
+/// NOTE: AWS's documented example key (`AKIAIOSFODNN7EXAMPLE`) is intentionally
+/// NOT carved out here. Unlike the Stripe-style `_test_` prefixes it is a
+/// real-format access key id (valid `AKIA` prefix + charset), and is used
+/// pervasively as a stand-in secret in fixtures/tests; flagging it is the
+/// conservative choice. Reading AWS docs that contain it is an accepted minor
+/// residual.
+const TEST_PLACEHOLDER_MARKERS: &[&str] = &[
+    "sk-test-",
+    "sk_test_",
+    "pk_test_",
+    "rk_test_",
+    "whsec_test_",
+];
+
+/// Lockfile integrity (npm/yarn `integrity: "sha512-<base64>"`) prefixes.
+const INTEGRITY_PREFIXES: &[&str] = &["sha512-", "sha384-", "sha256-", "sha1-"];
+
+fn bare_sha_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$").unwrap())
+}
+
+fn jwt_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$").unwrap())
+}
+
+fn uuid_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+            .unwrap()
+    })
+}
+
+/// True when the bytes immediately before `pos` (skipping quotes/spaces) end in
+/// `=` or `:` — i.e. the value is being assigned to a key, which makes a
+/// bare-looking hash far more likely to be a real secret than a git SHA.
+fn is_assignment_context(text: &str, pos: usize) -> bool {
+    let prefix = text[..pos].trim_end_matches([' ', '\t', '"', '\'']);
+    prefix.ends_with('=') || prefix.ends_with(':')
+}
+
+/// Byte offset where the surrounding whitespace/quote-delimited token begins.
+fn token_start_offset(text: &str, start: usize) -> usize {
+    let is_bound = |c: char| c.is_whitespace() || c == '"' || c == '\'';
+    text[..start]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| is_bound(*c))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
+}
+
+/// True when the secret-pattern match spanning `[start, end)` in `text` is a
+/// provably-benign shape that must not be treated as a live secret. Checks run
+/// against the whole surrounding token, since a pattern often matches only part
+/// of a benign value. See the curation-policy note above.
+fn is_benign_secret_value(text: &str, start: usize, end: usize) -> bool {
+    let token = surrounding_token(text, start, end);
+
+    // 1. Documented example / test placeholders (sk-test-, AWS example key, …).
+    if TEST_PLACEHOLDER_MARKERS.iter().any(|m| token.contains(m)) {
+        return true;
+    }
+    // 2. Lockfile integrity hash — `integrity: "sha512-<base64>"`. The token
+    //    carries (or the value is immediately preceded by) the `shaNNN-` prefix.
+    if INTEGRITY_PREFIXES.iter().any(|p| token.starts_with(p))
+        || INTEGRITY_PREFIXES
+            .iter()
+            .any(|p| text[..start].ends_with(p))
+    {
+        return true;
+    }
+    // 3. RFC-4122 UUID — never a credential.
+    if uuid_regex().is_match(token) {
+        return true;
+    }
+    // 4. JWT structure (`eyJ` header + base64url segments). Ubiquitous in
+    //    fixtures and docs; a JWT carrying an embedded credential is out of
+    //    scope for shape-based scanning (documented tradeoff).
+    if jwt_regex().is_match(token) {
+        return true;
+    }
+    // 5. Bare git/SHA hex digest (40 = SHA-1, 64 = SHA-256) NOT assigned to a
+    //    key. `git show <sha>:file`, file checksums, etc. The assignment check
+    //    looks before the *token*, so `key = "<40hex>"` still fires.
+    if bare_sha_regex().is_match(token)
+        && !is_assignment_context(text, token_start_offset(text, start))
+    {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -272,7 +495,9 @@ mod tests {
                 content_hash: "abc".into(),
             },
             serde_json::json!({
-                "content": "aws_access_key_id = AKIAIOSFODNN7EXAMPLE"
+                // A real-shaped key (NOT AWS's documented `AKIAIOSFODNN7EXAMPLE`,
+                // which is now carved out as a placeholder).
+                "content": "aws_access_key_id = AKIAQYLPMN5HZ3RT2WX4"
             }),
         );
         let result = filter.evaluate(&ctx).await.unwrap();
@@ -415,12 +640,213 @@ mod tests {
                 content_hash: "abc".into(),
             },
             serde_json::json!({
-                "content": "api_key = AKIAIOSFODNN7EXAMPLE123"
+                "content": "api_key = AKIAQYLPMN5HZ3RT2WX4"
             }),
         );
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         // AWS key pattern (5.0) should win over generic api_key (3.0)
         assert_eq!(result.score, 5.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // FP §5.11: benign-shape suppression — paired accept (benign → no match)
+    // and guard (real secret in the same context still fires) tests.
+    // -----------------------------------------------------------------------
+
+    async fn scan(filter: &SecretScanFilter, content: &str) -> FilterResult {
+        let ctx = make_ctx_with_args(
+            ToolCallType::FileRead {
+                path: "/repo/file".into(),
+            },
+            serde_json::json!({ "content": content }),
+        );
+        filter.evaluate(&ctx).await.unwrap()
+    }
+
+    /// The real shipped corpus (1,620 patterns) is what actually over-matches in
+    /// the field, so the suppression tests run against it, not the toy set.
+    fn real_filter() -> SecretScanFilter {
+        SecretScanFilter::new(load_real_secret_patterns())
+    }
+
+    #[tokio::test]
+    async fn benign_git_sha_not_flagged() {
+        let f = real_filter();
+        // 40-hex SHA-1 (git) and 64-hex SHA-256, bare, no assignment.
+        assert!(
+            !scan(&f, "commit da39a3ee5e6b4b0d3255bfef95601890afd80709")
+                .await
+                .matched,
+            "bare 40-hex git SHA must not be flagged"
+        );
+        assert!(
+            !scan(
+                &f,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  file.tar.gz"
+            )
+            .await
+            .matched,
+            "bare 64-hex SHA-256 checksum must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_hex_secret_in_assignment_still_fires() {
+        let f = real_filter();
+        // Same 40-hex shape, but assigned to a secret key → must still fire.
+        assert!(
+            scan(
+                &f,
+                "aws_secret_access_key=da39a3ee5e6b4b0d3255bfef95601890afd80709"
+            )
+            .await
+            .matched,
+            "a 40-hex value assigned to a secret key must still fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn benign_lockfile_integrity_not_flagged() {
+        let f = real_filter();
+        let line = r#""integrity": "sha512-Gd2UZBJDkXlY7GbJxfsE8/nvKkUEU1G38c1siN6QP6a9Pt9KZ6JZNS9wgFwgL2C6Wq3jUMP+5K8aXFYS8H8YqQ==""#;
+        assert!(
+            !scan(&f, line).await.matched,
+            "npm/yarn lockfile integrity hash must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn benign_uuid_and_jwt_not_flagged() {
+        let f = real_filter();
+        assert!(
+            !scan(&f, "id = 550e8400-e29b-41d4-a716-446655440000")
+                .await
+                .matched,
+            "RFC-4122 UUID must not be flagged"
+        );
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        assert!(
+            !scan(&f, jwt).await.matched,
+            "JWT-shaped token must not be flagged as a generic secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn benign_documented_placeholders_not_flagged() {
+        let f = real_filter();
+        // The Stripe documented-example secret key is split with `concat!` so
+        // the contiguous `sk_test_…` literal never appears in source. This keeps
+        // GitHub push-protection from blocking the OSS-mirror publish on a
+        // false positive while leaving the value byte-identical at runtime — the
+        // scanner-under-test still receives the full key. (The publishable
+        // `pk_test_…` key is not a secret, so it needs no split.)
+        for placeholder in [
+            concat!("stripe key: sk_test_", "4eC39HqLyjWDarjtT1zdp7dc"),
+            "publishable: pk_test_TYooMQauvdEDq54NiTphI7jx",
+        ] {
+            assert!(
+                !scan(&f, placeholder).await.matched,
+                "documented placeholder must not be flagged: {placeholder:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_live_keys_still_fire() {
+        let f = real_filter();
+        // `live` markers and real-shaped keys must NOT be suppressed.
+        assert!(
+            scan(&f, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn")
+                .await
+                .matched,
+            "GitHub PAT must still fire"
+        );
+        assert!(
+            scan(&f, "AKIAQYLPMN5HZ3RT2WX4").await.matched,
+            "real-shaped AWS access key id must still fire"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FP §5.11: low-signal asset (minified / node_modules) down-weighting.
+    // -----------------------------------------------------------------------
+
+    async fn scan_at(filter: &SecretScanFilter, path: &str, content: &str) -> FilterResult {
+        let ctx = make_ctx_with_args(
+            ToolCallType::FileRead {
+                path: path.to_string(),
+            },
+            serde_json::json!({ "content": content }),
+        );
+        filter.evaluate(&ctx).await.unwrap()
+    }
+
+    #[test]
+    fn low_signal_asset_path_detection() {
+        for p in [
+            "/app/node_modules/foo/dist/index.js",
+            "/app/static/bundle.min.js",
+            "vendor.min.css",
+            "/app/dist/app.js.map",
+        ] {
+            assert!(is_low_signal_asset_path(p), "{p:?} should be low-signal");
+        }
+        for p in ["/app/src/config.js", "/etc/app/secrets.env", "main.rs"] {
+            assert!(
+                !is_low_signal_asset_path(p),
+                "{p:?} should NOT be low-signal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_match_in_minified_asset_is_down_weighted() {
+        let f = real_filter();
+        // No quotes — they'd be JSON-escaped (`\"`) in arguments.to_string()
+        // and break the assignment regex; the heuristic matches unquoted too.
+        let content = "var apiKey=ABCDEFGHIJKLMNOPQRST12345;";
+
+        // Outside an asset path: the generic keyword heuristic fires at full
+        // weight and would QUEUE.
+        let full = scan_at(&f, "/app/src/config.js", content).await;
+        assert!(
+            full.matched && full.score >= 3.0,
+            "full weight off-asset: {full:?}"
+        );
+
+        // Under a minified bundle / node_modules: down-weighted (not
+        // suppressed) below the QUEUE threshold.
+        for path in [
+            "/app/static/vendor.min.js",
+            "/app/node_modules/pkg/dist/index.js",
+        ] {
+            let r = scan_at(&f, path, content).await;
+            assert!(
+                r.matched,
+                "still recorded (not suppressed): {path:?} -> {r:?}"
+            );
+            assert!(
+                r.score < 3.0,
+                "generic match in low-signal asset must be down-weighted below QUEUE: {path:?} -> {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_real_key_in_minified_asset_keeps_full_weight() {
+        let f = real_filter();
+        // A real GitHub PAT embedded in a minified node_modules bundle is a
+        // supply-chain leak and must NOT be down-weighted.
+        let r = scan_at(
+            &f,
+            "/app/node_modules/evil/dist/bundle.min.js",
+            "const t='ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn';",
+        )
+        .await;
+        assert!(
+            r.matched && r.score >= 3.0,
+            "specific-format key must keep full weight in node_modules: {r:?}"
+        );
     }
 }

@@ -21,6 +21,102 @@ pub struct GrithConfig {
     pub server: ServerConfig,
     pub supervisor: SupervisorCoreConfig,
     pub notifications: NotificationConfig,
+    pub audit: AuditConfig,
+}
+
+/// Audit-log completeness configuration.
+///
+/// Controls how much of the supervisor's intercepted activity is persisted
+/// to the audit log. Higher levels add forensic / analytics value at the
+/// cost of audit-DB growth and supervisor-thread overhead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Completeness tier — see `AuditCompleteness` for the level semantics.
+    pub completeness: AuditCompleteness,
+    /// Days of full + compact audit rows to retain in the active DB.
+    /// Older rows get archived (if `cold_storage_enabled`) and deleted
+    /// in a contiguous-prefix prune that preserves chain integrity.
+    /// Set to 0 to disable retention entirely.
+    pub retain_full_days: u32,
+    /// Days of compact rows to retain. NOTE: not independently enforced
+    /// today — the single hash chain only supports prefix prunes, so the
+    /// effective compact cutoff matches `retain_full_days`. Reserved for
+    /// the dual-chain follow-up (audit-completeness-scaling.md W2).
+    pub retain_compact_days: u32,
+    /// When true, prune writes archive files to `<audit_dir>/cold/` as
+    /// date-partitioned NDJSON.zst before deleting from the active DB.
+    pub cold_storage_enabled: bool,
+    /// How often the daemon's prune task runs (hours). 0 disables periodic
+    /// pruning entirely; the daemon still prunes once on startup unless
+    /// `retain_full_days = 0`.
+    pub prune_interval_hours: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            completeness: AuditCompleteness::Spawns,
+            retain_full_days: 30,
+            retain_compact_days: 7,
+            cold_storage_enabled: true,
+            prune_interval_hours: 24,
+        }
+    }
+}
+
+/// Audit completeness tiers, from least to most data.
+///
+/// * `Decisions` — historical default. Only events that reach the proxy
+///   pipeline produce audit rows. Routine activity (anything matched by
+///   `session_allowed` or the noise filter) is filtered without trace.
+/// * `Spawns` — adds a compact audit row for every routine ProcessSpawn
+///   short-circuit. Answers "what binaries did the session actually
+///   execute?" with modest write volume. Default.
+/// * `Io` — additionally records routine file reads / writes. Forensic-ish.
+///   Expect ~100-1000× audit-DB growth versus `Decisions`.
+/// * `All` — additionally records noise-path events
+///   (`/proc/`, `/dev/null`, `/var/cache/`, …). Best for compliance / SIEM
+///   exports; requires retention tuning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditCompleteness {
+    Decisions,
+    #[default]
+    Spawns,
+    Io,
+    All,
+}
+
+impl AuditCompleteness {
+    // The core-side methods mirror the supervisor-side
+    // `AuditCompletenessLevel` for API symmetry. The supervisor crate
+    // owns its own enum to avoid a dependency cycle; the bridge
+    // function in `to_runtime_supervisor_config_with_audit` maps
+    // between them. Hot-path callers go through the supervisor mirror,
+    // so these methods are kept as part of the public surface but
+    // aren't called from within `grith-core` itself.
+    /// Whether the level wants a compact row for routine `ProcessSpawn`
+    /// events that short-circuit ahead of the proxy pipeline.
+    #[allow(dead_code)]
+    pub fn records_routine_spawns(&self) -> bool {
+        matches!(self, Self::Spawns | Self::Io | Self::All)
+    }
+
+    /// Whether the level wants a compact row for routine file-I/O events
+    /// (FileRead / FileWrite / FileAppend / FileDelete / FileChmod /
+    /// DirCreate / DirList) that short-circuit ahead of the proxy.
+    #[allow(dead_code)]
+    pub fn records_routine_io(&self) -> bool {
+        matches!(self, Self::Io | Self::All)
+    }
+
+    /// Whether the level wants a compact row for events the noise filter
+    /// (`is_noise_path`) discards before any policy evaluation.
+    #[allow(dead_code)]
+    pub fn records_noise_paths(&self) -> bool {
+        matches!(self, Self::All)
+    }
 }
 
 /// General daemon settings (log level, audit directory, plan tier).
@@ -98,20 +194,133 @@ pub struct RoutingConfig {
     pub complex_keywords: Vec<String>,
 }
 
-/// Security proxy scoring thresholds and cold-start parameters.
+/// Security proxy scoring thresholds (fixed; applied to every call).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     pub auto_allow_threshold: f64,
     pub auto_deny_threshold: f64,
-    pub cold_start_calls: u64,
-    pub cold_start_escalation_low: f64,
-    pub cold_start_escalation_high: f64,
     /// Seconds to wait for human review before auto-denying a queued tool call.
     /// Used by the agent loop (not supervisor, which has its own freeze_timeout_seconds).
     pub review_timeout_seconds: u64,
     /// Per-filter enable/disable overrides.
     pub filters: FilterGroupConfig,
+    /// PR 4 Phase H: ProcessSpawn-specific settings.
+    pub spawn: SpawnConfig,
+    /// Rate-limit / volume-detection rollout settings. See the
+    /// risk-gated-burst redesign in
+    /// `work/futurework/rate-limit-burst-redesign.md`.
+    pub rate_limit: ProxyRateLimitConfig,
+    /// Destructive-action coverage settings (work item 68).
+    pub destructive_action: DestructiveActionConfig,
+}
+
+/// Destructive-action coverage configuration (work item 68). Gates the
+/// `destructive-action` filter that hard-denies catastrophic host/storage
+/// destruction and escalates destructive-against-production to DENY.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DestructiveActionConfig {
+    /// Enable the destructive-action filter. Default **`true`** — this is the
+    /// coverage that backs grith's public "blocks the destructive step"
+    /// claim. Operators who hit a false positive on a specific verb can
+    /// disable the whole filter here; per-rule disable is a follow-up.
+    pub enabled: bool,
+}
+
+impl Default for DestructiveActionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Rate-limit volume-detection rollout configuration. Holds the rollout
+/// flag for the risk-gated burst signal — the FP-reduction reshape
+/// documented in [`work/futurework/rate-limit-burst-redesign.md`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxyRateLimitConfig {
+    /// Gate the `rate_limit` filter's volume penalties (burst `+3.0`,
+    /// per-minute `+2.0`, approaching `+1.0`) on per-op risk: they only
+    /// apply to operations carrying a risk signal (tainted source, network
+    /// egress, or egress-capable spawn). A burst of untainted routine file
+    /// churn (`~/.cache`, `.git/` internals, build outputs) never escalates,
+    /// which subsumes the per-pattern scratch exemptions (now retired).
+    ///
+    /// Default **`true`** (rollout step 4): the supervisor's target-aware
+    /// mass-destruction signal backfills the one case risk-gating drops (an
+    /// untainted destructive spree). Operators can set `false` to restore the
+    /// legacy frequency-blind burst counter — note that doing so also forfeits
+    /// the per-pattern scratch/`~/.cache`/`.git` exemptions, which were retired
+    /// in favour of this gate.
+    ///
+    /// Implementation reads this through `RateLimitFilter`'s
+    /// `with_risk_gated_burst` builder so the runtime cost on the hot path
+    /// is a single field load.
+    pub risk_gated_burst: bool,
+}
+
+impl Default for ProxyRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            risk_gated_burst: true,
+        }
+    }
+}
+
+/// PR 4 Phase H: ProcessSpawn-specific proxy configuration. Holds the
+/// rollout flag for the provenance-backed routine-spawn signal — the
+/// `+0.5` reduction documented in [`work/64-pr4-provenance-routine-spawn-work.md`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpawnConfig {
+    /// Enable the provenance-backed routine-spawn signal added in PR 4.
+    /// Default `false` until operators have verified the session-pinned
+    /// inventory (Phase C) and audit-log routing (Phase F) are emitting
+    /// the data the dashboard needs. See the rollout doc for the order
+    /// of enablement.
+    ///
+    /// Implementation reads this through `OperationRiskFilter`'s
+    /// `routine_signal_enabled` constructor argument so the runtime
+    /// cost on the spawn hot path is a single field load.
+    pub routine_provenance_signal: bool,
+    /// Enable PR 2's data-flow-based taint-on-spawn rule. When false,
+    /// taint keeps the legacy behavior: any active session taint adds
+    /// `+3.0` to every spawn. When true, the taint score applies only
+    /// when argv/env/fd-lineage/outbound-binary/shell-pattern checks
+    /// show plausible flow from tainted data to the spawn.
+    ///
+    /// Default **`true`** (FP research §5.2): the legacy "any taint → +3.0 on
+    /// every spawn/connect" flagged read-credential-then-use-credential as a
+    /// false positive (read `~/.npmrc` then `npm install`, `~/.kube/config`
+    /// then `kubectl`, `~/.aws/credentials` then `aws`). The data-flow rule
+    /// still catches genuine exfil (it fires when argv references the tainted
+    /// path/env or a pipe/redirect carries it). Operators can set `false` to
+    /// restore the legacy behavior.
+    pub taint_data_flow_only: bool,
+    /// Narrow condition 4 of the data-flow taint rule (FP research §5.2).
+    /// When true, an outbound-capable binary under taint (`git push`,
+    /// `aws s3 ls`, `npm publish`) only fires when the spawn actually
+    /// references the tainted data (argv path/env, pipe/redirect, or
+    /// shell-pattern) — not merely because a credential was read earlier and
+    /// the tool is outbound-capable. Genuine exfil of the tainted data still
+    /// fires (conditions 1–3/5), and outbound-to-untrusted-destination is
+    /// independently scored by the egress filter.
+    ///
+    /// Default **`true`**: the standalone outbound-binary trigger was the
+    /// dominant own-credential false positive (read `~/.aws/credentials` then
+    /// `aws s3 ls`). Operators can set `false` to restore the standalone fire.
+    pub taint_outbound_requires_data_flow: bool,
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        Self {
+            routine_provenance_signal: false,
+            taint_data_flow_only: true,
+            taint_outbound_requires_data_flow: true,
+        }
+    }
 }
 
 /// Per-filter enable/disable toggles for Phase 3 (context) filters.
@@ -122,11 +331,49 @@ pub struct ProxyConfig {
 #[serde(default)]
 pub struct FilterGroupConfig {
     pub reputation: FilterToggle,
-    pub behavioural: FilterToggle,
+    /// PR 69 Change 1: behavioural now carries tunable knobs alongside
+    /// the on/off toggle — previously `FilterToggle`, so `min_calls_for_baseline`
+    /// and the deviation scores in `config/default.toml` were ignored
+    /// by the daemon at construction time.
+    pub behavioural: BehaviouralFilterConfig,
     pub taint: FilterToggle,
     pub rate_limit: FilterToggle,
     pub egress: FilterToggle,
     pub session_containment: FilterToggle,
+}
+
+/// PR 69 Change 1: operator-tunable behavioural filter config.
+/// Mirrors `grith_proxy::filters::behavioural::BehaviouralConfig` plus
+/// the `enabled` toggle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BehaviouralFilterConfig {
+    pub enabled: bool,
+    pub min_calls_for_baseline: usize,
+    pub mild_deviation_score: f64,
+    pub significant_deviation_score: f64,
+}
+
+impl Default for BehaviouralFilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_calls_for_baseline: 200,
+            mild_deviation_score: 1.0,
+            significant_deviation_score: 3.0,
+        }
+    }
+}
+
+impl BehaviouralFilterConfig {
+    /// Convert to the proxy-layer behavioural config struct.
+    pub fn to_proxy_config(&self) -> grith_proxy::filters::behavioural::BehaviouralConfig {
+        grith_proxy::filters::behavioural::BehaviouralConfig {
+            min_calls_for_baseline: self.min_calls_for_baseline,
+            mild_deviation_score: self.mild_deviation_score,
+            significant_deviation_score: self.significant_deviation_score,
+        }
+    }
 }
 
 /// Single filter enable/disable toggle.
@@ -214,6 +461,13 @@ pub struct ServerConfig {
     /// Seconds to wait after the last supervisor session exits before
     /// auto-shutting down the daemon. Set to 0 to disable idle shutdown.
     pub idle_shutdown_seconds: u64,
+    /// Open the dashboard in the operator's default browser when the server
+    /// starts, handing off the dashboard token via the URL fragment so it is
+    /// never rendered to the terminal. Skipped automatically on headless /
+    /// SSH sessions (no `$DISPLAY` / `$SSH_CONNECTION` set). When disabled, or
+    /// when no browser can be opened, the CLI prints a single-use pairing URL
+    /// instead of the raw token. Defaults to `true`.
+    pub auto_open_dashboard: bool,
 }
 
 /// Per-bucket API rate limiting configuration.
@@ -243,8 +497,31 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// How the Linux supervisor attaches to the supervised process tree.
+///
+/// Migration knob for the `PTRACE_SEIZE` work (see
+/// `work/futurework/ptrace-seize-migration.md`). `traceme` is the current,
+/// shipped mechanism; `seize` is being built behind this flag so the two
+/// paths can coexist during rollout. Defaults to `traceme` — selecting
+/// `seize` today aborts the session with a clear "not yet implemented"
+/// error rather than silently falling back, so the flag's effect is
+/// observable. No effect on macOS/Windows (their interceptors don't use
+/// ptrace).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachMode {
+    /// `fork` + child `PTRACE_TRACEME` + `execve` (current, shipped).
+    #[default]
+    Traceme,
+    /// Parent `PTRACE_SEIZE` of the child after a pre-exec barrier (WIP).
+    Seize,
+}
+
 /// Supervisor configuration (v1.5 — CLI supervisor mode).
 /// Maps to `grith_supervisor::config::SupervisorConfig` at runtime.
+// Independent operator knobs (enabled / pty_forwarding / require_sandbox /
+// pty_ownership_enforce) — collapsing them would hide that independence.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SupervisorCoreConfig {
@@ -253,6 +530,8 @@ pub struct SupervisorCoreConfig {
     pub freeze_timeout_seconds: u64,
     pub max_concurrent_sessions: usize,
     pub pty_forwarding: bool,
+    /// Linux attach mechanism (`traceme` | `seize`). See [`AttachMode`].
+    pub attach_mode: AttachMode,
     /// Refuse startup if the platform cannot provide full per-syscall interception.
     /// When `true`, `grith exec` aborts if the supervision backend is degraded
     /// (macOS lifecycle-only) or unavailable (ptrace blocked). Defaults to `false`.
@@ -260,6 +539,66 @@ pub struct SupervisorCoreConfig {
     pub platform: SupervisorPlatformConfig,
     pub noise_reduction: SupervisorNoiseConfig,
     pub dns_inspection: SupervisorDnsInspectionConfig,
+    /// PR 6: per-category coverage flags for the staged rollout of
+    /// syscall-coverage expansion. See `CoverageConfig`.
+    pub coverage: CoverageConfig,
+    /// H2 Option 1: enforce PTY ownership. When `false` (default), writes to a
+    /// `/dev/pts/N` that is not the supervised tool's own controlling terminal
+    /// are detected + forensically logged but still allowed (audit-only); when
+    /// `true`, they are denied (the `echo > /dev/pts/<sibling-pane>` injection
+    /// vector). Off by default until the false-positive budget is measured.
+    #[serde(default)]
+    pub pty_ownership_enforce: bool,
+}
+
+/// PR 6 Phase F: per-category coverage feature flags.
+///
+/// Each PR 6 category can be enabled or disabled independently so
+/// operators can stage the rollout. When a category is disabled, its
+/// syscalls fall through to the "not security-relevant" branch (silent
+/// allow), matching pre-PR-6 behaviour.
+///
+/// Defaults reflect the work-doc's recommended rollout:
+///   - Categories 1 and 4 are extreme ops with no legitimate dev-tool
+///     use → ON by default (the kernel-module / kexec / reboot
+///     family).
+///   - Categories 2 and 3 may queue legitimate operations until
+///     operator profiles are calibrated → OFF by default.
+///
+/// The four bools are intentional — each represents an independent
+/// staged-rollout knob with its own threat model.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoverageConfig {
+    /// Category 1: hard-deny kernel-module load/unload + kexec.
+    /// No legitimate use in supervised AI tools. **Default ON.**
+    pub category1_hard_deny: bool,
+    /// Category 2: proxy-evaluated chown / mount / ptrace family.
+    /// May QUEUE legitimate operations during calibration. **Default
+    /// OFF.** Enable once the relevant profile capability grants
+    /// (fs:ownership / fs:mount / process:ptrace) are wired.
+    pub category2_proxy: bool,
+    /// Category 3: namespace primitives (unshare/setns) with the
+    /// profile-declared `namespace_users` carveout. **Default OFF.**
+    /// Enable once the profile's `namespace_users` and
+    /// `routine_exec_roots` have been audited together.
+    pub category3_namespace: bool,
+    /// Category 4: hard-deny arch-privileged ops (sethostname /
+    /// iopl / swapon / reboot, etc.). **Default ON** — same threat
+    /// profile as Category 1.
+    pub category4_arch_priv: bool,
+}
+
+impl Default for CoverageConfig {
+    fn default() -> Self {
+        Self {
+            category1_hard_deny: true,
+            category2_proxy: false,
+            category3_namespace: false,
+            category4_arch_priv: true,
+        }
+    }
 }
 
 /// Platform-specific interception mechanism configuration.
@@ -547,11 +886,11 @@ impl Default for ProxyConfig {
         Self {
             auto_allow_threshold: 3.0,
             auto_deny_threshold: 8.0,
-            cold_start_calls: 0,
-            cold_start_escalation_low: 2.0,
-            cold_start_escalation_high: 10.0,
             review_timeout_seconds: 300,
             filters: FilterGroupConfig::default(),
+            spawn: SpawnConfig::default(),
+            rate_limit: ProxyRateLimitConfig::default(),
+            destructive_action: DestructiveActionConfig::default(),
         }
     }
 }
@@ -560,7 +899,7 @@ impl Default for FilterGroupConfig {
     fn default() -> Self {
         Self {
             reputation: FilterToggle { enabled: true },
-            behavioural: FilterToggle { enabled: true },
+            behavioural: BehaviouralFilterConfig::default(),
             taint: FilterToggle { enabled: true },
             rate_limit: FilterToggle { enabled: true },
             egress: FilterToggle { enabled: true },
@@ -596,6 +935,7 @@ impl Default for ServerConfig {
             tls: None,
             rate_limit: RateLimitConfig::default(),
             idle_shutdown_seconds: 30,
+            auto_open_dashboard: true,
         }
     }
 }
@@ -608,10 +948,13 @@ impl Default for SupervisorCoreConfig {
             freeze_timeout_seconds: 300,
             max_concurrent_sessions: 4,
             pty_forwarding: true,
+            attach_mode: AttachMode::default(),
             require_sandbox: false,
             platform: SupervisorPlatformConfig::default(),
             noise_reduction: SupervisorNoiseConfig::default(),
             dns_inspection: SupervisorDnsInspectionConfig::default(),
+            coverage: CoverageConfig::default(),
+            pty_ownership_enforce: false,
         }
     }
 }
@@ -1188,6 +1531,7 @@ fn apply_env_overrides(mut config: GrithConfig) -> GrithConfig {
     env_parse!(config, "GRITH_PROXY_REVIEW_TIMEOUT"          => proxy.review_timeout_seconds);
     env_parse!(config, "GRITH_SERVER_PORT"                   => server.port);
     env_parse!(config, "GRITH_SERVER_ENABLED"                => server.enabled);
+    env_parse!(config, "GRITH_AUTO_OPEN_DASHBOARD"           => server.auto_open_dashboard);
     env_parse!(config, "GRITH_SUPERVISOR_ENABLED"            => supervisor.enabled);
     env_parse!(config, "GRITH_SUPERVISOR_TIMEOUT"            => supervisor.freeze_timeout_seconds);
     env_parse!(config, "GRITH_SUPERVISOR_DNS_INSPECTION_ENABLED" => supervisor.dns_inspection.enabled);
@@ -1443,6 +1787,50 @@ enabled = true
         assert!(config.proxy.filters.behavioural.enabled);
         // Unset filters use default (true)
         assert!(config.proxy.filters.taint.enabled);
+    }
+
+    /// Risk-gated-burst rollout flag: defaults off, and `proxy.rate_limit.
+    /// risk_gated_burst = true` from TOML must reach `ProxyConfig` so the
+    /// filter registry can pass it to `RateLimitFilter::with_risk_gated_burst`.
+    /// See work/futurework/rate-limit-burst-redesign.md.
+    #[test]
+    fn test_risk_gated_burst_flag_wired() {
+        // Default is ON (rollout step 4): risk-gating is the shipped behaviour.
+        assert!(GrithConfig::default().proxy.rate_limit.risk_gated_burst);
+
+        // Operators can opt out via TOML.
+        let toml_str = r#"
+[proxy.rate_limit]
+risk_gated_burst = false
+"#;
+        let config: GrithConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.proxy.rate_limit.risk_gated_burst);
+
+        // Round-trips through serialization.
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: GrithConfig = toml::from_str(&serialized).unwrap();
+        assert!(!reparsed.proxy.rate_limit.risk_gated_burst);
+    }
+
+    /// PR 69 Change 1: `min_calls_for_baseline` from TOML must reach the
+    /// proxy config struct (previously the daemon hard-coded 20 even when
+    /// `config/default.toml` advertised 200).
+    #[test]
+    fn test_behavioural_config_keys_wired() {
+        let toml_str = r#"
+[proxy.filters.behavioural]
+enabled = true
+min_calls_for_baseline = 200
+mild_deviation_score = 0.75
+significant_deviation_score = 4.25
+"#;
+        let config: GrithConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.proxy.filters.behavioural.enabled);
+        assert_eq!(config.proxy.filters.behavioural.min_calls_for_baseline, 200);
+        let proxy_cfg = config.proxy.filters.behavioural.to_proxy_config();
+        assert_eq!(proxy_cfg.min_calls_for_baseline, 200);
+        assert_eq!(proxy_cfg.mild_deviation_score, 0.75);
+        assert_eq!(proxy_cfg.significant_deviation_score, 4.25);
     }
 
     #[test]

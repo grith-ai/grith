@@ -40,9 +40,6 @@ fn make_proxy_with_capabilities(grants: Vec<CapabilityGrant>) -> SecurityProxy {
     let scoring = ScoringConfig {
         auto_allow_threshold: 3.0,
         auto_deny_threshold: 8.0,
-        cold_start_calls: 0, // Skip cold start for predictable thresholds
-        cold_start_escalation_low: 2.0,
-        cold_start_escalation_high: 10.0,
     };
     let meta_rules = MetaRuleEngine::new(vec![]);
     SecurityProxy::new(registry, scoring, meta_rules)

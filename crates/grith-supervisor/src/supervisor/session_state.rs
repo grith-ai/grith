@@ -63,6 +63,13 @@ impl SessionStats {
         self.total_intercepted += 1;
         self.total_intercepted
     }
+
+    /// Count of calls the proxy actually evaluated (allowed/queued/denied),
+    /// excluding noise-filtered syscalls. Used as the "meaningful activity"
+    /// signal that drives the session's idle age — noise must not reset idle.
+    pub fn proxy_evals(&self) -> u64 {
+        self.total_allowed + self.total_queued + self.total_denied
+    }
 }
 
 /// A single active supervisor session tracking one supervised CLI tool.
@@ -94,11 +101,36 @@ pub struct SupervisorSession {
     /// Last time this session was synced via IPC (heartbeat).
     /// Used by `reap_dead()` to detect stale thin-client sessions whose
     /// PID liveness checks may be unreliable (e.g. ptraced processes).
+    ///
+    /// This is a pure liveness signal — it is refreshed on *every* snapshot
+    /// push (including noise-only traffic), so it must NOT be used as the
+    /// session's idle age. Use `last_activity_at` for that.
     pub last_synced_at: Instant,
+    /// Last time the proxy evaluated a real (non-noise) call for this session.
+    /// Bumped by the sync paths when `stats.proxy_evals()` increases. Drives
+    /// the dashboard "Idle" column so background noise does not pin idle to 0.
+    pub last_activity_at: Instant,
     /// Cumulative statistics for this session.
     pub stats: SessionStats,
     /// Project name derived from the working directory (e.g., "grith-website").
     pub project_name: Option<String>,
+    /// Absolute working directory the supervised tool was launched from.
+    /// Surfaced in `grith exec list` and the dashboard so an operator can
+    /// locate a forgotten/orphaned session.
+    pub cwd: Option<String>,
+    /// Controlling terminal of the launching CLI (e.g. "pts/21"). The single
+    /// most useful "where do I go to close this" hint for a human.
+    pub tty: Option<String>,
+    /// Wedge-watchdog dedup: tids we've already reported as wedged this
+    /// session. Avoids spamming the log + audit DB on every 10s scan when
+    /// the same tid stays stuck. Cleared at session end.
+    pub wedge_reported_tids: std::collections::HashSet<u32>,
+    /// H2 Option 1: the supervised tool's own controlling terminal (e.g.
+    /// `/dev/pts/3`), resolved once (lazily) from `/proc/<root_pid>/fd/0` and
+    /// cached. `Some(None)` means "resolved, but not a pts" (redirected
+    /// stdin). Used to distinguish writes to the tool's own terminal from
+    /// writes injected into a sibling pane's pts.
+    pub controlling_pts: std::sync::OnceLock<Option<String>>,
 }
 
 impl SupervisorSession {
@@ -118,9 +150,28 @@ impl SupervisorSession {
             root_pid,
             started_at: now,
             last_synced_at: now,
+            last_activity_at: now,
             stats: SessionStats::default(),
             project_name: None,
+            cwd: None,
+            tty: None,
+            wedge_reported_tids: std::collections::HashSet::new(),
+            controlling_pts: std::sync::OnceLock::new(),
         }
+    }
+
+    /// H2 Option 1: the supervised tool's controlling pts (`/dev/pts/N`),
+    /// resolved once from `/proc/<root_pid>/fd/0` and cached. Returns `None`
+    /// if stdin is not a pts or the link can't be read.
+    pub fn controlling_pts(&self) -> Option<&str> {
+        self.controlling_pts
+            .get_or_init(|| {
+                std::fs::read_link(format!("/proc/{}/fd/0", self.root_pid))
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .filter(|s| s.starts_with("/dev/pts/"))
+            })
+            .as_deref()
     }
 
     /// Wall-clock seconds since the session was created.
@@ -141,8 +192,15 @@ impl SupervisorSession {
             id: self.id,
             tool_name: self.tool_name.clone(),
             project_name: self.project_name.clone(),
+            cwd: self.cwd.clone(),
+            tty: self.tty.clone(),
             root_pid: self.root_pid,
             uptime_seconds: self.started_at.elapsed().as_secs(),
+            // Seconds since the last *meaningful* (proxy-evaluated, non-noise)
+            // call — the session's idle age. Decoupled from the liveness
+            // heartbeat (`last_synced_at`) so background noise traffic does not
+            // pin idle to 0.
+            last_activity_seconds: self.last_activity_at.elapsed().as_secs(),
             stats: self.stats.clone(),
             containment_remaining_seconds: None,
         }
@@ -167,8 +225,17 @@ pub struct SessionSummary {
     /// Project name derived from the working directory (e.g., "grith-website").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+    /// Absolute working directory the supervised tool was launched from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Controlling terminal of the launching CLI (e.g. "pts/21").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
     pub root_pid: u32,
     pub uptime_seconds: u64,
+    /// Seconds since the last heartbeat/activity — the session's "idle" age.
+    #[serde(default)]
+    pub last_activity_seconds: u64,
     pub stats: SessionStats,
     /// Remaining seconds of containment, or `None` if this session is not
     /// currently in containment mode.
@@ -391,8 +458,11 @@ mod tests {
             id: Uuid::nil(),
             tool_name: "claude-code".into(),
             project_name: None,
+            cwd: None,
+            tty: None,
             root_pid: 42,
             uptime_seconds: 120,
+            last_activity_seconds: 5,
             stats: SessionStats {
                 total_intercepted: 10,
                 total_allowed: 8,
@@ -416,8 +486,11 @@ mod tests {
             id: Uuid::nil(),
             tool_name: "codex".into(),
             project_name: None,
+            cwd: None,
+            tty: None,
             root_pid: 10,
             uptime_seconds: 60,
+            last_activity_seconds: 0,
             stats: SessionStats::default(),
             containment_remaining_seconds: Some(245),
         };
@@ -433,8 +506,11 @@ mod tests {
             id,
             tool_name: "aider".into(),
             project_name: None,
+            cwd: None,
+            tty: None,
             root_pid: 1,
             uptime_seconds: 0,
+            last_activity_seconds: 0,
             stats: SessionStats::default(),
             containment_remaining_seconds: None,
         };

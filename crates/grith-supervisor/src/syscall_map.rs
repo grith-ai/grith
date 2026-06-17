@@ -99,10 +99,75 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
         // RawSocketCreate is hard-denied in event_handler before reaching here;
         // this arm is unreachable in practice but makes the mapping explicit.
         SyscallKind::RawSocketCreate { .. } => None,
+        // PR 6 Phase A: KernelModuleOp / KexecLoad are hard-denied in
+        // event_handler before reaching here. Match explicitly so an
+        // accidental routing-through is a compile-time error.
+        SyscallKind::KernelModuleOp { .. } | SyscallKind::KexecLoad { .. } => None,
+        // PR 6 Phase D: ArchPrivilegedOp is hard-denied in
+        // event_handler before reaching here.
+        SyscallKind::ArchPrivilegedOp { .. } => None,
+        // PR 6 Phase B: category-2 syscalls map to dedicated
+        // ToolCallType variants. operation_risk scores +5.0 baseline
+        // → QUEUE by default. Profile capability grants can lower.
+        SyscallKind::OwnershipChange {
+            path,
+            new_uid,
+            new_gid,
+            ..
+        } => Some(ToolCallType::OwnershipChange {
+            target: path.clone(),
+            new_uid: *new_uid,
+            new_gid: *new_gid,
+        }),
+        SyscallKind::FilesystemMutation {
+            op,
+            source,
+            target,
+            fstype,
+        } => Some(ToolCallType::FilesystemMutation {
+            op: format!("{op:?}").to_ascii_lowercase(),
+            source: source.clone(),
+            target: target.clone(),
+            fstype: fstype.clone(),
+        }),
+        SyscallKind::CrossProcessAccess { op, target_pid } => {
+            Some(ToolCallType::CrossProcessAccess {
+                op: format!("{op:?}").to_ascii_lowercase(),
+                target_pid: *target_pid,
+            })
+        }
+        // PR 6 Phase C: namespace primitive. The supervisor's
+        // `event_handler.rs` short-circuits this to a silent allow
+        // when the calling binary is on the profile's
+        // `namespace_users` list. When that carveout doesn't match,
+        // the call reaches the proxy and `operation_risk` scores
+        // +5.0 → QUEUE.
+        SyscallKind::NamespaceOp { syscall, flags } => Some(ToolCallType::NamespaceOp {
+            syscall: format!("{syscall:?}").to_ascii_lowercase(),
+            flags: *flags,
+        }),
         // Filtered out: fd-only reads/writes without path, ProcessFork,
         // regular NetSendTo (connected datagrams), PipeCreate, SocketPair
         _ => None,
     }
+}
+
+/// True for ANOTHER process's environment or memory under `/proc`
+/// (`/proc/<pid>/environ` or `/proc/<pid>/mem` where `<pid>` is numeric) — a
+/// cross-process secret-theft vector that must not be noise-exempt. The
+/// caller's own (`/proc/self/*`, `/proc/thread-self/*`) is benign and stays
+/// exempt. (Research doc §5.1 #1.)
+pub fn is_cross_process_secret_proc_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    if rest.starts_with("self/") || rest.starts_with("thread-self/") {
+        return false;
+    }
+    let mut parts = rest.splitn(2, '/');
+    let pid = parts.next().unwrap_or("");
+    let sub = parts.next().unwrap_or("");
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && (sub == "environ" || sub == "mem")
 }
 
 /// Check if a path should be filtered as noise (internal temp files, etc.).
@@ -110,13 +175,25 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
 /// These are paths that are accessed frequently by runtime internals but are
 /// not meaningful from a security perspective.
 pub fn is_noise_path(path: &str) -> bool {
-    path.starts_with("/proc/")
+    // /proc is noise EXCEPT another process's environment/memory, which leak
+    // that process's secrets (env vars, in-memory keys) — those must reach the
+    // proxy, not be silently exempt (research doc §5.1 #1). /proc/self/* and
+    // /proc/thread-self/* (the caller's own) stay exempt.
+    (path.starts_with("/proc/") && !is_cross_process_secret_proc_path(path))
         || path.starts_with("/sys/")
         || path.starts_with("/dev/null")
         || path.starts_with("/dev/urandom")
         || path.starts_with("/dev/random")
         || path.starts_with("/dev/pts/")
         || path.starts_with("/dev/tty")
+        // /dev/fd/N is just a reference to an FD the process already holds.
+        // The originating openat was already intercepted at open time, so
+        // there is no real authority to grant here. Same reasoning applies
+        // to /dev/stdin|stdout|stderr (symlinks into /dev/fd/0..2).
+        || path.starts_with("/dev/fd/")
+        || path == "/dev/stdin"
+        || path == "/dev/stdout"
+        || path == "/dev/stderr"
         || path.starts_with("/etc/ssl/")
         || path.starts_with("/etc/ca-certificates/")
         || path.starts_with("/usr/share/ca-certificates/")
@@ -209,14 +286,86 @@ pub fn is_sensitive_path(path: &str) -> bool {
     if file_name == ".env" || file_name.starts_with(".env.") {
         return true;
     }
+
+    // Credential / history files (read-then-exfil sources). This gate is what
+    // the `ignore_read_only` fast-path consults: a read-only open is allowed
+    // BEFORE the proxy UNLESS this returns true. So every file the taint filter
+    // treats as a sensitive source must appear here too, or the read never
+    // reaches the proxy and no taint is registered (research doc §5.1 #4 — this
+    // gate must stay a superset of the proxy's sensitive-read classifiers).
+    // `.git-credentials`/`.docker/config.json` are already covered above.
+    if matches!(
+        file_name,
+        ".netrc" | ".npmrc" | ".pypirc" | ".pgpass" | ".bash_history" | ".zsh_history"
+    ) {
+        return true;
+    }
+
+    // Another process's environment/memory under /proc is a cross-process
+    // secret-theft vector and must reach the proxy despite the /proc fast-paths
+    // and ignore_read_only (research doc §5.1 #1).
+    if is_cross_process_secret_proc_path(path) {
+        return true;
+    }
+    // Substring-keyword rule: a filename merely *containing* a
+    // credential-ish word. This is the broadest, weakest signal and the
+    // biggest false-positive source. Two carveouts keep it from mass-
+    // misfiring on ordinary code:
+    //
+    //   * `node_modules/` (PR 69 Change 5) — library filenames like
+    //     `tokenize.js` / `tokenTypes.js`.
+    //   * Source-code files — a class/module file whose NAME contains
+    //     "token"/"auth"/etc. (`AccessToken.php`, `RefreshToken.ts`,
+    //     `OAuth2Client.java`, `Tokenizer.go`) is code, not a credential
+    //     store. Real secrets live in `.env` / key files / credential dirs
+    //     (handled above, regardless of this carveout) — not in a `.php`
+    //     source file's *name*. Without this, an AI assistant reading a
+    //     vendored OAuth/SDK library floods the operator with prompts.
+    //
+    // The strong rules above (.env, key/cert files, credential dirs, system
+    // stores, /proc cross-process) are unaffected by both carveouts.
     if ["secret", "credential", "token", "apikey"]
         .iter()
         .any(|kw| file_name.contains(kw))
+        && !path_contains_node_modules(&path_lc)
+        && !is_source_code_filename(file_name)
     {
         return true;
     }
 
     false
+}
+
+/// True when `file_name` ends in a programming-language source extension — a
+/// code module, not a credential file. Used to suppress the weakest
+/// substring-keyword sensitivity rule (see [`is_sensitive_path`]). Config /
+/// data / script / key extensions (`.env`, `.json`, `.yaml`, `.sh`, `.sql`,
+/// `.pem`, …) are deliberately NOT here: those genuinely hold secrets.
+fn is_source_code_filename(file_name: &str) -> bool {
+    const SOURCE_EXTS: &[&str] = &[
+        ".php", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".py", ".pyi", ".rb", ".go",
+        ".rs", ".java", ".kt", ".kts", ".scala", ".cs", ".fs", ".c", ".h", ".cc", ".cpp", ".cxx",
+        ".hpp", ".hh", ".hxx", ".swift", ".m", ".mm", ".dart", ".lua", ".ex", ".exs", ".erl",
+        ".clj", ".cljs", ".hs", ".ml", ".mli", ".pl", ".pm", ".groovy", ".jl", ".nim", ".zig",
+        ".d", ".pas",
+    ];
+    SOURCE_EXTS.iter().any(|ext| file_name.ends_with(ext))
+}
+
+/// PR 69 Change 5: returns true if the symlink-resolved canonical path
+/// contains `/node_modules/` as a path component. Falls back to the raw
+/// path when canonicalisation fails — fail-safe because the carveout
+/// only suppresses one boolean rule; everything else still fires.
+fn path_contains_node_modules(path_lc: &str) -> bool {
+    if let Ok(canonical) = std::fs::canonicalize(path_lc) {
+        if let Some(s) = canonical.to_str() {
+            return s
+                .replace('\\', "/")
+                .to_lowercase()
+                .contains("/node_modules/");
+        }
+    }
+    path_lc.contains("/node_modules/")
 }
 
 #[cfg(test)]
@@ -482,6 +631,8 @@ mod tests {
     #[test]
     fn net_bind_maps_to_net_listen() {
         let kind = SyscallKind::NetBind {
+            sockaddr_ptr: None,
+            addrlen: None,
             address: "0.0.0.0".into(),
             port: 8080,
             protocol: crate::interceptor::NetProtocol::Tcp,
@@ -568,6 +719,24 @@ mod tests {
         assert!(is_noise_path("/proc/1234/maps"));
     }
 
+    // Protection suite (research doc §5.1 #1): another process's environment or
+    // memory leaks its secrets and must NOT be noise-exempt; the caller's own
+    // /proc/self/* stays exempt.
+    #[test]
+    fn cross_process_environ_and_mem_are_not_noise() {
+        assert!(is_cross_process_secret_proc_path("/proc/1234/environ"));
+        assert!(is_cross_process_secret_proc_path("/proc/1234/mem"));
+        assert!(!is_noise_path("/proc/1234/environ"));
+        assert!(!is_noise_path("/proc/1234/mem"));
+        // Own environment/memory + other /proc entries stay exempt.
+        assert!(!is_cross_process_secret_proc_path("/proc/self/environ"));
+        assert!(!is_cross_process_secret_proc_path("/proc/thread-self/mem"));
+        assert!(!is_cross_process_secret_proc_path("/proc/1234/status"));
+        assert!(is_noise_path("/proc/self/environ"));
+        assert!(is_noise_path("/proc/1234/status"));
+        assert!(is_noise_path("/proc/1234/maps"));
+    }
+
     #[test]
     fn sys_paths_are_noise() {
         assert!(is_noise_path("/sys/class/net/eth0"));
@@ -587,6 +756,28 @@ mod tests {
     #[test]
     fn dev_tty_is_noise() {
         assert!(is_noise_path("/dev/tty"));
+    }
+
+    #[test]
+    fn dev_fd_and_stdio_are_noise() {
+        // Process-local FD references — the originating openat is what gets
+        // policy-checked, so these aliases add no authority.
+        assert!(is_noise_path("/dev/fd/0"));
+        assert!(is_noise_path("/dev/fd/6"));
+        assert!(is_noise_path("/dev/fd/255"));
+        assert!(is_noise_path("/dev/stdin"));
+        assert!(is_noise_path("/dev/stdout"));
+        assert!(is_noise_path("/dev/stderr"));
+    }
+
+    #[test]
+    fn dev_fd_lookalikes_are_not_noise() {
+        // Guard against the prefix accidentally matching a real path. There
+        // is no real /dev/fdsomething or /dev/stdinX device, but we want the
+        // matcher to be exact so a future addition doesn't widen the surface
+        // by accident.
+        assert!(!is_noise_path("/dev/fdsomething"));
+        assert!(!is_noise_path("/dev/stdinjector"));
     }
 
     #[test]
@@ -693,6 +884,8 @@ mod tests {
     fn sink_net_bind_is_mapped() {
         // NetBind (server listen) could be used for reverse-shell exfiltration.
         let kind = SyscallKind::NetBind {
+            sockaddr_ptr: None,
+            addrlen: None,
             address: "0.0.0.0".into(),
             port: 4444,
             protocol: crate::interceptor::NetProtocol::Tcp,
@@ -767,6 +960,8 @@ mod tests {
                 protocol: crate::interceptor::NetProtocol::Tcp,
             },
             SyscallKind::NetBind {
+                sockaddr_ptr: None,
+                addrlen: None,
                 address: "0.0.0.0".into(),
                 port: 8080,
                 protocol: crate::interceptor::NetProtocol::Tcp,
@@ -848,5 +1043,78 @@ mod tests {
         assert!(!is_sensitive_path("/tmp/output.txt"));
         assert!(!is_sensitive_path("/var/log/syslog"));
         assert!(!is_sensitive_path("/usr/share/doc/README"));
+    }
+
+    /// Source files whose NAME contains a credential-ish word (`AccessToken.php`,
+    /// `RefreshToken.ts`, `OAuth2Client.java`) are code modules, not credential
+    /// stores. They must NOT be flagged — otherwise an AI assistant reading a
+    /// vendored OAuth/SDK library floods the operator with prompts.
+    #[test]
+    fn source_files_with_credential_words_in_name_are_not_sensitive() {
+        for p in [
+            "/proj/vendor/league/oauth2-client/src/Token/AccessToken.php",
+            "/proj/vendor/xeroapi/xero-php-oauth2/lib/Models/Identity/RefreshToken.php",
+            "/proj/mercury_html/docs/FPDI-2.6.0/src/PdfParser/Tokenizer.php",
+            "/proj/src/auth/OAuth2Client.ts",
+            "/proj/internal/token/Token.go",
+            "/proj/app/Secrets.java",
+            "/proj/lib/credentials.rb",
+        ] {
+            assert!(
+                !is_sensitive_path(p),
+                "source file should not be sensitive: {p}"
+            );
+        }
+    }
+
+    /// The carveout is extension-scoped: credential-ish NON-source files (data,
+    /// config, plain names) stay sensitive.
+    #[test]
+    fn non_source_credential_files_stay_sensitive_after_carveout() {
+        assert!(is_sensitive_path("/proj/api_token")); // no extension
+        assert!(is_sensitive_path("/proj/token.txt"));
+        assert!(is_sensitive_path("/proj/secrets.json"));
+        assert!(is_sensitive_path("/proj/credentials.yaml"));
+        assert!(is_sensitive_path("/proj/get_token.sh")); // scripts can hold real secrets
+    }
+
+    /// PR 69 Change 5: substring-token rule must not fire on legitimate
+    /// npm dependency filenames inside `node_modules/`. These were the
+    /// exact paths queued during the codex audit (session 7f256630-…).
+    #[test]
+    fn node_modules_tokenish_files_are_not_sensitive() {
+        assert!(!is_sensitive_path(
+            "/home/u/.nvm/versions/node/v22.22.2/lib/node_modules/npm/node_modules/postcss-selector-parser/dist/tokenize.js"
+        ));
+        assert!(!is_sensitive_path(
+            "/home/u/proj/node_modules/some-lib/dist/tokenTypes.js"
+        ));
+        assert!(!is_sensitive_path(
+            "/home/u/proj/node_modules/some-lib/auth-helper.js"
+        ));
+    }
+
+    /// PR 69 Change 5: other sensitive-path rules still fire on paths
+    /// that happen to be inside `node_modules/`. Only the substring-
+    /// token rule is suppressed.
+    #[test]
+    fn node_modules_still_protects_keys_and_env_files() {
+        // Key file inside node_modules should still match.
+        assert!(is_sensitive_path("/home/u/proj/node_modules/x/id_rsa"));
+        assert!(is_sensitive_path("/home/u/proj/node_modules/x/foo.pem"));
+        // .env inside node_modules should still match.
+        assert!(is_sensitive_path("/home/u/proj/node_modules/x/.env"));
+    }
+
+    /// PR 69 Change 5: a path with a decoy `node_modules_*` substring
+    /// (NOT an actual `/node_modules/` path component) does not inherit
+    /// the carveout — the substring-token rule still fires. The
+    /// supervisor's substring set is {secret, credential, token,
+    /// apikey}, so the filename here uses "token".
+    #[test]
+    fn node_modules_decoy_substring_does_not_grant_carveout() {
+        assert!(is_sensitive_path(
+            "/home/u/proj/node_modules_decoy/auth-token.txt"
+        ));
     }
 }

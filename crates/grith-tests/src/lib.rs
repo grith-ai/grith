@@ -19,12 +19,18 @@ pub use grith_proxy::filters::argument::ArgumentFilter;
 pub use grith_proxy::filters::canary::{CanaryFilter, CanaryRegistry};
 pub use grith_proxy::filters::capability::{CapabilityFilter, CapabilityGrant};
 pub use grith_proxy::filters::command::{CommandFilter, CommandRule};
+pub use grith_proxy::filters::destructive_action::DestructiveActionFilter;
 pub use grith_proxy::filters::dlp_gate::DlpGateFilter;
-pub use grith_proxy::filters::egress_policy::EgressPolicyFilter;
+pub use grith_proxy::filters::egress_policy::{EgressPolicyConfig, EgressPolicyFilter};
 pub use grith_proxy::filters::egress_rate::EgressRateFilter;
+pub use grith_proxy::filters::operation_risk::OperationRiskFilter;
 pub use grith_proxy::filters::path_match::{PathMatchFilter, PathRule};
+pub use grith_proxy::filters::rate_limit::RateLimitFilter;
+pub use grith_proxy::filters::reputation::ReputationFilter;
 pub use grith_proxy::filters::secret_scan::{SecretPattern, SecretScanFilter};
+pub use grith_proxy::filters::sensitive_path::SensitivePathHeuristicFilter;
 pub use grith_proxy::filters::session_containment::SessionContainmentFilter;
+pub use grith_proxy::filters::taint::TaintFilter;
 pub use grith_proxy::filters::FilterRegistry;
 pub use grith_proxy::meta_rules::MetaRuleEngine;
 pub use grith_proxy::scoring::ScoringConfig;
@@ -32,6 +38,113 @@ pub use grith_proxy::types::{
     FilterResult, ProxyAction, ProxyDecision, QueuePriority, Severity, TaintLevel, ToolCallContext,
     ToolCallType,
 };
+
+/// Build a `SecurityProxy` from the **real shipped `config/filters/*.toml`** —
+/// the FP-research §6.3 fidelity harness. Unlike [`TestFixtures::default_filter_registry`]
+/// (simplified inline rules), this loads the production path-match, secret-scan
+/// (full ~1600-pattern corpus), command, and egress configs, and wires the
+/// static + context filters with the same flags `config/default.toml` ships
+/// after the FP fixes (`taint_data_flow_only = true`,
+/// `taint_outbound_requires_data_flow = true`, `risk_gated_burst = true`,
+/// `routine_provenance_signal = false`). `ScoringConfig::default()` matches the
+/// shipped fixed `3.0`/`8.0` thresholds (there is no cold-start widening).
+///
+/// Included filters: operation_risk, path_match, sensitive_path, argument,
+/// secret_scan, command, destructive_action, egress_policy, **reputation** (static safe/malicious
+/// lists + raw-IP/suspicious-TLD scoring — it can ADD score on a single
+/// stateless op, so it is registered for fidelity), taint, rate_limit.
+///
+/// Deliberately EXCLUDED (documented fidelity gaps): allowlist + capability
+/// (reduce/neutralise — omission OVER-counts, safe); dlp_gate + canary +
+/// session_containment (exfil-specific); behavioural + egress_rate (per-session
+/// STATEFUL — cold on the fresh-session corpus); the meta-rule engine (its only
+/// score-ADDING rule, `env-exfiltration-risk +5.0`, needs accumulated env-file
+/// taint, which the fresh-session corpus never builds).
+///
+/// **Fidelity caveat:** because the corpus replays each op in a FRESH session
+/// (no taint/rate/behavioural accumulation), this harness validates the
+/// *single-op, cold-state* regime only. Taint-accumulation FP floods (read a
+/// credential → N tainted ops → meta-rule `env-exfiltration-risk`) are NOT
+/// exercised here and need a separate stateful-sequence fixture.
+pub fn production_filter_registry() -> SecurityProxy {
+    use serde::Deserialize;
+    let dir =
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/filters"));
+    let read = |f: &str| {
+        let p = dir.join(f);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    };
+
+    #[derive(Deserialize)]
+    struct Rules<T> {
+        rules: Vec<T>,
+    }
+    #[derive(Deserialize)]
+    struct Patterns {
+        patterns: Vec<SecretPattern>,
+    }
+    #[derive(Deserialize)]
+    struct EgressFile {
+        egress: EgressPolicyConfig,
+    }
+    #[derive(Deserialize, Default)]
+    struct DomainList {
+        #[serde(default)]
+        domains: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct DomainsFile {
+        #[serde(default)]
+        known_safe: DomainList,
+        #[serde(default)]
+        known_malicious: DomainList,
+    }
+
+    let path_rules: Rules<PathRule> = toml::from_str(&read("paths.toml")).expect("paths.toml");
+    let command_rules: Rules<CommandRule> =
+        toml::from_str(&read("commands.toml")).expect("commands.toml");
+    let secrets: Patterns = toml::from_str(&read("secrets.toml")).expect("secrets.toml");
+    let egress: EgressFile = toml::from_str(&read("egress.toml")).expect("egress.toml");
+    let domains: DomainsFile = toml::from_str(&read("domains.toml")).expect("domains.toml");
+    let safe: std::collections::HashSet<String> = domains
+        .known_safe
+        .domains
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let malicious: std::collections::HashSet<String> = domains
+        .known_malicious
+        .domains
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    let mut reg = FilterRegistry::new();
+    // Phase 1 (static)
+    reg.register(Box::new(OperationRiskFilter::with_routine_signal(false)));
+    reg.register(Box::new(PathMatchFilter::new(path_rules.rules)));
+    reg.register(Box::new(SensitivePathHeuristicFilter::new()));
+    reg.register(Box::new(ArgumentFilter::new()));
+    // Phase 2 (pattern)
+    reg.register(Box::new(SecretScanFilter::new(secrets.patterns)));
+    reg.register(Box::new(CommandFilter::new(command_rules.rules)));
+    reg.register(Box::new(DestructiveActionFilter::new()));
+    if egress.egress.enabled {
+        reg.register(Box::new(EgressPolicyFilter::from_config(egress.egress)));
+    }
+    // Phase 3 (context) — flags as shipped post-FP-fixes.
+    reg.register(Box::new(ReputationFilter::new(malicious, safe)));
+    reg.register(Box::new(
+        TaintFilter::with_defaults()
+            .with_spawn_data_flow_only(true)
+            .with_outbound_taint_requires_data_flow(true),
+    ));
+    reg.register(Box::new(
+        RateLimitFilter::with_defaults().with_risk_gated_burst(true),
+    ));
+
+    SecurityProxy::new(reg, ScoringConfig::default(), MetaRuleEngine::new(vec![]))
+}
 
 /// Pre-configured test environment with all subsystems ready for integration testing.
 pub struct TestFixtures {
@@ -142,7 +255,11 @@ impl TestFixtures {
     pub fn full_filter_registry() -> FilterRegistry {
         let mut registry = Self::default_filter_registry();
 
+        // Phase 1: heuristic sensitive-path filter (production ships it).
+        registry.register(Box::new(SensitivePathHeuristicFilter::new()));
+
         // Phase 2: Pattern filters (v1.6)
+        registry.register(Box::new(DestructiveActionFilter::new()));
         registry.register(Box::new(EgressPolicyFilter::with_defaults()));
         registry.register(Box::new(DlpGateFilter::with_defaults()));
         registry.register(Box::new(CanaryFilter::new(Arc::new(
@@ -236,6 +353,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             score: 5.0,
             severity: "critical".into(),
             message: "Access to SSH private key".into(),
+            exclude: vec![],
         },
         PathRule {
             id: "ssh-dir".into(),
@@ -249,6 +367,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             score: 3.0,
             severity: "warning".into(),
             message: "Access to SSH directory".into(),
+            exclude: vec![],
         },
         PathRule {
             id: "env-file".into(),
@@ -257,6 +376,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             score: 3.0,
             severity: "warning".into(),
             message: "Access to environment file".into(),
+            exclude: vec![],
         },
         PathRule {
             id: "pem-files".into(),
@@ -265,6 +385,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             score: 4.0,
             severity: "error".into(),
             message: "Access to PEM file".into(),
+            exclude: vec![],
         },
     ]
 }
@@ -371,9 +492,6 @@ mod tests {
         let scoring = ScoringConfig {
             auto_allow_threshold: 5.0,
             auto_deny_threshold: 9.0,
-            cold_start_calls: 100,
-            cold_start_escalation_low: 3.0,
-            cold_start_escalation_high: 11.0,
         };
         let fixtures = TestFixtures::with_scoring(scoring);
         assert_eq!(fixtures.proxy.filter_count(), 6);

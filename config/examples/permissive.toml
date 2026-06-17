@@ -7,7 +7,6 @@ log_level = "info"
 [proxy]
 auto_allow_threshold = 5.0
 auto_deny_threshold = 9.0
-cold_start_calls = 50
 review_timeout_seconds = 120  # 2 minutes for permissive mode
 
 [digest]

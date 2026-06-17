@@ -16,8 +16,66 @@
 //! the audit log and digest queue via grith-audit / grith-digest.
 
 use async_trait::async_trait;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
+
+/// Forensic snapshot of a tracee that appears wedged in a ptrace stop.
+///
+/// Produced by [`SyscallInterceptor::wedge_scan`] on every watchdog tick so
+/// the next investigation has live `/proc` state for any tracee that's been
+/// silent for longer than the configured threshold. The watchdog is
+/// observation-only — it does NOT auto-release the tracee, on the basis
+/// that masking the wedge would also mask the underlying bug.
+#[derive(Debug, Clone)]
+pub struct WedgedTracee {
+    /// Tracee tid that hasn't produced an event in `since_last_event`.
+    pub tid: u32,
+    /// Elapsed time since the supervisor last recorded an event for this
+    /// tid (received from the kernel or sent back via allow/deny).
+    pub since_last_event: Duration,
+    /// Last event-kind string the supervisor recorded for this tid (e.g.
+    /// `"seccomp"`, `"stopped"`, `"ptrace-event:3"`, `"allow"`). `None`
+    /// when nothing has ever been recorded — typically a tid that was
+    /// just added to `supervised` but hasn't seen its first event.
+    pub last_event_kind: Option<String>,
+    /// `/proc/<tid>/comm` — short thread name (e.g. `"HeapHelper"`).
+    pub comm: String,
+    /// State letter from `/proc/<tid>/status` State line (e.g. `"t"`).
+    pub state: String,
+    /// `/proc/<tid>/syscall` contents — empty when stopped between syscalls
+    /// (i.e. at a non-syscall ptrace event boundary).
+    pub syscall_info: String,
+    /// `/proc/<tid>/stack` — first few kernel-stack frames at the stop point.
+    pub stack_summary: String,
+    /// Pending/blocked signal masks from `/proc/<tid>/status`
+    /// (`SigPnd`/`ShdPnd`/`SigBlk`), as `"SigPnd=… ShdPnd=… SigBlk=…"`.
+    /// Diagnoses whether the tracee is held by a pending signal the
+    /// supervisor's resume didn't clear (e.g. a group-stop the doc's
+    /// PTRACE_SEIZE theory predicted but which the seize validation did not
+    /// observe — see the wedge root-cause investigation).
+    pub signal_summary: String,
+    /// True when a job-control stop signal (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU)
+    /// is **pending** in `SigPnd | ShdPnd`.
+    ///
+    /// IMPORTANT: `false` does NOT rule out a group-stop. A thread that has
+    /// already *entered* a group-stop has consumed the SIGSTOP, so nothing is
+    /// pending — yet `PTRACE_CONT(sig=0)` still won't lift it. Use the `state`
+    /// letter ('T' = TASK_STOPPED group-stop vs 't' = TASK_TRACED ptrace-stop)
+    /// to distinguish, not this field alone.
+    pub jobctl_stop_pending: bool,
+    /// The ptrace resume primitive last issued for this tid: `"CONT"`,
+    /// `"SYSCALL"`, or `"none"` (never resumed). A wedged freshly-cloned child
+    /// (`is_thread`) showing `"SYSCALL"` is the clone-child wrong-primitive
+    /// race: it was resumed before its seccomp membership was registered.
+    pub resume_primitive: String,
+    /// True if this tid is a clone()'d thread (in `thread_tids`) rather than a
+    /// process — the population most exposed to the out-of-order clone race.
+    pub is_thread: bool,
+    /// True if the supervisor believes this tid is mid-`PTRACE_SYSCALL`
+    /// entry/exit (in `in_syscall_entry`) — a desync indicator.
+    pub in_syscall_stop: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Syscall event types
@@ -133,6 +191,19 @@ pub enum SyscallKind {
         port: u16,
         /// Protocol family.
         protocol: NetProtocol,
+        /// PR 5 Phase D: tracee-side pointer to the sockaddr struct
+        /// the kernel will read. `None` for non-Linux platforms or
+        /// when the classifier can't extract the pointer. The
+        /// supervisor reads this on the allow path to rewrite the
+        /// sockaddr in-place when `allow_clamp` applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sockaddr_ptr: Option<u64>,
+        /// PR 5 Phase D: companion to `sockaddr_ptr`. Length the
+        /// tracee passed to `bind(2)`. Used to verify the buffer is
+        /// large enough before writing; smaller than expected → fail
+        /// closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addrlen: Option<u32>,
     },
     /// `sendto` — datagram sent to a specific address.
     NetSendTo {
@@ -172,6 +243,207 @@ pub enum SyscallKind {
         /// Protocol number (e.g. ETH_P_ALL=3 for AF_PACKET).
         protocol: i32,
     },
+    /// PR 6 Phase A: kernel-module load/unload.
+    ///
+    /// Covers `init_module`, `finit_module`, and `delete_module`. No
+    /// legitimate use in supervised AI tools — these privileged
+    /// syscalls modify the running kernel's code. Hard-denied in
+    /// `event_handler.rs` before proxy evaluation (mirrors
+    /// `IoUringSetup` and `RawSocketCreate`).
+    KernelModuleOp {
+        /// Which of the three module syscalls fired. Used in the
+        /// audit log so operators can see whether the tool tried to
+        /// load (init/finit) or unload (delete) a module.
+        op: KernelModuleOpKind,
+    },
+    /// PR 6 Phase A: kernel-image replacement via `kexec_load` or
+    /// `kexec_file_load`. Hard-denied — supervised AI tools have no
+    /// reason to stage a new kernel for next boot.
+    KexecLoad {
+        /// Whether the load came from a buffer (`kexec_load`) or a
+        /// file descriptor (`kexec_file_load`). Audit-log only;
+        /// neither shape is permitted.
+        from_fd: bool,
+    },
+    /// PR 6 Phase B: chown-family ownership change.
+    ///
+    /// Routed through the proxy as `ToolCallType::OwnershipChange`
+    /// with a `+5.0` baseline so a chown outside profile-declared
+    /// scope queues for review. An LLM that escapes file-write
+    /// filters can no longer escalate via `chown` to make a target
+    /// file owner-writable by itself.
+    OwnershipChange {
+        /// Which chown variant fired.
+        op: OwnershipOp,
+        /// Target path. For `fchown` (by-fd) the supervisor reports
+        /// the fd-resolved path when known; otherwise a `<fd:N>`
+        /// placeholder.
+        path: String,
+        /// New owner uid, or `-1` for "leave unchanged".
+        new_uid: i64,
+        /// New group gid, or `-1` for "leave unchanged".
+        new_gid: i64,
+    },
+    /// PR 6 Phase B: mount/umount2/pivot_root filesystem mutation.
+    ///
+    /// Routed through the proxy as
+    /// `ToolCallType::FilesystemMutation` with `+5.0` baseline so
+    /// any filesystem-reshape attempt queues. Defeats the path-
+    /// filter-bypass via remount.
+    FilesystemMutation {
+        /// Which mutation fired.
+        op: FsMutationOp,
+        /// Source path (for `mount`) or `None` for `umount2` /
+        /// `pivot_root`.
+        source: Option<String>,
+        /// Target mount point.
+        target: String,
+        /// Filesystem type (for `mount`) — `None` for other ops.
+        fstype: Option<String>,
+    },
+    /// PR 6 Phase B: ptrace + process_vm_readv/writev against a
+    /// non-self target. `process_vm_*` calls where `target_pid` is
+    /// the caller's own pid are filtered out in `classify_syscall`
+    /// before this variant is constructed.
+    ///
+    /// Routed through the proxy as
+    /// `ToolCallType::CrossProcessAccess` with `+5.0` baseline.
+    CrossProcessAccess {
+        /// Which cross-process op fired.
+        op: CrossProcessOp,
+        /// Target pid (never the calling pid — that case is filtered
+        /// upstream).
+        target_pid: u32,
+    },
+    /// PR 6 Phase C: `unshare(2)` / `setns(2)` — namespace primitives.
+    ///
+    /// The supervisor's decision flow on this variant is:
+    ///   1. If the calling binary's `SpawnProvenance` has
+    ///      `matched_routine_root` set AND its canonical path is in
+    ///      the profile's `namespace_users` list (e.g. `bwrap`,
+    ///      `bubblewrap`, `firejail`), allow silently.
+    ///   2. Otherwise route to the proxy as
+    ///      `ToolCallType::NamespaceOp` with `+5.0` baseline.
+    ///
+    /// `clone`/`clone3` with `CLONE_NEW*` flags would conceptually fit
+    /// here too; the existing clone path emits `ProcessFork` and is
+    /// not yet routed through this variant — deferred as a follow-up.
+    NamespaceOp {
+        /// Which syscall fired (`unshare` or `setns`).
+        syscall: NamespaceSyscall,
+        /// `unshare`: the `flags` argument (a `CLONE_NEW*` bitmap).
+        /// `setns`:   the `nstype` argument (a single `CLONE_NEW*` bit
+        ///            or `0` to derive from the fd's namespace link).
+        flags: u64,
+    },
+    /// PR 6 Phase D: architecture-specific privileged op.
+    /// Hard-denied in event_handler.rs before proxy evaluation,
+    /// mirroring the kernel-module / kexec pattern. The op kind is
+    /// recorded for forensic audit only — neither shape is permitted.
+    ArchPrivilegedOp {
+        /// Which architecture-specific privileged syscall fired.
+        op: ArchPrivOp,
+    },
+}
+
+/// PR 6 Phase A: discriminator for `SyscallKind::KernelModuleOp`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum KernelModuleOpKind {
+    /// `init_module(2)` — load a module from a user buffer.
+    Init,
+    /// `finit_module(2)` — load a module from a file descriptor.
+    Finit,
+    /// `delete_module(2)` — unload a module.
+    Delete,
+}
+
+/// PR 6 Phase B: discriminator for `SyscallKind::OwnershipChange`.
+/// Records which chown-family syscall fired so the audit log can
+/// distinguish "by path" vs "by fd" vs "by path-relative" attempts.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum OwnershipOp {
+    /// `chown(2)` — by path, follows symlinks.
+    Chown,
+    /// `fchown(2)` — by file descriptor.
+    Fchown,
+    /// `lchown(2)` — by path, does NOT follow symlinks.
+    Lchown,
+    /// `fchownat(2)` — by path relative to a directory fd.
+    Fchownat,
+}
+
+/// PR 6 Phase B: discriminator for `SyscallKind::FilesystemMutation`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum FsMutationOp {
+    /// `mount(2)` — bring a new filesystem online.
+    Mount,
+    /// `umount2(2)` — unmount. On x86_64 there is no separate
+    /// `umount` syscall; `umount2` carries the legacy semantics
+    /// when `flags == 0`.
+    Umount2,
+    /// `pivot_root(2)` — change the root filesystem of the calling
+    /// process's namespace.
+    PivotRoot,
+    /// `chroot(2)` — change the process root directory.
+    Chroot,
+    /// `open_tree(2)` — clone/open a mount tree.
+    OpenTree,
+    /// `move_mount(2)` — move/attach a mount tree.
+    MoveMount,
+    /// `fsopen(2)` — create a filesystem context.
+    Fsopen,
+    /// `fsconfig(2)` — configure a filesystem context.
+    Fsconfig,
+    /// `fsmount(2)` — create a mount from a filesystem context.
+    Fsmount,
+    /// `fspick(2)` — select a mount for reconfiguration.
+    Fspick,
+    /// `mount_setattr(2)` — change mount attributes.
+    MountSetattr,
+}
+
+/// PR 6 Phase B: discriminator for `SyscallKind::CrossProcessAccess`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum CrossProcessOp {
+    /// `ptrace(2)` — attach/read/write another process. Any ptrace
+    /// request against a non-self target is high-risk.
+    Ptrace,
+    /// `process_vm_readv(2)` against a non-self target.
+    ProcessVmReadv,
+    /// `process_vm_writev(2)` against a non-self target.
+    ProcessVmWritev,
+}
+
+/// PR 6 Phase C: discriminator for `SyscallKind::NamespaceOp`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum NamespaceSyscall {
+    /// `unshare(flags)` — disassociate from caller's namespaces.
+    Unshare,
+    /// `setns(fd, nstype)` — join an existing namespace.
+    Setns,
+}
+
+/// PR 6 Phase D: discriminator for `SyscallKind::ArchPrivilegedOp` —
+/// the architecture-specific privileged operations that are
+/// unconditionally hard-denied. Each represents a host-wide
+/// authority change that supervised AI tools have no legitimate
+/// reason to invoke.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ArchPrivOp {
+    /// `sethostname(2)` — set the system hostname (global identity).
+    SetHostname,
+    /// `setdomainname(2)` — set the NIS domain name.
+    SetDomainName,
+    /// `iopl(2)` — set the I/O privilege level (x86 only).
+    Iopl,
+    /// `ioperm(2)` — toggle access to specific I/O ports (x86 only).
+    Ioperm,
+    /// `swapon(2)` — enable a swap area.
+    Swapon,
+    /// `swapoff(2)` — disable a swap area.
+    Swapoff,
+    /// `reboot(2)` — reboot/halt/etc.
+    Reboot,
 }
 
 /// Decoded file-open flags.
@@ -244,6 +516,13 @@ pub enum SyscallResponse {
 ///    release processes.
 #[async_trait]
 pub trait SyscallInterceptor: Send + Sync {
+    /// Select the attach mechanism for spawned processes
+    /// (`traceme` | `seize`). Default is a no-op: only the Linux ptrace
+    /// backend honours it; macOS/Windows interceptors don't use ptrace.
+    /// Called once after construction, before the first spawn. See
+    /// `work/futurework/ptrace-seize-migration.md`.
+    fn set_attach_mode(&mut self, _mode: crate::config::AttachMode) {}
+
     /// Attach to an existing process by PID.
     ///
     /// The process will be stopped and syscall tracing enabled. Returns an
@@ -348,6 +627,23 @@ pub trait SyscallInterceptor: Send + Sync {
     /// Human-readable name of the interception mechanism (e.g., `"ptrace"`,
     /// `"endpoint-security"`).
     fn mechanism_name(&self) -> &str;
+
+    /// Scan supervised tracees for ones that appear wedged in a ptrace stop.
+    ///
+    /// "Wedged" = no event has been recorded for the tracee in at least
+    /// `threshold`, AND its `/proc/<tid>/status` state begins with `t`/`T`
+    /// (tracing stop). Returns a forensic snapshot for each such tracee.
+    ///
+    /// Observation-only by design: detection logs the wedge but does not
+    /// release the tracee, so the underlying bug remains visible for
+    /// debugging. The supervisor's main loop calls this on a fixed interval
+    /// and emits a structured audit row per detected wedge.
+    ///
+    /// Default implementation returns an empty Vec (platforms without
+    /// `ptrace`-style stop tracking).
+    fn wedge_scan(&self, _threshold: Duration) -> Vec<WedgedTracee> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +688,7 @@ impl std::fmt::Display for SyscallKind {
                 address,
                 port,
                 protocol,
+                ..
             } => write!(f, "NetBind({protocol:?} {address}:{port})"),
             Self::NetSendTo { address, port } => write!(f, "NetSendTo({address}:{port})"),
             Self::PipeCreate => write!(f, "PipeCreate"),
@@ -405,6 +702,41 @@ impl std::fmt::Display for SyscallKind {
                 f,
                 "RawSocketCreate(domain={domain}, type={socket_type}, proto={protocol})"
             ),
+            Self::KernelModuleOp { op } => write!(f, "KernelModuleOp({op:?})"),
+            Self::KexecLoad { from_fd } => {
+                if *from_fd {
+                    write!(f, "KexecLoad(file)")
+                } else {
+                    write!(f, "KexecLoad(buffer)")
+                }
+            }
+            Self::OwnershipChange {
+                op,
+                path,
+                new_uid,
+                new_gid,
+            } => write!(
+                f,
+                "OwnershipChange({op:?} path={path} uid={new_uid} gid={new_gid})"
+            ),
+            Self::FilesystemMutation {
+                op,
+                source,
+                target,
+                fstype,
+            } => write!(
+                f,
+                "FilesystemMutation({op:?} src={src} target={target} fstype={fs})",
+                src = source.as_deref().unwrap_or(""),
+                fs = fstype.as_deref().unwrap_or(""),
+            ),
+            Self::CrossProcessAccess { op, target_pid } => {
+                write!(f, "CrossProcessAccess({op:?} target_pid={target_pid})")
+            }
+            Self::NamespaceOp { syscall, flags } => {
+                write!(f, "NamespaceOp({syscall:?} flags={flags:#x})")
+            }
+            Self::ArchPrivilegedOp { op } => write!(f, "ArchPrivilegedOp({op:?})"),
         }
     }
 }
@@ -580,6 +912,8 @@ mod tests {
                 address: "0.0.0.0".into(),
                 port: 8080,
                 protocol: NetProtocol::Tcp,
+                sockaddr_ptr: None,
+                addrlen: None,
             },
             SyscallKind::NetSendTo {
                 address: "10.0.0.1".into(),

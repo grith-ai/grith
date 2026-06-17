@@ -133,6 +133,53 @@ pub fn create_interceptor() -> Result<Box<dyn SyscallInterceptor>> {
     )))
 }
 
+/// Whether the current platform supports observing syscall return values
+/// (post-syscall stops) in addition to syscall entry interception.
+///
+/// PR 3 of the codex-startup-prompt-flood remediation plan uses this to
+/// gate the failed-exec / failed-connect suppressions: only when the
+/// platform can confirm the kernel returned `ENOENT` / `ECONNREFUSED`
+/// can we safely suppress the QUEUE that would otherwise have prompted.
+/// Without post-syscall observation we fall back to the pre-PR-3
+/// behaviour (QUEUE every spawn that the proxy would queue, even when
+/// the kernel is about to reject the call).
+///
+/// # Audit (2026-05)
+///
+/// - **Linux + ptrace**: yes. The seccomp-BPF path stops on entry as
+///   `PTRACE_EVENT_SECCOMP`. After the supervisor allows the syscall,
+///   resuming with `PTRACE_SYSCALL` instead of `PTRACE_CONT` causes the
+///   kernel to deliver a second stop at syscall exit, where RAX holds
+///   the return value. The fallback `PTRACE_SYSCALL` path already
+///   delivers entry+exit stops natively. Either way the return value
+///   is readable via `read_registers`. See
+///   `crates/grith-supervisor/src/platform/linux/events.rs` for the
+///   existing entry-stop machinery; the exit-stop wiring lands in
+///   PR 3 Phase B/C.
+/// - **macOS + Endpoint Security**: no. ES events are lifecycle-only
+///   and cannot observe per-syscall return codes. macOS gets `false`
+///   here; PR 3's suppressions are disabled on that platform.
+/// - **Other platforms**: false (no supervision mechanism at all).
+///
+/// This is intentionally a separate function rather than a fourth
+/// `PlatformCapability` variant because post-syscall observation is
+/// orthogonal to the Full/Degraded/Unavailable axis — it's an
+/// additional sub-capability that Full platforms may or may not have.
+pub fn has_post_syscall_observation() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::PtraceSupervisor::is_available();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return false;
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
 /// Check if supervisor mode is supported on the current platform.
 ///
 /// This is a lightweight check suitable for UI feature-gating — it does not
@@ -259,5 +306,31 @@ mod tests {
     fn macos_module_accessible() {
         // Ensure the macos sub-module compiles and the type is accessible.
         let _ = macos::EndpointSecuritySupervisor::is_available();
+    }
+
+    // PR 3 Phase A: post-syscall observation capability detection.
+
+    #[test]
+    fn post_syscall_observation_returns_bool() {
+        // Smoke test: must return a value on any platform without panicking.
+        let _ = has_post_syscall_observation();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_post_syscall_observation_matches_is_supported() {
+        // On Linux post-syscall observation is available whenever ptrace
+        // is — the seccomp-BPF + PTRACE_SYSCALL exit-stop machinery is
+        // part of the standard interception path.
+        assert_eq!(has_post_syscall_observation(), is_supported());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_post_syscall_observation_is_false() {
+        // Endpoint Security is lifecycle-only; no per-syscall return-
+        // value observation. PR 3's failed-exec / failed-connect
+        // suppressions are disabled on macOS until that gap closes.
+        assert!(!has_post_syscall_observation());
     }
 }

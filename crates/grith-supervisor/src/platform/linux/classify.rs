@@ -157,6 +157,14 @@ impl PtraceSupervisor {
                 let mode = regs.rsi as u32;
                 Ok(Some(SyscallKind::FileChmod { path, mode }))
             }
+            syscall_nr::FCHMOD => {
+                // fchmod(fd, mode)
+                let fd = regs.rdi as i32;
+                let path =
+                    Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>"));
+                let mode = regs.rsi as u32;
+                Ok(Some(SyscallKind::FileChmod { path, mode }))
+            }
             syscall_nr::FCHMODAT => {
                 // fchmodat(dirfd, pathname, mode, flags)
                 let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
@@ -275,16 +283,24 @@ impl PtraceSupervisor {
             syscall_nr::BIND => {
                 // bind(sockfd, addr, addrlen)
                 let sockfd = regs.rdi as i32;
+                let sockaddr_ptr = regs.rsi;
+                let addrlen = regs.rdx as u32;
                 match self.read_sockaddr(
                     pid,
-                    regs.rsi,
-                    regs.rdx as usize,
+                    sockaddr_ptr,
+                    addrlen as usize,
                     Some((pid_u32, sockfd)),
                 )? {
                     Some((address, port, protocol)) => Ok(Some(SyscallKind::NetBind {
                         address,
                         port,
                         protocol,
+                        // PR 5 Phase D: forward the tracee-side
+                        // sockaddr pointer so the supervisor's
+                        // allow path can clamp the bind to loopback
+                        // when the profile authorises it.
+                        sockaddr_ptr: Some(sockaddr_ptr),
+                        addrlen: Some(addrlen),
                     })),
                     None => Ok(None),
                 }
@@ -412,6 +428,302 @@ impl PtraceSupervisor {
             | syscall_nr::IO_URING_REGISTER => Ok(Some(SyscallKind::IoUringSetup)),
 
             // ---------------------------------------------------------------
+            // PR 6 Phase A: kernel-module load/unload — hard-denied
+            // ---------------------------------------------------------------
+            syscall_nr::INIT_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
+                op: crate::interceptor::KernelModuleOpKind::Init,
+            })),
+            syscall_nr::FINIT_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
+                op: crate::interceptor::KernelModuleOpKind::Finit,
+            })),
+            syscall_nr::DELETE_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
+                op: crate::interceptor::KernelModuleOpKind::Delete,
+            })),
+
+            // ---------------------------------------------------------------
+            // PR 6 Phase A: kernel-image replacement — hard-denied
+            // ---------------------------------------------------------------
+            syscall_nr::KEXEC_LOAD => Ok(Some(SyscallKind::KexecLoad { from_fd: false })),
+            syscall_nr::KEXEC_FILE_LOAD => Ok(Some(SyscallKind::KexecLoad { from_fd: true })),
+
+            // ---------------------------------------------------------------
+            // PR 6 Phase B: ownership change family.
+            //
+            // chown/lchown(path, uid, gid)        — rdi=path, rsi=uid, rdx=gid
+            // fchown(fd, uid, gid)                — rdi=fd,   rsi=uid, rdx=gid
+            // fchownat(dirfd, path, uid, gid, ..) — rdi=dirfd, rsi=path, rdx=uid, r10=gid
+            // ---------------------------------------------------------------
+            syscall_nr::CHOWN | syscall_nr::LCHOWN => {
+                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = Self::canonicalize_for_tracee(pid_u32, &path);
+                Ok(Some(SyscallKind::OwnershipChange {
+                    op: if regs.orig_rax as i64 == syscall_nr::CHOWN {
+                        crate::interceptor::OwnershipOp::Chown
+                    } else {
+                        crate::interceptor::OwnershipOp::Lchown
+                    },
+                    path,
+                    new_uid: regs.rsi as i64,
+                    new_gid: regs.rdx as i64,
+                }))
+            }
+            syscall_nr::FCHOWN => {
+                let fd = regs.rdi as i32;
+                let path =
+                    Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>"));
+                Ok(Some(SyscallKind::OwnershipChange {
+                    op: crate::interceptor::OwnershipOp::Fchown,
+                    path,
+                    new_uid: regs.rsi as i64,
+                    new_gid: regs.rdx as i64,
+                }))
+            }
+            syscall_nr::FCHOWNAT => {
+                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let dirfd = regs.rdi as i32;
+                let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                Ok(Some(SyscallKind::OwnershipChange {
+                    op: crate::interceptor::OwnershipOp::Fchownat,
+                    path,
+                    new_uid: regs.rdx as i64,
+                    new_gid: regs.r10 as i64,
+                }))
+            }
+
+            // ---------------------------------------------------------------
+            // PR 6 Phase B: filesystem mutation.
+            //
+            // mount(src, target, fstype, flags, data) — rdi=src, rsi=target, rdx=fstype
+            // umount2(target, flags)                  — rdi=target
+            // pivot_root(new_root, put_old)           — rdi=new_root, rsi=put_old
+            // chroot(path)                            — rdi=path
+            // open_tree(dfd, filename, flags)         — rdi=dfd, rsi=filename
+            // move_mount(from_dfd, from, to_dfd, to)  — rdi/rsi, rdx/r10
+            // fsopen/fsconfig/fsmount                 — fd/context-based mount API
+            // fspick(dfd, path, flags)                — rdi=dfd, rsi=path
+            // mount_setattr(dfd, path, flags, ...)    — rdi=dfd, rsi=path
+            // ---------------------------------------------------------------
+            syscall_nr::MOUNT => {
+                let source = self.read_tracee_string(pid, regs.rdi, 4096).ok();
+                let target = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let target = Self::canonicalize_for_tracee(pid_u32, &target);
+                let fstype = self.read_tracee_string(pid, regs.rdx, 256).ok();
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Mount,
+                    source,
+                    target,
+                    fstype,
+                }))
+            }
+            syscall_nr::UMOUNT2 => {
+                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let target = Self::canonicalize_for_tracee(pid_u32, &target);
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Umount2,
+                    source: None,
+                    target,
+                    fstype: None,
+                }))
+            }
+            syscall_nr::PIVOT_ROOT => {
+                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let target = Self::canonicalize_for_tracee(pid_u32, &target);
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::PivotRoot,
+                    source: None,
+                    target,
+                    fstype: None,
+                }))
+            }
+            syscall_nr::CHROOT => {
+                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let target = Self::canonicalize_for_tracee(pid_u32, &target);
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Chroot,
+                    source: None,
+                    target,
+                    fstype: None,
+                }))
+            }
+            syscall_nr::OPEN_TREE => {
+                let dirfd = regs.rdi as i32;
+                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let target = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::OpenTree,
+                    source: None,
+                    target,
+                    fstype: None,
+                }))
+            }
+            syscall_nr::MOVE_MOUNT => {
+                let from_dfd = regs.rdi as i32;
+                let raw_from = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let to_dfd = regs.rdx as i32;
+                let raw_to = self.read_tracee_string(pid, regs.r10, 4096)?;
+                let source = if raw_from.is_empty() {
+                    Some(format!("<fd:{from_dfd}>"))
+                } else {
+                    Some(Self::resolve_at_path(pid_u32, from_dfd, &raw_from))
+                };
+                let target = if raw_to.is_empty() {
+                    format!("<fd:{to_dfd}>")
+                } else {
+                    Self::resolve_at_path(pid_u32, to_dfd, &raw_to)
+                };
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::MoveMount,
+                    source,
+                    target,
+                    fstype: None,
+                }))
+            }
+            syscall_nr::FSOPEN => {
+                let fs_name = self.read_tracee_string(pid, regs.rdi, 256)?;
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Fsopen,
+                    source: None,
+                    target: "<fsopen>".into(),
+                    fstype: if fs_name.is_empty() {
+                        None
+                    } else {
+                        Some(fs_name)
+                    },
+                }))
+            }
+            syscall_nr::FSCONFIG => {
+                let fd = regs.rdi as i32;
+                let key = self.read_tracee_string(pid, regs.rdx, 256).ok();
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Fsconfig,
+                    source: None,
+                    target: format!("<fsconfig:{fd}>"),
+                    fstype: key,
+                }))
+            }
+            syscall_nr::FSMOUNT => {
+                let fd = regs.rdi as i32;
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Fsmount,
+                    source: None,
+                    target: format!("<fsmount:{fd}>"),
+                    fstype: None,
+                }))
+            }
+            syscall_nr::FSPICK => {
+                let dirfd = regs.rdi as i32;
+                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let target = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::Fspick,
+                    source: None,
+                    target,
+                    fstype: None,
+                }))
+            }
+            syscall_nr::MOUNT_SETATTR => {
+                let dirfd = regs.rdi as i32;
+                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let target = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                Ok(Some(SyscallKind::FilesystemMutation {
+                    op: crate::interceptor::FsMutationOp::MountSetattr,
+                    source: None,
+                    target,
+                    fstype: None,
+                }))
+            }
+
+            // ---------------------------------------------------------------
+            // PR 6 Phase B: cross-process access.
+            //
+            // ptrace(request, pid, addr, data)              — rsi=target_pid
+            // process_vm_readv(pid, ...)                    — rdi=target_pid
+            // process_vm_writev(pid, ...)                   — rdi=target_pid
+            //
+            // Self-target carveout: process_vm_* against the caller's
+            // own pid is benign (used by some allocators for memory
+            // copying); filter it out so we don't QUEUE the
+            // supervised tool's own internal use. ptrace against self
+            // is rare and we don't carve it out.
+            // ---------------------------------------------------------------
+            syscall_nr::PTRACE => Ok(Some(SyscallKind::CrossProcessAccess {
+                op: crate::interceptor::CrossProcessOp::Ptrace,
+                target_pid: regs.rsi as u32,
+            })),
+            syscall_nr::PROCESS_VM_READV => {
+                let target = regs.rdi as u32;
+                if target == pid_u32 {
+                    return Ok(None);
+                }
+                Ok(Some(SyscallKind::CrossProcessAccess {
+                    op: crate::interceptor::CrossProcessOp::ProcessVmReadv,
+                    target_pid: target,
+                }))
+            }
+            syscall_nr::PROCESS_VM_WRITEV => {
+                let target = regs.rdi as u32;
+                if target == pid_u32 {
+                    return Ok(None);
+                }
+                Ok(Some(SyscallKind::CrossProcessAccess {
+                    op: crate::interceptor::CrossProcessOp::ProcessVmWritev,
+                    target_pid: target,
+                }))
+            }
+
+            // ---------------------------------------------------------------
+            // PR 6 Phase C: namespace primitives.
+            //
+            // unshare(flags)   — rdi = CLONE_NEW* bitmap
+            // setns(fd, nstype) — rdi = fd, rsi = nstype (CLONE_NEW* bit
+            //                     or 0 to defer to the fd's link)
+            //
+            // We always emit `NamespaceOp` regardless of which flag
+            // bits are set; the supervisor's bwrap-carveout in
+            // `event_handler.rs` does the per-bit check against the
+            // profile's namespace_users list. Reporting *every*
+            // `unshare`/`setns` keeps the audit log honest — even a
+            // call with `flags = 0` is worth logging since it shows
+            // the tool was probing.
+            // ---------------------------------------------------------------
+            syscall_nr::UNSHARE => Ok(Some(SyscallKind::NamespaceOp {
+                syscall: crate::interceptor::NamespaceSyscall::Unshare,
+                flags: regs.rdi,
+            })),
+            syscall_nr::SETNS => Ok(Some(SyscallKind::NamespaceOp {
+                syscall: crate::interceptor::NamespaceSyscall::Setns,
+                flags: regs.rsi,
+            })),
+
+            // ---------------------------------------------------------------
+            // PR 6 Phase D: architecture-specific privileged ops.
+            // Hard-denied unconditionally in event_handler.rs. We don't
+            // bother extracting arguments; the audit record carries the
+            // syscall identity, which is sufficient for forensics.
+            // ---------------------------------------------------------------
+            syscall_nr::SETHOSTNAME => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::SetHostname,
+            })),
+            syscall_nr::SETDOMAINNAME => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::SetDomainName,
+            })),
+            syscall_nr::IOPL => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::Iopl,
+            })),
+            syscall_nr::IOPERM => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::Ioperm,
+            })),
+            syscall_nr::SWAPON => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::Swapon,
+            })),
+            syscall_nr::SWAPOFF => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::Swapoff,
+            })),
+            syscall_nr::REBOOT => Ok(Some(SyscallKind::ArchPrivilegedOp {
+                op: crate::interceptor::ArchPrivOp::Reboot,
+            })),
+
+            // ---------------------------------------------------------------
             // Unrecognised (should not reach here for SECURITY_RELEVANT nrs)
             // ---------------------------------------------------------------
             _ => Ok(None),
@@ -476,7 +788,7 @@ impl PtraceSupervisor {
             libc::AF_INET => {
                 // struct sockaddr_in { sa_family_t(2), in_port_t(2), in_addr(4) }
                 let port = u16::from_be_bytes([bytes0[2], bytes0[3]]);
-                let ip = format!("{}.{}.{}.{}", bytes0[4], bytes0[5], bytes0[6], bytes0[7]);
+                let ip = sockaddr_in_to_string([bytes0[4], bytes0[5], bytes0[6], bytes0[7]]);
                 let protocol = sock_info
                     .map(|(p, fd)| Self::resolve_socket_protocol(p, fd))
                     .unwrap_or(NetProtocol::Tcp);
@@ -494,19 +806,10 @@ impl PtraceSupervisor {
                 let word2 = ptrace::read(pid, (addr + 16) as *mut libc::c_void).unwrap_or(0);
                 let b1 = word1.to_ne_bytes();
                 let b2 = word2.to_ne_bytes();
-                // Each word is 8 bytes = 4 u16 segments. word1 covers
-                // segments 0..4, word2 covers segments 4..8.
-                let segments: Vec<String> = (0..8)
-                    .map(|i| {
-                        let (src, off) = if i < 4 {
-                            (&b1, i * 2)
-                        } else {
-                            (&b2, (i - 4) * 2)
-                        };
-                        format!("{:x}", u16::from_be_bytes([src[off], src[off + 1]]))
-                    })
-                    .collect();
-                let ip = segments.join(":");
+                // PR 5 Phase A: see `sockaddr_in6_to_string` for the canonical
+                // form contract (zero-compressed `::`, `::1`,
+                // `::ffff:127.0.0.1`).
+                let ip = sockaddr_in6_to_string(b1, b2);
                 let protocol = sock_info
                     .map(|(p, fd)| Self::resolve_socket_protocol(p, fd))
                     .unwrap_or(NetProtocol::Tcp);
@@ -690,6 +993,39 @@ impl PtraceSupervisor {
 }
 
 // ---------------------------------------------------------------------------
+// PR 5 Phase A — sockaddr address-byte → string helpers
+// ---------------------------------------------------------------------------
+//
+// Extracted from `read_sockaddr` so unit tests can drive the byte-pattern
+// → string conversion deterministically without a real ptracee.
+
+/// PR 5 Phase A: convert the 4 network-byte-order octets of an
+/// `in_addr` into dotted-quad string form. `[0, 0, 0, 0]` →
+/// `"0.0.0.0"` (INADDR_ANY); `[127, 0, 0, 1]` → `"127.0.0.1"`
+/// (INADDR_LOOPBACK).
+pub(super) fn sockaddr_in_to_string(octets: [u8; 4]) -> String {
+    std::net::Ipv4Addr::from(octets).to_string()
+}
+
+/// PR 5 Phase A: convert the two 8-byte halves of an `in6_addr`
+/// (network byte order) into canonical zero-compressed string form.
+///
+/// Uses `Ipv6Addr::Display` so well-known addresses render canonically:
+///   - in6addr_any (all zeros) → `"::"`.
+///   - in6addr_loopback (`...:0:0:0:1`) → `"::1"`.
+///   - IPv4-mapped (`::ffff:a.b.c.d`) → `"::ffff:a.b.c.d"`.
+///
+/// The previous implementation produced the expanded form
+/// (`"0:0:0:0:0:0:0:1"`) which broke `is_loopback_bind_address`'s
+/// literal-string match. PR 5 Phase A unifies on the canonical form.
+pub(super) fn sockaddr_in6_to_string(high: [u8; 8], low: [u8; 8]) -> String {
+    let mut octets = [0u8; 16];
+    octets[..8].copy_from_slice(&high);
+    octets[8..].copy_from_slice(&low);
+    std::net::Ipv6Addr::from(octets).to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -847,6 +1183,231 @@ mod tests {
         assert_eq!(syscall_nr::TEE, 276);
     }
 
+    // -- PR 6 Phase A: kernel-module + kexec syscall numbers ----------------
+
+    #[test]
+    fn syscall_nr_init_module_is_175() {
+        assert_eq!(syscall_nr::INIT_MODULE, 175);
+    }
+
+    #[test]
+    fn syscall_nr_finit_module_is_313() {
+        assert_eq!(syscall_nr::FINIT_MODULE, 313);
+    }
+
+    #[test]
+    fn syscall_nr_delete_module_is_176() {
+        assert_eq!(syscall_nr::DELETE_MODULE, 176);
+    }
+
+    #[test]
+    fn syscall_nr_kexec_load_is_246() {
+        assert_eq!(syscall_nr::KEXEC_LOAD, 246);
+    }
+
+    #[test]
+    fn syscall_nr_kexec_file_load_is_320() {
+        assert_eq!(syscall_nr::KEXEC_FILE_LOAD, 320);
+    }
+
+    #[test]
+    fn phase_a_kernel_module_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::INIT_MODULE));
+        assert!(is_security_relevant(syscall_nr::FINIT_MODULE));
+        assert!(is_security_relevant(syscall_nr::DELETE_MODULE));
+    }
+
+    #[test]
+    fn phase_a_kexec_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::KEXEC_LOAD));
+        assert!(is_security_relevant(syscall_nr::KEXEC_FILE_LOAD));
+    }
+
+    // -- PR 6 Phase B: ownership / fs / cross-process syscall numbers ----
+
+    #[test]
+    fn syscall_nr_chown_is_92() {
+        assert_eq!(syscall_nr::CHOWN, 92);
+    }
+
+    #[test]
+    fn syscall_nr_fchown_is_93() {
+        assert_eq!(syscall_nr::FCHOWN, 93);
+    }
+
+    #[test]
+    fn syscall_nr_lchown_is_94() {
+        assert_eq!(syscall_nr::LCHOWN, 94);
+    }
+
+    #[test]
+    fn syscall_nr_fchownat_is_260() {
+        assert_eq!(syscall_nr::FCHOWNAT, 260);
+    }
+
+    #[test]
+    fn syscall_nr_fchmod_is_91() {
+        assert_eq!(syscall_nr::FCHMOD, 91);
+    }
+
+    #[test]
+    fn syscall_nr_mount_is_165() {
+        assert_eq!(syscall_nr::MOUNT, 165);
+    }
+
+    #[test]
+    fn syscall_nr_umount2_is_166() {
+        assert_eq!(syscall_nr::UMOUNT2, 166);
+    }
+
+    #[test]
+    fn syscall_nr_pivot_root_is_155() {
+        assert_eq!(syscall_nr::PIVOT_ROOT, 155);
+    }
+
+    #[test]
+    fn syscall_nr_chroot_is_161() {
+        assert_eq!(syscall_nr::CHROOT, 161);
+    }
+
+    #[test]
+    fn syscall_nr_new_mount_api_numbers_are_correct() {
+        assert_eq!(syscall_nr::OPEN_TREE, 428);
+        assert_eq!(syscall_nr::MOVE_MOUNT, 429);
+        assert_eq!(syscall_nr::FSOPEN, 430);
+        assert_eq!(syscall_nr::FSCONFIG, 431);
+        assert_eq!(syscall_nr::FSMOUNT, 432);
+        assert_eq!(syscall_nr::FSPICK, 433);
+        assert_eq!(syscall_nr::MOUNT_SETATTR, 442);
+    }
+
+    #[test]
+    fn syscall_nr_ptrace_is_101() {
+        assert_eq!(syscall_nr::PTRACE, 101);
+    }
+
+    #[test]
+    fn syscall_nr_process_vm_readv_is_310() {
+        assert_eq!(syscall_nr::PROCESS_VM_READV, 310);
+    }
+
+    #[test]
+    fn syscall_nr_process_vm_writev_is_311() {
+        assert_eq!(syscall_nr::PROCESS_VM_WRITEV, 311);
+    }
+
+    #[test]
+    fn phase_b_ownership_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::CHOWN));
+        assert!(is_security_relevant(syscall_nr::FCHOWN));
+        assert!(is_security_relevant(syscall_nr::LCHOWN));
+        assert!(is_security_relevant(syscall_nr::FCHOWNAT));
+        assert!(is_security_relevant(syscall_nr::FCHMOD));
+    }
+
+    #[test]
+    fn phase_b_filesystem_mutation_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::MOUNT));
+        assert!(is_security_relevant(syscall_nr::UMOUNT2));
+        assert!(is_security_relevant(syscall_nr::PIVOT_ROOT));
+        assert!(is_security_relevant(syscall_nr::CHROOT));
+        assert!(is_security_relevant(syscall_nr::OPEN_TREE));
+        assert!(is_security_relevant(syscall_nr::MOVE_MOUNT));
+        assert!(is_security_relevant(syscall_nr::FSOPEN));
+        assert!(is_security_relevant(syscall_nr::FSCONFIG));
+        assert!(is_security_relevant(syscall_nr::FSMOUNT));
+        assert!(is_security_relevant(syscall_nr::FSPICK));
+        assert!(is_security_relevant(syscall_nr::MOUNT_SETATTR));
+    }
+
+    #[test]
+    fn phase_b_cross_process_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::PTRACE));
+        assert!(is_security_relevant(syscall_nr::PROCESS_VM_READV));
+        assert!(is_security_relevant(syscall_nr::PROCESS_VM_WRITEV));
+    }
+
+    // -- PR 6 Phase C: namespace primitive syscall numbers ----
+
+    #[test]
+    fn syscall_nr_unshare_is_272() {
+        assert_eq!(syscall_nr::UNSHARE, 272);
+    }
+
+    #[test]
+    fn syscall_nr_setns_is_308() {
+        assert_eq!(syscall_nr::SETNS, 308);
+    }
+
+    #[test]
+    fn phase_c_namespace_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::UNSHARE));
+        assert!(is_security_relevant(syscall_nr::SETNS));
+    }
+
+    // -- PR 6 Phase D: architecture-specific syscall numbers ----
+
+    #[test]
+    fn syscall_nr_sethostname_is_170() {
+        assert_eq!(syscall_nr::SETHOSTNAME, 170);
+    }
+
+    #[test]
+    fn syscall_nr_setdomainname_is_171() {
+        assert_eq!(syscall_nr::SETDOMAINNAME, 171);
+    }
+
+    #[test]
+    fn syscall_nr_iopl_is_172() {
+        assert_eq!(syscall_nr::IOPL, 172);
+    }
+
+    #[test]
+    fn syscall_nr_ioperm_is_173() {
+        assert_eq!(syscall_nr::IOPERM, 173);
+    }
+
+    #[test]
+    fn syscall_nr_swapon_is_167() {
+        assert_eq!(syscall_nr::SWAPON, 167);
+    }
+
+    #[test]
+    fn syscall_nr_swapoff_is_168() {
+        assert_eq!(syscall_nr::SWAPOFF, 168);
+    }
+
+    #[test]
+    fn syscall_nr_reboot_is_169() {
+        assert_eq!(syscall_nr::REBOOT, 169);
+    }
+
+    #[test]
+    fn phase_d_arch_privileged_syscalls_are_security_relevant() {
+        assert!(is_security_relevant(syscall_nr::SETHOSTNAME));
+        assert!(is_security_relevant(syscall_nr::SETDOMAINNAME));
+        assert!(is_security_relevant(syscall_nr::IOPL));
+        assert!(is_security_relevant(syscall_nr::IOPERM));
+        assert!(is_security_relevant(syscall_nr::SWAPON));
+        assert!(is_security_relevant(syscall_nr::SWAPOFF));
+        assert!(is_security_relevant(syscall_nr::REBOOT));
+    }
+
+    #[test]
+    fn phase_c_clone_new_ns_mask_covers_all_namespace_bits() {
+        // CLONE_NEWNS (0x00020000), NEWCGROUP (0x02000000),
+        // NEWUTS (0x04000000), NEWIPC (0x08000000),
+        // NEWUSER (0x10000000), NEWPID (0x20000000), NEWNET (0x40000000)
+        let expected: u64 = 0x00020000
+            | 0x02000000
+            | 0x04000000
+            | 0x08000000
+            | 0x10000000
+            | 0x20000000
+            | 0x40000000;
+        assert_eq!(crate::platform::linux::CLONE_NEW_NS_MASK, expected);
+    }
+
     // -- Security relevance predicate ---------------------------------------
 
     #[test]
@@ -886,12 +1447,17 @@ mod tests {
 
     #[test]
     fn security_relevant_list_has_expected_count() {
-        // 30 distinct syscall numbers are tracked (READ/WRITE excluded;
-        // mmap added for file-backed mmaps; io_uring_setup/enter/register added;
-        // sendfile/splice/tee added for kernel-bypass fd-to-fd transfers;
-        // socket(41) added for raw-socket creation detection;
-        // execveat(322) added alongside execve for exec provenance).
-        assert_eq!(SECURITY_RELEVANT.len(), 30);
+        // 63 distinct syscall numbers are tracked:
+        //   - 30 from PR 1..5.
+        //   - PR 6 Phase A: 5 hard-denied (init/finit/delete_module +
+        //     kexec_load/kexec_file_load).
+        //   - PR 6 Phase B: 19 proxy-evaluated (4 chown + fchmod + 3
+        //     original fs + chroot + 7 new mount-api + 3 cross-process).
+        //   - PR 6 Phase C: 2 namespace primitives (unshare, setns).
+        //   - PR 6 Phase D: 7 architecture-specific privileged ops
+        //     (sethostname, setdomainname, iopl, ioperm, swapon, swapoff,
+        //     reboot).
+        assert_eq!(SECURITY_RELEVANT.len(), 63);
     }
 
     #[test]
@@ -1281,6 +1847,7 @@ mod tests {
             syscall_nr::MKDIR,
             syscall_nr::UNLINK,
             syscall_nr::CHMOD,
+            syscall_nr::FCHMOD,
             syscall_nr::GETDENTS64,
             syscall_nr::OPENAT,
             syscall_nr::MKDIRAT,
@@ -1297,6 +1864,42 @@ mod tests {
             syscall_nr::TEE,
             syscall_nr::SOCKET,
             syscall_nr::EXECVEAT,
+            // PR 6 Phase A: category-1 hard-deny syscalls.
+            syscall_nr::INIT_MODULE,
+            syscall_nr::FINIT_MODULE,
+            syscall_nr::DELETE_MODULE,
+            syscall_nr::KEXEC_LOAD,
+            syscall_nr::KEXEC_FILE_LOAD,
+            // PR 6 Phase B: category-2 proxy-evaluated syscalls.
+            syscall_nr::CHOWN,
+            syscall_nr::FCHOWN,
+            syscall_nr::LCHOWN,
+            syscall_nr::FCHOWNAT,
+            syscall_nr::MOUNT,
+            syscall_nr::UMOUNT2,
+            syscall_nr::PIVOT_ROOT,
+            syscall_nr::CHROOT,
+            syscall_nr::OPEN_TREE,
+            syscall_nr::MOVE_MOUNT,
+            syscall_nr::FSOPEN,
+            syscall_nr::FSCONFIG,
+            syscall_nr::FSMOUNT,
+            syscall_nr::FSPICK,
+            syscall_nr::MOUNT_SETATTR,
+            syscall_nr::PTRACE,
+            syscall_nr::PROCESS_VM_READV,
+            syscall_nr::PROCESS_VM_WRITEV,
+            // PR 6 Phase C.
+            syscall_nr::UNSHARE,
+            syscall_nr::SETNS,
+            // PR 6 Phase D.
+            syscall_nr::SETHOSTNAME,
+            syscall_nr::SETDOMAINNAME,
+            syscall_nr::IOPL,
+            syscall_nr::IOPERM,
+            syscall_nr::SWAPON,
+            syscall_nr::SWAPOFF,
+            syscall_nr::REBOOT,
         ];
 
         let relevant_set: HashSet<i64> = SECURITY_RELEVANT.iter().copied().collect();
@@ -1433,6 +2036,77 @@ mod tests {
         assert!(
             result.is_none(),
             "AF_UNIX socket() should return None, got {result:?}"
+        );
+    }
+
+    // ---- PR 5 Phase A: sockaddr address-byte → string contract ----
+
+    #[test]
+    fn af_inet_inaddr_any_renders_as_dotted_zero() {
+        // INADDR_ANY is the all-zeros network-order word; the
+        // dotted-quad form is "0.0.0.0".
+        assert_eq!(sockaddr_in_to_string([0, 0, 0, 0]), "0.0.0.0");
+    }
+
+    #[test]
+    fn af_inet_inaddr_loopback_renders_as_127_0_0_1() {
+        // INADDR_LOOPBACK is 0x7f000001 in host order; network-order
+        // bytes are [0x7f, 0x00, 0x00, 0x01].
+        assert_eq!(sockaddr_in_to_string([127, 0, 0, 1]), "127.0.0.1");
+    }
+
+    #[test]
+    fn af_inet_arbitrary_address() {
+        assert_eq!(sockaddr_in_to_string([192, 168, 1, 10]), "192.168.1.10");
+    }
+
+    #[test]
+    fn af_inet6_in6addr_any_renders_as_canonical_double_colon() {
+        // in6addr_any = 16 zero octets; canonical form is "::".
+        let zeros = [0u8; 8];
+        assert_eq!(sockaddr_in6_to_string(zeros, zeros), "::");
+    }
+
+    #[test]
+    fn af_inet6_in6addr_loopback_renders_as_double_colon_one() {
+        // in6addr_loopback = [0; 15, 1]; canonical form is "::1".
+        let high = [0u8; 8];
+        let low = [0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(sockaddr_in6_to_string(high, low), "::1");
+    }
+
+    #[test]
+    fn af_inet6_ipv4_mapped_v6_renders_with_dotted_quad_tail() {
+        // IPv4-mapped IPv6: ::ffff:a.b.c.d. The 80 leading bits are
+        // zero, then 16 bits of 1s, then the v4 address in network
+        // order. The `Display` impl chooses the dotted-quad tail
+        // for these.
+        let high = [0u8; 8];
+        let low = [0, 0, 0xff, 0xff, 127, 0, 0, 1];
+        assert_eq!(sockaddr_in6_to_string(high, low), "::ffff:127.0.0.1");
+    }
+
+    #[test]
+    fn af_inet6_ipv4_mapped_wildcard_renders_with_zero_dotted_quad() {
+        let high = [0u8; 8];
+        let low = [0, 0, 0xff, 0xff, 0, 0, 0, 0];
+        assert_eq!(sockaddr_in6_to_string(high, low), "::ffff:0.0.0.0");
+    }
+
+    /// Regression guard for the original PR 5 Phase A bug: the
+    /// expanded-form string `"0:0:0:0:0:0:0:1"` (what the previous
+    /// implementation produced) is NOT a substring of the canonical
+    /// `"::1"`. Asserts the helper returns the canonical form so
+    /// downstream literal-string matchers keep working.
+    #[test]
+    fn af_inet6_loopback_does_not_use_expanded_form() {
+        let high = [0u8; 8];
+        let low = [0, 0, 0, 0, 0, 0, 0, 1];
+        let out = sockaddr_in6_to_string(high, low);
+        assert!(out == "::1", "expected canonical \"::1\", got {out:?}");
+        assert!(
+            out != "0:0:0:0:0:0:0:1",
+            "must NOT return expanded form — the previous bug",
         );
     }
 }

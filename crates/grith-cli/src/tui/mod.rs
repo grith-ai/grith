@@ -6,6 +6,8 @@
 
 pub mod events;
 pub mod exec_tui;
+pub mod fullscreen_scrollback;
+pub mod input_thread;
 pub mod render;
 pub mod state;
 pub mod theme;

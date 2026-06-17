@@ -19,7 +19,7 @@ use super::{
 fn enforce_chain_integrity(
     storage: &grith_audit::AuditStorage,
 ) -> Result<(), axum::response::Response> {
-    match storage.verify_chain() {
+    match storage.cached_verify_chain() {
         Ok(grith_audit::ChainVerification::Valid { .. } | grith_audit::ChainVerification::Empty) => {
             Ok(())
         }
@@ -49,7 +49,19 @@ pub(super) struct AuditQueryParams {
     #[serde(default = "default_limit")]
     limit: usize,
     #[serde(default)]
+    offset: usize,
+    #[serde(default)]
     session_id: Option<String>,
+    /// `full` (default) — only proxy-decision rows. `all` — include
+    /// compact short-circuit rows. Anything else falls back to `full`.
+    #[serde(default)]
+    include: Option<String>,
+}
+
+impl AuditQueryParams {
+    fn include_compact(&self) -> bool {
+        matches!(self.include.as_deref(), Some("all"))
+    }
 }
 
 pub(crate) async fn list_audit(
@@ -94,13 +106,21 @@ pub(crate) async fn list_audit(
         }
     } else {
         let effective_limit = params.limit.min(MAX_PAGE_LIMIT);
-        match storage.get_recent(effective_limit) {
+        let include_compact = params.include_compact();
+        let result = if params.offset == 0 {
+            storage.get_recent_filtered(effective_limit, include_compact)
+        } else {
+            storage.get_page_filtered(params.offset, effective_limit, include_compact)
+        };
+        match result {
             Ok(records) => {
-                let total = storage.count().unwrap_or(0);
+                let total = storage.count_filtered(include_compact).unwrap_or(0);
                 Json(serde_json::json!({
                     "records": records,
                     "total": total,
                     "limit": effective_limit,
+                    "offset": params.offset,
+                    "include": if include_compact { "all" } else { "full" },
                 }))
                 .into_response()
             }
@@ -120,6 +140,17 @@ pub(super) struct ExportParams {
     format: String,
     #[serde(default = "default_export_limit")]
     limit: usize,
+    /// When true, also read cold-storage archives from `<audit_dir>/cold/`
+    /// and merge their rows with the active-DB results. Default false to
+    /// keep the hot path cheap.
+    #[serde(default)]
+    include_cold: bool,
+    /// Optional `YYYY-MM-DD` date filter. When set with `include_cold`,
+    /// only archive files whose date is >= `from_date` are read. Active-DB
+    /// records are not filtered by date here (callers can post-filter
+    /// the response).
+    #[serde(default)]
+    from_date: Option<String>,
 }
 
 fn default_format() -> String {
@@ -148,7 +179,7 @@ pub(crate) async fn export_audit(
     if let Err(resp) = enforce_chain_integrity(&storage) {
         return resp;
     }
-    let records = match storage.get_recent(params.limit) {
+    let mut records = match storage.get_recent(params.limit) {
         Ok(r) => r,
         Err(e) => {
             return api_error(
@@ -159,6 +190,34 @@ pub(crate) async fn export_audit(
             .into_response();
         }
     };
+
+    // Cold-archive stitching. Defaults off so the hot Export button
+    // continues to be cheap; opt-in via `?include_cold=true`.
+    if params.include_cold {
+        let cold_dir = state
+            .audit_db_path
+            .parent()
+            .map(|p| p.join("cold"))
+            .unwrap_or_else(|| std::path::PathBuf::from("cold"));
+        let from_date = params.from_date.as_deref();
+        let mut cold_rows: Vec<_> = grith_audit::retention::list_archive_files(&cold_dir)
+            .into_iter()
+            .filter(|p| {
+                from_date.is_none_or(|fd| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_suffix(".jsonl.zst"))
+                        .is_some_and(|date| date >= fd)
+                })
+            })
+            .filter_map(|p| grith_audit::retention::read_zstd_jsonl(&p).ok())
+            .flatten()
+            .collect();
+        records.append(&mut cold_rows);
+        // Newest-first ordering for response consistency with active-DB
+        // get_recent. Tie-break by id to keep the order deterministic.
+        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+    }
 
     match params.format.as_str() {
         "csv" => {

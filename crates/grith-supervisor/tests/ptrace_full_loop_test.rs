@@ -34,9 +34,6 @@ fn full_supervisor_loop_with_real_process() {
         let scoring = ScoringConfig {
             auto_allow_threshold: 3.0,
             auto_deny_threshold: 8.0,
-            cold_start_calls: 0,
-            cold_start_escalation_low: 2.0,
-            cold_start_escalation_high: 10.0,
         };
         let proxy = Arc::new(SecurityProxy::new(
             registry,
@@ -89,6 +86,7 @@ fn full_supervisor_loop_with_real_process() {
                 None,
                 &[],
                 std::collections::HashSet::new(),
+                None,
                 None,
                 None,
                 None,

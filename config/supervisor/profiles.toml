@@ -23,6 +23,73 @@ routine_paths = [
     # System introspection (read-only, world-readable)
     "/proc",
     "/etc/profile.d",
+    # Rust toolchain — cargo cache (registry, git checkouts, package-cache-mutate
+    # lock file) and rustup toolchain storage. Routine for any Rust dev workflow;
+    # safe to mark routine because trust here grants file I/O only, not exec.
+    "${HOME}/.cargo/**",
+    "${HOME}/.rustup/**",
+
+    # Node toolchain install trees — destination for `npm install -g` across
+    # the common version managers. LLM tools (claude-code, codex, …) self-
+    # update by running `npm install -g <pkg>` which writes hundreds of files
+    # into these trees and triggers rate-limit prompts. Trust here is file I/O
+    # only; `routine_exec_roots` for the same trees is handled per-tool
+    # profile (so only the relevant @vendor/<pkg> binaries become trusted to
+    # spawn, not arbitrary binaries the user `npm install -g`'d).
+    "${HOME}/.local/share/mise/installs/**",
+    "${HOME}/.nvm/versions/**",
+    "${HOME}/.volta/tools/image/**",
+    "${HOME}/.local/share/pnpm/global/**",
+
+    # ─── Toolchain scratch dirs under /tmp ───────────────────────────────────
+    # High-churn install/build scratch. Trust here grants file I/O only — the
+    # exec axis is independent (PR 4 routine_exec_roots), so a payload dropped
+    # into one of these still gets QUEUE'd at spawn time. Prefixes are
+    # tool-specific naming conventions, not blanket /tmp.
+
+    # Rust — cargo install bootstrap, cargo-target overrides, cargo-fetch
+    "/tmp/cargo-*",
+    # Rust — rustc compilation tempdirs (e.g. /tmp/rustcW0EmZ7/lib.meta)
+    "/tmp/rustc*",
+
+    # Node — npm cacache staging, yarn v1 (double-dash is intentional),
+    # node-gyp build dir, V8 per-user compile caches
+    "/tmp/npm-*",
+    "/tmp/yarn--*",
+    "/tmp/.node-gyp*",
+    "/tmp/v8-compile-cache-*",
+
+    # Python — pip install/build-env/req-build/unpack/wheel-cache staging,
+    # uv (modern installer) staging
+    "/tmp/pip-*",
+    "/tmp/uv-*",
+
+    # PHP — composer install staging
+    "/tmp/composer-*",
+
+    # Go — build cache scratch
+    "/tmp/go-build*",
+
+    # C / C++ — gcc/clang tempfiles. Suffix-scoped on purpose: .o and .s are
+    # not dlopen targets, .ld is consumed only by the immediately-spawned
+    # linker. A bare `/tmp/cc*` would allow .so writes, which IS dlopen-
+    # reachable, so we don't widen the glob.
+    "/tmp/cc*.o",
+    "/tmp/cc*.s",
+    "/tmp/cc*.ld",
+    # Linker staging
+    "/tmp/ld-*",
+
+    # Ruby — bundler tempdirs
+    "/tmp/bundler*",
+
+    # JVM — perf data dir (per-user) and attach-mechanism sockets
+    "/tmp/hsperfdata_*",
+    "/tmp/.java_pid*",
+
+    # .NET — nuget scratch and dotnet CLI staging
+    "/tmp/NuGetScratch/",
+    "/tmp/dotnet-*",
 ]
 
 routine_commands = [
@@ -36,6 +103,12 @@ routine_commands = [
     "readlink", "realpath", "dirname", "basename",
     # Text processing
     "tr", "cut", "sort", "uniq", "sed", "awk", "xargs", "tee", "jq",
+    # Encoding / decoding — `base64` shows up on every Claude Code / Codex
+    # Bash tool call because both wrap the user command as
+    # `bash -c "... eval $(echo <b64-cmd> | base64 -d)"`. Marking it
+    # routine silences the prompt flood; the actual payload is in the
+    # *bash* invocation argv, where it stays subject to taint scoring.
+    "base64",
     # System info
     "which", "uname", "id", "whoami", "date",
     # Output and control flow
@@ -46,6 +119,14 @@ routine_commands = [
     "getopt", "getconf", "lsb_release", "dpkg-query", "dpkg", "ps",
     # Git and SCM
     "git", "ssh",
+    # Linker chain — invoked by rustc/cargo/cc during every compile. Listed
+    # individually rather than via routine_exec_roots so they don't get the
+    # `exec-prefix:` short-circuit that would bypass taint scoring. clang
+    # and ld can both load arbitrary code via `-fplugin` / linker scripts,
+    # so taint must still apply to them under a contaminated session; the
+    # `exec:<canonical>` pin from routine_commands keeps provenance checks
+    # while still letting the taint filter score additively.
+    "clang", "ld", "ld.bfd", "ld.gold", "ld.lld", "mold", "lld",
 ]
 
 # No shared destinations in defaults — outbound trust belongs in
@@ -55,6 +136,12 @@ routine_destinations = []
 routine_exec_roots = [
     # Git helper binaries (git-remote-http, git-credential-*, etc.)
     "/usr/lib/git-core/",
+    # Rust toolchain binaries — rustup-managed (rustc, cargo, rustdoc, clippy,
+    # rustfmt, etc.) plus cargo's installed-bins dir. PR 4 provenance check
+    # verifies component-writability before trusting; the path itself does not
+    # bypass other proxy filters.
+    "${HOME}/.rustup/toolchains/",
+    "${HOME}/.cargo/bin/",
 ]
 
 # Read-only trusted paths — auto-allow reads only, not writes.
@@ -218,15 +305,33 @@ routine_destinations = [
     "visualstudio.com",
     "vsassets.io",
     "microsoft.com",
+    # VS Code update/asset CDN (e.g. main.vscode-cdn.net — used to download
+    # the VS Code server binary and updates when Claude Code runs in the
+    # integrated terminal). Base domain for subdomain matching.
+    "vscode-cdn.net",
 ]
 
 routine_listen_addresses = []
+
+# PR 5 Phase G: `local_listener_policy` is intentionally empty here.
+# Claude Code's default workflows don't bind any listener; mcp-server
+# subcommands that do should QUEUE so the operator sees the bind. See
+# `docs/SUPERVISOR-PROFILES.md` § "Authoring local_listener_policy"
+# for the entry template and the meaning of `allow_clamp`.
+local_listener_policy = []
 
 routine_exec_roots = [
     # Claude-bundled helper binaries (rg, etc.) — reviewed, provenance-verified.
     # Justification: Claude Code bundles its own rg under this tree. Needed for
     # code search functionality. Ownership is user-only, permissions verified.
     "${HOME}/.local/share/claude/versions/",
+    # Claude Code npm-global installs across version managers (PR 4 Phase B).
+    # Glob entries are expanded at session start via the `glob` crate and
+    # canonicalised before becoming `exec-prefix:` entries — so version
+    # bumps stop prompting without enumerating every NN.NN.N path.
+    "/usr/lib/node_modules/@anthropic-ai/claude-code",
+    "${HOME}/.nvm/versions/node/*/lib/node_modules/@anthropic-ai/claude-code",
+    "${HOME}/.volta/tools/image/packages/@anthropic-ai/claude-code/*",
     # VS Code system helpers
     "/usr/share/code/",
     # Version manager roots — node/python installed by nvm, mise, etc.
@@ -238,11 +343,29 @@ routine_exec_roots = [
     "${HOME}/.local/share/nvm/",
 ]
 
+# Rate-limit burst exemption only (every other filter still runs). Claude Code
+# extracts/rewrites large numbers of files under its XDG cache on startup
+# (random ~/.cache/.tmpXXXX/ staging dirs, node code-cache, package unpacking),
+# which trips the burst threshold and queues routine work. These roots are not
+# trusted for anything else — secret-scan, deny-list and write-target checks
+# still apply.
+scratch_roots = [
+    "${HOME}/.cache",
+]
+
 [[profiles]]
 name = "codex"
 display_name = "OpenAI Codex CLI"
 extends = "generic"
 rationale = "Codex routinely reads project and local CLI state, shells out to common development tools, and contacts OpenAI and repository infrastructure."
+# PR 70: grith is the supervising security layer here, so codex's own
+# approval/sandbox flow is redundant — and it surfaces prompts to the
+# user that bypass grith's audit trail. `--dangerously-bypass-approvals-
+# and-sandbox` is codex's "I trust the outer security layer" switch;
+# the equivalent is wired for claude-code (`--dangerously-skip-
+# permissions`) at line 142. EXTREMELY DANGEROUS without an outer
+# enforcer — only safe because grith is supervising every syscall.
+launch_contract = { required_args = ["--dangerously-bypass-approvals-and-sandbox"] }
 
 routine_paths = [
     "${PROJECT_DIR}/**",
@@ -289,7 +412,70 @@ routine_destinations = [
 
 # Changed from ["0.0.0.0"] — investigation confirmed no default Codex
 # behaviour needs wildcard bind. Loopback is auto-allowed by grith.
+# PR 5 Phase B: `routine_listen_addresses` is now strictly loopback-only;
+# wildcard binds must go through `local_listener_policy` (see below).
 routine_listen_addresses = []
+
+# PR 5 Phase G + PR 69 Change 3: `local_listener_policy` declares the
+# local IPC ports Codex legitimately binds. The MCP transport entry below
+# was added after audit-log evidence (session 7f256630-…, 2026-05-25)
+# showed Codex's startup binding `0.0.0.0:0` (kernel-assigned ephemeral
+# port) for its localhost MCP transport. Without an entry, PR 5's
+# `wildcard-bind-undeclared` rule denied every bind (46 in a single
+# startup) and blocked the MCP handshake. `allow_clamp = true` lets the
+# supervisor silently rewrite the sockaddr to loopback at the syscall-
+# argument level — the listener is reachable on 127.0.0.1 only and the
+# rewrite is audited. If your workflow needs additional ports, copy the
+# template from `docs/SUPERVISOR-PROFILES.md` § "Authoring
+# local_listener_policy".
+#
+# Inline-table array syntax is required here because later keys in this
+# profile (`namespace_users`, `routine_exec_roots`, …) would otherwise be
+# scoped under the listener entry by TOML's table-header rules.
+local_listener_policy = [
+    { port = 0, family = "v4", desc = "Codex MCP transport — kernel-assigned localhost port", allow_clamp = true },
+]
+
+# PR 6 Phase C: namespace_users — binaries Codex's bootstrap legitimately
+# spawns to set up its own sandbox. These canonical paths are allowed
+# to invoke `unshare(2)` / `setns(2)` silently — but ONLY when the same
+# canonical path is ALSO under a `routine_exec_root` below. Both
+# conditions are required (fail-safe): an attacker who somehow drops
+# their own `/usr/bin/bwrap` outside a routine root gets QUEUE'd.
+#
+# NOTE: by default `/usr/bin` is NOT in `routine_exec_roots` for the
+# codex profile, so these entries are effectively dormant until the
+# operator explicitly adds `/usr/bin/` (or a tighter subpath like
+# `/usr/bin/bwrap` literal) to `routine_exec_roots`. That's the right
+# safety posture — measure before trusting.
+namespace_users = [
+    "/usr/bin/bwrap",
+    "/usr/bin/bubblewrap",
+    "/usr/bin/firejail",
+    "/usr/bin/nsenter",
+    "/usr/bin/unshare",
+]
+
+routine_exec_roots = [
+    # Codex npm-global installs across version managers (PR 4 Phase B).
+    # Glob entries are expanded at session start, so minor-version bumps
+    # of @openai/codex stop prompting without enumerating each version.
+    "/usr/lib/node_modules/@openai/codex",
+    "${HOME}/.local/share/codex",
+    "${HOME}/.nvm/versions/node/*/lib/node_modules/@openai/codex",
+    "${HOME}/.volta/tools/image/packages/@openai/codex/*",
+    "${HOME}/.local/share/pnpm/global/*/node_modules/@openai/codex",
+    # Version manager roots — node/python installed by nvm, mise, etc.
+    "${HOME}/.nvm/versions/",
+    "${HOME}/.local/share/mise/",
+    "${HOME}/.local/share/nvm/",
+]
+
+# Rate-limit burst exemption only (see claude-code profile for rationale).
+# Codex churns the same XDG cache staging dirs on startup.
+scratch_roots = [
+    "${HOME}/.cache",
+]
 
 [[profiles]]
 name = "aider"

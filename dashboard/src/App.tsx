@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { Link, NavLink, Route, Routes } from "react-router-dom";
 import { DashboardPage } from "@/pages/Dashboard";
 import { DigestPage } from "@/pages/Digest";
 import { AuditPage } from "@/pages/Audit";
+import { SessionsPage } from "@/pages/Sessions";
 import { NotificationSettingsPage } from "@/pages/NotificationSettings";
 import { SettingsPage } from "@/pages/Settings";
 import { BillingPage } from "@/pages/Billing";
-import { getHealth, getAuditRecords, shutdownServer } from "@/lib/api";
+import { InventoryPage } from "@/pages/Inventory";
+import { ListenerRewritesPage } from "@/pages/ListenerRewrites";
+import { getHealth, getSessions, shutdownServer } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
 // Navigation items
@@ -43,6 +46,33 @@ const NAV_ITEMS: NavItem[] = [
     icon: (
       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+      </svg>
+    ),
+  },
+  {
+    to: "/sessions",
+    label: "Sessions",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M6 6.878V6a2.25 2.25 0 0 1 2.25-2.25h7.5A2.25 2.25 0 0 1 18 6v.878m-12 0c.235-.083.487-.128.75-.128h10.5c.263 0 .515.045.75.128m-12 0A2.25 2.25 0 0 0 4.5 9v.878m13.5-3A2.25 2.25 0 0 1 19.5 9v.878m0 0a2.246 2.246 0 0 0-.75-.128H5.25c-.263 0-.515.045-.75.128m15 0A2.25 2.25 0 0 1 21 12v6a2.25 2.25 0 0 1-2.25 2.25H5.25A2.25 2.25 0 0 1 3 18v-6c0-.98.626-1.813 1.5-2.122" />
+      </svg>
+    ),
+  },
+  {
+    to: "/inventory",
+    label: "Trusted Binaries",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 0 1-1.043 3.296 3.745 3.745 0 0 1-3.296 1.043A3.745 3.745 0 0 1 12 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 0 1-3.296-1.043 3.745 3.745 0 0 1-1.043-3.296A3.745 3.745 0 0 1 3 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 0 1 1.043-3.296 3.745 3.745 0 0 1 3.296-1.043A3.745 3.745 0 0 1 12 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 0 1 3.296 1.043 3.746 3.746 0 0 1 1.043 3.296A3.745 3.745 0 0 1 21 12Z" />
+      </svg>
+    ),
+  },
+  {
+    to: "/listener-rewrites",
+    label: "Listener Rewrites",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21 3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
       </svg>
     ),
   },
@@ -91,23 +121,30 @@ export function App() {
 
   useEffect(() => {
     async function poll() {
+      // Reachability is decided by the OPEN health endpoint only. The session
+      // count comes from `/api/supervisor/sessions`, which is token-gated — a
+      // 401 there means "this tab isn't authorised", NOT "the server is down".
+      // Folding both into one Promise.all (as before) made a missing dashboard
+      // token surface as a false "Server unreachable".
       try {
-        const [health, audit] = await Promise.all([
-          getHealth(),
-          getAuditRecords({ limit: 20, offset: 0 }),
-        ]);
+        const health = await getHealth();
         setServerReachable(true);
         setDaemonVersion(health.version);
-        // Count distinct session_ids with activity in the last 30 seconds.
-        const cutoff = Date.now() - 30_000;
-        const recentIds = new Set(
-          audit.records
-            .filter((r) => new Date(r.timestamp).getTime() > cutoff)
-            .map((r) => r.session_id),
-        );
-        setActiveSessions(recentIds.size);
       } catch {
         setServerReachable(false);
+        setActiveSessions(0);
+        return;
+      }
+
+      // Best-effort: ask the supervisor registry directly. Inferring "active"
+      // from recent audit timestamps misses idle-but-live sessions (a
+      // `grith exec claude` window where the user is reading the model's
+      // output and not triggering proxy calls). An auth failure here just
+      // leaves the active-session count at 0.
+      try {
+        const sessions = await getSessions();
+        setActiveSessions(sessions.total);
+      } catch {
         setActiveSessions(0);
       }
     }
@@ -183,13 +220,18 @@ export function App() {
                     : "bg-status-deny-red"
               }`}
             />
-            <span className="text-xs text-grith-muted">
-              {proxyActive
-                ? `${activeSessions} active session${activeSessions !== 1 ? "s" : ""}`
-                : serverReachable
-                  ? "Idle — no active sessions"
-                  : "Server unreachable"}
-            </span>
+            {proxyActive ? (
+              <Link
+                to="/sessions"
+                className="text-xs text-grith-muted hover:text-grith-text transition-colors"
+              >
+                {`${activeSessions} active session${activeSessions !== 1 ? "s" : ""}`}
+              </Link>
+            ) : (
+              <span className="text-xs text-grith-muted">
+                {serverReachable ? "Idle — no active sessions" : "Server unreachable"}
+              </span>
+            )}
           </div>
           <button
             onClick={handleStopDashboard}
@@ -210,6 +252,12 @@ export function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/digest" element={<DigestPage />} />
           <Route path="/audit" element={<AuditPage />} />
+          <Route path="/sessions" element={<SessionsPage />} />
+          <Route path="/inventory" element={<InventoryPage />} />
+          <Route
+            path="/listener-rewrites"
+            element={<ListenerRewritesPage />}
+          />
           <Route path="/notifications" element={<NotificationSettingsPage />} />
           <Route path="/billing" element={<BillingPage />} />
           <Route path="/settings" element={<SettingsPage />} />

@@ -1,6 +1,29 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { DashboardPage } from "../Dashboard";
+
+// jsdom has no real <canvas>, so stub the card generator and assert wiring.
+const shareSpy = vi.fn().mockResolvedValue("downloaded");
+vi.mock("@/lib/shareCard", () => ({
+  shareOrDownloadStats: (s: unknown) => shareSpy(s),
+  // The hero's share menu pre-warms a link on open; give it a resolvable stub
+  // so it doesn't hit the network in tests.
+  createShareLink: vi.fn().mockResolvedValue("https://grith.ai/s/test123"),
+  shareIntents: () => ({ x: "#", threads: "#", hn: "#" }),
+}));
+
+// The Live Decisions ticker opens a real WebSocket on mount, which jsdom
+// cannot service — stub the hook so the dashboard renders without spawning
+// background reconnect timers. The ticker falls back to audit records, which
+// the fetch mock supplies.
+vi.mock("@/hooks/useWebSocket", () => ({
+  useWebSocket: () => ({
+    connected: false,
+    messages: [],
+    lastEvent: null,
+    liveFeedUnavailable: false,
+  }),
+}));
 
 const mockHealth = {
   status: "healthy",
@@ -20,7 +43,6 @@ const mockProxy = {
   allow_count: 1200,
   queue_count: 250,
   deny_count: 50,
-  cold_start_remaining: 0,
   filters: [
     {
       name: "path_match",
@@ -70,6 +92,32 @@ function mockFetchSuccess() {
         ok: true,
         status: 200,
         json: () => Promise.resolve(mockExfil),
+      });
+    }
+    if (url.includes("/api/supervisor/sessions")) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            sessions: [
+              {
+                id: "sess-1",
+                tool_name: "grith",
+                root_pid: 1234,
+                uptime_seconds: 10,
+                last_activity_seconds: 0,
+                stats: {
+                  total_intercepted: 5,
+                  total_allowed: 3,
+                  total_queued: 1,
+                  total_denied: 1,
+                  total_filtered_noise: 0,
+                },
+              },
+            ],
+            total: 1,
+          }),
       });
     }
     if (url.includes("/api/audit")) {
@@ -148,16 +196,19 @@ describe("DashboardPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders health status and stats", async () => {
+  it("renders the hero with live status and uptime", async () => {
     mockFetchSuccess();
     render(<DashboardPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("healthy")).toBeTruthy();
+      expect(screen.getByText("Supervising live")).toBeTruthy();
     });
 
-    expect(screen.getAllByText("5").length).toBeGreaterThan(0);
-    expect(screen.getByText("1h 1m")).toBeTruthy();
+    // Brand + tagline in the hero.
+    expect(screen.getAllByText("grith").length).toBeGreaterThan(0);
+    expect(screen.getByText("Zero Trust for AI Agents")).toBeTruthy();
+    // Uptime surfaced in the hero legend ("uptime 1h 1m").
+    expect(screen.getByText(/1h 1m/)).toBeTruthy();
   });
 
   it("shows error on API failure", async () => {
@@ -169,25 +220,52 @@ describe("DashboardPage", () => {
     });
   });
 
-  it("renders decision distribution counts from audit records", async () => {
+  it("renders the decision posture legend in the hero", async () => {
     mockFetchSuccess();
     render(<DashboardPage />);
 
     await waitFor(() => {
-      expect(screen.getByText(/Allow: 3/)).toBeTruthy();
+      expect(screen.getAllByText("Allowed").length).toBeGreaterThan(0);
     });
 
-    expect(screen.getByText(/Queue: 1/)).toBeTruthy();
-    expect(screen.getByText(/Deny: 1/)).toBeTruthy();
+    expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Denied").length).toBeGreaterThan(0);
   });
 
-  it("renders filter summary line", async () => {
+  it("share menu downloads a stats card with aggregate numbers only", async () => {
+    shareSpy.mockClear();
+    mockFetchSuccess();
+    render(<DashboardPage />);
+
+    // Open the share menu, then choose the PNG download item.
+    const btn = await screen.findByText("Share stats");
+    fireEvent.click(btn);
+    const dl = await screen.findByText("Download image (PNG)");
+    fireEvent.click(dl);
+
+    await waitFor(() => expect(shareSpy).toHaveBeenCalledTimes(1));
+    const arg = shareSpy.mock.calls[0]?.[0] as Record<string, unknown>;
+    // Only aggregate counts — no path, project, cwd, or session detail.
+    expect(arg).toHaveProperty("totalEvals");
+    expect(arg).toHaveProperty("allow");
+    expect(arg).toHaveProperty("deny");
+    expect(arg).not.toHaveProperty("cwd");
+    expect(arg).not.toHaveProperty("project_name");
+    // Confirms the success label swap.
+    await waitFor(() => expect(screen.getByText("Saved PNG")).toBeTruthy());
+  });
+
+  it("renders the filter pipeline with active count", async () => {
     mockFetchSuccess();
     render(<DashboardPage />);
 
     await waitFor(() => {
-      expect(screen.getByText(/2 filters active/)).toBeTruthy();
+      expect(screen.getByText("Filter Pipeline")).toBeTruthy();
     });
+
+    // Phase labels from the pipeline viz.
+    expect(screen.getByText("Static")).toBeTruthy();
+    expect(screen.getByText("Pattern")).toBeTruthy();
   });
 
   it("renders subsystem health indicators", async () => {

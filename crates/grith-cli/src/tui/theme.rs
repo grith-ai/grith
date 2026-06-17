@@ -6,7 +6,11 @@
 use ratatui::style::Color;
 
 pub const BG: Color = Color::Rgb(0x0d, 0x11, 0x17);
-pub const BG_PANEL: Color = Color::Rgb(0x16, 0x1b, 0x22);
+// Chrome panels (titlebar, subheader, log, statusbar). Significantly lighter
+// than `BG` so the top/bottom chrome reads as clearly separate from the
+// central terminal pane. Targets ~2.5× perceived-luminance ratio against BG
+// — equivalent to GitHub's `canvas.overlay` / modern dark-UI "surface 2".
+pub const BG_PANEL: Color = Color::Rgb(0x2d, 0x33, 0x3b);
 pub const BORDER: Color = Color::Rgb(0x30, 0x36, 0x3d);
 pub const TEXT: Color = Color::Rgb(0xc9, 0xd1, 0xd9);
 pub const TEXT_DIM: Color = Color::Rgb(0x48, 0x4f, 0x58);

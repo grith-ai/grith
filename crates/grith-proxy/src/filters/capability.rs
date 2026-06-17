@@ -67,6 +67,14 @@ impl CapabilityFilter {
             ToolCallType::NetListen { .. } => "net:listen",
             ToolCallType::ProcessSpawn { .. } => "shell:exec",
             ToolCallType::DnsQuery { .. } => "net:connect",
+            // PR 6 Phase B: category-2 syscalls. Use dedicated
+            // capability strings so a profile can grant them
+            // explicitly without overloading existing fs:* / net:*
+            // capabilities.
+            ToolCallType::OwnershipChange { .. } => "fs:ownership",
+            ToolCallType::FilesystemMutation { .. } => "fs:mount",
+            ToolCallType::CrossProcessAccess { .. } => "process:ptrace",
+            ToolCallType::NamespaceOp { .. } => "process:namespace",
         }
     }
 }

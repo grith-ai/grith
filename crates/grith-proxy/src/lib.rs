@@ -16,6 +16,7 @@ pub mod filters;
 pub mod meta_rules;
 pub mod reputation;
 pub mod scoring;
+pub mod session_state;
 pub mod types;
 
 pub use error::Error;

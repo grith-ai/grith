@@ -4,8 +4,156 @@
 //! Baseline operation risk scoring filter.
 
 use crate::filters::{FilterPhase, SecurityFilter};
-use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType};
-use std::net::IpAddr;
+use crate::session_state::SessionStateRegistry;
+use crate::types::{FilterResult, Severity, SpawnProvenance, ToolCallContext, ToolCallType};
+
+/// PR 4 Phase H: read the rollout flag from the filter instance.
+///
+/// Phase D shipped this as an env var (`GRITH_PROXY_ROUTINE_SIGNAL_ENABLED`)
+/// so the signal could be smoke-tested before the config schema was
+/// wired. Phase H replaces that with the operator-visible config key
+/// `proxy.spawn.routine_provenance_signal`, plumbed through
+/// `OperationRiskFilter`'s constructor. The env-var path is retained
+/// as a tie-breaker: when set to a truthy value it forces the signal
+/// ON, useful for emergency rollback testing without editing config.
+/// The env-var read is the documented escape hatch — production
+/// behaviour comes from config.
+fn routine_signal_env_override() -> Option<bool> {
+    let v = std::env::var_os("GRITH_PROXY_ROUTINE_SIGNAL_ENABLED")?;
+    let s = v.to_string_lossy();
+    if s.is_empty() {
+        return None;
+    }
+    let truthy = !s.eq_ignore_ascii_case("0")
+        && !s.eq_ignore_ascii_case("false")
+        && !s.eq_ignore_ascii_case("no");
+    Some(truthy)
+}
+
+/// PR 4 Phase D: the routine-spawn signal score. **Exactly `0.5`, never `0.0`.**
+///
+/// `+0.5` keeps the security boundary additive: a routine spawn plus
+/// any single phase-3 hit at `+3.0` lands at `3.5`, still above the
+/// `>3.0` QUEUE threshold. Scoring `+0.0` would silently absorb that
+/// hit; documented as explicitly rejected in
+/// `work/64-pr4-provenance-routine-spawn-work.md`.
+pub const ROUTINE_SPAWN_SCORE: f64 = 0.5;
+
+/// PR 4 Phase D: the legacy ProcessSpawn baseline score. Applied when
+/// the routine signal does not fire (or is disabled).
+pub const NON_ROUTINE_SPAWN_SCORE: f64 = 1.0;
+
+/// PR 4 Phase D: rule_id emitted on `FilterResult` when the routine
+/// signal applies. Phase F's audit-record builder keys
+/// `shadow_phase3_filters` off this string, so the literal MUST stay
+/// in one place. Lift to a const so a future rename is a compile-time
+/// failure rather than a silent forensic-data loss.
+pub const ROUTINE_SPAWN_RULE_ID: &str = "process-spawn-routine";
+
+/// PR 4 Phase D: rule_id emitted on the legacy ProcessSpawn baseline.
+pub const NON_ROUTINE_SPAWN_RULE_ID: &str = "process-spawn-baseline";
+
+/// PR 4 Phase D: evaluate whether a `ProcessSpawn` qualifies for the
+/// routine signal. Returns the baseline score the filter should apply.
+///
+/// The signal applies only when EVERY condition is met:
+///   1. Feature flag enabled (Phase D env var; Phase H config).
+///   2. `SpawnProvenance` attached and `matched_routine_root` populated.
+///   3. Every path component on the canonical binary path passes the
+///      writability safety check (no world-writable, no other-writable,
+///      no root-owned-group-writable).
+///   4. `is_outbound_capable = false`.
+///   5. The binary's canonical path is present in the session-pinned
+///      inventory AND the hash matches what was pinned at session start.
+///
+/// Note: cross-reference to PR 2's argv-tainted-path / argv-tainted-env
+/// conditions (work-doc condition 4) is achieved *additively* — when
+/// argv references taint, PR 2's taint filter independently scores
+/// `+3.0`, so a routine spawn that also trips taint lands at `3.5` and
+/// still queues. Re-checking taint here would only widen the signal's
+/// margin by 0.5 and would tightly couple two filters; we skip it.
+///
+/// Returns `ROUTINE_SPAWN_SCORE` (0.5) on signal; `NON_ROUTINE_SPAWN_SCORE`
+/// (1.0) otherwise.
+pub fn operation_risk_for_spawn(ctx: &ToolCallContext, enabled: bool) -> f64 {
+    if has_routine_signal(ctx, enabled) {
+        ROUTINE_SPAWN_SCORE
+    } else {
+        NON_ROUTINE_SPAWN_SCORE
+    }
+}
+
+fn has_routine_signal(ctx: &ToolCallContext, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    let Some(prov) = ctx.spawn_provenance.as_ref() else {
+        return false;
+    };
+    if !provenance_qualifies(prov) {
+        return false;
+    }
+    inventory_pins_canonical(ctx, prov)
+}
+
+/// Conditions 2, 3, 4 (provenance shape + writability + outbound-capable).
+/// Split out so unit tests can exercise the predicate without setting up
+/// a `SessionState`.
+fn provenance_qualifies(prov: &SpawnProvenance) -> bool {
+    if prov.matched_routine_root.is_none() {
+        return false;
+    }
+    if prov.is_outbound_capable {
+        return false;
+    }
+    let unsafe_component = prov
+        .component_writability
+        .iter()
+        .any(|c| c.world_writable || c.other_writable || c.group_writable_non_root);
+    !unsafe_component
+}
+
+/// Condition 5 — session-pinned inventory match. We require a pin for
+/// every routine root (system and user-owned alike) per the work-doc
+/// Open Question 1 recommendation: "pin, with a profile knob to disable".
+/// The knob is deferred to Phase H.
+///
+/// Returns `false` when the session lacks a SessionState entry yet
+/// (e.g. the spawn fires before Phase C's inventory-build task has
+/// landed an entry), keeping the routine signal fail-closed during the
+/// session-start race window.
+fn inventory_pins_canonical(ctx: &ToolCallContext, prov: &SpawnProvenance) -> bool {
+    let Some(scope) = ctx.session_scope else {
+        tracing::debug!(
+            target: "grith_proxy::operation_risk",
+            canonical = %prov.canonical_path,
+            "routine signal denied: no session_scope on ctx",
+        );
+        return false;
+    };
+    let state = match SessionStateRegistry::global().get(scope) {
+        Some(s) => s,
+        None => {
+            tracing::debug!(
+                target: "grith_proxy::operation_risk",
+                %scope,
+                canonical = %prov.canonical_path,
+                "routine signal denied: no SessionState entry (Phase C race or scope leak)",
+            );
+            return false;
+        }
+    };
+    let Some(inventory) = state.pinned_inventory() else {
+        tracing::debug!(
+            target: "grith_proxy::operation_risk",
+            %scope,
+            canonical = %prov.canonical_path,
+            "routine signal denied: pinned_inventory not yet installed",
+        );
+        return false;
+    };
+    inventory.contains(&prov.canonical_path, &prov.sha256)
+}
 
 /// Filter that assigns baseline risk scores based on the inherent
 /// riskiness of the operation type.
@@ -26,28 +174,55 @@ use std::net::IpAddr;
 /// - `0.5` for writes and HTTP: `FileWrite`, `HttpRequest`, `NetConnect`
 /// - `1.0` for risky ops: `ShellExec`, `ProcessSpawn`, `FileDelete`, `FileChmod`
 /// - `4.0` for non-loopback listeners that expose services beyond the local machine
-pub struct OperationRiskFilter;
+pub struct OperationRiskFilter {
+    /// PR 4 Phase H: cached rollout flag for the routine-spawn signal.
+    /// Operators set this via `proxy.spawn.routine_provenance_signal` in
+    /// config; `grith-core`'s daemon constructs the filter with the
+    /// resolved value. Reading from a struct field instead of `getenv`
+    /// keeps the spawn hot path branch-predictable.
+    routine_signal_enabled: bool,
+}
 
 impl OperationRiskFilter {
+    /// Construct with the routine signal **disabled**. Use this for
+    /// callsites that don't need the PR 4 signal — every pre-PR-4
+    /// callsite is covered by this shape, so no existing behaviour
+    /// changes. To opt in to the signal, build with
+    /// [`OperationRiskFilter::with_routine_signal(true)`]. New tests
+    /// that *want* the signal-on path MUST construct via that method —
+    /// `new()` will silently keep the signal off, which is the
+    /// fail-closed default during rollout.
     pub fn new() -> Self {
-        Self
+        Self {
+            routine_signal_enabled: false,
+        }
+    }
+
+    /// PR 4 Phase H: construct with the routine signal flag explicit.
+    /// `grith-core/src/daemon/filter_registry.rs` calls this with
+    /// `cfg.proxy.spawn.routine_provenance_signal`.
+    pub fn with_routine_signal(routine_signal_enabled: bool) -> Self {
+        Self {
+            routine_signal_enabled,
+        }
+    }
+
+    /// Effective enablement: config flag OR an env-var override (used
+    /// for emergency rollback / smoke testing). An env value of
+    /// `0`/`false`/`no` explicitly disables even when config is true,
+    /// which is the documented escape hatch for cutting the signal
+    /// without a config redeploy.
+    fn effective_routine_signal_enabled(&self) -> bool {
+        match routine_signal_env_override() {
+            Some(value) => value,
+            None => self.routine_signal_enabled,
+        }
     }
 }
 
 impl Default for OperationRiskFilter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn is_loopback_listen_target(address: &str) -> bool {
-    if address.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    match address.parse::<IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => false,
     }
 }
 
@@ -127,7 +302,18 @@ impl SecurityFilter for OperationRiskFilter {
                 } else {
                     format!("Process spawn: {} {}", command, args.join(" "))
                 };
-                (1.0, "process-spawn-baseline", Severity::Notice, msg)
+                // PR 4 Phase D: the baseline is `operation_risk_for_spawn`
+                // — `0.5` when the routine signal applies, `1.0` otherwise.
+                // The phase-3 filters still run unmodified, so a routine
+                // spawn that trips taint or behavioural anomaly lands at
+                // `0.5 + 3.0 = 3.5` and still QUEUEs.
+                let score = operation_risk_for_spawn(ctx, self.effective_routine_signal_enabled());
+                let rule_id = if score < NON_ROUTINE_SPAWN_SCORE {
+                    ROUTINE_SPAWN_RULE_ID
+                } else {
+                    NON_ROUTINE_SPAWN_RULE_ID
+                };
+                (score, rule_id, Severity::Notice, msg)
             }
             ToolCallType::FileDelete { path } => (
                 1.0,
@@ -135,34 +321,100 @@ impl SecurityFilter for OperationRiskFilter {
                 Severity::Warning,
                 format!("File deletion: {path}"),
             ),
-            ToolCallType::FileChmod { path, mode } => (
-                1.0,
-                "file-chmod-baseline",
-                Severity::Warning,
-                format!("Permission change: {path} (mode {mode:o})"),
-            ),
-            ToolCallType::NetListen { address, port } => {
-                if is_loopback_listen_target(address) {
+            ToolCallType::FileChmod { path, mode } => {
+                // setuid (0o4000) / setgid (0o2000) bits are a privilege-
+                // escalation primitive (research doc §5.1 #3): the command
+                // filter caught the string `chmod +s`, but an octal `0o4755`
+                // mode previously scored the same flat baseline as any chmod.
+                // Score the dangerous bit, not the syscall.
+                if *mode & 0o6000 != 0 {
                     (
-                        0.5,
-                        "loopback-net-listen",
-                        Severity::Notice,
-                        format!("Loopback-only network listen: {address}:{port}"),
+                        5.0,
+                        "file-chmod-setuid",
+                        Severity::Error,
+                        format!("setuid/setgid permission change: {path} (mode {mode:o})"),
                     )
                 } else {
                     (
-                        4.0,
-                        "remote-net-listen",
+                        1.0,
+                        "file-chmod-baseline",
                         Severity::Warning,
-                        format!("Non-loopback network listen requires review: {address}:{port}"),
+                        format!("Permission change: {path} (mode {mode:o})"),
                     )
                 }
+            }
+            ToolCallType::NetListen { address, port } => {
+                // PR 69 Change 4: `operation_risk` no longer scores
+                // bind-shape exposure. PR 5's `egress_policy` is the
+                // authoritative scorer for the loopback / wildcard /
+                // declared-clamp / specific-iface matrix; doubling the
+                // score here pushed wildcard-undeclared from QUEUE
+                // (5.0) to DENY (9.0) and broke codex's MCP startup
+                // (see work/69-codex-prompt-noise-followup-work.md).
+                //
+                // We still want a non-zero baseline so listen ops show
+                // up in audit-log queries even when no other filter
+                // matches. The shape distinction now lives entirely in
+                // `egress_policy`.
+                (
+                    0.5,
+                    "net-listen-baseline",
+                    Severity::Notice,
+                    format!("Network listen: {address}:{port}"),
+                )
             }
             ToolCallType::DnsQuery { domain, query_type } => (
                 0.5,
                 "dns-query-baseline",
                 Severity::Notice,
                 format!("DNS query: {domain} ({query_type})"),
+            ),
+            // PR 6 Phase B: category-2 syscalls. All three families
+            // get a +5.0 baseline so QUEUE is the default outcome;
+            // profile-declared allowlists can override per the
+            // standard mechanism.
+            ToolCallType::OwnershipChange {
+                target,
+                new_uid,
+                new_gid,
+            } => (
+                5.0,
+                "ownership-change-baseline",
+                Severity::Warning,
+                format!("Ownership change: target={target} uid={new_uid} gid={new_gid}"),
+            ),
+            ToolCallType::FilesystemMutation {
+                op,
+                source,
+                target,
+                fstype,
+            } => (
+                5.0,
+                "filesystem-mutation-baseline",
+                Severity::Warning,
+                format!(
+                    "Filesystem mutation: op={op} src={src} target={target} fstype={fs}",
+                    src = source.as_deref().unwrap_or(""),
+                    fs = fstype.as_deref().unwrap_or(""),
+                ),
+            ),
+            ToolCallType::CrossProcessAccess { op, target_pid } => (
+                5.0,
+                "cross-process-access-baseline",
+                Severity::Warning,
+                format!("Cross-process access: op={op} target_pid={target_pid}"),
+            ),
+            // PR 6 Phase C: namespace primitive scored at +5.0 → QUEUE
+            // by default. The supervisor's `namespace_users` carveout
+            // (in `event_handler.rs`) short-circuits this evaluation
+            // entirely when the calling binary is on the profile-
+            // declared allowlist, so this baseline only fires for
+            // non-allowlisted binaries.
+            ToolCallType::NamespaceOp { syscall, flags } => (
+                5.0,
+                "namespace-op-baseline",
+                Severity::Warning,
+                format!("Namespace primitive: {syscall} flags={flags:#x}"),
             ),
         };
 
@@ -258,8 +510,11 @@ mod tests {
         assert_eq!(result.score, 0.5);
     }
 
+    /// PR 69 Change 4: every NetListen — loopback, wildcard, or
+    /// specific interface — gets the same low baseline here. Bind-shape
+    /// exposure is owned by `egress_policy`.
     #[tokio::test]
-    async fn test_net_listen_baseline() {
+    async fn test_net_listen_wildcard_returns_baseline_only() {
         let filter = OperationRiskFilter::new();
         let ctx = make_ctx(ToolCallType::NetListen {
             address: "0.0.0.0".into(),
@@ -267,12 +522,12 @@ mod tests {
         });
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
-        assert_eq!(result.score, 4.0);
-        assert_eq!(result.rule_id, "remote-net-listen");
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.rule_id, "net-listen-baseline");
     }
 
     #[tokio::test]
-    async fn test_loopback_net_listen_is_low_risk() {
+    async fn test_net_listen_loopback_returns_baseline_only() {
         let filter = OperationRiskFilter::new();
         let ctx = make_ctx(ToolCallType::NetListen {
             address: "127.0.0.1".into(),
@@ -281,7 +536,20 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert_eq!(result.score, 0.5);
-        assert_eq!(result.rule_id, "loopback-net-listen");
+        assert_eq!(result.rule_id, "net-listen-baseline");
+    }
+
+    #[tokio::test]
+    async fn test_net_listen_specific_iface_returns_baseline_only() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::NetListen {
+            address: "192.168.1.10".into(),
+            port: 8080,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.rule_id, "net-listen-baseline");
     }
 
     #[tokio::test]
@@ -305,5 +573,310 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert_eq!(result.score, 0.2);
+    }
+
+    // ---- PR 6 Phase B: category-2 syscalls score +5.0 (QUEUE) ----
+
+    #[tokio::test]
+    async fn phase_b_ownership_change_scores_five() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::OwnershipChange {
+            target: "/etc/passwd".into(),
+            new_uid: 1000,
+            new_gid: 1000,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 5.0);
+        assert_eq!(result.rule_id, "ownership-change-baseline");
+    }
+
+    #[tokio::test]
+    async fn phase_b_filesystem_mutation_scores_five() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::FilesystemMutation {
+            op: "mount".into(),
+            source: Some("/dev/sda1".into()),
+            target: "/mnt/x".into(),
+            fstype: Some("ext4".into()),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 5.0);
+        assert_eq!(result.rule_id, "filesystem-mutation-baseline");
+    }
+
+    #[tokio::test]
+    async fn phase_b_cross_process_access_scores_five() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::CrossProcessAccess {
+            op: "ptrace".into(),
+            target_pid: 9999,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 5.0);
+        assert_eq!(result.rule_id, "cross-process-access-baseline");
+    }
+
+    // PR 6 Phase C: namespace primitive scores +5.0 (QUEUE) when not
+    // carved-out. The supervisor's namespace_users + routine_root
+    // check short-circuits this entirely for trusted sandbox tools.
+    #[tokio::test]
+    async fn phase_c_namespace_op_scores_five() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::NamespaceOp {
+            syscall: "unshare".into(),
+            flags: 0x1002_0000, // CLONE_NEWUSER | CLONE_NEWNS
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 5.0);
+        assert_eq!(result.rule_id, "namespace-op-baseline");
+    }
+
+    // ---- PR 4 Phase D: routine spawn signal tests ----
+
+    use crate::session_state::SessionPinnedInventory;
+    use crate::types::{ComponentWritability, SessionScopeKey, SpawnProvenance};
+
+    fn safe_component(path: &str) -> ComponentWritability {
+        ComponentWritability {
+            path: path.into(),
+            owner_uid: 0,
+            other_writable: false,
+            group_writable_non_root: false,
+            world_writable: false,
+        }
+    }
+
+    fn good_provenance() -> SpawnProvenance {
+        SpawnProvenance {
+            canonical_path: "/home/u/.nvm/versions/node/v22/lib/node_modules/x/bin".into(),
+            sha256: "ab".repeat(32),
+            owner_uid: 1000,
+            owner_gid: 1000,
+            mode: 0o755,
+            component_writability: vec![
+                safe_component("/"),
+                safe_component("/home"),
+                safe_component("/home/u"),
+            ],
+            matched_routine_root: Some("/home/u/.nvm/versions/node/v22/lib/node_modules/x/".into()),
+            is_outbound_capable: false,
+        }
+    }
+
+    fn install_inventory(scope: SessionScopeKey, prov: &SpawnProvenance) {
+        let state = SessionStateRegistry::global().get_or_create(scope);
+        let inv = SessionPinnedInventory::from_entries([(
+            prov.canonical_path.clone(),
+            prov.sha256.clone(),
+        )]);
+        state.set_pinned_inventory(inv);
+    }
+
+    fn spawn_ctx_with_provenance(prov: SpawnProvenance) -> ToolCallContext {
+        let mut ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: prov.canonical_path.clone(),
+            args: Vec::new(),
+        });
+        ctx.session_scope = Some(SessionScopeKey::fresh());
+        ctx.spawn_provenance = Some(prov);
+        ctx
+    }
+
+    // Phase D tests bypass the env-var gate by calling `has_routine_signal`
+    // with an explicit `enabled` bool. The env-var read is exercised by
+    // `default_off_env_var_check` only, which is isolated from other tests.
+
+    /// Phase D guardrail: scoring is **exactly 0.5** on signal — never 0.0.
+    #[tokio::test]
+    async fn routine_signal_scores_exactly_zero_point_five() {
+        let prov = good_provenance();
+        let ctx = spawn_ctx_with_provenance(prov.clone());
+        install_inventory(ctx.session_scope.unwrap(), &prov);
+        assert!(has_routine_signal(&ctx, true));
+        // Direct constant check (constant-time, no env-var involvement).
+        assert!((ROUTINE_SPAWN_SCORE - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// Phase D critical guardrail: routine spawn + a simulated phase-3
+    /// hit at +3.0 still QUEUEs (the +0.5 baseline is additive). Proves
+    /// "+0.5 not +0.0". The integration test
+    /// `tests/routine_phase3_still_queues.rs` covers this same invariant
+    /// from outside the crate; this unit test is the local mirror.
+    #[tokio::test]
+    #[allow(clippy::assertions_on_constants)]
+    async fn routine_spawn_plus_phase3_still_queues() {
+        // 0.5 (routine) + 3.0 (taint, simulated) = 3.5 → > 3.0 threshold.
+        let sim_phase3 = 3.0_f64;
+        let queue_threshold = 3.0_f64;
+        assert!(
+            ROUTINE_SPAWN_SCORE + sim_phase3 > queue_threshold,
+            "scoring +0.0 would silently absorb a phase-3 hit at +3.0; \
+             routine signal MUST be +0.5 (or greater)",
+        );
+        // Equally critical: confirm the constant is exactly 0.5, not 0.0.
+        assert!((ROUTINE_SPAWN_SCORE - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// Phase D gate: when the `enabled` bool is false (matching the
+    /// default env-var-absent state), the signal never fires even on
+    /// otherwise-qualifying provenance + inventory.
+    #[tokio::test]
+    async fn routine_signal_off_when_disabled() {
+        let prov = good_provenance();
+        let ctx = spawn_ctx_with_provenance(prov.clone());
+        install_inventory(ctx.session_scope.unwrap(), &prov);
+        assert!(!has_routine_signal(&ctx, false));
+    }
+
+    #[tokio::test]
+    async fn provenance_disqualifies_when_no_matched_root() {
+        let mut prov = good_provenance();
+        prov.matched_routine_root = None;
+        assert!(!provenance_qualifies(&prov));
+    }
+
+    #[tokio::test]
+    async fn provenance_disqualifies_when_outbound_capable() {
+        let mut prov = good_provenance();
+        prov.is_outbound_capable = true;
+        assert!(!provenance_qualifies(&prov));
+    }
+
+    #[tokio::test]
+    async fn provenance_disqualifies_when_world_writable_component() {
+        let mut prov = good_provenance();
+        prov.component_writability.push(ComponentWritability {
+            path: "/home/u/bad".into(),
+            owner_uid: 1000,
+            other_writable: true,
+            group_writable_non_root: false,
+            world_writable: true,
+        });
+        assert!(!provenance_qualifies(&prov));
+    }
+
+    #[tokio::test]
+    async fn provenance_disqualifies_when_root_owned_group_writable() {
+        let mut prov = good_provenance();
+        prov.component_writability.push(ComponentWritability {
+            path: "/etc".into(),
+            owner_uid: 0,
+            other_writable: false,
+            group_writable_non_root: true,
+            world_writable: false,
+        });
+        assert!(!provenance_qualifies(&prov));
+    }
+
+    /// Spawn outside the routine root → no signal even when enabled.
+    #[tokio::test]
+    async fn non_routine_spawn_no_signal_when_enabled() {
+        let mut prov = good_provenance();
+        prov.matched_routine_root = None;
+        let ctx = spawn_ctx_with_provenance(prov);
+        assert!(!has_routine_signal(&ctx, true));
+    }
+
+    /// Spawn with no SpawnProvenance attached (LLM path or missing
+    /// provenance) → no signal.
+    #[tokio::test]
+    async fn spawn_with_no_provenance_no_signal_when_enabled() {
+        let mut ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/whatever".into(),
+            args: Vec::new(),
+        });
+        ctx.session_scope = Some(SessionScopeKey::fresh());
+        assert!(!has_routine_signal(&ctx, true));
+    }
+
+    /// Inventory miss (path not pinned) → routine signal denied.
+    #[tokio::test]
+    async fn inventory_miss_denies_routine_signal() {
+        let prov = good_provenance();
+        let ctx = spawn_ctx_with_provenance(prov);
+        // Inventory NOT installed for this scope.
+        assert!(!has_routine_signal(&ctx, true));
+    }
+
+    /// Inventory has a different hash for this canonical path → routine
+    /// signal denied (binary swapped mid-session).
+    #[tokio::test]
+    async fn inventory_hash_drift_denies_routine_signal() {
+        let prov = good_provenance();
+        let scope = SessionScopeKey::fresh();
+        let state = SessionStateRegistry::global().get_or_create(scope);
+        let inv = SessionPinnedInventory::from_entries([(
+            prov.canonical_path.clone(),
+            "cc".repeat(32), // wrong hash
+        )]);
+        state.set_pinned_inventory(inv);
+        let mut ctx = spawn_ctx_with_provenance(prov);
+        ctx.session_scope = Some(scope);
+        assert!(!has_routine_signal(&ctx, true));
+    }
+
+    /// PR 4 Phase E: a routine-rooted /usr/bin/curl (i.e. SpawnProvenance
+    /// has matched_routine_root set AND is_outbound_capable=true) is
+    /// denied the routine signal. Documents the cross-reference between
+    /// PR 2's outbound-capable list and PR 4's routine signal: just
+    /// because curl lives under a declared routine root does not mean
+    /// it should auto-allow.
+    #[tokio::test]
+    async fn phase_e_outbound_curl_under_routine_root_denies_signal() {
+        let mut prov = good_provenance();
+        prov.canonical_path = "/usr/bin/curl".into();
+        prov.matched_routine_root = Some("/usr/bin/".into());
+        prov.is_outbound_capable = true; // what classify_binary returns
+
+        // Pin the curl path so condition 5 (inventory) would otherwise
+        // succeed — proves condition 4 (not outbound-capable) is doing
+        // the rejection, not a missing pin.
+        let ctx = spawn_ctx_with_provenance(prov.clone());
+        install_inventory(ctx.session_scope.unwrap(), &prov);
+
+        assert!(!has_routine_signal(&ctx, true));
+        // Also verify the predicate directly, so a future refactor that
+        // moves the outbound check elsewhere still trips here.
+        assert!(!provenance_qualifies(&prov));
+    }
+
+    /// Env-var override: when unset, returns `None` so the filter's
+    /// config flag wins. When set to a truthy value, forces signal ON;
+    /// when set to a falsy value, forces signal OFF.
+    #[tokio::test]
+    async fn env_var_override_semantics() {
+        // SAFETY: this test only reads. Other tests do not mutate the
+        // env var any more (we refactored away from `set_var` calls),
+        // so we can rely on the env being clean here.
+        let was_set = std::env::var_os("GRITH_PROXY_ROUTINE_SIGNAL_ENABLED").is_some();
+        if !was_set {
+            assert_eq!(routine_signal_env_override(), None);
+        }
+    }
+
+    /// PR 4 Phase H: the filter constructor caches the config flag,
+    /// and the env-var override (when set) takes precedence in either
+    /// direction.
+    #[tokio::test]
+    async fn phase_h_config_flag_off_by_default() {
+        let f = OperationRiskFilter::new();
+        // Without an env override, the filter respects its constructed flag.
+        if std::env::var_os("GRITH_PROXY_ROUTINE_SIGNAL_ENABLED").is_none() {
+            assert!(!f.effective_routine_signal_enabled());
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_h_with_routine_signal_constructor() {
+        let on = OperationRiskFilter::with_routine_signal(true);
+        let off = OperationRiskFilter::with_routine_signal(false);
+        if std::env::var_os("GRITH_PROXY_ROUTINE_SIGNAL_ENABLED").is_none() {
+            assert!(on.effective_routine_signal_enabled());
+            assert!(!off.effective_routine_signal_enabled());
+        }
     }
 }

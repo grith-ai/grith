@@ -105,14 +105,24 @@ impl AuditStats {
         let conn = storage.connection();
         let mut stmt =
             conn.prepare("SELECT filter_scores FROM audit_log WHERE filter_scores IS NOT NULL")?;
+        // Stage 3: `filter_scores` may be TEXT (legacy) or BLOB
+        // (zstd-compressed). Read raw bytes either way and decompress.
         let rows = stmt.query_map([], |row| {
-            let json_str: String = row.get(0)?;
-            Ok(json_str)
+            let bytes: Vec<u8> = match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+                    b.to_vec()
+                }
+                _ => Vec::new(),
+            };
+            Ok(bytes)
         })?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for row in rows {
-            let json_str = row?;
+            let bytes = row?;
+            let Ok(json_str) = crate::compression::decompress_string(&bytes) else {
+                continue;
+            };
             if let Ok(map) =
                 serde_json::from_str::<std::collections::HashMap<String, f64>>(&json_str)
             {

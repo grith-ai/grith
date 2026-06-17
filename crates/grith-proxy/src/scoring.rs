@@ -29,13 +29,15 @@ pub fn severity_for(score: f64) -> Severity {
 }
 
 /// Proxy scoring configuration.
+///
+/// Every tool call is evaluated against the same fixed thresholds — there is no
+/// call-count-dependent "cold-start" widening. A consistent single regime means
+/// the first call in a session is filtered identically to the thousandth, so a
+/// destructive or exfiltrating operation issued early is never under-scored.
 #[derive(Debug, Clone)]
 pub struct ScoringConfig {
     pub auto_allow_threshold: f64,
     pub auto_deny_threshold: f64,
-    pub cold_start_calls: u64,
-    pub cold_start_escalation_low: f64,
-    pub cold_start_escalation_high: f64,
 }
 
 impl Default for ScoringConfig {
@@ -43,26 +45,14 @@ impl Default for ScoringConfig {
         Self {
             auto_allow_threshold: SCORE_QUEUE_THRESHOLD,
             auto_deny_threshold: SCORE_DENY_THRESHOLD,
-            cold_start_calls: 0,
-            cold_start_escalation_low: 2.0,
-            cold_start_escalation_high: 10.0,
         }
     }
 }
 
 impl ScoringConfig {
-    /// Get the effective thresholds, accounting for optional cold-start widening.
-    ///
-    /// `cold_start_calls = 0` disables the cold-start phase entirely.
-    pub fn effective_thresholds(&self, call_count: u64) -> (f64, f64) {
-        if self.cold_start_calls > 0 && call_count < self.cold_start_calls {
-            (
-                self.cold_start_escalation_low,
-                self.cold_start_escalation_high,
-            )
-        } else {
-            (self.auto_allow_threshold, self.auto_deny_threshold)
-        }
+    /// The allow/deny thresholds applied to every call.
+    pub fn thresholds(&self) -> (f64, f64) {
+        (self.auto_allow_threshold, self.auto_deny_threshold)
     }
 }
 
@@ -153,36 +143,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cold_start_thresholds() {
-        let config = ScoringConfig {
-            cold_start_calls: 200,
-            cold_start_escalation_low: 2.0,
-            cold_start_escalation_high: 10.0,
-            ..ScoringConfig::default()
-        };
-
-        // During cold start
-        let (allow, deny) = config.effective_thresholds(50);
-        assert_eq!(allow, 2.0);
-        assert_eq!(deny, 10.0);
-
-        // After cold start
-        let (allow, deny) = config.effective_thresholds(200);
-        assert_eq!(allow, 3.0);
-        assert_eq!(deny, 8.0);
-    }
-
-    #[test]
-    fn test_zero_cold_start_calls_disables_cold_start() {
+    fn test_thresholds_are_fixed() {
+        // No call-count dependence: the same thresholds apply to every call.
         let config = ScoringConfig::default();
-
-        let (allow, deny) = config.effective_thresholds(0);
-        assert_eq!(allow, 3.0);
-        assert_eq!(deny, 8.0);
-
-        let (allow, deny) = config.effective_thresholds(50);
-        assert_eq!(allow, 3.0);
-        assert_eq!(deny, 8.0);
+        assert_eq!(config.thresholds(), (3.0, 8.0));
     }
 
     #[test]

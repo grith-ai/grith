@@ -308,7 +308,11 @@ impl Daemon {
                     filter_scores: r.filter_scores.clone(),
                     timestamp: r.timestamp.to_rfc3339(),
                     session_id: Some(r.session_id.to_string()),
-                    project_name: r.task_context.clone(),
+                    // Prefer the dedicated project_name column; fall back to
+                    // task_context for records written before that column
+                    // existed (the supervisor used to stash the project name
+                    // there).
+                    project_name: r.project_name.clone().or_else(|| r.task_context.clone()),
                     llm_provider: r.llm_provider.clone(),
                     llm_model: r.llm_model.clone(),
                     prompt_tokens: r.prompt_tokens,

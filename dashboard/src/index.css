@@ -107,3 +107,92 @@ body {
 .font-mono {
   font-feature-settings: "liga" 0;
 }
+
+/* ── Dashboard hero (the shareable centerpiece) ───────────────────────── */
+
+/* Staggered reveal on load. Pair with inline animation-delay for cascade. */
+@keyframes grith-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.grith-fade-up {
+  opacity: 0;
+  animation: grith-fade-up 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Live pulse for the "supervising" indicator. */
+@keyframes grith-pulse-ring {
+  0% {
+    transform: scale(0.9);
+    opacity: 0.7;
+  }
+  70% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.grith-pulse-ring::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: grith-pulse-ring 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Slow drift of the hero's radial glow so it feels alive, not static. */
+@keyframes grith-glow-drift {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: translate(3%, -4%) scale(1.08);
+  }
+}
+
+/* Hero atmosphere: deep terminal background + green aurora + fine grid. */
+.grith-hero {
+  background-color: #0a0c10;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+.grith-hero::before {
+  content: "";
+  position: absolute;
+  inset: -40% -10% auto -10%;
+  height: 140%;
+  background:
+    radial-gradient(60% 80% at 78% 8%, rgba(0, 229, 160, 0.22), transparent 60%),
+    radial-gradient(45% 60% at 12% 4%, rgba(0, 168, 90, 0.14), transparent 60%);
+  animation: grith-glow-drift 14s ease-in-out infinite;
+  z-index: -1;
+}
+.grith-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 38px 38px;
+  mask-image: radial-gradient(120% 100% at 50% 0%, #000 35%, transparent 78%);
+  z-index: -1;
+}
+
+/* Count-up-friendly tabular figures for the big security numbers. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

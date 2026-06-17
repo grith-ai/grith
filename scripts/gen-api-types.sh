@@ -138,6 +138,10 @@ export interface TierResponse {
   billing_portal_url: string | null;
   features: Record<string, boolean>;
   refresh: RefreshState | null;
+  /** Rolling count of session-limit (429) rejections within the window. */
+  session_limit_rejections?: number;
+  /** Length of the rejection-count window, in days. */
+  session_limit_rejection_window_days?: number;
 }
 
 export interface LicenseStatusResponse {
@@ -165,6 +169,8 @@ export interface FilterResultSummary {
 
 export type ProxyActionSummary = "allow" | "queue" | "deny";
 
+export type RecordType = "full" | "compact";
+
 export interface AuditRecord {
   id: string;
   timestamp: string;
@@ -182,10 +188,16 @@ export interface AuditRecord {
   source: string;
   supervised_tool?: string | null;
   supervised_pid?: number | null;
+  /// Project name for the session (from --project or the cwd basename),
+  /// persisted on the record so audit history can be labelled by project.
+  project_name?: string | null;
   correlation_id?: string | null;
   record_hash?: string | null;
   prev_hash?: string | null;
   chain_sequence?: number | null;
+  /// "full" — proxy-evaluated row (default). "compact" — short-circuit
+  /// bookkeeping row from session-allowed / noise-path paths.
+  record_type?: RecordType;
 }
 
 export interface AuditListResponse {
@@ -203,6 +215,10 @@ export interface AuditQuery {
   call_type_filter?: string[];
   limit?: number;
   offset?: number;
+  /// `"full"` (default) returns only proxy-decision rows. `"all"`
+  /// includes compact short-circuit rows from session-allowed and
+  /// noise-path paths.
+  include?: "full" | "all";
 }
 
 export type AuditExportFormat = "json" | "csv";
@@ -235,7 +251,6 @@ export interface ProxyStatusResponse {
   allow_count: number;
   queue_count: number;
   deny_count: number;
-  cold_start_remaining: number;
   filters: FilterStatus[];
 }
 
@@ -253,7 +268,6 @@ export interface ProxyTestResponse {
   decision_reason: string;
   evaluation_time_ms: number;
   filters_evaluated: number;
-  cold_start: boolean;
   filter_results: ProxyTestFilterDetail[];
 }
 
@@ -309,8 +323,14 @@ export interface SessionSummary {
   tool_name: string;
   /** Project name derived from the working directory (e.g., "grith-website"). */
   project_name?: string | null;
+  /** Absolute working directory the supervised tool was launched from. */
+  cwd?: string | null;
+  /** Controlling terminal of the launching CLI (e.g. "pts/21"). */
+  tty?: string | null;
   root_pid: number;
   uptime_seconds: number;
+  /** Seconds since the last heartbeat/activity — the session's "idle" age. */
+  last_activity_seconds?: number;
   stats: SessionStats;
   containment_remaining_seconds?: number | null;
 }
@@ -362,6 +382,8 @@ export interface WsToolCallCompleted {
 export interface WsProxyEvaluation {
   type: "proxy_evaluation";
   call_id: string;
+  /** Supervisor session id the evaluation belongs to. */
+  session_id?: string;
   timestamp: string;
   composite_score: number;
   action: ProxyActionSummary;
@@ -575,6 +597,58 @@ export interface Policy {
 export interface PolicyListResponse {
   policies: Policy[];
   total: number;
+}
+
+// ---------------------------------------------------------------------------
+// PR 4 Phase G — Session-pinned binary inventory
+// ---------------------------------------------------------------------------
+
+export interface InventoryEntry {
+  /** Canonical absolute path of the pinned binary. */
+  path: string;
+  /** Hex-encoded SHA-256 of the binary contents at session start. */
+  sha256: string;
+}
+
+export interface InventoryResponse {
+  session_id: string;
+  binaries_pinned: number;
+  total_scanned: number;
+  /** True when the walk hit INVENTORY_MAX_FILES and stopped short. */
+  truncated: boolean;
+  entries: InventoryEntry[];
+  /**
+   * Cross-session diff. Currently always omitted — populated by a
+   * future PR once last-N inventories persist to the audit DB.
+   */
+  previous_session_diff?: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// PR 5 Phase E — Listener rewrites
+// ---------------------------------------------------------------------------
+
+export interface ListenerRewrite {
+  /** Audit record UUID. */
+  id: string;
+  /** RFC3339 timestamp. */
+  timestamp: string;
+  /** Supervised tracee PID. */
+  pid?: number;
+  /** Tool name (e.g. "codex"). */
+  tool?: string;
+  /** Original address:port the tracee asked for. */
+  original_addr: string;
+  /** Address:port the kernel actually bound after the clamp. */
+  rewritten_addr: string;
+  /** Description of the local_listener_policy entry that authorised this rewrite. */
+  clamp_profile_entry: string;
+}
+
+export interface ListenerRewritesResponse {
+  session_id: string;
+  total: number;
+  rewrites: ListenerRewrite[];
 }
 TYPESCRIPT
 

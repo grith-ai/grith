@@ -14,6 +14,9 @@ const mockDigestReturn: UseDigestReturn = {
   deny: vi.fn().mockResolvedValue(undefined),
   learn: vi.fn().mockResolvedValue(undefined),
   escalate: vi.fn().mockResolvedValue(undefined),
+  approveMany: vi.fn().mockResolvedValue(undefined),
+  denyMany: vi.fn().mockResolvedValue(undefined),
+  bulkBusy: false,
   refresh: vi.fn().mockResolvedValue(undefined),
 };
 

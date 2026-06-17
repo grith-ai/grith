@@ -271,6 +271,11 @@ pub fn action_name(call_type: &ToolCallType) -> &'static str {
         ToolCallType::NetConnect { .. } => "NetConnect",
         ToolCallType::NetListen { .. } => "NetListen",
         ToolCallType::DnsQuery { .. } => "DnsQuery",
+        // PR 6 Phase B: category-2 syscalls.
+        ToolCallType::OwnershipChange { .. } => "OwnershipChange",
+        ToolCallType::FilesystemMutation { .. } => "FilesystemMutation",
+        ToolCallType::CrossProcessAccess { .. } => "CrossProcessAccess",
+        ToolCallType::NamespaceOp { .. } => "NamespaceOp",
     }
 }
 

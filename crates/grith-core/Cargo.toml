@@ -26,6 +26,7 @@ grith-supervisor = { path = "../grith-supervisor" }
 grith-notify = { path = "../grith-notify" }
 
 clap.workspace = true
+clap_complete.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -48,6 +49,7 @@ open.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 rand.workspace = true
+crossbeam-channel.workspace = true
 include_dir = "0.7"
 
 [lints]

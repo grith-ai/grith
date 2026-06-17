@@ -311,12 +311,17 @@ fn summary_lines(req: &PermissionRequest) -> Vec<Line<'static>> {
         .map(|(address, port)| (address.trim(), port.trim()))
         .unwrap_or((detail.as_str(), ""));
 
-    let bind_meaning = if address == "0.0.0.0" || address == "::" {
+    // PR 5 Phase A: parse the address rather than string-equality-match so
+    // IPv6 loopback/wildcard in any canonical form (`::1`, `0:0:0:0:0:0:0:1`,
+    // `::ffff:127.0.0.1`) labels the same as the dotted-quad form.
+    let parsed_ip = address.parse::<std::net::IpAddr>().ok();
+    let is_wildcard_bind = parsed_ip.is_some_and(|ip| ip.is_unspecified());
+    let is_loopback_bind =
+        parsed_ip.is_some_and(|ip| ip.is_loopback()) || address.eq_ignore_ascii_case("localhost");
+
+    let bind_meaning = if is_wildcard_bind {
         "all interfaces"
-    } else if address == "127.0.0.1"
-        || address == "::1"
-        || address.eq_ignore_ascii_case("localhost")
-    {
+    } else if is_loopback_bind {
         "loopback only"
     } else {
         "specific interface"
@@ -330,12 +335,9 @@ fn summary_lines(req: &PermissionRequest) -> Vec<Line<'static>> {
         "fixed port requested"
     };
 
-    let risk = if address == "0.0.0.0" || address == "::" {
+    let risk = if is_wildcard_bind {
         "remotely reachable unless firewall or network policy blocks it"
-    } else if address == "127.0.0.1"
-        || address == "::1"
-        || address.eq_ignore_ascii_case("localhost")
-    {
+    } else if is_loopback_bind {
         "local-only listener"
     } else {
         "reachable from networks that can access that interface"
@@ -481,7 +483,7 @@ fn process_spawn_summary(req: &PermissionRequest) -> Vec<Line<'static>> {
     let fallback_request = req
         .tool
         .find('(')
-        .and_then(|open| req.tool.rfind(')').map(|close| (open, close)))
+        .zip(req.tool.rfind(')'))
         .and_then(|(open, close)| (close > open + 1).then(|| req.tool[open + 1..close].trim()))
         .filter(|s| !s.is_empty())
         .map(str::to_string)

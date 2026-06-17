@@ -239,9 +239,6 @@ complex_keywords = ["refactor", "architect", "security review"]
 [proxy]
 auto_allow_threshold = 3.0
 auto_deny_threshold = 8.0
-cold_start_calls = 200
-cold_start_escalation_low = 2.0
-cold_start_escalation_high = 10.0
 review_timeout_seconds = 300            # auto-deny queued calls after 5 minutes of no review
 
 [digest]
@@ -832,7 +829,7 @@ pub enum FilterPhase {
 - Score: 0 to +2
 
 **Filter 5: Secret/Credential Scanning** (`secret_scan.rs`)
-- 1,600+ regex patterns from `secrets-patterns-db`
+- 1,620+ regex patterns from `secrets-patterns-db`
 - Entropy analysis for high-entropy strings
 - Scans tool call arguments AND content being written/sent
 - Score: +3 to +5
@@ -1234,6 +1231,47 @@ dashboard/
 ### 13.2 Design System
 
 Uses the shared brand from `PLATFORM.md` §11: dark theme, Outfit font, forge orange accents, minimal border radius.
+
+### 13.3 Local Auth Model
+
+The dashboard binds loopback-only (`127.0.0.1:3141`) by default, but loopback
+reachability is **not** treated as authorisation. Two trust boundaries layer on
+top of the bind:
+
+- **Daemon IPC token** (`~/.config/grith/daemon.token`, `0600`) — bearer-auth
+  for machine callers on `/api/ipc/*`, `/api/proxy/status/full`,
+  `/api/server/shutdown`. Constant-time compared. Unchanged.
+- **Per-server dashboard token** (`~/.config/grith/dashboard.token`, `0600`,
+  minted per launch, distinct from the IPC token so a browser session cannot
+  impersonate a daemon IPC client). Carried in the `x-grith-csrf` header (or
+  `?token=` on WebSocket handshakes). Required by default on:
+  - all browser-facing **mutations** (digest actions, `PUT /config`, canary /
+    policy writes, `/sync/apply`, notification test, supervisor create/kill/
+    delete, `/proxy/test`); and
+  - **sensitive reads** (audit, digest, canaries, config, analytics, policies,
+    inventory, listener-rewrites, supervisor session detail) once a token is
+    configured.
+
+  Low-sensitivity status (`/health`, `/tier`, `/proxy/status`,
+  `/license/status`, `/sync/status`) stays open so zero-config health checks
+  keep working.
+
+**Bootstrap.** The CLI prints a `http://127.0.0.1:3141/#token=<tok>` URL on
+launch; the SPA captures the fragment into `localStorage` and strips it from the
+address bar (the fragment is never sent to the server). A `CSRF_REQUIRED` /
+`DASHBOARD_AUTH_REQUIRED` rejection surfaces an actionable "re-open the printed
+URL" message.
+
+**Browser-origin defence.** Requiring a custom header forces a CORS preflight
+that the locked-origin layer rejects for non-dashboard origins; WebSocket
+handshakes (not covered by CORS) are additionally origin-vs-host checked.
+
+**Scripting.** Same-UID automation reads the token from
+`~/.config/grith/dashboard.token` and sends it as `x-grith-csrf: <token>`. The
+server never exposes the token over an unauthenticated HTTP endpoint.
+
+Implementation: `crates/grith-server/src/{csrf,ws_auth,ipc_auth}.rs`; design
+record in `work/futurework/dashboard-localhost-auth-csrf.md`.
 
 ---
 

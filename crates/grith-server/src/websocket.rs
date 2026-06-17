@@ -10,6 +10,10 @@ use axum::response::IntoResponse;
 use tokio::sync::broadcast;
 
 /// WebSocket upgrade handler for `/ws/live`.
+///
+/// Authorization (Origin-vs-Host plus dashboard token when configured) is
+/// enforced by the [`crate::ws_auth::require_ws_auth`] middleware layered on
+/// this route, so a rejected handshake never reaches this handler.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_connection(socket, state.ws_tx.subscribe()))
 }

@@ -43,11 +43,24 @@ impl SecurityProxy {
         }
     }
 
+    /// Drop scope-keyed filter state for `scope` AND the corresponding entry
+    /// in `SessionStateRegistry`. Returns the number of entries removed
+    /// across all filters (for telemetry — useful for spotting unusually
+    /// large session footprints).
+    ///
+    /// PR 1 Phase F: called by the supervisor at session-end and for each
+    /// stale scope discovered at session-start.
+    pub fn evict_session_state(&self, scope: crate::types::SessionScopeKey) -> usize {
+        let removed = self.registry.evict_session_state(scope);
+        crate::session_state::SessionStateRegistry::global().evict(scope);
+        removed
+    }
+
     /// Evaluate a tool call through the full filter pipeline.
     pub async fn evaluate(&self, ctx: &ToolCallContext) -> ProxyDecision {
         let start = Instant::now();
-        let call_num = self.call_count.fetch_add(1, Ordering::Relaxed);
-        let (allow_threshold, deny_threshold) = self.scoring.effective_thresholds(call_num);
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        let (allow_threshold, deny_threshold) = self.scoring.thresholds();
 
         let mut all_results = Vec::new();
 
@@ -175,16 +188,6 @@ impl SecurityProxy {
         self.registry.count()
     }
 
-    pub fn is_cold_start(&self) -> bool {
-        self.call_count() < self.scoring.cold_start_calls
-    }
-
-    pub fn cold_start_remaining(&self) -> u64 {
-        self.scoring
-            .cold_start_calls
-            .saturating_sub(self.call_count())
-    }
-
     pub fn scoring_config(&self) -> &ScoringConfig {
         &self.scoring
     }
@@ -245,6 +248,64 @@ mod tests {
         SecurityProxy::new(registry, scoring, MetaRuleEngine::new(vec![]))
     }
 
+    /// PR 1 Phase F: `SecurityProxy::evict_session_state` walks every
+    /// registered filter and clears the corresponding `SessionStateRegistry`
+    /// entry. Filters that opt into the default `evict_session_state`
+    /// (no-op) contribute zero; scoping filters return their counts.
+    #[tokio::test]
+    async fn evict_session_state_fans_out_to_filters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingFilter {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl SecurityFilter for CountingFilter {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn phase(&self) -> FilterPhase {
+                FilterPhase::Static
+            }
+            async fn evaluate(&self, _ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
+                Ok(FilterResult::no_match("counting"))
+            }
+            fn evict_session_state(&self, _scope: SessionScopeKey) -> usize {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                7 // deterministic non-zero count
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let proxy = make_proxy(vec![Box::new(CountingFilter {
+            calls: calls.clone(),
+        })]);
+        let scope = SessionScopeKey::fresh();
+
+        // Prime the SessionStateRegistry so we can confirm the proxy clears it.
+        crate::session_state::SessionStateRegistry::global().activate_containment(
+            scope,
+            crate::session_state::ContainmentReason::Manual {
+                actor: "test".into(),
+            },
+        );
+        assert!(crate::session_state::SessionStateRegistry::global().is_containment_active(scope));
+
+        let removed = proxy.evict_session_state(scope);
+        assert_eq!(removed, 7, "filter's evict count must propagate up");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "filter called exactly once"
+        );
+        assert!(
+            !crate::session_state::SessionStateRegistry::global().is_containment_active(scope),
+            "SessionStateRegistry entry must also be evicted"
+        );
+    }
+
     #[tokio::test]
     async fn test_empty_pipeline_allows() {
         let proxy = make_proxy(vec![]);
@@ -271,7 +332,6 @@ mod tests {
             phase: FilterPhase::Static,
             result: FilterResult::matched("med", "r1", 5.0, Severity::Warning, "medium risk"),
         })]);
-        // Using call_count > 200 to exit cold start
         proxy.call_count.store(300, Ordering::Relaxed);
         let decision = proxy.evaluate(&make_ctx()).await;
         assert!(matches!(decision.action, ProxyAction::Queue { .. }));
@@ -328,28 +388,6 @@ mod tests {
         assert!(decision.is_denied());
         // Phase 2 filter should not have run, so only 1 result
         assert_eq!(decision.filter_results.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_cold_start_widens_thresholds() {
-        // During cold start, allow threshold = 2.0, deny = 10.0
-        // A score of 2.5 would allow normally but queue during cold start
-        let proxy = make_proxy_with_scoring(
-            vec![Box::new(FixedFilter {
-                name: "f1".into(),
-                phase: FilterPhase::Static,
-                result: FilterResult::matched("f1", "r1", 2.5, Severity::Warning, "test"),
-            })],
-            ScoringConfig {
-                cold_start_calls: 200,
-                cold_start_escalation_low: 2.0,
-                cold_start_escalation_high: 10.0,
-                ..ScoringConfig::default()
-            },
-        );
-        // Cold start (call 0)
-        let decision = proxy.evaluate(&make_ctx()).await;
-        assert!(matches!(decision.action, ProxyAction::Queue { .. }));
     }
 
     #[tokio::test]

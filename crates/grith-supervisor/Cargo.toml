@@ -27,12 +27,18 @@ futures.workspace = true
 toml.workspace = true
 sha2.workspace = true
 hex.workspace = true
+glob.workspace = true
 reqwest.workspace = true
+crossbeam-channel.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+dirs.workspace = true
 
 portable-pty.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

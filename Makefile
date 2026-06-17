@@ -44,9 +44,17 @@ dashboard: ## Build the React dashboard (npm install + vite build)
 
 install: release ## Release build + install binary to INSTALL_DIR
 	@mkdir -p "$(INSTALL_DIR)"
-	cp target/release/$(BINARY_NAME) "$(INSTALL_DIR)/$(BINARY_NAME)"
-	chmod +x "$(INSTALL_DIR)/$(BINARY_NAME)"
+	@# Stage to a temp file then atomically rename into place. `mv` (rename)
+	@# swaps the directory entry and works even while the old binary is running;
+	@# a plain `cp` over a live binary fails with ETXTBSY ("Text file busy") when
+	@# a daemon or `grith exec` session is open. Running processes keep their old
+	@# inode until they restart.
+	cp target/release/$(BINARY_NAME) "$(INSTALL_DIR)/$(BINARY_NAME).new"
+	chmod +x "$(INSTALL_DIR)/$(BINARY_NAME).new"
+	mv -f "$(INSTALL_DIR)/$(BINARY_NAME).new" "$(INSTALL_DIR)/$(BINARY_NAME)"
 	@printf "\033[1;32m[ok]\033[0m    Installed $(BINARY_NAME) to $(INSTALL_DIR)/$(BINARY_NAME)\n"
+	@printf "\033[1;33m[note]\033[0m  Open daemon/sessions keep the old binary until they restart.\n"
+	@printf "             Pick up changes with: grith dashboard stop && grith dashboard start\n"
 	@$(MAKE) --no-print-directory completions
 
 test: ## Run all workspace tests

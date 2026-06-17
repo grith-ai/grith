@@ -27,9 +27,11 @@ uuid.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
+# Used by production_filter_registry() in lib.rs to load the shipped
+# config/filters/*.toml, so it must be a regular (not dev) dependency.
+toml.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 tower.workspace = true
 http = "1"
-toml.workspace = true

@@ -20,6 +20,7 @@ uuid.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

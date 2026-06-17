@@ -21,6 +21,8 @@ import type {
   DigestListResponse,
   ExfilStatsResponse,
   HealthResponse,
+  InventoryResponse,
+  ListenerRewritesResponse,
   NotificationEvent,
   Policy,
   PolicyListResponse,
@@ -31,10 +33,31 @@ import type {
   LicenseStatusResponse,
   TierResponse,
 } from "@/types/api";
+import { csrfHeaders } from "./csrf";
 
 // ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
+
+interface ParsedApiError {
+  code?: string;
+  requiredTier?: string;
+}
+
+function parseApiErrorBody(body: string): ParsedApiError {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    return {
+      code: typeof parsed.code === "string" ? parsed.code : undefined,
+      requiredTier:
+        typeof parsed.required_tier === "string"
+          ? parsed.required_tier
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
 
 export class ApiError extends Error {
   /** Structured error code from JSON body (e.g. "FEATURE_GATED"), if present. */
@@ -47,22 +70,38 @@ export class ApiError extends Error {
     public readonly statusText: string,
     public readonly body: string,
   ) {
-    super(`API error ${status} (${statusText}): ${body}`);
+    super(ApiError.buildMessage(status, statusText, body));
     this.name = "ApiError";
 
-    // Try to extract structured error fields from JSON body.
-    try {
-      const parsed = JSON.parse(body) as Record<string, unknown>;
-      if (typeof parsed.code === "string") this.code = parsed.code;
-      if (typeof parsed.required_tier === "string")
-        this.requiredTier = parsed.required_tier;
-    } catch {
-      // Body is not JSON — leave fields undefined.
+    const { code, requiredTier } = parseApiErrorBody(body);
+    this.code = code;
+    this.requiredTier = requiredTier;
+  }
+
+  private static buildMessage(
+    status: number,
+    statusText: string,
+    body: string,
+  ): string {
+    const code = parseApiErrorBody(body).code;
+    if (code === "CSRF_REQUIRED" || code === "DASHBOARD_AUTH_REQUIRED") {
+      // This browser hasn't paired with the daemon (opened the bare URL
+      // directly, or its stored token was cleared). Point the operator at the
+      // pairing command, which opens/prints a one-time link.
+      return "This browser isn't authorised for the dashboard yet. Run `grith dashboard pair` (it opens or prints a one-time link), then reload.";
     }
+    return `API error ${status} (${statusText}): ${body}`;
   }
 
   get isFeatureGated(): boolean {
     return this.code === "FEATURE_GATED";
+  }
+
+  /** True when the request was rejected by the dashboard CSRF / token guard. */
+  get isCsrfRejected(): boolean {
+    return (
+      this.code === "CSRF_REQUIRED" || this.code === "DASHBOARD_AUTH_REQUIRED"
+    );
   }
 }
 
@@ -80,6 +119,9 @@ async function request<T>(
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    // Dashboard CSRF / auth header — harmless on reads, required by the
+    // daemon on browser-facing mutations. See lib/csrf.ts.
+    ...csrfHeaders(),
     ...(options.headers as Record<string, string> | undefined),
   };
 
@@ -229,6 +271,7 @@ export function getAuditRecords(
     if (query.limit !== undefined) params.set("limit", String(query.limit));
     if (query.offset !== undefined)
       params.set("offset", String(query.offset));
+    if (query.include) params.set("include", query.include);
   }
 
   const qs = params.toString();
@@ -237,6 +280,40 @@ export function getAuditRecords(
 
 export function getAuditRecord(id: string): Promise<AuditRecord> {
   return request<AuditRecord>(`/api/audit/${id}`);
+}
+
+// ---------------------------------------------------------------------------
+// PR 4 Phase G — Session-pinned binary inventory
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the session-pinned binary inventory ("binaries trusted this session").
+ *
+ * Returns an empty `entries` array with `binaries_pinned: 0` when the
+ * session exists but the inventory hasn't been installed yet (Phase C
+ * runs the FS walk in a background task — there's a small race window
+ * after session start). Returns a 404 when the session is unknown.
+ */
+export function getInventory(sessionId: string): Promise<InventoryResponse> {
+  return request<InventoryResponse>(`/api/inventory/${sessionId}`);
+}
+
+// ---------------------------------------------------------------------------
+// PR 5 Phase E — Listener rewrites
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the per-session listener rewrites — every wildcard → loopback
+ * clamp the supervisor performed for this session. Returns an empty
+ * list (200, total=0) when the session has no clamp events (the
+ * common case).
+ */
+export function getListenerRewrites(
+  sessionId: string,
+): Promise<ListenerRewritesResponse> {
+  return request<ListenerRewritesResponse>(
+    `/api/sessions/${sessionId}/listener-rewrites`,
+  );
 }
 
 export function getExfilStats(): Promise<ExfilStatsResponse> {
@@ -261,7 +338,9 @@ export function exportAudit(
   }
 
   const url = `${BASE_URL}/api/audit/export?${params.toString()}`;
-  return fetch(url).then((res) => {
+  // `/api/audit/export` is a token-gated sensitive read (item 4), so this raw
+  // fetch must carry the dashboard CSRF / token header just like the wrapper.
+  return fetch(url, { headers: { ...csrfHeaders() } }).then((res) => {
     if (!res.ok) throw new ApiError(res.status, res.statusText, "");
     return res.blob();
   });
@@ -277,6 +356,18 @@ export function getSessions(): Promise<SessionListResponse> {
 
 export function getSession(id: string): Promise<SessionDetailResponse> {
   return request<SessionDetailResponse>(`/api/supervisor/sessions/${id}`);
+}
+
+/**
+ * Terminate a supervised session and its process tree. Returns the final
+ * session stats. Operator-initiated — this kills a live process.
+ *
+ * Uses the supervisor route (not the IPC-auth-gated one) so the same-origin
+ * dashboard can call it without a bearer token. Dead sessions are reaped
+ * automatically by the daemon's always-on reaper, so the UI offers kill only.
+ */
+export function killSession(id: string): Promise<unknown> {
+  return request(`/api/supervisor/sessions/${id}/kill`, { method: "POST" });
 }
 
 // ---------------------------------------------------------------------------

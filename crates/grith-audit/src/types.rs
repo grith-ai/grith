@@ -51,6 +51,13 @@ pub struct AuditRecord {
     /// PID of the supervised process, if source is `"supervisor"`.
     #[serde(default)]
     pub supervised_pid: Option<u32>,
+    /// Project name for the session — from the `--project` override or the cwd
+    /// basename at session start. Captured on every evaluation so audit history
+    /// can be grouped/labelled by project even after the session ends and ages
+    /// out of the in-memory live-session registry. `None` for the built-in
+    /// agent path (which has no project concept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     /// Correlation ID linking related source-read and outbound-sink events.
     /// Events in the same source→sink chain share a correlation ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,10 +89,115 @@ pub struct AuditRecord {
     /// Estimated cost in USD for this LLM call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
+
+    // ── PR 4 Phase F: routine-spawn forensic fields ──
+    /// SHA-256 hex of the spawned binary's canonical path content at
+    /// the moment of the spawn decision. Populated for every
+    /// `ProcessSpawn` evaluation so post-incident review can spot
+    /// hash drift across sessions. `None` for non-spawn calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_sha256: Option<String>,
+    /// Profile-declared routine root that matched the spawned binary's
+    /// canonical path, or `None` if no routine root matched. Populated
+    /// only on `ProcessSpawn`. Operators can grep this column to
+    /// understand which root grants trust in their environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_routine_root: Option<String>,
+    /// JSON-encoded list of phase-3 filter names that fired on this
+    /// decision (matched, non-zero score). Populated only when the
+    /// routine signal applied (i.e. score `0.5` on a ProcessSpawn) so
+    /// operators can see what *would have* tripped at the higher
+    /// `1.0` baseline. Schema: `[{"filter": "taint", "score": 3.0}, …]`.
+    ///
+    /// **Sentinel semantics:**
+    /// * `None` — routine signal did NOT apply (or non-spawn call).
+    /// * `Some("[]")` — routine signal applied AND no phase-3 filter
+    ///   matched: a clean routine-rooted spawn. Distinct from `None`.
+    /// * `Some("[…]")` — routine signal applied AND phase-3 filters
+    ///   matched: shows which ones, for "what would have queued at
+    ///   +1.0?" analysis.
+    ///
+    /// Queries that want "spawns that earned the routine signal"
+    /// should use `shadow_phase3_filters IS NOT NULL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_phase3_filters: Option<String>,
+
+    // ── PR 5 Phase E: listener-rewrite forensic fields ──
+    /// Original (pre-rewrite) bind address the tracee passed to
+    /// `bind(2)`. Populated only when the supervisor performed a
+    /// wildcard → loopback clamp on a `NetListen` decision. Format:
+    /// `"<address>:<port>"` (e.g. `"0.0.0.0:8080"`). `None` for
+    /// non-clamp calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_addr: Option<String>,
+    /// Address the kernel actually saw after the clamp (e.g.
+    /// `"127.0.0.1:8080"`). Always set when `original_addr` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewritten_addr: Option<String>,
+    /// Description from the `local_listener_policy` entry that
+    /// authorised the clamp — copied verbatim from
+    /// `LocalListenerEntry::desc`. Surfaced in the dashboard so
+    /// operators can trace a clamp back to the TOML rule that
+    /// allowed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clamp_profile_entry: Option<String>,
+
+    // ── Compact-record support (options 2 + 3 / "audit completeness") ──
+    /// Indicates whether this record carries the full proxy evaluation
+    /// (`Full`) or is a compact bookkeeping row emitted by the
+    /// session-allowed / noise-path short-circuits (`Compact`).
+    ///
+    /// Compact records have empty `filter_results`, no `filter_scores`,
+    /// no `composite_score` contribution, and a minimal
+    /// `arguments_summary`. They exist so analytics / compliance
+    /// workflows can still see every `bash`, `find`, `grep`, … the
+    /// session ran, without bloating the per-row payload to the size
+    /// of a fully-evaluated record.
+    #[serde(default)]
+    pub record_type: RecordType,
 }
 
 fn default_source() -> String {
     "wasm".to_string()
+}
+
+/// Classification of an audit row by what it carries.
+///
+/// `Full` is the historical default — a complete proxy decision, including
+/// all per-filter scores and the full arguments summary. `Compact` is a
+/// short bookkeeping row emitted when an event short-circuits ahead of the
+/// proxy pipeline (session-allowlist match, noise-path filter) but
+/// completeness-tier configuration still wants the event recorded for
+/// "what did the session actually do?" analysis.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordType {
+    /// Full proxy evaluation. Default for backwards compatibility.
+    #[default]
+    Full,
+    /// Short-circuit bookkeeping row — no filter detail, minimal args.
+    Compact,
+}
+
+impl std::fmt::Display for RecordType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::Compact => write!(f, "compact"),
+        }
+    }
+}
+
+impl RecordType {
+    /// Parse a record-type tag from its string form (used at the SQLite
+    /// boundary). Unknown values default to `Full` to keep deserialisation
+    /// of older or hand-written rows robust.
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "compact" => Self::Compact,
+            _ => Self::Full,
+        }
+    }
 }
 
 /// Compact summary of a proxy action for storage.
@@ -155,18 +267,43 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Summarize tool call arguments for display (truncated to 256 chars).
+/// Default argument-summary truncation limit (bytes). Tuned for the
+/// historical "summary" shape: path + handful of flags fits comfortably,
+/// long argv blobs get the `...` suffix.
+pub const DEFAULT_SUMMARY_LIMIT: usize = 256;
+
+/// Extended truncation limit used for `ProcessSpawn` rows where the
+/// useful information lives deep in argv (e.g. the base64-encoded
+/// command inside a `bash -c "... eval $(echo … | base64 -d)"`
+/// wrapper). 4096 captures Claude Code / Codex wrappers in full.
+///
+/// Used by callers (typically the supervisor's `build_audit_record` and
+/// `maybe_log_compact`) that swap the default summary for the extended
+/// one after constructing an `AuditRecord`.
+pub const SPAWN_SUMMARY_LIMIT: usize = 4096;
+
+/// Summarize tool call arguments for display, truncated to the default
+/// limit (256 chars). For ProcessSpawn rows callers should reach for
+/// [`summarize_arguments_with_limit`] with [`SPAWN_SUMMARY_LIMIT`].
 ///
 /// M-8: Uses `char_indices` for safe truncation instead of byte slicing,
 /// which would panic on multi-byte (non-ASCII) characters.
 pub fn summarize_arguments(args: &serde_json::Value) -> String {
+    summarize_arguments_with_limit(args, DEFAULT_SUMMARY_LIMIT)
+}
+
+/// Summarize tool call arguments for display, truncated to `limit`
+/// bytes (char-boundary safe).
+pub fn summarize_arguments_with_limit(args: &serde_json::Value, limit: usize) -> String {
     let s = args.to_string();
-    if s.len() > 256 {
-        // Find the last char boundary at or before byte index 253
+    if s.len() > limit {
+        // Find the last char boundary at or before byte index `limit - 3`
+        // (leave room for the trailing "..." marker).
+        let target = limit.saturating_sub(3);
         let truncate_at = s
             .char_indices()
             .map(|(i, _)| i)
-            .take_while(|&i| i <= 253)
+            .take_while(|&i| i <= target)
             .last()
             .unwrap_or(0);
         format!("{}...", &s[..truncate_at])
@@ -219,6 +356,7 @@ impl AuditRecord {
             source: default_source(),
             supervised_tool: None,
             supervised_pid: None,
+            project_name: None,
             correlation_id: None,
             record_hash: None,
             prev_hash: None,
@@ -228,7 +366,109 @@ impl AuditRecord {
             prompt_tokens: None,
             completion_tokens: None,
             estimated_cost_usd: None,
+            spawn_sha256: None,
+            matched_routine_root: None,
+            shadow_phase3_filters: None,
+            original_addr: None,
+            rewritten_addr: None,
+            clamp_profile_entry: None,
+            record_type: RecordType::Full,
         }
+    }
+
+    /// Build a compact audit row.
+    ///
+    /// Used by the supervisor's short-circuit paths (session-allowlist
+    /// match, noise-path filter) when the operator has opted into
+    /// completeness levels above `decisions`. Compact rows record the
+    /// fact that *something* happened and *what* it was, without paying
+    /// the storage cost of a full filter breakdown.
+    ///
+    /// Callers must follow up with `.with_supervisor_source(...)` so the
+    /// row carries `source = "supervisor"` and the pid/tool labels.
+    pub fn new_compact(
+        session_id: Uuid,
+        plugin_id: String,
+        tool_call_type: String,
+        arguments: &serde_json::Value,
+        action: ProxyActionSummary,
+    ) -> Self {
+        let arguments_summary = summarize_arguments(arguments);
+        let arguments_hash = sha256_hex(arguments.to_string().as_bytes());
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            session_id,
+            plugin_id,
+            tool_call_type,
+            arguments_summary,
+            arguments_hash,
+            composite_score: 0.0,
+            proxy_action: action,
+            filter_results: Vec::new(),
+            filter_scores: None,
+            execution_result: None,
+            evaluation_time_ms: 0.0,
+            task_context: None,
+            source: default_source(),
+            supervised_tool: None,
+            supervised_pid: None,
+            project_name: None,
+            correlation_id: None,
+            record_hash: None,
+            prev_hash: None,
+            chain_sequence: None,
+            llm_provider: None,
+            llm_model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            estimated_cost_usd: None,
+            spawn_sha256: None,
+            matched_routine_root: None,
+            shadow_phase3_filters: None,
+            original_addr: None,
+            rewritten_addr: None,
+            clamp_profile_entry: None,
+            record_type: RecordType::Compact,
+        }
+    }
+
+    /// PR 5 Phase E: attach listener-rewrite forensic data to an
+    /// audit record. Called from the supervisor's clamp path when a
+    /// wildcard `NetListen` was rewritten to loopback. All three
+    /// arguments must be `Some` together — pass `None` if no clamp
+    /// happened.
+    pub fn with_listener_rewrite(
+        mut self,
+        original_addr: impl Into<String>,
+        rewritten_addr: impl Into<String>,
+        clamp_profile_entry: impl Into<String>,
+    ) -> Self {
+        self.original_addr = Some(original_addr.into());
+        self.rewritten_addr = Some(rewritten_addr.into());
+        self.clamp_profile_entry = Some(clamp_profile_entry.into());
+        self
+    }
+
+    /// PR 4 Phase F: attach routine-spawn provenance to an audit record.
+    ///
+    /// * `spawn_sha256` — always set on `ProcessSpawn` decisions when
+    ///   `SpawnProvenance` was computed (Phase D plumbs this).
+    /// * `matched_routine_root` — `Some` when the canonical path was
+    ///   under a profile-declared root.
+    /// * `shadow_phase3_filters` — JSON list of `{filter, score}` for
+    ///   every phase-3 filter that matched. Caller passes `None` to
+    ///   skip when the routine signal didn't apply.
+    pub fn with_spawn_provenance(
+        mut self,
+        spawn_sha256: Option<String>,
+        matched_routine_root: Option<String>,
+        shadow_phase3_filters: Option<String>,
+    ) -> Self {
+        self.spawn_sha256 = spawn_sha256;
+        self.matched_routine_root = matched_routine_root;
+        self.shadow_phase3_filters = shadow_phase3_filters;
+        self
     }
 
     /// Compute a deterministic hash of this record's content for chain integrity.
@@ -263,6 +503,13 @@ impl AuditRecord {
         self.source = "supervisor".to_string();
         self.supervised_tool = Some(tool.into());
         self.supervised_pid = Some(pid);
+        self
+    }
+
+    /// Attach the session's project name (from `--project` or the cwd basename)
+    /// so audit history can be labelled by project after the session ends.
+    pub fn with_project_name(mut self, project_name: Option<String>) -> Self {
+        self.project_name = project_name;
         self
     }
 
@@ -313,6 +560,34 @@ mod tests {
         let summary = summarize_arguments(&args);
         assert_eq!(summary.len(), 256);
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn summarize_arguments_with_limit_respects_higher_cap() {
+        // 1 KB payload that the default 256-byte limit would chop. With
+        // the spawn-limit (4096 B) the full payload fits without
+        // truncation.
+        let payload = "a".repeat(1024);
+        let args = serde_json::json!({"data": payload});
+        let small = summarize_arguments_with_limit(&args, DEFAULT_SUMMARY_LIMIT);
+        let big = summarize_arguments_with_limit(&args, SPAWN_SUMMARY_LIMIT);
+        assert!(small.ends_with("..."));
+        assert_eq!(small.len(), DEFAULT_SUMMARY_LIMIT);
+        assert!(
+            !big.ends_with("..."),
+            "1 KB payload fits inside 4 KB spawn limit without truncation"
+        );
+        assert!(big.contains(&"a".repeat(1024)));
+    }
+
+    #[test]
+    fn summarize_arguments_with_limit_chops_above_cap() {
+        // 8 KB payload exceeds even the spawn limit — must truncate.
+        let payload = "b".repeat(8 * 1024);
+        let args = serde_json::json!({"data": payload});
+        let big = summarize_arguments_with_limit(&args, SPAWN_SUMMARY_LIMIT);
+        assert!(big.ends_with("..."));
+        assert!(big.len() <= SPAWN_SUMMARY_LIMIT);
     }
 
     #[test]

@@ -1,7 +1,16 @@
-# Canonical metadata for the 17 grith filters.
+# Canonical metadata for the 18 active grith filters.
 # Source-of-truth for the docs site. Keep this in sync with
 # crates/grith-proxy/src/filters/. grith-docgen will warn when a filter
 # source module exists without a matching entry here.
+#
+# Ordinals are 1..=18 across three phases: static (1-6), pattern (7-12),
+# context (13-18). Intentionally NOT listed (they surface as `unmapped: true`
+# in filters.json, which the docs FilterTable excludes):
+#   - `semantic`          — inactive embedding-classifier stub, not in the
+#                           shipped pipeline yet (documented separately; v1.5
+#                           roadmap).
+#   - `outbound_binaries` — a curated classifier registry used by the taint
+#                           filter, not itself a `SecurityFilter`.
 
 [[filters]]
 ordinal = 1
@@ -60,7 +69,7 @@ name = "Secret / credential scanning"
 phase = "pattern"
 score_range = [3.0, 5.0]
 config_file = "config/filters/secrets.toml"
-summary = "Scans content for embedded credentials. 1,600+ regex patterns covering provider API keys, tokens, private keys, and bespoke credential formats."
+summary = "Scans content for embedded credentials. 1,620+ regex patterns covering provider API keys, tokens, private keys, and bespoke credential formats."
 
 [[filters]]
 ordinal = 8
@@ -73,6 +82,14 @@ summary = "Parses shell commands. Catches dangerous patterns: piped curl-to-sh, 
 
 [[filters]]
 ordinal = 9
+module = "destructive_action"
+name = "Destructive action coverage"
+phase = "pattern"
+score_range = [3.5, 99.0]
+summary = "Hard-denies catastrophic, irreversible host/storage destruction (filesystem format, raw block-device overwrite, recursive removal of a system root or database data directory) and escalates destructive operations directed at production (managed-DB endpoints, prod/live-tagged resources) to deny; other destructive operations queue for review. Also scores docker/podman run host-escalation."
+
+[[filters]]
+ordinal = 10
 module = "egress_policy"
 name = "Egress policy"
 phase = "pattern"
@@ -81,7 +98,7 @@ config_file = "config/filters/egress.toml"
 summary = "Network destination policy. Allowlisted hosts lower the score; denylisted or unknown hosts raise it. Plays with the reputation filter for adaptive trust."
 
 [[filters]]
-ordinal = 10
+ordinal = 11
 module = "dlp_gate"
 name = "DLP gate"
 phase = "pattern"
@@ -90,7 +107,7 @@ config_file = "config/filters/dlp.toml"
 summary = "Scans outbound network payloads for sensitive data leaving the box: credentials, PII, large file contents bundled into POST bodies."
 
 [[filters]]
-ordinal = 11
+ordinal = 12
 module = "canary"
 name = "Canary secret detection"
 phase = "pattern"
@@ -99,7 +116,7 @@ config_file = "config/filters/canary.toml"
 summary = "Hard DENY. Detects registered canary tokens (fake secrets seeded in your repo) reaching any outbound sink — definitive proof of exfiltration."
 
 [[filters]]
-ordinal = 12
+ordinal = 13
 module = "reputation"
 name = "Destination reputation"
 phase = "context"
@@ -108,7 +125,7 @@ config_file = "config/filters/domains.toml"
 summary = "Per-destination trust accumulated over time. Established trusted hosts get a discount; suspicious or unfamiliar ones get a markup."
 
 [[filters]]
-ordinal = 13
+ordinal = 14
 module = "behavioural"
 name = "Behavioural anomaly"
 phase = "context"
@@ -116,15 +133,15 @@ score_range = [1.0, 3.0]
 summary = "Compares the current call against the session's historical baseline (default 200-call minimum). Sudden bursts, unusual destinations, or out-of-pattern operations contribute score."
 
 [[filters]]
-ordinal = 14
+ordinal = 15
 module = "taint"
 name = "Taint tracking"
 phase = "context"
 score_range = [0.0, 5.0]
-summary = "Tracks data flow from sensitive sources (e.g. a .env read) through subsequent operations. Network calls or shell execs after a sensitive read inherit taint."
+summary = "Tracks data flow from sensitive sources (e.g. a .env read) through subsequent operations. Network calls or shell execs that reference tainted data inherit taint."
 
 [[filters]]
-ordinal = 15
+ordinal = 16
 module = "session_containment"
 name = "Session containment"
 phase = "context"
@@ -133,21 +150,17 @@ config_file = "config/filters/containment.toml"
 summary = "Enforces per-session isolation zones. A session bound to project A cannot reach project B's files or network without explicit cross-zone approval."
 
 [[filters]]
-ordinal = 16
+ordinal = 17
 module = "rate_limit"
 name = "Rate limiting"
-phase = "pattern"
+phase = "context"
 score_range = [0.0, 99.0]
-summary = "Per-minute caps on file writes (default 30), shell execs (20), and network requests (60). Bursts trigger queue; sustained violations trigger DENY."
+summary = "Per-minute caps on file writes (default 30), shell execs (20), and network requests (60). Bursts trigger queue; sustained violations trigger DENY. Volume penalties are risk-gated by default."
 
 [[filters]]
-ordinal = 17
-module = "semantic"
-name = "Semantic analysis"
-phase = "pattern"
-score_range = [0.0, 0.0]
-summary = "Stub for v0.1. Local embedding-based intent classification. Disabled by default; full implementation planned for v1.5."
-
-# Note: `egress_rate` exists as a module but is internally a sibling helper to
-# rate_limit (filter 16), not a separately-numbered filter. It will surface as
-# `unmapped: true` in filters.json, which is the intended drift signal.
+ordinal = 18
+module = "egress_rate"
+name = "Egress rate / burst detection"
+phase = "context"
+score_range = [1.0, 3.0]
+summary = "Per-destination outbound rate and burst detection. Flags rapid bursts of network egress to the same or many destinations — a beaconing or exfil shape that single-call filters miss."

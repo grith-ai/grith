@@ -75,6 +75,13 @@ impl SecurityFilter for ArgumentFilter {
             ToolCallType::NetConnect { .. }
             | ToolCallType::NetListen { .. }
             | ToolCallType::DnsQuery { .. } => Ok(FilterResult::no_match("argument")),
+            // PR 6 Phase B: category-2 syscalls — the argument
+            // filter's path-length / suspicious-shell-pattern checks
+            // don't apply. Other filters handle these.
+            ToolCallType::OwnershipChange { target, .. } => self.check_path(target),
+            ToolCallType::FilesystemMutation { target, .. } => self.check_path(target),
+            ToolCallType::CrossProcessAccess { .. } => Ok(FilterResult::no_match("argument")),
+            ToolCallType::NamespaceOp { .. } => Ok(FilterResult::no_match("argument")),
         }
     }
 }

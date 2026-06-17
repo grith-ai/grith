@@ -5,9 +5,47 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Key that scopes mutable filter state to a single supervised session (or LLM
+/// conversation). All filters that maintain cross-call state — taint registry,
+/// recent-sensitive-read map, rate-limit counters, behavioural baselines — key
+/// by this scope so that fresh sessions cannot inherit state from earlier ones.
+///
+/// Derived from the session UUID at session start. See
+/// `work/61-pr1-session-scoped-state-work.md` for the design.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SessionScopeKey(Uuid);
+
+impl SessionScopeKey {
+    /// Construct a scope key from an existing session UUID. The supervisor and
+    /// LLM paths both already carry a session UUID, so they use this to attach
+    /// the same scope to every `ToolCallContext` in the session.
+    pub fn from_session_id(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    /// Allocate a fresh scope key. Use only when no session UUID is available
+    /// (e.g. internal proxy callers that don't belong to any session).
+    pub fn fresh() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for SessionScopeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Context for a single tool call being evaluated by the proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +68,111 @@ pub struct ToolCallContext {
     /// preventing taint bleed between sequential conversations on the same session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Per-session scope for mutable filter state. Populated by the supervisor
+    /// at session start and by the LLM path at conversation start. When `None`,
+    /// filters fall back to legacy unscoped behaviour and emit a `tracing::warn!`
+    /// to make the gap visible during the PR 1 rollout. See PR 1 work doc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_scope: Option<SessionScopeKey>,
+    /// Provenance metadata for `ProcessSpawn` calls — canonical path,
+    /// SHA-256 hash, component-writability walk, matched routine root,
+    /// and outbound-capable flag. Populated by the supervisor when the
+    /// spawn target is resolvable; consumed by `operation_risk.rs` to
+    /// decide whether the spawn earns the +0.5 routine signal instead
+    /// of the default +1.0 baseline. See PR 4 work doc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_provenance: Option<SpawnProvenance>,
+    /// PR 5 Phase C: match against the supervisor profile's
+    /// `local_listener_policy`. `None` means the bind was not
+    /// pre-declared by the profile (egress_policy treats as
+    /// queue/deny). `Some(_)` means the bind matched a declared
+    /// `(port, family)` entry — `allow_clamp` controls whether
+    /// `0.0.0.0`/`::` binds are rewritten to loopback (Phase D)
+    /// or merely allowed loopback-only with queue on wildcard.
+    ///
+    /// Populated by the supervisor's event_handler when classifying
+    /// a `NetListen` syscall; consumed by `egress_policy.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listener_policy_match: Option<ListenerPolicyMatch>,
+}
+
+/// PR 5 Phase C: structured signal from the supervisor profile's
+/// `local_listener_policy` to the proxy. The supervisor pre-computes
+/// this match (port + family) before evaluating the proxy so the
+/// filter pipeline doesn't need to know the profile schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListenerPolicyMatch {
+    /// The matching entry's `allow_clamp` flag. When `true` and the
+    /// bind is wildcard, the supervisor will rewrite the sockaddr to
+    /// loopback at syscall-argument level (Phase D). When `false`,
+    /// wildcard binds still queue even with a declaration.
+    pub allow_clamp: bool,
+    /// Profile-declared description, surfaced in audit logs + the
+    /// dashboard "Listener rewrites" view. Forwarded verbatim from
+    /// the matching `LocalListenerEntry::desc`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub desc: String,
+}
+
+/// PR 4: structured provenance metadata for a `ProcessSpawn`, computed
+/// by the supervisor and consumed by `operation_risk.rs` to decide
+/// whether the spawn earns the +0.5 routine signal.
+///
+/// All five fields are independent gates — the routine signal applies
+/// only when (a) `matched_routine_root.is_some()`, (b) every
+/// `component_writability` entry has safe permissions, (c)
+/// `is_outbound_capable` is false, (d) argv doesn't reference tainted
+/// paths/env vars (checked separately by the filter), and (e) for
+/// user-owned roots, the canonical path + SHA-256 was in the session-
+/// pinned inventory at session start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnProvenance {
+    /// Canonical (symlink-resolved) absolute path of the executable.
+    pub canonical_path: String,
+    /// SHA-256 of the executable file's contents at the time the
+    /// supervisor computed provenance. Hex-encoded for serde
+    /// compatibility (the dashboard surfaces this string directly).
+    pub sha256: String,
+    /// Owning UID of the binary file itself.
+    pub owner_uid: u32,
+    /// Owning GID of the binary file itself.
+    pub owner_gid: u32,
+    /// File mode (permission + type bits) of the binary itself.
+    pub mode: u32,
+    /// Permission walk over every path component from `/` down to the
+    /// binary. Any unsafe entry rejects the routine signal.
+    pub component_writability: Vec<ComponentWritability>,
+    /// The profile-declared `routine_exec_roots` entry whose prefix
+    /// the canonical path matched. `None` when the canonical path
+    /// isn't under any declared root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_routine_root: Option<String>,
+    /// Whether the canonical path is on PR 2's curated outbound-
+    /// capable list. Set by the supervisor at provenance-computation
+    /// time so the proxy filter doesn't have to re-classify.
+    pub is_outbound_capable: bool,
+}
+
+/// PR 4: writability properties of one path component along the way
+/// to a spawned binary. Used by the routine-signal check to reject
+/// binaries reachable through directories that other principals can
+/// write to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComponentWritability {
+    /// The component's absolute path (cumulative from root).
+    pub path: String,
+    /// Owning UID of the component.
+    pub owner_uid: u32,
+    /// Whether the component is writable by "other" (`mode & 0o002`).
+    /// Always disqualifies the routine signal.
+    pub other_writable: bool,
+    /// Whether the component is writable by "group" AND owned by uid 0
+    /// (`mode & 0o020 && uid == 0`). Disqualifies — root-owned-group-
+    /// writable directories let group members inject binaries.
+    pub group_writable_non_root: bool,
+    /// Whether the component is world-writable. Redundant with
+    /// `other_writable` but recorded distinctly for audit-log clarity.
+    pub world_writable: bool,
 }
 
 /// The type of tool call being made.
@@ -88,6 +231,54 @@ pub enum ToolCallType {
     DnsQuery {
         domain: String,
         query_type: String,
+    },
+    /// PR 6 Phase B: chown-family ownership change. Routed to the
+    /// operation-risk filter for a `+5.0` baseline so any chown
+    /// outside profile-declared scope queues for review.
+    OwnershipChange {
+        /// Target path. For fd-based ownership changes the supervisor
+        /// reports the fd-resolved path when known, otherwise a
+        /// `<fd:N>` placeholder.
+        target: String,
+        /// New owner uid, `-1` for "leave unchanged".
+        new_uid: i64,
+        /// New group gid, `-1` for "leave unchanged".
+        new_gid: i64,
+    },
+    /// PR 6 Phase B: mount, chroot, pivot-root, and new-mount-API
+    /// filesystem mutation. Routed for `+5.0` baseline. Defeats
+    /// path-filter bypass via remount or root/view reshaping.
+    FilesystemMutation {
+        /// Operation tag, such as "mount", "umount2", "pivotroot",
+        /// "chroot", "opentree", "movemount", or "mountsetattr".
+        op: String,
+        /// Source path when available. `None` for fd/context-only
+        /// operations.
+        source: Option<String>,
+        /// Target mount point, new root, path, or fd/context
+        /// placeholder for fd-only operations.
+        target: String,
+        /// Filesystem type or context key when available.
+        fstype: Option<String>,
+    },
+    /// PR 6 Phase B: ptrace + process_vm_readv/writev against a
+    /// non-self target. `+5.0` baseline.
+    CrossProcessAccess {
+        /// Operation tag — "ptrace", "process_vm_readv", or
+        /// "process_vm_writev".
+        op: String,
+        /// Target pid (never the caller's own pid).
+        target_pid: u32,
+    },
+    /// PR 6 Phase C: `unshare(2)` / `setns(2)` namespace primitive.
+    /// `+5.0` baseline; routine-binary carveout in the supervisor
+    /// skips this evaluation entirely when the calling binary is on
+    /// the profile's `namespace_users` list.
+    NamespaceOp {
+        /// Syscall tag — "unshare" or "setns".
+        syscall: String,
+        /// `CLONE_NEW*` flag bitmap (unshare) or `nstype` (setns).
+        flags: u64,
     },
 }
 
@@ -169,6 +360,9 @@ pub enum TaintLevel {
 
 impl ToolCallContext {
     /// Create a new context with the given plugin, call type, and session.
+    /// Derives `session_scope` from the session id; callers that need a
+    /// different scope (e.g. an LLM path with its own conversation lifetime)
+    /// should override via [`with_session_scope`].
     pub fn new(plugin_id: impl Into<String>, call_type: ToolCallType, session_id: Uuid) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -182,6 +376,9 @@ impl ToolCallContext {
             source_taint: TaintLevel::None,
             profile_name: None,
             conversation_id: None,
+            session_scope: Some(SessionScopeKey::from_session_id(session_id)),
+            spawn_provenance: None,
+            listener_policy_match: None,
         }
     }
 
@@ -189,6 +386,36 @@ impl ToolCallContext {
     pub fn with_profile(mut self, name: impl Into<String>) -> Self {
         self.profile_name = Some(name.into());
         self
+    }
+
+    /// Override the session scope. Use when the calling layer has a finer-grained
+    /// lifetime than the session UUID (e.g. an LLM conversation that spans a
+    /// shorter window than the daemon session).
+    pub fn with_session_scope(mut self, scope: SessionScopeKey) -> Self {
+        self.session_scope = Some(scope);
+        self
+    }
+
+    /// Resolve the session scope for keying filter state, with a once-per-
+    /// (session, filter) warn if the scope is missing.
+    ///
+    /// Filter authors call this with their filter name; the helper returns
+    /// either the populated `session_scope` or — for legacy/IPC callers that
+    /// don't yet populate it — a deterministic fallback derived from
+    /// `session_id`. Because the fallback is deterministic, two calls within
+    /// the same legacy session still hash to the same key, preserving the
+    /// per-session isolation guarantee that PR 1 cares about, just without
+    /// the explicit `session_scope` field.
+    ///
+    /// The warn is throttled per `(session_id, filter_name)` so an older
+    /// supervisor sending many calls without `session_scope` does not spam
+    /// the log.
+    pub fn scope_or_warn(&self, filter_name: &'static str) -> SessionScopeKey {
+        if let Some(scope) = self.session_scope {
+            return scope;
+        }
+        warn_missing_scope_once(self.session_id, filter_name);
+        SessionScopeKey::from_session_id(self.session_id)
     }
 
     /// Extract the primary path from the tool call, if any.
@@ -202,6 +429,8 @@ impl ToolCallContext {
             | ToolCallType::FileChmod { path, .. }
             | ToolCallType::DirCreate { path } => Some(path),
             ToolCallType::FileRename { old_path, .. } => Some(old_path),
+            ToolCallType::OwnershipChange { target, .. }
+            | ToolCallType::FilesystemMutation { target, .. } => Some(target),
             _ => None,
         }
     }
@@ -245,6 +474,30 @@ impl ToolCallContext {
             | ToolCallType::NetListen { address, port } => Some((address, *port)),
             _ => None,
         }
+    }
+}
+
+/// Set of `(session_id, filter_name)` pairs that have already produced a
+/// missing-scope warning, so each filter logs at most once per session.
+///
+/// Memory bound: `ToolCallContext::new` populates `session_scope`, so this
+/// path is only reached by legacy IPC clients that explicitly omit the
+/// field. With three scoping filters today (taint, rate_limit, behavioural),
+/// the worst case is `3 × N_legacy_sessions × ~50 bytes` — self-limiting
+/// once clients upgrade. No eviction needed.
+fn warn_missing_scope_once(session_id: Uuid, filter_name: &'static str) {
+    static SEEN: OnceLock<Mutex<HashSet<(Uuid, &'static str)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert((session_id, filter_name)) {
+        tracing::warn!(
+            session_id = %session_id,
+            filter = filter_name,
+            "ToolCallContext.session_scope is None; falling back to session-id-derived scope. Caller should populate session_scope for clean keying.",
+        );
     }
 }
 
@@ -367,6 +620,28 @@ impl std::fmt::Display for ToolCallType {
             }
             Self::DnsQuery { domain, query_type } => {
                 write!(f, "DnsQuery({domain} {query_type})")
+            }
+            Self::OwnershipChange {
+                target,
+                new_uid,
+                new_gid,
+            } => write!(f, "OwnershipChange({target} uid={new_uid} gid={new_gid})"),
+            Self::FilesystemMutation {
+                op,
+                source,
+                target,
+                fstype,
+            } => write!(
+                f,
+                "FilesystemMutation({op} src={src} target={target} fstype={fs})",
+                src = source.as_deref().unwrap_or(""),
+                fs = fstype.as_deref().unwrap_or(""),
+            ),
+            Self::CrossProcessAccess { op, target_pid } => {
+                write!(f, "CrossProcessAccess({op} target_pid={target_pid})")
+            }
+            Self::NamespaceOp { syscall, flags } => {
+                write!(f, "NamespaceOp({syscall} flags={flags:#x})")
             }
         }
     }
@@ -560,6 +835,171 @@ mod tests {
         assert_eq!(parsed.task_context, ctx.task_context);
         assert_eq!(parsed.profile_name, ctx.profile_name);
         assert_eq!(parsed.arguments, ctx.arguments);
+        assert_eq!(parsed.session_scope, ctx.session_scope);
+    }
+
+    #[test]
+    fn session_scope_populated_by_new() {
+        let sid = test_session();
+        let ctx = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            sid,
+        );
+        assert_eq!(
+            ctx.session_scope,
+            Some(SessionScopeKey::from_session_id(sid)),
+            "ToolCallContext::new must populate session_scope from session_id"
+        );
+    }
+
+    #[test]
+    fn session_scope_with_override() {
+        let sid = test_session();
+        let other = SessionScopeKey::fresh();
+        let ctx = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            sid,
+        )
+        .with_session_scope(other);
+        assert_eq!(ctx.session_scope, Some(other));
+    }
+
+    #[test]
+    fn session_scope_serde_skip_when_none() {
+        let mut ctx = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            test_session(),
+        );
+        ctx.session_scope = None;
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(
+            !json.contains("session_scope"),
+            "None scope should be skipped during serialization (got {json})"
+        );
+    }
+
+    #[test]
+    fn session_scope_key_derives_deterministically() {
+        let sid = test_session();
+        let a = SessionScopeKey::from_session_id(sid);
+        let b = SessionScopeKey::from_session_id(sid);
+        assert_eq!(a, b, "from_session_id must be deterministic");
+        assert_eq!(a.as_uuid(), sid);
+    }
+
+    #[test]
+    fn session_scope_key_fresh_is_unique() {
+        let a = SessionScopeKey::fresh();
+        let b = SessionScopeKey::fresh();
+        assert_ne!(a, b, "fresh() must allocate a new UUID each call");
+    }
+
+    #[test]
+    fn scope_or_warn_returns_populated_scope() {
+        let sid = test_session();
+        let scope = SessionScopeKey::fresh();
+        let ctx = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            sid,
+        )
+        .with_session_scope(scope);
+        assert_eq!(ctx.scope_or_warn("test-filter"), scope);
+    }
+
+    #[test]
+    fn scope_or_warn_falls_back_to_session_id_when_missing() {
+        let sid = test_session();
+        let mut ctx = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            sid,
+        );
+        ctx.session_scope = None;
+        let resolved = ctx.scope_or_warn("test-filter-fallback");
+        // Fallback is deterministic: two missing-scope contexts on the same
+        // session_id hash to the same SessionScopeKey, preserving per-session
+        // isolation even on the legacy IPC path.
+        assert_eq!(resolved, SessionScopeKey::from_session_id(sid));
+    }
+
+    #[test]
+    fn scope_or_warn_deterministic_across_calls() {
+        let sid = test_session();
+        let mut a = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            sid,
+        );
+        let mut b = ToolCallContext::new(
+            "test",
+            ToolCallType::FileRead {
+                path: "/tmp/y".into(),
+            },
+            sid,
+        );
+        a.session_scope = None;
+        b.session_scope = None;
+        assert_eq!(
+            a.scope_or_warn("filter"),
+            b.scope_or_warn("filter"),
+            "fallback key derivation must be deterministic per session_id"
+        );
+    }
+
+    #[test]
+    fn session_scope_key_inner_is_not_publicly_constructible() {
+        // This test is a compile-time-style assertion: if SessionScopeKey's
+        // inner UUID were `pub`, the following would compile and we'd have a
+        // way to bypass the constructor. By keeping the field private, the
+        // only ways to build a scope are `from_session_id` and `fresh`.
+        // (No `SessionScopeKey(Uuid::nil())` literal is possible from outside
+        // the module — verified by the type's public surface.)
+        let sid = test_session();
+        let _ = SessionScopeKey::from_session_id(sid);
+        let _ = SessionScopeKey::fresh();
+    }
+
+    #[test]
+    fn session_scope_absent_in_legacy_payload_deserializes_to_none() {
+        // Older supervisor clients (pre-PR-1) POST proxy contexts without a
+        // session_scope field. Confirm serde's Option default handles this so
+        // IPC stays backward-compatible. This is the contract Phase B's
+        // None-fallback warn relies on.
+        let sid = test_session();
+        let legacy = format!(
+            r#"{{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "timestamp": "2026-05-18T12:00:00Z",
+                "plugin_id": "test",
+                "call_type": {{"type": "FileRead", "path": "/tmp/x"}},
+                "arguments": null,
+                "session_id": "{sid}",
+                "task_context": null,
+                "call_sequence_number": 0,
+                "source_taint": "None"
+            }}"#
+        );
+        let parsed: ToolCallContext = serde_json::from_str(&legacy)
+            .expect("legacy payload without session_scope must deserialize");
+        assert_eq!(parsed.session_scope, None);
+        assert_eq!(parsed.conversation_id, None);
+        assert_eq!(parsed.profile_name, None);
     }
 
     #[test]
@@ -610,6 +1050,29 @@ mod tests {
             test_session(),
         );
         assert_eq!(mkdir.path(), Some("/tmp/newdir"));
+
+        let ownership = ToolCallContext::new(
+            "supervisor:claude-code",
+            ToolCallType::OwnershipChange {
+                target: "/etc/passwd".into(),
+                new_uid: 1000,
+                new_gid: 1000,
+            },
+            test_session(),
+        );
+        assert_eq!(ownership.path(), Some("/etc/passwd"));
+
+        let mutation = ToolCallContext::new(
+            "supervisor:claude-code",
+            ToolCallType::FilesystemMutation {
+                op: "mount".into(),
+                source: Some("/dev/sda1".into()),
+                target: "/mnt/project".into(),
+                fstype: Some("ext4".into()),
+            },
+            test_session(),
+        );
+        assert_eq!(mutation.path(), Some("/mnt/project"));
     }
 
     #[test]

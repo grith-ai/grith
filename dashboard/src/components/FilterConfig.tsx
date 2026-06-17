@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { csrfHeaders } from "@/lib/csrf";
 
 interface FilterDef {
   id: string;
@@ -82,7 +83,7 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
         `${window.location.origin}/api/proxy/test`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...csrfHeaders() },
           body: JSON.stringify({
             tool_call: parsed,
             enabled_filters: Object.entries(enabledFilters)

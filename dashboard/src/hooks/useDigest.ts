@@ -11,6 +11,29 @@ import {
 /** Auto-refresh interval in milliseconds. */
 const REFRESH_INTERVAL = 30_000;
 
+/** Max concurrent in-flight requests for a bulk action, so clearing a large
+ *  backlog doesn't fire hundreds of requests at the daemon at once. */
+const BULK_CONCURRENCY = 6;
+
+/** Run `fn` over every item with a bounded number of concurrent workers. */
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  const queue = [...items];
+  const worker = async () => {
+    for (;;) {
+      const next = queue.shift();
+      if (next === undefined) return;
+      await fn(next);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, queue.length) }, worker),
+  );
+}
+
 export interface UseDigestReturn {
   /** List of pending/escalated digest items. */
   items: DigestItem[];
@@ -30,6 +53,12 @@ export interface UseDigestReturn {
   learn: (id: string, notes?: string) => Promise<void>;
   /** Escalate a digest item for senior review. Stays in the list with updated status. */
   escalate: (id: string, notes?: string) => Promise<void>;
+  /** Approve many items at once (bounded concurrency). */
+  approveMany: (ids: string[]) => Promise<void>;
+  /** Deny many items at once (bounded concurrency). */
+  denyMany: (ids: string[]) => Promise<void>;
+  /** Whether a bulk action is currently in flight. */
+  bulkBusy: boolean;
   /** Manually trigger a refresh. */
   refresh: () => Promise<void>;
 }
@@ -47,6 +76,7 @@ export function useDigest(): UseDigestReturn {
   const [escalatedCount, setEscalatedCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
   const mountedRef = useRef(true);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -164,6 +194,32 @@ export function useDigest(): UseDigestReturn {
     [items],
   );
 
+  const approveMany = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      setBulkBusy(true);
+      try {
+        await runWithConcurrency(ids, BULK_CONCURRENCY, (id) => approve(id));
+      } finally {
+        if (mountedRef.current) setBulkBusy(false);
+      }
+    },
+    [approve],
+  );
+
+  const denyMany = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      setBulkBusy(true);
+      try {
+        await runWithConcurrency(ids, BULK_CONCURRENCY, (id) => deny(id));
+      } finally {
+        if (mountedRef.current) setBulkBusy(false);
+      }
+    },
+    [deny],
+  );
+
   useEffect(() => {
     mountedRef.current = true;
     void fetchItems();
@@ -188,6 +244,9 @@ export function useDigest(): UseDigestReturn {
     deny,
     learn,
     escalate,
+    approveMany,
+    denyMany,
+    bulkBusy,
     refresh: fetchItems,
   };
 }

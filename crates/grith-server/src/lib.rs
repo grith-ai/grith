@@ -7,6 +7,7 @@
 //! for audit, digest, proxy, supervisor, and notification management.
 
 pub mod auth;
+pub mod csrf;
 pub mod error;
 pub mod ipc_auth;
 pub mod rate_limit;
@@ -14,6 +15,7 @@ pub mod routes;
 pub mod static_files;
 pub mod supervisor;
 pub mod websocket;
+pub mod ws_auth;
 
 pub use error::Error;
 
@@ -153,6 +155,58 @@ pub struct AppState {
     pub sync_api_base_url: Option<String>,
     /// Bearer token for IPC endpoint authentication (empty = no auth).
     pub ipc_token: String,
+    /// Per-server dashboard token gating browser-facing mutations (and, from
+    /// item 4, sensitive reads). Sent by the SPA in the `x-grith-csrf` header.
+    /// Empty = no token configured: the CSRF guard then accepts the public
+    /// sentinel (zero-config / test mode). See [`crate::csrf`].
+    pub dashboard_token: String,
+    /// Single-use browser pairing code (see [`crate::routes::dashboard_pair`]).
+    ///
+    /// Minted on demand; exchanged once for the real `dashboard_token` at the
+    /// open `/api/dashboard/pair` endpoint, then cleared. Lets the CLI hand a
+    /// browser the token without ever printing the long-lived secret — only the
+    /// disposable code appears in a URL, and only until first use. `None` when
+    /// no code is currently outstanding.
+    pub dashboard_pair_code: Arc<Mutex<Option<String>>>,
+    /// Rolling record of session-limit (429) rejection timestamps, pruned to a
+    /// 7-day window on access. Powers the dashboard "you hit your session limit
+    /// N times this week" upgrade nudge and `/api/tier` rejection telemetry.
+    pub session_limit_rejections: Arc<Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+}
+
+/// Number of days of session-limit rejections retained for the upgrade nudge.
+pub const SESSION_LIMIT_REJECTION_WINDOW_DAYS: i64 = 7;
+
+/// Record a session-limit rejection and return the rolling-window count.
+///
+/// Prunes entries older than [`SESSION_LIMIT_REJECTION_WINDOW_DAYS`] so the
+/// returned count reflects only recent rejections. Lock poisoning is treated as
+/// "no history" rather than panicking the request path.
+pub fn record_session_limit_rejection(
+    log: &Arc<Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+) -> usize {
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::days(SESSION_LIMIT_REJECTION_WINDOW_DAYS);
+    match log.lock() {
+        Ok(mut entries) => {
+            entries.retain(|ts| *ts >= cutoff);
+            entries.push(now);
+            entries.len()
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Count session-limit rejections within the rolling window without recording a
+/// new one. Used by read-only endpoints (e.g. `/api/tier`).
+pub fn count_recent_session_limit_rejections(
+    log: &Arc<Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+) -> usize {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(SESSION_LIMIT_REJECTION_WINDOW_DAYS);
+    match log.lock() {
+        Ok(entries) => entries.iter().filter(|ts| **ts >= cutoff).count(),
+        Err(_) => 0,
+    }
 }
 
 /// Dependencies required to construct `AppState` for the server.
@@ -222,6 +276,9 @@ impl AppState {
             sync_api_key: deps.sync_api_key,
             sync_api_base_url: deps.sync_api_base_url,
             ipc_token: String::new(),
+            dashboard_token: String::new(),
+            dashboard_pair_code: Arc::new(Mutex::new(None)),
+            session_limit_rejections: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -230,6 +287,39 @@ impl AppState {
     /// Set the IPC bearer token for endpoint authentication.
     pub fn set_ipc_token(&mut self, token: String) {
         self.ipc_token = token;
+    }
+
+    pub fn set_dashboard_token(&mut self, token: String) {
+        self.dashboard_token = token;
+    }
+
+    /// Mint a fresh single-use browser pairing code, replacing any outstanding
+    /// one, and return it. The caller surfaces it to exactly one browser (via
+    /// the `#pair=` URL fragment), which exchanges it at `/api/dashboard/pair`.
+    pub fn mint_pair_code(&self) -> String {
+        let code = uuid::Uuid::new_v4().simple().to_string();
+        if let Ok(mut slot) = self.dashboard_pair_code.lock() {
+            *slot = Some(code.clone());
+        }
+        code
+    }
+
+    /// Exchange a pairing code for the dashboard token. Returns the token when
+    /// `candidate` matches the outstanding code (constant-time), clearing it so
+    /// it cannot be reused; returns `None` otherwise (no code outstanding, or
+    /// mismatch). An empty candidate never matches.
+    pub fn redeem_pair_code(&self, candidate: &str) -> Option<String> {
+        if candidate.is_empty() {
+            return None;
+        }
+        let mut slot = self.dashboard_pair_code.lock().ok()?;
+        let current = slot.as_deref()?;
+        if crate::ipc_auth::constant_time_eq(candidate.as_bytes(), current.as_bytes()) {
+            *slot = None; // single-use
+            Some(self.dashboard_token.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -290,6 +380,7 @@ impl GrithServer {
                 header::CONTENT_TYPE,
                 header::AUTHORIZATION,
                 axum::http::HeaderName::from_static("x-grith-api-key"),
+                axum::http::HeaderName::from_static(csrf::DASHBOARD_CSRF_HEADER),
             ]);
 
         // Build rate limiter from config
@@ -308,7 +399,9 @@ impl GrithServer {
         // Wrap each sub-router with its bucket-specific rate limit layer.
         // Rate limiting runs inside auth layers (innermost), so
         // unauthenticated requests are rejected before consuming quota.
-        let general = routes::general_routes().layer(axum::middleware::from_fn({
+
+        // Low-sensitivity status reads: open, General rate-limit bucket.
+        let open_read = routes::open_read_routes().layer(axum::middleware::from_fn({
             let limiter = Arc::clone(&limiter);
             move |req, next| {
                 let limiter = Arc::clone(&limiter);
@@ -319,7 +412,46 @@ impl GrithServer {
             }
         }));
 
-        let write = routes::write_routes().layer(axum::middleware::from_fn({
+        // Sensitive reads (item 4): dashboard-token guard (outermost) over the
+        // General rate-limit bucket. Gated only when a token is configured.
+        let sensitive_read = routes::sensitive_read_routes()
+            .layer(axum::middleware::from_fn({
+                let limiter = Arc::clone(&limiter);
+                move |req, next| {
+                    let limiter = Arc::clone(&limiter);
+                    async move {
+                        rate_limit::check(limiter, rate_limit::RateLimitBucket::General, req, next)
+                            .await
+                    }
+                }
+            }))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                csrf::require_dashboard_token,
+            ));
+
+        // Browser-facing dashboard mutations: CSRF guard (outermost, so
+        // unauthenticated requests are rejected before consuming write quota)
+        // over the write-bucket rate limiter.
+        let dashboard_write = routes::dashboard_write_routes()
+            .layer(axum::middleware::from_fn({
+                let limiter = Arc::clone(&limiter);
+                move |req, next| {
+                    let limiter = Arc::clone(&limiter);
+                    async move {
+                        rate_limit::check(limiter, rate_limit::RateLimitBucket::Write, req, next)
+                            .await
+                    }
+                }
+            }))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                csrf::require_dashboard_csrf,
+            ));
+
+        // Mutating routes with their own non-CSRF auth (webhook nonce / IPC
+        // bearer). Same rate-limit bucket, but no CSRF layer.
+        let protected_write = routes::protected_write_routes().layer(axum::middleware::from_fn({
             let limiter = Arc::clone(&limiter);
             move |req, next| {
                 let limiter = Arc::clone(&limiter);
@@ -329,16 +461,28 @@ impl GrithServer {
             }
         }));
 
-        let proxy_test = routes::proxy_test_routes().layer(axum::middleware::from_fn({
-            let limiter = Arc::clone(&limiter);
-            move |req, next| {
+        // Proxy dry-run is a dashboard-driven route (FilterConfig.tsx) — CSRF
+        // guard over its own rate-limit bucket.
+        let proxy_test = routes::proxy_test_routes()
+            .layer(axum::middleware::from_fn({
                 let limiter = Arc::clone(&limiter);
-                async move {
-                    rate_limit::check(limiter, rate_limit::RateLimitBucket::ProxyTest, req, next)
+                move |req, next| {
+                    let limiter = Arc::clone(&limiter);
+                    async move {
+                        rate_limit::check(
+                            limiter,
+                            rate_limit::RateLimitBucket::ProxyTest,
+                            req,
+                            next,
+                        )
                         .await
+                    }
                 }
-            }
-        }));
+            }))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                csrf::require_dashboard_csrf,
+            ));
 
         let ipc = routes::ipc_routes().layer(axum::middleware::from_fn({
             let limiter = Arc::clone(&limiter);
@@ -350,28 +494,58 @@ impl GrithServer {
             }
         }));
 
-        let api_router = general.merge(write).merge(proxy_test).merge(ipc);
+        let api_router = open_read
+            .merge(sensitive_read)
+            .merge(dashboard_write)
+            .merge(protected_write)
+            .merge(proxy_test)
+            .merge(ipc);
 
         // Supervisor API routes are mounted outside `routes::api_router()`,
-        // so apply the same limiter here to keep coverage consistent.
-        let supervisor_api = supervisor::supervisor_router().layer(axum::middleware::from_fn({
-            let limiter = Arc::clone(&limiter);
-            move |req: axum::extract::Request, next| {
+        // so apply the same limiter here to keep coverage consistent. Two auth
+        // layers compose here:
+        //   * `require_dashboard_csrf` gates the mutations (create / kill /
+        //     delete) on every profile, including zero-config, so a browser
+        //     drive-by can't kill sessions.
+        //   * `require_dashboard_token` gates the reads (`/sessions`,
+        //     `/sessions/:id` — session/process metadata, root PIDs) once a
+        //     token is configured (item 4 two-tier).
+        let supervisor_api = supervisor::supervisor_router()
+            .layer(axum::middleware::from_fn({
                 let limiter = Arc::clone(&limiter);
-                async move {
-                    let bucket = match *req.method() {
-                        Method::GET | Method::HEAD | Method::OPTIONS => {
-                            rate_limit::RateLimitBucket::General
-                        }
-                        _ => rate_limit::RateLimitBucket::Write,
-                    };
-                    rate_limit::check(limiter, bucket, req, next).await
+                move |req: axum::extract::Request, next| {
+                    let limiter = Arc::clone(&limiter);
+                    async move {
+                        let bucket = match *req.method() {
+                            Method::GET | Method::HEAD | Method::OPTIONS => {
+                                rate_limit::RateLimitBucket::General
+                            }
+                            _ => rate_limit::RateLimitBucket::Write,
+                        };
+                        rate_limit::check(limiter, bucket, req, next).await
+                    }
                 }
-            }
-        }));
-        let supervisor_ws = supervisor::supervisor_ws_router();
+            }))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                csrf::require_dashboard_csrf,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                csrf::require_dashboard_token,
+            ));
+        // WebSocket streams are not covered by CORS, so gate the upgrade with
+        // the Origin-vs-Host + dashboard-token middleware before any handler.
+        let supervisor_ws = supervisor::supervisor_ws_router().layer(
+            axum::middleware::from_fn_with_state(self.state.clone(), ws_auth::require_ws_auth),
+        );
 
-        let ws_router = Router::new().route("/ws/live", axum::routing::get(websocket::ws_handler));
+        let ws_router = Router::new()
+            .route("/ws/live", axum::routing::get(websocket::ws_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                ws_auth::require_ws_auth,
+            ));
 
         let state = self.state.clone();
 
@@ -505,6 +679,27 @@ impl GrithServer {
         self
     }
 
+    /// Set the per-server dashboard token gating browser-facing mutations.
+    ///
+    /// When set, the [`crate::csrf`] guard requires the SPA to present this
+    /// exact value in `x-grith-csrf` (verified in constant time) rather than
+    /// the public sentinel. The SPA learns it from the `#token=` launch
+    /// fragment.
+    pub fn with_dashboard_token(mut self, token: impl Into<String>) -> Self {
+        self.state.set_dashboard_token(token.into());
+        self
+    }
+
+    /// Mint a fresh single-use browser pairing code on this server's state.
+    ///
+    /// Used by in-process launch paths (`grith run` / a direct `dashboard
+    /// start`) to obtain a code *before* `start()` consumes `self`, so the CLI
+    /// can build the `#pair=<code>` URL without printing the long-lived token.
+    /// Separate-process callers fetch one over IPC instead.
+    pub fn mint_pair_code(&self) -> String {
+        self.state.mint_pair_code()
+    }
+
     /// Set the plan tier for feature gating.
     pub fn with_plan_tier(mut self, tier: impl Into<String>) -> Self {
         self.state.plan_tier = tier.into();
@@ -629,6 +824,32 @@ mod tests {
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3141);
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn session_limit_rejection_counter_records_and_counts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(count_recent_session_limit_rejections(&log), 0);
+        assert_eq!(record_session_limit_rejection(&log), 1);
+        assert_eq!(record_session_limit_rejection(&log), 2);
+        // Read-only count reflects the recorded entries without adding more.
+        assert_eq!(count_recent_session_limit_rejections(&log), 2);
+        assert_eq!(count_recent_session_limit_rejections(&log), 2);
+    }
+
+    #[test]
+    fn session_limit_rejection_counter_prunes_old_entries() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // Seed an entry older than the retention window.
+        {
+            let mut entries = log.lock().unwrap();
+            entries.push(
+                chrono::Utc::now()
+                    - chrono::Duration::days(SESSION_LIMIT_REJECTION_WINDOW_DAYS + 1),
+            );
+        }
+        // Recording prunes the stale entry, leaving only the fresh one.
+        assert_eq!(record_session_limit_rejection(&log), 1);
     }
 
     #[test]
@@ -780,17 +1001,611 @@ mod tests {
 
         let session_id = uuid::Uuid::new_v4();
         let path = format!("/api/supervisor/sessions/{session_id}/kill");
+        // Send the dashboard CSRF header so these requests reach the
+        // rate-limit layer rather than being rejected by the CSRF guard.
         let first = app
             .clone()
-            .oneshot(Request::post(path.clone()).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post(path.clone())
+                    .header(
+                        crate::csrf::DASHBOARD_CSRF_HEADER,
+                        crate::csrf::DASHBOARD_CSRF_SENTINEL,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
 
         let second = app
-            .oneshot(Request::post(path).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post(path)
+                    .header(
+                        crate::csrf::DASHBOARD_CSRF_HEADER,
+                        crate::csrf::DASHBOARD_CSRF_SENTINEL,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // --- Dashboard CSRF guard (item 1) ---
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn csrf_test_server() -> GrithServer {
+        let config = ServerConfig::default();
+        let deps = make_deps();
+        let (_, rx) = broadcast::channel(1);
+        GrithServer::new(config, deps, "0.1.0", rx)
+    }
+
+    fn csrf_test_server_with_token(token: &str) -> GrithServer {
+        let config = ServerConfig::default();
+        let deps = make_deps();
+        let (_, rx) = broadcast::channel(1);
+        GrithServer::new(config, deps, "0.1.0", rx).with_dashboard_token(token)
+    }
+
+    async fn sync_apply_status(app: axum::Router, header: Option<(&str, &str)>) -> StatusCode {
+        let mut req = Request::post("/api/sync/apply");
+        if let Some((name, value)) = header {
+            req = req.header(name, value);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    // --- Browser pairing (single-use code → token) ---
+
+    #[tokio::test]
+    async fn pair_code_mint_requires_ipc_bearer_then_redeems_once() {
+        let dash_token = "the-real-dashboard-token";
+        let config = ServerConfig::default();
+        let deps = make_deps();
+        let (_, rx) = broadcast::channel(1);
+        let server = GrithServer::new(config, deps, "0.1.0", rx)
+            .with_ipc_token("daemon-bearer")
+            .with_dashboard_token(dash_token);
+        let app = server.build_router();
+
+        // Mint without the IPC bearer → 401.
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::post("/api/ipc/dashboard/pair-code")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // Mint with the bearer → 200 + a code.
+        let minted = app
+            .clone()
+            .oneshot(
+                Request::post("/api/ipc/dashboard/pair-code")
+                    .header("authorization", "Bearer daemon-bearer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(minted.status(), StatusCode::OK);
+        let code = body_json(minted).await["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!code.is_empty());
+
+        let redeem = |c: &str| {
+            let app = app.clone();
+            let body = format!("{{\"code\":\"{c}\"}}");
+            async move {
+                app.oneshot(
+                    Request::post("/api/dashboard/pair")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Redeem the valid code → 200 + the real dashboard token.
+        let ok = redeem(&code).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_json(ok).await["token"].as_str().unwrap(), dash_token);
+
+        // Single-use: the same code is now dead → 401.
+        assert_eq!(redeem(&code).await.status(), StatusCode::UNAUTHORIZED);
+
+        // A bogus code never matches.
+        assert_eq!(
+            redeem("not-a-code").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_redeem_with_no_outstanding_code_is_unauthorized() {
+        // Fresh server, no code minted yet → any redeem attempt fails.
+        let app = csrf_test_server_with_token("tok").build_router();
+        let resp = app
+            .oneshot(
+                Request::post("/api/dashboard/pair")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"code\":\"anything\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dashboard_write_with_configured_token_requires_exact_token() {
+        let token = "s3cr3t-dashboard-token";
+
+        // Correct token → passes the guard (handler returns its own non-CSRF
+        // response, here a Pro feature gate).
+        let app = csrf_test_server_with_token(token).build_router();
+        let resp = app
+            .oneshot(
+                Request::post("/api/sync/apply")
+                    .header(crate::csrf::DASHBOARD_CSRF_HEADER, token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!body_string(resp).await.contains("CSRF_REQUIRED"));
+
+        // The public sentinel is NOT accepted once a real token is configured.
+        let status = sync_apply_status(
+            csrf_test_server_with_token(token).build_router(),
+            Some((
+                crate::csrf::DASHBOARD_CSRF_HEADER,
+                crate::csrf::DASHBOARD_CSRF_SENTINEL,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Wrong token → rejected.
+        let status = sync_apply_status(
+            csrf_test_server_with_token(token).build_router(),
+            Some((crate::csrf::DASHBOARD_CSRF_HEADER, "wrong-token")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Missing header → rejected.
+        let status =
+            sync_apply_status(csrf_test_server_with_token(token).build_router(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dashboard_read_is_open_even_with_token_configured() {
+        // Item 2 gates writes only; reads stay open until item 4.
+        let app = csrf_test_server_with_token("a-token").build_router();
+        let resp = app
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- Two-tier read gating (item 4) ---
+
+    async fn get_status(app: axum::Router, path: &str, token: Option<&str>) -> StatusCode {
+        let mut req = Request::get(path);
+        if let Some(t) = token {
+            req = req.header(crate::csrf::DASHBOARD_CSRF_HEADER, t);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn sensitive_reads_require_token_when_configured() {
+        let token = "read-gate-token";
+        // No token header → 401 for sensitive reads.
+        for path in ["/api/audit", "/api/digest", "/api/canaries", "/api/config"] {
+            let status = get_status(
+                csrf_test_server_with_token(token).build_router(),
+                path,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} should be gated");
+        }
+
+        // Correct token → not the auth rejection (handler runs).
+        let status = get_status(
+            csrf_test_server_with_token(token).build_router(),
+            "/api/audit",
+            Some(token),
+        )
+        .await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+
+        // Wrong token / sentinel → still 401 once a real token is set.
+        for bad in [crate::csrf::DASHBOARD_CSRF_SENTINEL, "nope"] {
+            let status = get_status(
+                csrf_test_server_with_token(token).build_router(),
+                "/api/audit",
+                Some(bad),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn open_reads_stay_open_with_token_configured() {
+        let token = "read-gate-token";
+        for path in ["/api/health", "/api/tier", "/api/proxy/status"] {
+            let status = get_status(
+                csrf_test_server_with_token(token).build_router(),
+                path,
+                None,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{path} must stay open even with a token configured"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_reads_open_in_zero_config() {
+        // No dashboard token configured → sensitive reads are not gated.
+        for path in ["/api/audit", "/api/digest", "/api/config"] {
+            let status = get_status(csrf_test_server().build_router(), path, None).await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{path} open in zero-config"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_reads_require_token_when_configured() {
+        let token = "read-gate-token";
+        let status = get_status(
+            csrf_test_server_with_token(token).build_router(),
+            "/api/supervisor/sessions",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dashboard_write_without_csrf_header_is_forbidden() {
+        let app = csrf_test_server().build_router();
+        let resp = app
+            .oneshot(
+                Request::post("/api/sync/apply")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_string(resp).await.contains("CSRF_REQUIRED"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_write_with_csrf_header_passes_the_guard() {
+        let app = csrf_test_server().build_router();
+        let resp = app
+            .oneshot(
+                Request::post("/api/sync/apply")
+                    .header(
+                        crate::csrf::DASHBOARD_CSRF_HEADER,
+                        crate::csrf::DASHBOARD_CSRF_SENTINEL,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The handler runs (here it returns a Pro feature-gate response); the
+        // important invariant is that the CSRF guard did not reject the request.
+        assert!(!body_string(resp).await.contains("CSRF_REQUIRED"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_write_with_wrong_csrf_value_is_forbidden() {
+        let app = csrf_test_server().build_router();
+        let resp = app
+            .oneshot(
+                Request::post("/api/sync/apply")
+                    .header(crate::csrf::DASHBOARD_CSRF_HEADER, "not-the-sentinel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_string(resp).await.contains("CSRF_REQUIRED"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_read_does_not_require_csrf() {
+        let app = csrf_test_server().build_router();
+        let resp = app
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn supervisor_mutation_without_csrf_is_forbidden() {
+        let app = csrf_test_server().build_router();
+        let id = uuid::Uuid::new_v4();
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/supervisor/sessions/{id}/kill"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_string(resp).await.contains("CSRF_REQUIRED"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_read_does_not_require_csrf() {
+        let app = csrf_test_server().build_router();
+        let resp = app
+            .oneshot(
+                Request::get("/api/supervisor/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn webhook_review_is_not_csrf_gated() {
+        // The webhook callback authenticates via a single-use nonce, not the
+        // dashboard CSRF header. A POST without the header must reach the
+        // handler (and fail on the bad nonce / lookup), never the CSRF guard.
+        let app = csrf_test_server().build_router();
+        let id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "action": "approve",
+            "reviewer": "tester",
+            "notes": serde_json::Value::Null,
+            "nonce": "definitely-not-valid"
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/digest/{id}/webhook-review"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Positively confirm the request reached the webhook handler and failed
+        // on the bad nonce (REVIEW_ERROR), rather than being stopped by the
+        // CSRF guard — proving the route is not CSRF-gated.
+        let body = body_string(resp).await;
+        assert!(body.contains("REVIEW_ERROR"), "body was: {body}");
+        assert!(!body.contains("CSRF_REQUIRED"));
+    }
+
+    // --- WebSocket upgrade authorization (item 3) ---
+
+    fn ws_request(path: &str, origin: Option<&str>, host: &str) -> axum::http::Request<Body> {
+        let mut builder = Request::get(path)
+            .header("host", host)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let Some(o) = origin {
+            builder = builder.header("origin", o);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ws_live_rejects_cross_origin_handshake() {
+        let app = csrf_test_server().build_router();
+        let resp = app
+            .oneshot(ws_request(
+                "/ws/live",
+                Some("http://evil.example"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_string(resp).await.contains("WS_ORIGIN_FORBIDDEN"));
+    }
+
+    #[tokio::test]
+    async fn ws_live_requires_token_when_configured() {
+        let token = "ws-secret-token";
+        // Same-origin but no token → 401.
+        let resp = csrf_test_server_with_token(token)
+            .build_router()
+            .oneshot(ws_request(
+                "/ws/live",
+                Some("http://127.0.0.1:3141"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(body_string(resp).await.contains("WS_TOKEN_REQUIRED"));
+
+        // Same-origin with the correct token → the auth middleware passes the
+        // request through. (A real upgrade can't complete under `oneshot`, so
+        // assert only that auth did not reject it.)
+        let resp = csrf_test_server_with_token(token)
+            .build_router()
+            .oneshot(ws_request(
+                &format!("/ws/live?token={token}"),
+                Some("http://127.0.0.1:3141"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        assert!(!body_string(resp).await.contains("WS_TOKEN_REQUIRED"));
+
+        // Same-origin with a wrong token → 401.
+        let resp = csrf_test_server_with_token(token)
+            .build_router()
+            .oneshot(ws_request(
+                "/ws/live?token=wrong",
+                Some("http://127.0.0.1:3141"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ws_supervisor_stream_is_origin_and_token_gated() {
+        let token = "ws-secret-token";
+        let id = uuid::Uuid::new_v4();
+
+        // Cross-origin → 403 before the session-existence probe.
+        let resp = csrf_test_server_with_token(token)
+            .build_router()
+            .oneshot(ws_request(
+                &format!("/ws/supervisor/{id}"),
+                Some("http://evil.example"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_string(resp).await.contains("WS_ORIGIN_FORBIDDEN"));
+
+        // Same-origin, no token → 401 (still no session-existence leak: a bare
+        // handler would 404 on this random UUID, so 401 proves auth ran first).
+        let resp = csrf_test_server_with_token(token)
+            .build_router()
+            .oneshot(ws_request(
+                &format!("/ws/supervisor/{id}"),
+                Some("http://127.0.0.1:3141"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(body_string(resp).await.contains("WS_TOKEN_REQUIRED"));
+    }
+
+    #[tokio::test]
+    async fn ws_live_open_without_token_when_unconfigured() {
+        // Zero-config (no dashboard token): same-origin handshake is not
+        // rejected by the auth middleware.
+        let resp = csrf_test_server()
+            .build_router()
+            .oneshot(ws_request(
+                "/ws/live",
+                Some("http://127.0.0.1:3141"),
+                "127.0.0.1:3141",
+            ))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ipc_events_require_bearer_and_reject_browser_injection() {
+        // The event-ingestion route is IPC-only and bearer-authed. A browser
+        // (or any caller) without the daemon token cannot inject events.
+        let config = ServerConfig::default();
+        let deps = make_deps();
+        let (_, rx) = broadcast::channel(1);
+        let app = GrithServer::new(config, deps, "0.1.0", rx)
+            .with_ipc_token("test-token")
+            .build_router();
+
+        let event = serde_json::json!({ "type": "test" }).to_string();
+
+        // No bearer token → rejected by IpcAuth before any broadcast.
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::post("/api/ipc/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // The browser-facing `/api/events` route no longer exists at all.
+        let removed = app
+            .clone()
+            .oneshot(
+                Request::post("/api/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::NOT_FOUND);
+
+        // With the daemon bearer token → accepted.
+        let authed = app
+            .oneshot(
+                Request::post("/api/ipc/events")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(event))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::ACCEPTED);
     }
 }

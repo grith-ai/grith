@@ -109,13 +109,12 @@ pub fn render_vterm(
     }
 
     // Position the real terminal cursor at the vt100 cursor location.
-    // Only when the tool hasn't hidden it — tools like Claude Code/Ink hide
-    // the cursor (`CSI ?25l`) and manage their own visual cursor through
-    // escape sequences. Their internal vt100 cursor position doesn't match
-    // the visual cursor, so showing it would place it at the wrong row.
-    // Tools that keep the cursor visible (shells, vim, etc.) get it
-    // positioned correctly.
-    if show_cursor && !screen.hide_cursor() {
+    // We deliberately ignore `screen.hide_cursor()` (CSI ?25l): Ink-based
+    // tools (Claude Code) hide the OS cursor and rely on an inverse-video
+    // cell as a fake cursor, which can be invisible when the underlying
+    // cell is a space with default fg/bg. Always positioning the real
+    // cursor at the vt100 location keeps something visible for the user.
+    if show_cursor {
         let (cursor_row, cursor_col) = screen.cursor_position();
         if cursor_row < screen_row_start {
             return;

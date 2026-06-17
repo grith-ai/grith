@@ -34,6 +34,11 @@ impl SessionSync for RegistrySessionSync {
             .lock()
             .map_err(|_| "supervisor registry lock poisoned".to_string())?;
         if let Some(existing) = registry.get_mut(&session.id) {
+            // Bump idle age only when the proxy evaluated a real (non-noise)
+            // call since the last sync; noise-only traffic must not reset idle.
+            if session.stats.proxy_evals() > existing.stats.proxy_evals() {
+                existing.last_activity_at = std::time::Instant::now();
+            }
             existing.stats = session.stats.clone();
             existing.process_tree = session.process_tree.clone();
             existing.profile_name = session.profile_name.clone();

@@ -166,6 +166,64 @@ describe("useDigest", () => {
     expect(result.current.items[0]?.status).toBe("pending");
   });
 
+  it("approveMany approves every given item and clears the list", async () => {
+    const items = ["a", "b", "c"].map((id) => ({ ...mockItem, id }));
+    vi.mocked(getDigestItems).mockResolvedValue({
+      ...mockListResponse,
+      items,
+      pending_count: 3,
+    });
+    vi.mocked(approveDigest).mockResolvedValue(mockItem);
+
+    const { result } = renderHook(() => useDigest());
+    await waitFor(() => expect(result.current.items).toHaveLength(3));
+    // Ignore any calls from earlier tests (factory mocks aren't auto-cleared).
+    vi.mocked(approveDigest).mockClear();
+
+    await act(async () => {
+      await result.current.approveMany(["a", "b", "c"]);
+    });
+
+    expect(approveDigest).toHaveBeenCalledTimes(3);
+    expect(result.current.items).toHaveLength(0);
+    expect(result.current.bulkBusy).toBe(false);
+  });
+
+  it("denyMany denies every given item", async () => {
+    const items = ["a", "b"].map((id) => ({ ...mockItem, id }));
+    vi.mocked(getDigestItems).mockResolvedValue({
+      ...mockListResponse,
+      items,
+      pending_count: 2,
+    });
+    vi.mocked(denyDigest).mockResolvedValue(mockItem);
+
+    const { result } = renderHook(() => useDigest());
+    await waitFor(() => expect(result.current.items).toHaveLength(2));
+    vi.mocked(denyDigest).mockClear();
+
+    await act(async () => {
+      await result.current.denyMany(["a", "b"]);
+    });
+
+    expect(denyDigest).toHaveBeenCalledTimes(2);
+    expect(result.current.items).toHaveLength(0);
+  });
+
+  it("approveMany with no ids is a no-op", async () => {
+    vi.mocked(getDigestItems).mockResolvedValue(mockListResponse);
+    const { result } = renderHook(() => useDigest());
+    await waitFor(() => expect(result.current.items).toHaveLength(1));
+    vi.mocked(approveDigest).mockClear();
+
+    await act(async () => {
+      await result.current.approveMany([]);
+    });
+
+    expect(approveDigest).not.toHaveBeenCalled();
+    expect(result.current.items).toHaveLength(1);
+  });
+
   it("sets error on fetch failure", async () => {
     vi.mocked(getDigestItems).mockRejectedValue(new Error("Network error"));
 

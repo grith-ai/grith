@@ -93,3 +93,62 @@ pub fn remove_dashboard_pid() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+// --- "Browser already auto-opened" marker ---
+//
+// Records the daemon PID we last auto-opened the dashboard for, so auto-open
+// fires at most once per daemon instance. A second `grith exec` against the
+// same running daemon won't pop a new tab; a fresh daemon (new PID) will open
+// again. Keyed by PID, not a boolean, so a leftover marker from a crashed
+// previous daemon doesn't suppress the new one's open.
+
+fn opened_marker_path() -> PathBuf {
+    runtime_dir().join("dashboard.opened")
+}
+
+/// Record that we auto-opened the dashboard for the daemon with this PID.
+pub fn mark_dashboard_opened(daemon_pid: u32) {
+    let dir = runtime_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(opened_marker_path(), daemon_pid.to_string());
+}
+
+/// Returns true if we have already auto-opened the dashboard for this exact
+/// daemon PID. A marker for a different (older/crashed) PID — or a missing /
+/// corrupt one — returns false, so the current daemon still gets its one open.
+pub fn dashboard_already_opened(daemon_pid: u32) -> bool {
+    match std::fs::read_to_string(opened_marker_path()) {
+        Ok(content) => opened_marker_matches(&content, daemon_pid),
+        Err(_) => false,
+    }
+}
+
+/// Pure marker-match: does the marker file content name exactly `daemon_pid`?
+/// A non-numeric / empty / mismatched marker is treated as "not opened".
+fn opened_marker_matches(content: &str, daemon_pid: u32) -> bool {
+    content.trim().parse::<u32>() == Ok(daemon_pid)
+}
+
+/// Remove the auto-open marker (on daemon shutdown).
+pub fn remove_dashboard_opened() {
+    let _ = std::fs::remove_file(opened_marker_path());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opened_marker_matches;
+
+    #[test]
+    fn marker_matches_only_the_exact_pid() {
+        assert!(opened_marker_matches("4321", 4321));
+        assert!(opened_marker_matches("4321\n", 4321)); // trailing newline tolerated
+        assert!(!opened_marker_matches("4321", 9999)); // different daemon
+    }
+
+    #[test]
+    fn corrupt_or_empty_marker_means_not_opened() {
+        // A garbage marker must not suppress the current daemon's one open.
+        assert!(!opened_marker_matches("", 4321));
+        assert!(!opened_marker_matches("not-a-pid", 4321));
+    }
+}

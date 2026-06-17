@@ -22,12 +22,14 @@
 //! Works with any tool (Claude Code, Codex, Aider, vim, etc.).
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -37,9 +39,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use ratatui::Terminal;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{unbounded, Receiver as CbReceiver, Select, TryRecvError};
+
+use super::fullscreen_scrollback::FullscreenScrollback;
 use super::theme::*;
 use super::widgets;
 
@@ -72,6 +79,10 @@ pub const PERMISSION_PANEL_ROWS: u16 = 18;
 pub const MINIMAL_CHROME_ROWS: u16 = 1 + 2 + LOG_PANEL_ROWS + 1;
 
 /// Events sent from the supervisor to the exec TUI.
+///
+/// Note: permission requests are NOT carried on this channel — they have
+/// their own dedicated `PermissionEvent` channel so a backlog of `PtyOutput`
+/// events under heavy load cannot delay a user-facing permission prompt.
 pub enum ExecEvent {
     /// Raw bytes from the PTY (tool's output).
     PtyOutput(Vec<u8>),
@@ -82,14 +93,29 @@ pub enum ExecEvent {
         call_type: String,
         score: f64,
     },
-    /// A permission request — user must approve/deny before the tool resumes.
-    PermissionRequest {
-        request: super::state::PermissionRequest,
-        response_tx: std::sync::mpsc::SyncSender<&'static str>,
-    },
     /// Supervised process exited.
     ProcessExited,
 }
+
+/// A permission request — user must approve/deny before the tool resumes.
+/// Carried on a dedicated channel; the TUI's `select!` arm for permissions
+/// is biased ahead of supervisor events so prompt latency stays sub-frame
+/// regardless of `ExecEvent` queue depth.
+pub struct PermissionEvent {
+    pub request: super::state::PermissionRequest,
+    pub response_tx: std::sync::mpsc::SyncSender<&'static str>,
+}
+
+/// Supervisor-event drain budget per loop iteration. After `DRAIN_BUDGET`
+/// elapses OR `DRAIN_MAX` events have been processed (whichever first),
+/// the loop yields to input/render/pacing. Keeps the loop from monopolising
+/// on PTY-output bursts during heavy syscall load (cargo install, mold link).
+const DRAIN_BUDGET: Duration = Duration::from_millis(8);
+const DRAIN_MAX: usize = 256;
+/// Re-check the input channel after every Nth supervisor event during a
+/// drain pass — bounds in-pass keystroke latency to ~N events worth of vterm
+/// processing time.
+const INPUT_RECHECK_INTERVAL: usize = 64;
 
 /// Messages sent from the exec TUI to the PTY forwarding thread.
 pub enum PtyInput {
@@ -121,8 +147,18 @@ pub struct ExecState {
     log_offset: usize,
     log_follow: bool,
     log_focused: bool,
-    /// Scrollback offset (0 = live view, >0 = viewing history).
+    /// Line-oriented `vt100` scrollback offset (0 = live view, >0 = viewing
+    /// rows that scrolled off the top of the grid). Used for normal shell
+    /// output, line-by-line tools, and (when fullscreen-mirror is active)
+    /// the mirror's accumulated frame history. A single offset drives
+    /// whichever backing scrollback applies to the current tool.
     scroll_offset: usize,
+    /// Parallel "scrollback mirror" `vt100::Parser`. Frame contents from
+    /// fullscreen-repaint tools (Codex etc.) are appended row-by-row into
+    /// the mirror's primary grid, where vt100's built-in scrollback
+    /// machinery handles the actual scroll buffer. Active only when the
+    /// supervised tool emits fullscreen repaint signals.
+    fullscreen_scrollback: FullscreenScrollback,
     /// Active permission dialog (None = no dialog open).
     permission_dialog: Option<PermissionDialog>,
     /// Pending permission requests waiting for the current dialog to close.
@@ -136,11 +172,31 @@ pub struct ExecState {
     /// Current vterm dimensions (the child's PTY size, not the full terminal).
     vterm_rows: u16,
     vterm_cols: u16,
+    /// DECSET ?1007 alternate-scroll mode requested by the child.
+    ///
+    /// `vt100` 0.15 tracks xterm mouse modes but not alternate-scroll mode.
+    /// Full-screen TUIs such as Codex use ?1007 so terminals translate wheel
+    /// movement into cursor-key input. Grith has to emulate that translation
+    /// because the outer terminal's mouse capture sends wheel events to us.
+    alternate_scroll_mode: bool,
+    /// Tail bytes retained so the ?1007 scanner handles CSI sequences split
+    /// across PTY chunks.
+    mode_scan_tail: Vec<u8>,
     /// Timestamp of first Ctrl+C during a permission dialog. A second Ctrl+C
     /// within 1 second force-quits the TUI.
     last_ctrl_c: Option<Instant>,
     /// Dashboard URL (e.g. "http://127.0.0.1:3141") shown in the titlebar.
     pub dashboard_url: Option<String>,
+    /// Whether host-terminal mouse capture is currently active.
+    ///
+    /// Default `true`: grith grabs wheel/click events so the scroll wheel drives
+    /// our scrollback (instead of the host translating it to arrow keys the tool
+    /// rejects). The side effect of capture is that the terminal routes click +
+    /// drag to grith too, so native text selection ("highlight to copy") stops
+    /// working. Toggling this off (Ctrl+T) issues `DisableMouseCapture`, handing
+    /// the mouse back to the terminal so plain drag-selects again — at the cost
+    /// of the wheel falling back to the host's default until re-enabled.
+    mouse_capture: bool,
 }
 
 /// State for an active permission review dialog.
@@ -175,14 +231,22 @@ impl ExecState {
             log_follow: true,
             log_focused: false,
             scroll_offset: 0,
+            fullscreen_scrollback: {
+                let mut fs = FullscreenScrollback::with_default_capacity();
+                fs.resize_mirror(vterm_rows, cols);
+                fs
+            },
             permission_dialog: None,
             pending_permissions: Vec::new(),
             last_pty_activity: Instant::now(),
             screen_populated: false,
             vterm_rows,
             vterm_cols: cols,
+            alternate_scroll_mode: false,
+            mode_scan_tail: Vec::new(),
             last_ctrl_c: None,
             dashboard_url: None,
+            mouse_capture: true,
         }
     }
 
@@ -228,21 +292,142 @@ impl ExecState {
             self.log_follow = true;
         }
     }
+
+    /// True if the supervised tool is repainting full frames and we have at
+    /// least one captured snapshot — scrollback navigation should walk that
+    /// ring instead of the (mostly empty) `vt100` scrollback grid.
+    fn use_fullscreen_history(&self) -> bool {
+        // Claude Code prints its conversation as line-oriented output, which
+        // lands in vt100's 10k-line scrollback (proven: scrolling it natively
+        // shows the real transcript). It only trips `repaint_mode` because it
+        // repaints its input box / status line in place — but that chrome
+        // never enters scrollback. Routing its wheel to the fullscreen-FRAME
+        // history would show captured repaints (startup banners, menus)
+        // instead of the actual chat. So keep Claude Code on the vt100
+        // line-scrollback path. (The frame-history path remains for genuine
+        // fullscreen repainters whose content never reaches vt100 scrollback.)
+        self.fullscreen_scrollback.repaint_mode()
+            && !self.fullscreen_scrollback.is_empty()
+            && !is_claude_code_tool(self)
+    }
+
+    /// Reset all scrollback paths so input snaps back to the live screen.
+    fn snap_to_live(&mut self) {
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            self.vterm.set_scrollback(0);
+        }
+    }
+
+    fn observe_pty_modes(&mut self, bytes: &[u8]) {
+        let mut combined = Vec::with_capacity(self.mode_scan_tail.len() + bytes.len());
+        combined.extend_from_slice(&self.mode_scan_tail);
+        combined.extend_from_slice(bytes);
+        update_alternate_scroll_mode(&combined, &mut self.alternate_scroll_mode);
+
+        const MODE_SCAN_TAIL_MAX: usize = 48;
+        let keep = combined.len().min(MODE_SCAN_TAIL_MAX);
+        self.mode_scan_tail.clear();
+        self.mode_scan_tail
+            .extend_from_slice(&combined[combined.len().saturating_sub(keep)..]);
+    }
+}
+
+fn update_alternate_scroll_mode(bytes: &[u8], enabled: &mut bool) {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0x1b || bytes[i + 1] != b'[' || bytes[i + 2] != b'?' {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 3;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if (0x40..=0x7e).contains(&b) {
+                if matches!(b, b'h' | b'l') && csi_params_include_1007(&bytes[i + 3..j]) {
+                    *enabled = b == b'h';
+                }
+                i = j;
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+fn csi_params_include_1007(params: &[u8]) -> bool {
+    params.split(|b| *b == b';').any(|part| part == b"1007")
 }
 
 fn resize_exec_surface(state: &mut ExecState, pty_tx: &mpsc::Sender<PtyInput>, rows: u16) {
     state.vterm.set_size(rows, state.vterm_cols);
     state.vterm_rows = rows;
+    state
+        .fullscreen_scrollback
+        .resize_mirror(rows, state.vterm_cols);
     let _ = pty_tx.send(PtyInput::Resize {
         cols: state.vterm_cols,
         rows,
     });
 }
 
+/// Feed PTY bytes through the vt100 parser, catching panics from the
+/// upstream wide-character handling path.
+///
+/// vt100 0.15.2 panics with `Option::unwrap() on a None value` at
+/// `src/screen.rs:934` inside `fn text` when a wide-character cell
+/// lookup misses the grid — most commonly observed after a terminal
+/// resize while a tool is writing wide characters near the right edge.
+/// The bug persists in upstream 0.16.2; no clean fix has been published.
+/// See `work/futurework/vt100-panic-followup.md`.
+///
+/// We swallow the panic, log it (without spamming on repeat hits),
+/// re-create the parser at current dimensions, and drop the offending
+/// byte chunk. Lossy on the failing render but keeps the TUI alive —
+/// the alternative is the host process exiting raw mode mid-session.
+fn process_pty_bytes_resilient(state: &mut ExecState, bytes: &[u8]) {
+    // Take ownership of the parser so we can replace it on panic without
+    // satisfying UnwindSafe on the whole ExecState.
+    let mut parser = std::mem::replace(
+        &mut state.vterm,
+        vt100::Parser::new(state.vterm_rows, state.vterm_cols, 10_000),
+    );
+    let bytes_vec = bytes.to_vec();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parser.process(&bytes_vec);
+    }));
+    match outcome {
+        Ok(()) => {
+            state.vterm = parser;
+        }
+        Err(_) => {
+            // Parser is poisoned; keep the fresh replacement that's
+            // already in state.vterm. Log the recovery so we can spot
+            // a flood — anything more than one or two per session
+            // means the upstream bug is hitting a hot path and we
+            // should consider migrating to a maintained fork.
+            tracing::error!(
+                rows = state.vterm_rows,
+                cols = state.vterm_cols,
+                dropped_bytes = bytes_vec.len(),
+                "vt100 parser panicked; reset to fresh parser (terminal content may be lost for this chunk)"
+            );
+        }
+    }
+}
+
 /// Run the exec TUI. Blocks until the supervised process exits or the user quits.
+///
+/// `event_rx` carries bulk supervisor events (PTY output, intercept log entries,
+/// process-exit). `permission_rx` carries permission-request prompts on a
+/// dedicated channel so they aren't queued behind a backlog of PTY output
+/// under heavy syscall load.
 pub fn run_exec_tui(
     mut state: ExecState,
-    event_rx: mpsc::Receiver<ExecEvent>,
+    event_rx: CbReceiver<ExecEvent>,
+    permission_rx: CbReceiver<PermissionEvent>,
     pty_tx: mpsc::Sender<PtyInput>,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -255,14 +440,57 @@ pub fn run_exec_tui(
     // mode translate wheel to arrow keys, which Claude Code rejects with
     // "Scroll wheel is sending arrow keys").
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Request keyboard disambiguation so the host terminal reports
+    // Ctrl+Enter / Shift+Enter as distinct events. Legacy terminals send a
+    // bare CR for these, indistinguishable from plain Enter, so the modifier
+    // never reaches us and `key_to_bytes` can't emit the newline form.
+    // DISAMBIGUATE_ESCAPE_CODES alone does NOT enable key-release reporting,
+    // so it won't double keystrokes. Probe support first (this issues a
+    // terminal query and must run before the input thread starts consuming
+    // stdin) and only push when the terminal advertises support, so we can
+    // pop exactly what we pushed on teardown.
+    let pushed_kbd_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
+    if pushed_kbd_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     // No explicit clear needed — the first terminal.draw() call performs a full
     // differential render from an empty buffer, which is equivalent to a clear
     // but avoids an extra full-screen write before any content is ready.
 
-    let result = exec_event_loop(&mut terminal, &mut state, &event_rx, &pty_tx);
+    // Spawn a dedicated input thread. Moves crossterm's blocking event::read
+    // off the main loop so the loop wakes immediately on either supervisor
+    // events or keystrokes via crossbeam select! — instead of polling stdin
+    // only after draining the supervisor channel.
+    let (input_tx, input_rx) = unbounded::<Event>();
+    let input_shutdown = Arc::new(AtomicBool::new(false));
+    let input_handle = super::input_thread::spawn(input_tx, input_shutdown.clone());
 
+    let result = exec_event_loop(
+        &mut terminal,
+        &mut state,
+        &event_rx,
+        &permission_rx,
+        &input_rx,
+        &pty_tx,
+    );
+
+    // Tell the input thread to exit, then join it so we leave the stdin
+    // reader in a clean state before disabling raw mode.
+    input_shutdown.store(true, Ordering::Relaxed);
+    drop(input_rx); // close receiver so any in-flight send returns Err
+    let _ = input_handle.join();
+
+    if pushed_kbd_enhancement {
+        // Restore the host terminal's keyboard mode before leaving raw mode.
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -277,10 +505,20 @@ pub fn run_exec_tui(
     result
 }
 
+/// Outcome of processing a keyboard/mouse/resize event.
+enum InputOutcome {
+    /// Normal event handled, continue loop.
+    Continue,
+    /// User requested exit (double Ctrl+C during a permission dialog).
+    Exit,
+}
+
 fn exec_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut ExecState,
-    event_rx: &mpsc::Receiver<ExecEvent>,
+    event_rx: &CbReceiver<ExecEvent>,
+    permission_rx: &CbReceiver<PermissionEvent>,
+    input_rx: &CbReceiver<Event>,
     pty_tx: &mpsc::Sender<PtyInput>,
 ) -> anyhow::Result<()> {
     // Render at ~30fps max; only redraw when dirty
@@ -289,25 +527,50 @@ fn exec_event_loop(
     let mut last_anim_tick = Instant::now();
 
     loop {
-        // Drain supervisor events (non-blocking) — always drain ALL pending
-        // events BEFORE evaluating state or rendering. This batches rapid PTY
+        // ─── Phase 1: drain input (priority, non-blocking, fully) ─────────
+        // Human typing rate is tiny, so drain everything. Permission-dialog
+        // keys, scrollback navigation, and PTY-bound keystrokes all flow
+        // through here before any supervisor backlog is touched.
+        while let Ok(ev) = input_rx.try_recv() {
+            match handle_input_event(state, pty_tx, terminal, ev, &mut dirty)? {
+                InputOutcome::Continue => {}
+                InputOutcome::Exit => return Ok(()),
+            }
+        }
+
+        // ─── Phase 2: drain permission requests (high priority) ───────────
+        // Permission prompts are user-facing and block the supervised tool
+        // until answered. Drain ahead of bulk events so a 256-event PTY-out
+        // backlog never delays a prompt.
+        while let Ok(perm) = permission_rx.try_recv() {
+            enqueue_permission(state, perm);
+            dirty = true;
+        }
+
+        // ─── Phase 3: drain supervisor events (bounded) ───────────────────
+        // Always drain pending events BEFORE rendering — batching rapid PTY
         // output (e.g. CSI 2J clear + redraw arriving as separate chunks) so
-        // we only evaluate the FINAL vterm state, never intermediate blanks.
+        // the final vterm state is what we render, never an intermediate
+        // blank. This matches kitty/alacritty/wezterm's 4ms batch behaviour.
         //
-        // This matches how real terminal emulators work: kitty, alacritty, and
-        // wezterm batch ~4ms of PTY data before rendering a frame. tmux defers
-        // redraws until all pending input is processed. The drain loop achieves
-        // the same effect — all bytes available in the channel are fed to the
-        // vterm before any content checks run.
+        // Bounded by both wall-clock (DRAIN_BUDGET) and event count
+        // (DRAIN_MAX) so a sustained burst (mold linker under ptrace) can't
+        // monopolise the loop and starve input/render. Input is re-checked
+        // mid-pass every INPUT_RECHECK_INTERVAL events for sub-pass latency.
+        let drain_start = Instant::now();
+        let mut drained = 0usize;
         let mut had_pty_output = false;
         let mut entered_alt = false;
         let mut left_alt = false;
-        loop {
+        let mut should_exit = false;
+        'drain: while drained < DRAIN_MAX && drain_start.elapsed() < DRAIN_BUDGET {
             match event_rx.try_recv() {
                 Ok(ExecEvent::PtyOutput(bytes)) => {
                     state.last_pty_activity = Instant::now();
+                    state.observe_pty_modes(&bytes);
+                    state.fullscreen_scrollback.observe_bytes(&bytes);
                     let pre_alt = state.vterm.screen().alternate_screen();
-                    state.vterm.process(&bytes);
+                    process_pty_bytes_resilient(state, &bytes);
                     let post_alt = state.vterm.screen().alternate_screen();
                     if !pre_alt && post_alt {
                         entered_alt = true;
@@ -330,57 +593,47 @@ fn exec_event_loop(
                         "deny" => state.denied += 1,
                         _ => {}
                     }
-                    state.push_log(LogEntry {
-                        timestamp,
-                        action,
-                        call_type,
-                        score,
-                    });
-                    dirty = true;
-                }
-                Ok(ExecEvent::PermissionRequest {
-                    request,
-                    response_tx,
-                }) => {
-                    dbg_log(&format!(
-                        "PermissionRequest: call_type={}, pending={}",
-                        request.call_type,
-                        state.pending_permissions.len(),
-                    ));
-                    // Don't increment queued here — the Intercept broadcast
-                    // already counted this item.
-                    //
-                    // The supervised process is NOT frozen — only the specific
-                    // syscall thread is held at a ptrace stop. The tool continues
-                    // rendering, so we show live vterm content behind the dialog
-                    // overlay. No snapshot needed.
-                    let dialog = PermissionDialog {
-                        request,
-                        response_tx,
-                        show_inspect: false,
-                    };
-                    if state.permission_dialog.is_some() {
-                        // Queue behind the active dialog.
-                        state.pending_permissions.push(dialog);
-                    } else {
-                        state.permission_dialog = Some(dialog);
+                    if should_display_intercept_log(&action, &call_type, score) {
+                        state.push_log(LogEntry {
+                            timestamp,
+                            action,
+                            call_type,
+                            score,
+                        });
                     }
                     dirty = true;
                 }
                 Ok(ExecEvent::ProcessExited) => {
-                    return Ok(());
+                    should_exit = true;
+                    break 'drain;
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Ok(());
+                Err(TryRecvError::Empty) => break 'drain,
+                Err(TryRecvError::Disconnected) => {
+                    should_exit = true;
+                    break 'drain;
+                }
+            }
+            drained += 1;
+
+            // Interleaved input re-check during a long batch — bounds
+            // in-pass keystroke latency to ~INPUT_RECHECK_INTERVAL events.
+            if drained % INPUT_RECHECK_INTERVAL == 0 {
+                while let Ok(ev) = input_rx.try_recv() {
+                    match handle_input_event(state, pty_tx, terminal, ev, &mut dirty)? {
+                        InputOutcome::Continue => {}
+                        InputOutcome::Exit => return Ok(()),
+                    }
                 }
             }
         }
+        if should_exit {
+            return Ok(());
+        }
 
         // ---------------------------------------------------------------
-        // Post-drain evaluation — runs ONCE after ALL pending PtyOutput
-        // bytes have been processed. This ensures we evaluate the FINAL
-        // vterm state, not intermediate states between clear + redraw.
+        // Post-drain evaluation — runs ONCE after a drain pass. This
+        // ensures we evaluate the FINAL vterm state (within the batch),
+        // not intermediate states between clear + redraw.
         // ---------------------------------------------------------------
         if had_pty_output {
             // Log transitions
@@ -403,6 +656,13 @@ fn exec_event_loop(
                     state.screen_populated = true;
                 }
             }
+
+            // Capture a fullscreen-history frame if the batch closed on a
+            // repaint boundary. Done once per drain pass so we evaluate the
+            // FINAL post-batch screen, never an intermediate.
+            state
+                .fullscreen_scrollback
+                .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
         }
 
         // Force redraw for animations (live dot, waiting dots) every ~360ms
@@ -412,186 +672,316 @@ fn exec_event_loop(
             dirty = true;
         }
 
-        // Only redraw when state changed
-        if dirty {
+        // ─── Phase 4: render if dirty ─────────────────────────────────────
+        // While in select mode (mouse capture off via Ctrl+T) we FREEZE
+        // repaints: a redraw would wipe the terminal's drag-selection the
+        // instant it's made. The PTY keeps being parsed into `state.vterm`; we
+        // just don't paint. Exiting select mode (or a permission dialog that
+        // must be shown) repaints and catches up. A permission dialog overrides
+        // the freeze so a queued decision is never hidden behind a frozen frame.
+        let frozen_for_selection = !state.mouse_capture && state.permission_dialog.is_none();
+        if dirty && !frozen_for_selection {
             terminal.draw(|frame| render_exec(frame, state))?;
             state.frame_count += 1;
             dirty = false;
         }
 
-        // Poll for keyboard input
-        if event::poll(tick_rate)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    // Permission dialog keys — intercept before anything else.
-                    // While a dialog is active, only dialog keys are processed.
-                    if state.permission_dialog.is_some() {
-                        // Double Ctrl+C force-quits the TUI even during a dialog.
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            if let Some(last) = state.last_ctrl_c {
-                                if last.elapsed() < Duration::from_secs(1) {
-                                    // Deny all pending dialogs before exiting.
-                                    if let Some(dialog) = state.permission_dialog.take() {
-                                        let _ = dialog.response_tx.send("deny");
-                                    }
-                                    for dialog in state.pending_permissions.drain(..) {
-                                        let _ = dialog.response_tx.send("deny");
-                                    }
-                                    return Ok(());
-                                }
-                            }
-                            state.last_ctrl_c = Some(Instant::now());
-                            dirty = true;
-                            continue;
-                        }
-                        match key.code {
-                            KeyCode::Char('i') | KeyCode::Char('I') => {
-                                if let Some(dialog) = state.permission_dialog.as_mut() {
-                                    dialog.show_inspect = !dialog.show_inspect;
-                                }
-                            }
-                            _ => {
-                                let is_deny_dialog = state
-                                    .permission_dialog
-                                    .as_ref()
-                                    .map(|dialog| dialog.request.score > 8.0)
-                                    .unwrap_or(false);
-                                let action = match key.code {
-                                    KeyCode::Char('a') | KeyCode::Char('A') => Some("approve"),
-                                    KeyCode::Char('d') | KeyCode::Char('D') => Some("deny"),
-                                    KeyCode::Char('l') | KeyCode::Char('L') => {
-                                        Some("approve_and_learn")
-                                    }
-                                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                                        Some("deny_and_terminate")
-                                    }
-                                    KeyCode::Char('c') | KeyCode::Char('C') if is_deny_dialog => {
-                                        Some("deny")
-                                    }
-                                    KeyCode::Esc => Some("deny"),
-                                    _ => None,
-                                };
-                                if let Some(action) = action {
-                                    if let Some(dialog) = state.permission_dialog.take() {
-                                        dbg_log(&format!(
-                                            "Dialog dismiss: action={action}, pending={}",
-                                            state.pending_permissions.len(),
-                                        ));
-                                        // Send the review decision back to the supervisor.
-                                        // The intercepted syscall thread will be resumed
-                                        // (allowed or denied) — no SIGCONT needed since
-                                        // the process was never frozen.
-                                        let _ = dialog.response_tx.send(action);
-                                    }
-                                    // Advance to the next queued dialog, if any.
-                                    state.permission_dialog =
-                                        if state.pending_permissions.is_empty() {
-                                            None
-                                        } else {
-                                            Some(state.pending_permissions.remove(0))
-                                        };
-                                }
-                            }
-                        }
-                        dirty = true;
-                        continue;
-                    }
-                    // Ctrl+L — toggle log panel focus (grith shortcut)
-                    if key.code == KeyCode::Char('l')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        state.log_focused = !state.log_focused;
-                        dirty = true;
-                        continue;
-                    }
-                    // Shift+PgUp/PgDn — scroll terminal scrollback
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        let panel_height = terminal
-                            .size()?
-                            .height
-                            .saturating_sub(MINIMAL_CHROME_ROWS)
-                            .max(4) as usize;
-                        match key.code {
-                            KeyCode::PageUp => {
-                                state.scroll_offset =
-                                    state.scroll_offset.saturating_add(panel_height);
-                                state.vterm.set_scrollback(state.scroll_offset);
-                                dirty = true;
-                                continue;
-                            }
-                            KeyCode::PageDown => {
-                                state.scroll_offset =
-                                    state.scroll_offset.saturating_sub(panel_height);
-                                state.vterm.set_scrollback(state.scroll_offset);
-                                dirty = true;
-                                continue;
-                            }
-                            KeyCode::Home => {
-                                state.scroll_offset = usize::MAX;
-                                state.vterm.set_scrollback(state.scroll_offset);
-                                dirty = true;
-                                continue;
-                            }
-                            KeyCode::End => {
-                                state.scroll_offset = 0;
-                                state.vterm.set_scrollback(0);
-                                dirty = true;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    // When log is focused, arrow keys scroll the log
-                    if state.log_focused {
-                        match key.code {
-                            KeyCode::Up => {
-                                state.log_scroll_up();
-                                dirty = true;
-                                continue;
-                            }
-                            KeyCode::Down => {
-                                state.log_scroll_down();
-                                dirty = true;
-                                continue;
-                            }
-                            KeyCode::Esc => {
-                                state.log_focused = false;
-                                dirty = true;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Everything else → convert to bytes and send to PTY
-                    if let Some(bytes) = key_to_bytes(key.code, key.modifiers) {
-                        // Snap back to live view when sending input
-                        if state.scroll_offset > 0 {
-                            state.scroll_offset = 0;
-                            state.vterm.set_scrollback(0);
-                        }
-                        let _ = pty_tx.send(PtyInput::Bytes(bytes));
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    handle_mouse_event(state, pty_tx, mouse, &mut dirty);
-                }
-                Event::Resize(cols, rows) => {
-                    state.vterm_cols = cols;
-                    let vterm_rows = rows.saturating_sub(MINIMAL_CHROME_ROWS).max(4);
-                    resize_exec_surface(state, pty_tx, vterm_rows);
-                }
-                _ => {}
-            }
-            dirty = true;
-        }
+        // ─── Phase 5: pace via Select::ready_timeout ──────────────────────
+        // Park until any channel has data or the tick elapses. `ready_timeout`
+        // is readiness-only — it does NOT consume the message, so the next
+        // loop iteration's try_recv drains pick it up. Using the consuming
+        // `select!` macro here would eat PTY-output bytes (blank TUI) and
+        // keystrokes (unresponsive input) that arrived during pacing.
+        let mut sel = Select::new();
+        sel.recv(input_rx);
+        sel.recv(permission_rx);
+        sel.recv(event_rx);
+        let _ = sel.ready_timeout(tick_rate);
     }
+}
+
+/// Enqueue a permission request from the dedicated channel into the TUI's
+/// dialog state. If a dialog is already showing, the new request queues
+/// behind it; otherwise it becomes the active dialog.
+fn enqueue_permission(state: &mut ExecState, perm: PermissionEvent) {
+    dbg_log(&format!(
+        "PermissionRequest: call_type={}, pending={}",
+        perm.request.call_type,
+        state.pending_permissions.len(),
+    ));
+    // Don't increment queued here — the Intercept broadcast already
+    // counted this item.
+    //
+    // The supervised process is NOT frozen — only the specific syscall
+    // thread is held at a ptrace stop. The tool continues rendering, so
+    // we show live vterm content behind the dialog overlay.
+    let dialog = PermissionDialog {
+        request: perm.request,
+        response_tx: perm.response_tx,
+        show_inspect: false,
+    };
+    if state.permission_dialog.is_some() {
+        state.pending_permissions.push(dialog);
+    } else {
+        state.permission_dialog = Some(dialog);
+    }
+}
+
+/// Handle a single keyboard/mouse/resize event from the input thread.
+/// Returns `InputOutcome::Exit` when the user requests a force-quit
+/// (double Ctrl+C during a permission dialog).
+fn handle_input_event(
+    state: &mut ExecState,
+    pty_tx: &mpsc::Sender<PtyInput>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ev: Event,
+    dirty: &mut bool,
+) -> anyhow::Result<InputOutcome> {
+    match ev {
+        Event::Key(key) => {
+            // Permission dialog keys — intercept before anything else.
+            // While a dialog is active, only dialog keys are processed.
+            if state.permission_dialog.is_some() {
+                // Double Ctrl+C force-quits the TUI even during a dialog.
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let Some(last) = state.last_ctrl_c {
+                        if last.elapsed() < Duration::from_secs(1) {
+                            // Deny all pending dialogs before exiting.
+                            if let Some(dialog) = state.permission_dialog.take() {
+                                let _ = dialog.response_tx.send("deny");
+                            }
+                            for dialog in state.pending_permissions.drain(..) {
+                                let _ = dialog.response_tx.send("deny");
+                            }
+                            return Ok(InputOutcome::Exit);
+                        }
+                    }
+                    state.last_ctrl_c = Some(Instant::now());
+                    *dirty = true;
+                    return Ok(InputOutcome::Continue);
+                }
+                match key.code {
+                    KeyCode::Char('i') | KeyCode::Char('I') => {
+                        if let Some(dialog) = state.permission_dialog.as_mut() {
+                            dialog.show_inspect = !dialog.show_inspect;
+                        }
+                    }
+                    _ => {
+                        let is_deny_dialog = state
+                            .permission_dialog
+                            .as_ref()
+                            .map(|dialog| dialog.request.score > 8.0)
+                            .unwrap_or(false);
+                        let action = match key.code {
+                            KeyCode::Char('a') | KeyCode::Char('A') => Some("approve"),
+                            KeyCode::Char('d') | KeyCode::Char('D') => Some("deny"),
+                            KeyCode::Char('l') | KeyCode::Char('L') => Some("approve_and_learn"),
+                            KeyCode::Char('t') | KeyCode::Char('T') => Some("deny_and_terminate"),
+                            KeyCode::Char('c') | KeyCode::Char('C') if is_deny_dialog => {
+                                Some("deny")
+                            }
+                            KeyCode::Esc => Some("deny"),
+                            _ => None,
+                        };
+                        if let Some(action) = action {
+                            if let Some(dialog) = state.permission_dialog.take() {
+                                dbg_log(&format!(
+                                    "Dialog dismiss: action={action}, pending={}",
+                                    state.pending_permissions.len(),
+                                ));
+                                // Send the review decision back to the supervisor.
+                                // The intercepted syscall thread will be resumed
+                                // (allowed or denied) — no SIGCONT needed since
+                                // the process was never frozen.
+                                let _ = dialog.response_tx.send(action);
+                            }
+                            // Advance to the next queued dialog, if any.
+                            state.permission_dialog = if state.pending_permissions.is_empty() {
+                                None
+                            } else {
+                                Some(state.pending_permissions.remove(0))
+                            };
+                        }
+                    }
+                }
+                *dirty = true;
+                return Ok(InputOutcome::Continue);
+            }
+            // Ctrl+L — toggle log panel focus (grith shortcut)
+            if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                state.log_focused = !state.log_focused;
+                *dirty = true;
+                return Ok(InputOutcome::Continue);
+            }
+            // Ctrl+T — toggle host-terminal mouse capture (grith shortcut).
+            // Capture ON  → wheel drives grith's scrollback (the scroll fix),
+            //               but the terminal routes drag to us, disabling native
+            //               text selection.
+            // Capture OFF → hand the mouse back so plain drag selects/copies;
+            //               the wheel reverts to the host default until re-enabled.
+            if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                state.mouse_capture = !state.mouse_capture;
+                let mut out = io::stdout();
+                let _ = if state.mouse_capture {
+                    execute!(out, EnableMouseCapture)
+                } else {
+                    execute!(out, DisableMouseCapture)
+                };
+                // Repaint once now so the footer reflects the new mode. When
+                // entering select mode this is the LAST paint until the user
+                // toggles back — the loop freezes repaints so a drag-selection
+                // isn't wiped. When leaving, the loop resumes live repaints.
+                terminal.draw(|frame| render_exec(frame, state))?;
+                *dirty = false;
+                return Ok(InputOutcome::Continue);
+            }
+            // Shift+PgUp/PgDn — scroll terminal scrollback. Fullscreen
+            // history mode (paginated repaint TUIs) walks the snapshot
+            // ring by frame; line-oriented output falls through to vt100
+            // scrollback as before.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                let panel_height = terminal
+                    .size()?
+                    .height
+                    .saturating_sub(MINIMAL_CHROME_ROWS)
+                    .max(4) as usize;
+                let history_active = state.use_fullscreen_history();
+                match key.code {
+                    KeyCode::PageUp => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(panel_height);
+                        if history_active {
+                            // Clamp to available history so we don't
+                            // walk off the top.
+                            let max = state.fullscreen_scrollback.max_scroll_offset(panel_height);
+                            state.scroll_offset = state.scroll_offset.min(max);
+                        } else {
+                            state.vterm.set_scrollback(state.scroll_offset);
+                        }
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    KeyCode::PageDown => {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(panel_height);
+                        if !history_active {
+                            state.vterm.set_scrollback(state.scroll_offset);
+                        }
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    KeyCode::Home => {
+                        // Scroll to top of available history.
+                        if history_active {
+                            state.scroll_offset =
+                                state.fullscreen_scrollback.max_scroll_offset(panel_height);
+                        } else {
+                            state.scroll_offset = usize::MAX;
+                            state.vterm.set_scrollback(state.scroll_offset);
+                        }
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    KeyCode::End => {
+                        state.snap_to_live();
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    _ => {}
+                }
+            }
+            // When log is focused, arrow keys scroll the log
+            if state.log_focused {
+                match key.code {
+                    KeyCode::Up => {
+                        state.log_scroll_up();
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    KeyCode::Down => {
+                        state.log_scroll_down();
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    KeyCode::Esc => {
+                        state.log_focused = false;
+                        *dirty = true;
+                        return Ok(InputOutcome::Continue);
+                    }
+                    _ => {}
+                }
+            }
+            // Everything else → convert to bytes and send to PTY
+            if let Some(bytes) = key_to_bytes(key.code, key.modifiers) {
+                // Snap back to live view when sending input — covers both
+                // line-oriented scrollback and fullscreen history modes.
+                state.snap_to_live();
+                let _ = pty_tx.send(PtyInput::Bytes(bytes));
+            }
+        }
+        Event::Mouse(mouse) => {
+            handle_mouse_event(state, pty_tx, mouse, dirty);
+        }
+        Event::Resize(cols, rows) => {
+            state.vterm_cols = cols;
+            let vterm_rows = rows.saturating_sub(MINIMAL_CHROME_ROWS).max(4);
+            resize_exec_surface(state, pty_tx, vterm_rows);
+        }
+        _ => {}
+    }
+    *dirty = true;
+    Ok(InputOutcome::Continue)
 }
 
 // ---------------------------------------------------------------------------
 // Key-to-byte conversion for PTY passthrough
 // ---------------------------------------------------------------------------
+
+/// Build the xterm "modifyOtherKeys"-style modifier parameter for
+/// CSI-encoded special keys: `1 + bit-OR(shift=1, alt=2, ctrl=4)`.
+/// Returns `None` when no relevant modifiers are held — caller emits
+/// the unmodified form.
+fn xterm_modifier_param(modifiers: KeyModifiers) -> Option<u8> {
+    let mut bits = 0u8;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    if bits == 0 {
+        None
+    } else {
+        Some(1 + bits)
+    }
+}
+
+/// CSI-encode a cursor / function-key keystroke with optional modifiers.
+///
+/// `final_char` is the trailing letter (A/B/C/D for arrows, H/F for
+/// Home/End). When no modifiers are held, the short form `\x1b[<final>`
+/// is emitted to match what bare `xterm` would send and what every
+/// readline/Bash test expects. When modifiers are held, the
+/// xterm-compatible long form `\x1b[1;<mod><final>` is emitted —
+/// readline, fish, zsh, and the JS line-editors in claude / codex all
+/// parse this and map Ctrl+Left → backward-word, etc.
+fn csi_with_modifier(modifiers: KeyModifiers, final_char: u8) -> Vec<u8> {
+    match xterm_modifier_param(modifiers) {
+        None => vec![0x1b, b'[', final_char],
+        Some(m) => format!("\x1b[1;{m}{}", final_char as char).into_bytes(),
+    }
+}
+
+/// CSI-encode a `~`-terminated key (PageUp/Down, Delete, Insert) with
+/// optional modifiers. Same convention: `\x1b[<n>~` bare, `\x1b[<n>;<mod>~`
+/// when modified.
+fn csi_tilde_with_modifier(modifiers: KeyModifiers, n: u8) -> Vec<u8> {
+    match xterm_modifier_param(modifiers) {
+        None => format!("\x1b[{n}~").into_bytes(),
+        Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
+    }
+}
 
 /// Convert a crossterm key event to the raw byte sequence a terminal would send.
 fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
@@ -611,21 +1001,38 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
                 Some(s.as_bytes().to_vec())
             }
         }
-        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Enter => {
+            // Bare Enter submits (CR, 0x0d). Any held modifier means the user
+            // wants to insert a literal newline rather than submit — emit the
+            // "meta-Enter" sequence (ESC + CR) that Claude Code, Codex, and
+            // readline-based line editors all map to newline-insert. This is
+            // protocol-agnostic: it produces a newline whether or not the
+            // inner tool negotiated the kitty keyboard protocol on its PTY.
+            // The modifier must reach us first; legacy host terminals collapse
+            // Ctrl/Shift+Enter to a bare CR, which is why `run_exec_tui` pushes
+            // DISAMBIGUATE_ESCAPE_CODES. Alt+Enter is reported even on legacy
+            // terminals (ESC-prefix), so it works regardless.
+            if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            {
+                Some(vec![0x1b, b'\r'])
+            } else {
+                Some(vec![b'\r'])
+            }
+        }
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::Up => Some(csi_with_modifier(modifiers, b'A')),
+        KeyCode::Down => Some(csi_with_modifier(modifiers, b'B')),
+        KeyCode::Right => Some(csi_with_modifier(modifiers, b'C')),
+        KeyCode::Left => Some(csi_with_modifier(modifiers, b'D')),
+        KeyCode::Home => Some(csi_with_modifier(modifiers, b'H')),
+        KeyCode::End => Some(csi_with_modifier(modifiers, b'F')),
+        KeyCode::PageUp => Some(csi_tilde_with_modifier(modifiers, 5)),
+        KeyCode::PageDown => Some(csi_tilde_with_modifier(modifiers, 6)),
+        KeyCode::Delete => Some(csi_tilde_with_modifier(modifiers, 3)),
+        KeyCode::Insert => Some(csi_tilde_with_modifier(modifiers, 2)),
         KeyCode::F(1) => Some(b"\x1bOP".to_vec()),
         KeyCode::F(2) => Some(b"\x1bOQ".to_vec()),
         KeyCode::F(3) => Some(b"\x1bOR".to_vec()),
@@ -677,12 +1084,22 @@ fn handle_mouse_event(
 
     if mouse.row >= term_y_start && mouse.row < term_y_end {
         let mode = state.vterm.screen().mouse_protocol_mode();
+        let wheel_event = is_wheel_event(mouse.kind);
+        if wheel_event
+            && should_send_wheel_as_arrow_keys(state)
+            && send_wheel_as_arrow_keys(state, pty_tx, mouse.kind, dirty)
+        {
+            return;
+        }
+        if wheel_event && should_use_local_scrollback_for_wheel(state) {
+            scroll_local_scrollback(state, mouse.kind, dirty);
+            return;
+        }
         if mode != vt100::MouseProtocolMode::None {
             let encoding = state.vterm.screen().mouse_protocol_encoding();
             if let Some(bytes) = encode_mouse_for_pty(mouse, term_y_start, encoding, mode) {
                 if state.scroll_offset > 0 {
-                    state.scroll_offset = 0;
-                    state.vterm.set_scrollback(0);
+                    state.snap_to_live();
                     *dirty = true;
                 }
                 let _ = pty_tx.send(PtyInput::Bytes(bytes));
@@ -692,19 +1109,7 @@ fn handle_mouse_event(
         // Inner tool doesn't want mouse — provide local scrollback so the
         // wheel still does something useful (the same scrollback that
         // Shift+PgUp/PgDn drives).
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                state.scroll_offset = state.scroll_offset.saturating_add(LOCAL_SCROLL_STEP);
-                state.vterm.set_scrollback(state.scroll_offset);
-                *dirty = true;
-            }
-            MouseEventKind::ScrollDown => {
-                state.scroll_offset = state.scroll_offset.saturating_sub(LOCAL_SCROLL_STEP);
-                state.vterm.set_scrollback(state.scroll_offset);
-                *dirty = true;
-            }
-            _ => {}
-        }
+        scroll_local_scrollback(state, mouse.kind, dirty);
     } else if mouse.row >= log_y_start && mouse.row < log_y_end {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -717,6 +1122,140 @@ fn handle_mouse_event(
             }
             _ => {}
         }
+    }
+}
+
+fn is_wheel_event(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    )
+}
+
+fn should_use_local_scrollback_for_wheel(_state: &ExecState) -> bool {
+    // Tools that enabled mouse reporting receive the raw mouse event
+    // via encode_mouse_for_pty further down. Tools that didn't fall
+    // through to grith's local vterm scrollback as the final default.
+    // No tool currently needs an early opt-in here.
+    false
+}
+
+fn should_send_wheel_as_arrow_keys(state: &ExecState) -> bool {
+    // Translate the wheel to arrow keys ONLY when ALL hold:
+    //  1. the tool enabled alternate-scroll mode (DECSET 1007), AND
+    //  2. it is NOT raw-mouse-reporting right now — otherwise the raw-mouse
+    //     branch in handle_mouse_event must own the wheel, and this branch
+    //     (checked first) would wrongly preempt it. The original code dropped
+    //     this check despite the comment promising it, so a tool with BOTH
+    //     1007 and mouse reporting got arrow keys instead of the mouse event
+    //     it asked for, and the wheel "scrolled prompt history" intermittently
+    //     as the tool toggled modes between UI states.
+    //  3. the tool is not one that handles its own scrolling / rejects
+    //     arrow-wheel. Codex consumes wheel natively via raw mouse; Claude
+    //     Code errors with "Scroll wheel is sending arrow keys" and maps Up/
+    //     Down to prompt history — arrow-wheel is never correct for either, so
+    //     they fall through to the raw-mouse branch (mouse on) or grith's own
+    //     local scrollback (mouse off).
+    state.alternate_scroll_mode
+        && !rejects_wheel_as_arrow_keys(state)
+        && state.vterm.screen().mouse_protocol_mode() == vt100::MouseProtocolMode::None
+}
+
+fn is_codex_tool(state: &ExecState) -> bool {
+    state.profile_name == "codex" || state.tool_name == "codex"
+}
+
+fn is_claude_code_tool(state: &ExecState) -> bool {
+    state.profile_name == "claude-code"
+        || state.tool_name == "claude"
+        || state.tool_name == "claude-code"
+}
+
+/// Tools whose input editor misuses arrow keys for the wheel (prompt-history
+/// navigation, or an outright "scroll wheel is sending arrow keys" rejection).
+/// These never want wheel-as-arrows regardless of alternate-scroll mode.
+fn rejects_wheel_as_arrow_keys(state: &ExecState) -> bool {
+    is_codex_tool(state) || is_claude_code_tool(state)
+}
+
+fn send_wheel_as_arrow_keys(
+    state: &mut ExecState,
+    pty_tx: &mpsc::Sender<PtyInput>,
+    kind: MouseEventKind,
+    dirty: &mut bool,
+) -> bool {
+    let bytes = match kind {
+        MouseEventKind::ScrollUp => b"\x1b[A".to_vec(),
+        MouseEventKind::ScrollDown => b"\x1b[B".to_vec(),
+        MouseEventKind::ScrollLeft => b"\x1b[D".to_vec(),
+        MouseEventKind::ScrollRight => b"\x1b[C".to_vec(),
+        _ => return false,
+    };
+
+    if state.scroll_offset > 0 {
+        state.snap_to_live();
+        *dirty = true;
+    }
+
+    let _ = pty_tx.send(PtyInput::Bytes(bytes));
+    true
+}
+
+/// Build a viewport-sized `vt100::Parser` populated with the given
+/// scrollback lines. The parser is rendered through the existing
+/// `render_vterm` widget, so the visible result is consistent with
+/// the live view (just plain-text — colour preservation is a tracked
+/// follow-up that requires per-cell attr emission per line).
+///
+/// Important: `\r\n` is emitted only BETWEEN lines, never after the
+/// last one. If we emitted a trailing newline, the cursor would
+/// advance past the last row, scrolling the first line off the top
+/// into the parser's scrollback (which we don't render). The result
+/// would be a mostly-blank viewport with the meaningful first line
+/// invisible.
+fn build_history_viewport(rows: u16, cols: u16, lines: &[&str]) -> vt100::Parser {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    let total = lines.len();
+    for (idx, line) in lines.iter().enumerate() {
+        parser.process(line.as_bytes());
+        if idx + 1 < total {
+            parser.process(b"\r\n");
+        }
+    }
+    parser
+}
+
+fn scroll_local_scrollback(state: &mut ExecState, kind: MouseEventKind, dirty: &mut bool) {
+    // Single unified scroll_offset driven against the live vterm or the
+    // fullscreen-mirror, depending on which has actual content. The
+    // fullscreen mirror accumulates frame text into its own primary-grid
+    // scrollback; the live vterm's built-in scrollback handles
+    // line-oriented tools. Either way the user-visible behaviour is the
+    // same: wheel up = older content, wheel down = newer.
+    let history_active = state.use_fullscreen_history();
+    match kind {
+        MouseEventKind::ScrollUp => {
+            state.scroll_offset = state.scroll_offset.saturating_add(LOCAL_SCROLL_STEP);
+            if history_active {
+                let viewport_rows = state.vterm_rows as usize;
+                let max = state.fullscreen_scrollback.max_scroll_offset(viewport_rows);
+                state.scroll_offset = state.scroll_offset.min(max);
+            } else {
+                state.vterm.set_scrollback(state.scroll_offset);
+            }
+            *dirty = true;
+        }
+        MouseEventKind::ScrollDown => {
+            state.scroll_offset = state.scroll_offset.saturating_sub(LOCAL_SCROLL_STEP);
+            if !history_active {
+                state.vterm.set_scrollback(state.scroll_offset);
+            }
+            *dirty = true;
+        }
+        _ => {}
     }
 }
 
@@ -813,6 +1352,32 @@ fn push_utf8(buf: &mut Vec<u8>, val: u32) {
         let s = c.encode_utf8(&mut tmp);
         buf.extend_from_slice(s.as_bytes());
     }
+}
+
+fn should_display_intercept_log(action: &str, call_type: &str, score: f64) -> bool {
+    if action != "allow" {
+        return true;
+    }
+    if score > 0.5 {
+        return true;
+    }
+    !is_runtime_scratch_call(call_type)
+}
+
+fn is_runtime_scratch_call(call_type: &str) -> bool {
+    let Some(pathish) = call_type
+        .strip_prefix("FileWrite(")
+        .or_else(|| call_type.strip_prefix("FileAppend("))
+        .or_else(|| call_type.strip_prefix("FileDelete("))
+        .or_else(|| call_type.strip_prefix("FileRename("))
+    else {
+        return false;
+    };
+
+    pathish.starts_with("/var/tmp/etilqs_")
+        || pathish.starts_with("/tmp/etilqs_")
+        || pathish.starts_with("/tmp/sqlite_")
+        || pathish.starts_with("/tmp/node-compile-cache/")
 }
 
 // ---------------------------------------------------------------------------
@@ -983,11 +1548,11 @@ fn render_subheader(frame: &mut Frame, area: Rect, state: &ExecState) {
     ]);
 
     frame.render_widget(
-        Paragraph::new(left).style(Style::new().bg(BG)).block(
+        Paragraph::new(left).style(Style::new().bg(BG_PANEL)).block(
             Block::default()
                 .borders(Borders::BOTTOM)
                 .border_style(Style::new().fg(BORDER))
-                .style(Style::new().bg(BG)),
+                .style(Style::new().bg(BG_PANEL)),
         ),
         area,
     );
@@ -1000,7 +1565,10 @@ fn render_subheader(frame: &mut Frame, area: Rect, state: &ExecState) {
             width: right_width,
             height: 1,
         };
-        frame.render_widget(Paragraph::new(right).style(Style::new().bg(BG)), right_area);
+        frame.render_widget(
+            Paragraph::new(right).style(Style::new().bg(BG_PANEL)),
+            right_area,
+        );
     }
 }
 
@@ -1011,11 +1579,38 @@ fn render_subheader(frame: &mut Frame, area: Rect, state: &ExecState) {
 fn render_terminal(frame: &mut Frame, area: Rect, state: &ExecState) {
     frame.render_widget(Block::default().style(Style::new().bg(BG)), area);
 
-    // Always render live vterm — the process is never frozen, so the
-    // terminal content is always current and updating in real time.
-    let screen = state.vterm.screen();
-    let show_cursor = state.scroll_offset == 0;
-    widgets::terminal::render_vterm(frame, area, screen, show_cursor, state.scroll_offset == 0);
+    // Render path resolution:
+    //   scroll_offset > 0 + repaint_mode → build a synthetic parser
+    //     populated with the visible scrollback window's lines, render
+    //     from that. This bypasses vt100's one-viewport scrollback
+    //     limitation and gives truly unbounded scroll-back through the
+    //     accumulated frame history.
+    //   otherwise                        → live vterm.
+    let history_active = state.use_fullscreen_history();
+    let synthetic = if state.scroll_offset > 0 && history_active && area.height > 0 {
+        Some(build_history_viewport(
+            area.height,
+            area.width.max(1),
+            &state
+                .fullscreen_scrollback
+                .visible_window(area.height as usize, state.scroll_offset),
+        ))
+    } else {
+        None
+    };
+    let screen = synthetic
+        .as_ref()
+        .map(|p| p.screen())
+        .unwrap_or_else(|| state.vterm.screen());
+    let is_live = state.scroll_offset == 0;
+    // Cursor is only suppressed when we're rendering a synthetic
+    // (scrolled-back) screen — the synthetic parser's cursor would
+    // land at the end of the last scrollback line, which is not where
+    // the user is interacting. On the live screen the cursor must
+    // always be visible regardless of whether fullscreen-history mode
+    // is otherwise eligible for scrollback navigation.
+    let show_cursor = synthetic.is_none() && is_live;
+    widgets::terminal::render_vterm(frame, area, screen, show_cursor, is_live);
 
     // Waiting indicator — shown centered in the terminal panel when the tool
     // has been quiet for >500ms and grith is not the source of the delay.
@@ -1048,9 +1643,15 @@ fn render_terminal(frame: &mut Frame, area: Rect, state: &ExecState) {
         }
     }
 
-    // Scrollback indicator overlay
-    if state.scroll_offset > 0 {
-        let label = format!(" SCROLLBACK +{} ", state.scroll_offset);
+    // Scrollback indicator overlay — single unified label since the
+    // underlying scroll model is now the same (driven by scroll_offset
+    // against either the live vterm or the fullscreen mirror).
+    let indicator_label = if state.scroll_offset > 0 {
+        Some(format!(" SCROLLBACK +{} ", state.scroll_offset))
+    } else {
+        None
+    };
+    if let Some(label) = indicator_label {
         let w = label.len() as u16;
         if w + 2 < area.width {
             let indicator_area = Rect {
@@ -1126,6 +1727,15 @@ fn render_log(frame: &mut Frame, area: Rect, state: &ExecState) {
 // [d] digest  [s] session  [ctrl+l] audit log  [ctrl+c] stop agent  [q] quit    grith.ai
 // ---------------------------------------------------------------------------
 
+/// Status-bar key hints shown when mouse capture is on (the default). Kept as a
+/// const so tests can assert the select-text toggle stays advertised.
+const EXEC_FOOTER_KEYS: &[(&str, &str)] = &[
+    ("shift+pgup", "scroll"),
+    ("ctrl+t", "select text"),
+    ("ctrl+l", "log"),
+    ("a/d", "when prompted"),
+];
+
 fn render_statusbar(frame: &mut Frame, area: Rect, state: &ExecState) {
     // Show force-quit hint after first Ctrl+C during a permission dialog.
     let ctrl_c_pending = state.permission_dialog.is_some()
@@ -1139,13 +1749,17 @@ fn render_statusbar(frame: &mut Frame, area: Rect, state: &ExecState) {
             "Press Ctrl+C again to force quit",
             Style::new().fg(AMBER),
         ));
+    } else if !state.mouse_capture {
+        // Mouse capture is off so the user can drag-select/copy. Make it
+        // obvious that the scroll wheel is paused and how to restore it.
+        spans.push(Span::styled(
+            "SELECT MODE — drag to copy · wheel-scroll paused · ",
+            Style::new().fg(AMBER),
+        ));
+        spans.push(Span::styled("[ctrl+t]", Style::new().fg(TEXT_MID)));
+        spans.push(Span::styled(" resume scroll", Style::new().fg(TEXT_DIM)));
     } else {
-        let keys: &[(&str, &str)] = &[
-            ("shift+pgup", "scroll"),
-            ("ctrl+l", "log"),
-            ("a/d", "when prompted"),
-        ];
-        for (i, (key, desc)) in keys.iter().enumerate() {
+        for (i, (key, desc)) in EXEC_FOOTER_KEYS.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled("  ", Style::new().fg(TEXT_DIM)));
             }
@@ -1215,6 +1829,34 @@ mod tests {
     }
 
     #[test]
+    fn mouse_capture_defaults_on() {
+        // Default-on preserves the scroll fix (wheel drives grith scrollback).
+        let state = ExecState::new("claude".into(), "claude-code".into(), 1, 24, 80, 0);
+        assert!(state.mouse_capture);
+    }
+
+    #[test]
+    fn footer_advertises_select_text_toggle() {
+        // The Ctrl+T select-text affordance must stay discoverable in the footer.
+        assert!(
+            EXEC_FOOTER_KEYS
+                .iter()
+                .any(|(k, d)| *k == "ctrl+t" && d.contains("select")),
+            "footer should advertise the ctrl+t select-text toggle"
+        );
+    }
+
+    #[test]
+    fn render_select_mode_footer_no_panic() {
+        // Renders the SELECT MODE branch (mouse capture off) without panicking.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1, 24, 80, 0);
+        state.mouse_capture = false;
+        terminal.draw(|frame| render_exec(frame, &state)).unwrap();
+    }
+
+    #[test]
     fn log_scrollable() {
         let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
         for i in 0..10 {
@@ -1274,6 +1916,87 @@ mod tests {
     }
 
     #[test]
+    fn key_to_bytes_modified_enter_inserts_newline() {
+        // Bare Enter still submits with a carriage return.
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
+            Some(vec![b'\r'])
+        );
+        // Alt+Enter, Ctrl+Enter, Shift+Enter each insert a newline via the
+        // meta-Enter sequence (ESC + CR) rather than submitting.
+        for m in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                key_to_bytes(KeyCode::Enter, m),
+                Some(vec![0x1b, b'\r']),
+                "modifier {m:?} should produce meta-Enter newline",
+            );
+        }
+        // Combined modifiers still resolve to the single newline form.
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Some(vec![0x1b, b'\r'])
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_emits_modified_arrows() {
+        // Ctrl+Left = word-back. Standard xterm sequence \x1b[1;5D.
+        assert_eq!(
+            key_to_bytes(KeyCode::Left, KeyModifiers::CONTROL),
+            Some(b"\x1b[1;5D".to_vec()),
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Right, KeyModifiers::CONTROL),
+            Some(b"\x1b[1;5C".to_vec()),
+        );
+        // Alt+Left = word-back in some shells.
+        assert_eq!(
+            key_to_bytes(KeyCode::Left, KeyModifiers::ALT),
+            Some(b"\x1b[1;3D".to_vec()),
+        );
+        // Shift+Up — claude / codex / less treat as scroll-back.
+        assert_eq!(
+            key_to_bytes(KeyCode::Up, KeyModifiers::SHIFT),
+            Some(b"\x1b[1;2A".to_vec()),
+        );
+        // Combo: Ctrl+Shift+Right = 1 + 4 + 1 = 6.
+        assert_eq!(
+            key_to_bytes(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Some(b"\x1b[1;6C".to_vec()),
+        );
+        // Plain Left stays in the short form so it matches what bare
+        // xterm sends and what readline tests expect.
+        assert_eq!(
+            key_to_bytes(KeyCode::Left, KeyModifiers::NONE),
+            Some(b"\x1b[D".to_vec()),
+        );
+    }
+
+    #[test]
+    fn key_to_bytes_emits_modified_home_end_delete() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Home, KeyModifiers::CONTROL),
+            Some(b"\x1b[1;5H".to_vec()),
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::End, KeyModifiers::SHIFT),
+            Some(b"\x1b[1;2F".to_vec()),
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Delete, KeyModifiers::CONTROL),
+            Some(b"\x1b[3;5~".to_vec()),
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::PageUp, KeyModifiers::SHIFT),
+            Some(b"\x1b[5;2~".to_vec()),
+        );
+    }
+
+    #[test]
     fn mouse_wheel_encodes_sgr_when_inner_tool_requests_mouse() {
         // Wheel-up event over the second row of the terminal panel.
         let event = MouseEvent {
@@ -1312,6 +2035,157 @@ mod tests {
         handle_mouse_event(&mut state, &pty_tx, event, &mut dirty);
         assert_eq!(state.scroll_offset, LOCAL_SCROLL_STEP);
         assert!(dirty);
+    }
+
+    #[test]
+    fn alternate_scroll_mode_toggles_on_complete_sequence() {
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        state.observe_pty_modes(b"\x1b[?1007h");
+        assert!(state.alternate_scroll_mode);
+
+        state.observe_pty_modes(b"\x1b[?1007l");
+        assert!(!state.alternate_scroll_mode);
+    }
+
+    #[test]
+    fn wheel_arrows_suppressed_for_claude_code() {
+        // Claude Code rejects/misuses arrow-wheel (maps Up/Down to prompt
+        // history). Even with alternate-scroll mode on, never translate.
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1, 24, 80, 0);
+        state.observe_pty_modes(b"\x1b[?1007h");
+        assert!(state.alternate_scroll_mode);
+        assert!(!should_send_wheel_as_arrow_keys(&state));
+    }
+
+    #[test]
+    fn wheel_arrows_suppressed_when_mouse_reporting_active() {
+        // A tool with BOTH 1007 and raw mouse reporting must get the raw mouse
+        // event (handled by the later branch), not arrow keys — the arrow path
+        // must not preempt it. This is the regression that produced the
+        // content/prompt-history mixture.
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        state.observe_pty_modes(b"\x1b[?1007h");
+        state.vterm.process(b"\x1b[?1000h"); // enable mouse reporting
+        assert_ne!(
+            state.vterm.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert!(state.alternate_scroll_mode);
+        assert!(!should_send_wheel_as_arrow_keys(&state));
+    }
+
+    #[test]
+    fn wheel_arrows_kept_for_generic_alt_scroll_without_mouse() {
+        // The legitimate case is preserved: a non-special tool that enabled
+        // alternate-scroll and is NOT mouse-reporting still gets wheel→arrows.
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        state.observe_pty_modes(b"\x1b[?1007h");
+        assert_eq!(
+            state.vterm.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert!(should_send_wheel_as_arrow_keys(&state));
+    }
+
+    #[test]
+    fn alternate_scroll_mode_detects_split_sequences() {
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        state.observe_pty_modes(b"\x1b[?10");
+        assert!(!state.alternate_scroll_mode);
+
+        state.observe_pty_modes(b"07h");
+        assert!(state.alternate_scroll_mode);
+
+        state.observe_pty_modes(b"\x1b[?100");
+        state.observe_pty_modes(b"7l");
+        assert!(!state.alternate_scroll_mode);
+    }
+
+    #[test]
+    fn codex_mouse_wheel_forwards_sgr_event_not_arrow_keys() {
+        // Codex enables raw mouse reporting (mode 1006) and handles
+        // wheel events natively in its TUI. grith must forward the
+        // raw SGR-encoded mouse event — NOT translate to arrow keys
+        // (which codex's input editor would consume as prompt-history
+        // navigation) and NOT use grith's local scrollback (alt-screen
+        // means there's nothing pre-alt to show). This matches how
+        // codex behaves when run without grith in the loop.
+        let mut state = ExecState::new("codex".into(), "codex".into(), 1, 24, 80, 0);
+        state.alternate_scroll_mode = true;
+        state.vterm.process(b"\x1b[?1000h\x1b[?1006h");
+        let (pty_tx, pty_rx) = mpsc::channel();
+        let mut dirty = false;
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: TERMINAL_PANEL_Y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse_event(&mut state, &pty_tx, event, &mut dirty);
+
+        // No local-scrollback movement, no arrow-key translation.
+        assert_eq!(state.scroll_offset, 0);
+        let bytes = pty_rx
+            .try_recv()
+            .ok()
+            .and_then(|msg| match msg {
+                PtyInput::Bytes(b) => Some(b),
+                PtyInput::Resize { .. } => None,
+            })
+            .expect("codex should receive an SGR-encoded mouse event");
+        // SGR mouse encoding starts with ESC [ < — assert that's what
+        // codex sees (rather than e.g. ESC [ A for arrow-up).
+        assert!(
+            bytes.starts_with(b"\x1b[<"),
+            "expected SGR-encoded mouse event, got {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn non_codex_mouse_wheel_still_forwards_when_mouse_mode_enabled() {
+        let mut state = ExecState::new("vim".into(), "default".into(), 1, 24, 80, 0);
+        state.vterm.process(b"\x1b[?1000h\x1b[?1006h");
+        let (pty_tx, pty_rx) = mpsc::channel();
+        let mut dirty = false;
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: TERMINAL_PANEL_Y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse_event(&mut state, &pty_tx, event, &mut dirty);
+
+        assert_eq!(state.scroll_offset, 0);
+        assert!(
+            pty_rx.try_recv().is_ok(),
+            "non-Codex tools that request mouse mode should receive wheel events"
+        );
+    }
+
+    #[test]
+    fn intercept_log_hides_low_score_runtime_scratch_allows() {
+        assert!(!should_display_intercept_log(
+            "allow",
+            "FileWrite(/var/tmp/etilqs_123123123123123)",
+            0.5,
+        ));
+        assert!(!should_display_intercept_log(
+            "allow",
+            "FileRename(/tmp/node-compile-cache/v22/foo.tmp -> /tmp/node-compile-cache/v22/foo)",
+            0.3,
+        ));
+        assert!(should_display_intercept_log(
+            "queue",
+            "FileWrite(/var/tmp/etilqs_123123123123123)",
+            3.5,
+        ));
+        assert!(should_display_intercept_log(
+            "allow",
+            "FileWrite(/home/u/project/src/main.rs)",
+            0.5,
+        ));
     }
 
     #[test]
@@ -1435,5 +2309,186 @@ mod tests {
             has_content,
             "vterm content should be preserved after dialog dismiss"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fullscreen-repaint scrollback integration tests (Phase F).
+    // -----------------------------------------------------------------------
+
+    /// Drive `state.fullscreen_scrollback` end-to-end through bytes that
+    /// emulate a repainting TUI: an initial frame is committed via a
+    /// synchronized-output batch, then a second frame is rendered the same
+    /// way. After scrolling back one frame, the rendered panel must reflect
+    /// the older frame's content rather than the latest live screen.
+    #[test]
+    fn fullscreen_history_renders_older_frame_when_scrolled_back() {
+        let total_rows = 24u16;
+        let mut state = ExecState::new("codex".into(), "codex".into(), 7777, total_rows, 80, 0);
+        state.screen_populated = true;
+
+        let emit = |s: &mut ExecState, payload: &[u8]| {
+            s.fullscreen_scrollback.observe_bytes(payload);
+            s.vterm.process(payload);
+            s.fullscreen_scrollback
+                .capture_if_boundary_reached(s.vterm.screen(), s.last_pty_activity);
+        };
+
+        // Frame 1: enter alt screen, clear, home, type a unique marker,
+        // close sync update — this should trigger one capture.
+        emit(
+            &mut state,
+            b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[H\x1b[1;24rFRAME_ONE\x1b[?2026l",
+        );
+        assert!(state.fullscreen_scrollback.repaint_mode());
+        assert_eq!(state.fullscreen_scrollback.frames_pushed(), 1);
+
+        // Frame 2: another sync batch with different content. Capture again.
+        emit(&mut state, b"\x1b[?2026h\x1b[2J\x1b[HFRAME_TWO\x1b[?2026l");
+        assert_eq!(state.fullscreen_scrollback.frames_pushed(), 2);
+
+        // Live view shows FRAME_TWO.
+        let live = render_terminal_panel(&state);
+        assert!(
+            live.contains("FRAME_TWO"),
+            "live screen should show latest frame, got:\n{live}"
+        );
+        assert!(!live.contains("FRAME_ONE"));
+
+        // Scrolling back via scroll_offset drives the synthetic-parser
+        // render path. After scrolling far enough back, FRAME_ONE's
+        // content should appear in the rendered panel.
+        let viewport_rows = state.vterm_rows as usize;
+        state.scroll_offset = state.fullscreen_scrollback.max_scroll_offset(viewport_rows);
+        let backed = render_terminal_panel(&state);
+        assert!(
+            backed.contains("FRAME_ONE"),
+            "scrolling to top should reveal first frame's content, got:\n{backed}"
+        );
+    }
+
+    /// Repaint heuristics fire without alt-screen enter — primary-screen
+    /// fullscreen redrawers (Codex with `tui.alternate_screen = "never"`)
+    /// still get a capture once the screen has gone idle past the
+    /// REPAINT_IDLE_WINDOW.
+    #[test]
+    fn primary_screen_repaint_captures_via_idle_fallback() {
+        let total_rows = 24u16;
+        let mut state = ExecState::new("codex".into(), "codex".into(), 7777, total_rows, 80, 0);
+        state.screen_populated = true;
+
+        // Pure primary-screen fullscreen repaint sequence: no ?1049h.
+        let payload = b"\x1b[2J\x1b[H\x1b[1;24rPRIMARY_FRAME";
+        state.fullscreen_scrollback.observe_bytes(payload);
+        state.vterm.process(payload);
+        assert!(state.fullscreen_scrollback.repaint_mode());
+
+        // Simulate idle: shift last_pty_activity well into the past so the
+        // capture decision's idle-window precondition is satisfied.
+        state.last_pty_activity = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(500))
+            .unwrap_or_else(std::time::Instant::now);
+        state
+            .fullscreen_scrollback
+            .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+        assert_eq!(
+            state.fullscreen_scrollback.frames_pushed(),
+            1,
+            "primary-screen repaint with idle window should produce a captured frame"
+        );
+    }
+
+    /// Captured frame content is stored as lines in the scrollback. After
+    /// capture, the accumulated lines contain the frame's text tokens.
+    #[test]
+    fn captured_frame_text_stored_as_lines() {
+        let total_rows = 24u16;
+        let mut state = ExecState::new("codex".into(), "codex".into(), 7777, total_rows, 80, 0);
+        state.screen_populated = true;
+
+        let payload = b"\x1b[?2026h\x1b[2J\x1b[H\x1b[1;24rrender parity payload\x1b[?2026l";
+        state.fullscreen_scrollback.observe_bytes(payload);
+        state.vterm.process(payload);
+        state
+            .fullscreen_scrollback
+            .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+        assert_eq!(state.fullscreen_scrollback.frames_pushed(), 1);
+
+        let live_text = state.vterm.screen().contents();
+        // visible_window returning all accumulated lines should include
+        // the same tokens as the live screen text.
+        let stored = state
+            .fullscreen_scrollback
+            .visible_window(usize::MAX, 0)
+            .join("\n");
+        for token in live_text.split_whitespace() {
+            if !token.is_empty() {
+                assert!(
+                    stored.contains(token),
+                    "stored scrollback missing token {token:?}; stored=\n{stored}",
+                );
+            }
+        }
+    }
+
+    /// Snap-to-live resets the unified scroll offset.
+    #[test]
+    fn snap_to_live_resets_offsets() {
+        let mut state = ExecState::new("codex".into(), "codex".into(), 1234, 24, 80, 0);
+        state.scroll_offset = 12;
+        state.vterm.set_scrollback(12);
+
+        state.snap_to_live();
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    /// `use_fullscreen_history` flips on only when both repaint_mode is
+    /// active and at least one snapshot exists. A repaint-active session
+    /// with an empty ring still falls back to the vt100 scrollback path.
+    #[test]
+    fn use_fullscreen_history_requires_repaint_mode_and_snapshots() {
+        let mut state = ExecState::new("codex".into(), "codex".into(), 1234, 24, 80, 0);
+        assert!(!state.use_fullscreen_history());
+
+        // Repaint signals alone: still false because no captures yet.
+        state
+            .fullscreen_scrollback
+            .observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+        assert!(state.fullscreen_scrollback.repaint_mode());
+        assert!(!state.use_fullscreen_history());
+
+        // After capturing one frame, fullscreen-history mode becomes active.
+        state
+            .fullscreen_scrollback
+            .observe_bytes(b"\x1b[?2026h\x1b[?2026l");
+        state.vterm.process(b"some content");
+        state
+            .fullscreen_scrollback
+            .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+        assert!(state.use_fullscreen_history());
+    }
+
+    /// Claude Code's conversation is line-oriented and lives in vt100
+    /// scrollback, so it must stay on the vt100 line-scrollback path even when
+    /// it trips repaint_mode and has captured frames — otherwise the wheel
+    /// scrolls captured repaints (banners/menus) instead of the real chat.
+    #[test]
+    fn claude_code_stays_on_line_scrollback_not_fullscreen_history() {
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1234, 24, 80, 0);
+        // Drive it into the exact state that turns fullscreen-history ON for
+        // codex: repaint_mode active + at least one captured frame.
+        state
+            .fullscreen_scrollback
+            .observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+        state
+            .fullscreen_scrollback
+            .observe_bytes(b"\x1b[?2026h\x1b[?2026l");
+        state.vterm.process(b"some content");
+        state
+            .fullscreen_scrollback
+            .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+        assert!(state.fullscreen_scrollback.repaint_mode());
+        assert!(!state.fullscreen_scrollback.is_empty());
+        // ...but Claude Code is excluded, so it uses vt100 line scrollback.
+        assert!(!state.use_fullscreen_history());
     }
 }

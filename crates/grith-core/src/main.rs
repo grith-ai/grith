@@ -7,6 +7,7 @@
 //! dispatches to the appropriate subcommand or interactive REPL.
 
 mod agent;
+mod browser;
 mod commands;
 mod config;
 mod daemon;
@@ -18,7 +19,8 @@ mod profile_manifest;
 mod profile_updates;
 mod update_check;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -143,6 +145,11 @@ enum Command {
         #[command(subcommand)]
         action: ReputationAction,
     },
+    /// Generate a shell completion script for grith
+    Completions {
+        /// Target shell (bash, zsh, fish, elvish, powershell)
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -231,6 +238,8 @@ enum DaemonAction {
     Stop,
     /// Check if the daemon is running
     Status,
+    /// Authorise a browser for the dashboard (mints a single-use pairing link)
+    Pair,
 }
 
 #[derive(Subcommand)]
@@ -358,6 +367,15 @@ fn main() -> anyhow::Result<()> {
         return cmd_init();
     }
 
+    // Completion-script generation is a pure stdout emit — handle it before any
+    // config load or logging init so it works regardless of config state.
+    if let Some(Command::Completions { shell }) = &cli.command {
+        let mut cmd = Cli::command();
+        let bin_name = cmd.get_name().to_string();
+        clap_complete::generate(*shell, &mut cmd, bin_name, &mut std::io::stdout());
+        return Ok(());
+    }
+
     // Load configuration
     let mut cfg = config::GrithConfig::load(cli.config.as_deref())?;
 
@@ -429,6 +447,31 @@ fn main() -> anyhow::Result<()> {
         }) => {
             return commands::dashboard::cmd_dashboard_status();
         }
+        Some(Command::Daemon {
+            action: DaemonAction::Pair,
+        }) => {
+            return commands::dashboard::cmd_dashboard_pair(cfg.server.auto_open_dashboard);
+        }
+        // User-invoked `grith dashboard start`: background-spawn the daemon and
+        // print connection details here, BEFORE constructing a daemon in this
+        // parent process (which would spam tracing logs the user shouldn't see).
+        // The detached child carries GRITH_DASHBOARD_CHILD and falls through to
+        // run the server in the foreground below.
+        Some(Command::Daemon {
+            action: DaemonAction::Start,
+        }) if std::env::var_os("GRITH_DASHBOARD_CHILD").is_none() => {
+            if cfg.server.enabled {
+                commands::dashboard::ensure_dashboard_running_with_port(
+                    cfg.server.port,
+                    cfg.server.auto_open_dashboard,
+                    true, // explicit start → persist until `grith dashboard stop`
+                    cli.config.as_deref(),
+                );
+            } else {
+                println!("Dashboard server is disabled (server.enabled = false in config).");
+            }
+            return Ok(());
+        }
         Some(Command::Pro {
             action: ProAction::Login { ref api_key },
         }) => return commands::pro::cmd_pro_login(api_key.as_deref()),
@@ -469,6 +512,10 @@ fn main() -> anyhow::Result<()> {
     if thin_client_command && cfg.server.enabled {
         let _ = commands::dashboard::ensure_dashboard_running_with_port(
             cfg.server.port,
+            cfg.server.auto_open_dashboard,
+            // Auto-started for `grith exec`/supervisor — idle-shutdown after the
+            // session ends.
+            false,
             cli.config.as_deref(),
         );
         if let Some(daemon_client) = crate::daemon::client::DaemonClient::connect() {
@@ -524,6 +571,10 @@ fn main() -> anyhow::Result<()> {
             action: DaemonAction::Start
         })
     ) {
+        // Only reached for the detached child (GRITH_DASHBOARD_CHILD set); the
+        // user-invoked case background-spawned and returned in the early match
+        // above. Run the server in the foreground (this process's stdout is
+        // /dev/null, redirected by the parent that spawned it).
         return commands::dashboard::cmd_dashboard_start(&daemon);
     }
 
@@ -554,6 +605,9 @@ fn main() -> anyhow::Result<()> {
             .map(|creds| creds.api_key);
         let sync_api_base_url = Some(crate::license::api_base_url());
         let ipc_token = crate::daemon::token::generate_token();
+        // Reuse the persisted dashboard token across restarts so an open
+        // browser tab stays authorised (see `get_or_create_dashboard_token`).
+        let dashboard_token = crate::daemon::token::get_or_create_dashboard_token();
 
         let deps = grith_server::ServerDeps {
             audit_storage: daemon.audit_storage.clone(),
@@ -585,10 +639,15 @@ fn main() -> anyhow::Result<()> {
         .with_billing_portal_url(daemon.billing_portal_url.clone())
         .with_refresh_state(daemon.refresh_state.clone())
         .with_ipc_token(ipc_token)
+        .with_dashboard_token(dashboard_token.clone())
         .with_sync_api(sync_api_key, sync_api_base_url);
 
         let addr = server.address();
         let ws_tx = server.ws_sender();
+        // Mint the browser pairing code before `server` is moved into the spawn
+        // below; the token is handed off via a single-use `#pair=` code, never
+        // printed.
+        let pair_code = server.mint_pair_code();
 
         daemon.register_notification_channels(Some(ws_tx.clone()));
 
@@ -613,6 +672,22 @@ fn main() -> anyhow::Result<()> {
         });
 
         tracing::info!(address = %addr, "dashboard available at http://{}", addr);
+        // Hand the token to the browser via a single-use `#pair=` code (never
+        // the raw token), auto-opening at most once per daemon (keyed by PID).
+        let base = format!("http://{addr}");
+        let self_pid = std::process::id();
+        if crate::daemon::dashboard_already_opened(self_pid) {
+            println!("Dashboard: {base}");
+        } else {
+            let pair = format!("{base}/#pair={pair_code}");
+            if browser::maybe_open_dashboard(daemon.config.server.auto_open_dashboard, &pair) {
+                println!("Dashboard: {base}  (opened in your browser)");
+                crate::daemon::mark_dashboard_opened(self_pid);
+            } else {
+                println!("Dashboard: {base}");
+                println!("  Open this once to authorise your browser: {pair}");
+            }
+        }
 
         let result = match cli.command {
             None => commands::run::cmd_repl(
@@ -706,6 +781,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Reputation { action }) => cmd_reputation(action),
         // Already handled above
         Some(Command::Init)
+        | Some(Command::Completions { .. })
         | Some(Command::Config { .. })
         | Some(Command::Daemon { .. })
         | Some(Command::Pro { .. })
@@ -941,8 +1017,16 @@ fn cmd_reputation_remote(
     Ok(())
 }
 
+#[cfg(test)]
 fn to_runtime_supervisor_config(
     core: &config::SupervisorCoreConfig,
+) -> grith_supervisor::config::SupervisorConfig {
+    to_runtime_supervisor_config_with_audit(core, &config::AuditConfig::default())
+}
+
+fn to_runtime_supervisor_config_with_audit(
+    core: &config::SupervisorCoreConfig,
+    audit: &config::AuditConfig,
 ) -> grith_supervisor::config::SupervisorConfig {
     grith_supervisor::config::SupervisorConfig {
         enabled: core.enabled,
@@ -951,6 +1035,10 @@ fn to_runtime_supervisor_config(
         max_concurrent_sessions: core.max_concurrent_sessions,
         pty_forwarding: core.pty_forwarding,
         require_sandbox: core.require_sandbox,
+        attach_mode: match core.attach_mode {
+            config::AttachMode::Traceme => grith_supervisor::config::AttachMode::Traceme,
+            config::AttachMode::Seize => grith_supervisor::config::AttachMode::Seize,
+        },
         platform: grith_supervisor::config::PlatformConfig {
             linux_mechanism: core.platform.linux_mechanism.clone(),
             macos_mechanism: core.platform.macos_mechanism.clone(),
@@ -969,6 +1057,24 @@ fn to_runtime_supervisor_config(
         syscall_log_file: None,
         trace_syscalls_jsonl_file: None,
         reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+        // PR 6 Phase F: map core CoverageConfig → supervisor CoverageConfig.
+        coverage: grith_supervisor::config::CoverageConfig {
+            category1_hard_deny: core.coverage.category1_hard_deny,
+            category2_proxy: core.coverage.category2_proxy,
+            category3_namespace: core.coverage.category3_namespace,
+            category4_arch_priv: core.coverage.category4_arch_priv,
+        },
+        audit_completeness: match audit.completeness {
+            config::AuditCompleteness::Decisions => {
+                grith_supervisor::config::AuditCompletenessLevel::Decisions
+            }
+            config::AuditCompleteness::Spawns => {
+                grith_supervisor::config::AuditCompletenessLevel::Spawns
+            }
+            config::AuditCompleteness::Io => grith_supervisor::config::AuditCompletenessLevel::Io,
+            config::AuditCompleteness::All => grith_supervisor::config::AuditCompletenessLevel::All,
+        },
+        pty_ownership_enforce: core.pty_ownership_enforce,
     }
 }
 
@@ -1145,9 +1251,6 @@ mod session_summary_tests {
         let scoring = grith_proxy::scoring::ScoringConfig {
             auto_allow_threshold: -1.0,
             auto_deny_threshold: 10.0,
-            cold_start_calls: 0,
-            cold_start_escalation_low: -1.0,
-            cold_start_escalation_high: 10.0,
         };
         let meta_rules = grith_proxy::meta_rules::MetaRuleEngine::new(vec![]);
         grith_proxy::engine::SecurityProxy::new(filters, scoring, meta_rules)

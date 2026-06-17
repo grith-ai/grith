@@ -29,18 +29,22 @@ use grith_supervisor::reviewer::{DigestStore, PollingQueueReviewer, QueueReviewe
 
 /// A queue reviewer that sends permission requests to the exec TUI's
 /// permission dialog overlay and waits for the user's response.
+///
+/// Uses a dedicated `crossbeam_channel` for permission events so a
+/// backlog of supervisor `ExecEvent`s (PTY output, intercept entries)
+/// under heavy syscall load cannot delay a user-facing prompt.
 pub struct ExecTuiQueueReviewer {
-    event_tx: std::sync::mpsc::Sender<grith_cli::tui::exec_tui::ExecEvent>,
+    permission_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
     digest_store: Arc<dyn DigestStore>,
 }
 
 impl ExecTuiQueueReviewer {
     pub fn new(
-        event_tx: std::sync::mpsc::Sender<grith_cli::tui::exec_tui::ExecEvent>,
+        permission_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
         digest_store: Arc<dyn DigestStore>,
     ) -> Self {
         Self {
-            event_tx,
+            permission_tx,
             digest_store,
         }
     }
@@ -94,12 +98,12 @@ impl QueueReviewer for ExecTuiQueueReviewer {
         // Create a response channel.
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel::<&'static str>(1);
 
-        // Send the request to the TUI.
-        let event = grith_cli::tui::exec_tui::ExecEvent::PermissionRequest {
+        // Send the request to the TUI on the dedicated permission channel.
+        let event = grith_cli::tui::exec_tui::PermissionEvent {
             request: req,
             response_tx,
         };
-        if self.event_tx.send(event).is_err() {
+        if self.permission_tx.send(event).is_err() {
             return ReviewOutcome::Denied;
         }
 

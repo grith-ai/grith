@@ -3,6 +3,7 @@ import type {
   AdaptiveStatsResponse,
   AdaptiveFeedbackRequest,
 } from "@/types/api";
+import { csrfHeaders } from "@/lib/csrf";
 
 interface TierInfo {
   features: Record<string, boolean>;
@@ -63,7 +64,7 @@ export function AdaptiveScoring() {
       try {
         const res = await fetch("/api/adaptive/feedback", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...csrfHeaders() },
           body: JSON.stringify(body),
         });
         if (!res.ok) {

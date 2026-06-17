@@ -159,6 +159,89 @@ fn prepare_command_and_effective_policy(
     Ok((command, effective_policy))
 }
 
+/// Capture the controlling terminal of the launching CLI as a short label
+/// (e.g. "pts/21") so an operator can locate an orphaned session. Returns
+/// `None` when stdin is not a tty (piped/redirected) or on non-Linux.
+fn capture_launch_tty() -> Option<String> {
+    let target = std::fs::read_link("/proc/self/fd/0").ok()?;
+    let s = target.to_string_lossy();
+    let name = s.strip_prefix("/dev/").unwrap_or(&s);
+    if name.starts_with("pts/") || name.starts_with("tty") {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Absolute working directory the supervised tool is being launched from.
+fn capture_launch_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Format a duration in seconds as a compact human label (e.g. "2d21h", "6m").
+fn format_duration_secs(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Render a framed session-limit upgrade prompt instead of a bare 429 error.
+/// Shows the already-running sessions (so the user can see what to close) and
+/// the remediation options the daemon advertised.
+fn render_session_limit_upsell(
+    rej: &crate::daemon::client::SessionLimitRejection,
+    sessions: &[crate::daemon::client::RemoteSessionSummary],
+) {
+    eprintln!();
+    eprintln!(
+        "  \u{26a0}  Session limit reached — {} of {} on the {} plan.",
+        rej.active_sessions, rej.current_limit, rej.tier
+    );
+    if !sessions.is_empty() {
+        eprintln!();
+        eprintln!("  Already running:");
+        for s in sessions {
+            let location = s
+                .project_name
+                .as_deref()
+                .or(s.cwd.as_deref())
+                .unwrap_or("?");
+            let tty = s
+                .tty
+                .as_deref()
+                .map(|t| format!(" ({t})"))
+                .unwrap_or_default();
+            eprintln!(
+                "    {}  {}  {}{}  up {}",
+                &s.id.to_string()[..8],
+                s.tool_name,
+                location,
+                tty,
+                format_duration_secs(s.uptime_seconds),
+            );
+        }
+    }
+    eprintln!();
+    eprintln!("  Options:");
+    eprintln!("    • Close one:  grith exec kill <id>");
+    eprintln!("    • Clear dead: grith exec prune");
+    if let Some(url) = &rej.upgrade_url {
+        eprintln!("    • Upgrade:    {url}");
+    }
+    eprintln!();
+}
+
 fn print_remote_sessions(
     sessions: &[crate::daemon::client::RemoteSessionSummary],
 ) -> anyhow::Result<()> {
@@ -171,12 +254,31 @@ fn print_remote_sessions(
                 .containment_remaining_seconds
                 .map(|r| format!(" | CONTAINED ({r}s)"))
                 .unwrap_or_default();
+            // Prefer the project/cwd + tty as the human "where to find it" hint.
+            let location = s
+                .project_name
+                .as_deref()
+                .or(s.cwd.as_deref())
+                .unwrap_or("?");
+            let tty = s
+                .tty
+                .as_deref()
+                .map(|t| format!(" {t}"))
+                .unwrap_or_default();
+            let idle = if s.last_activity_seconds >= 60 {
+                format!(" | idle {}", format_duration_secs(s.last_activity_seconds))
+            } else {
+                String::new()
+            };
             println!(
-                "  {} | {} | pid {} | up {}s | {} intercepted ({} allowed, {} queued, {} denied){}",
+                "  {} | {} | {}{} | pid {} | up {}{} | {} intercepted ({} allowed, {} queued, {} denied){}",
                 &s.id.to_string()[..8],
                 s.tool_name,
+                location,
+                tty,
                 s.root_pid,
-                s.uptime_seconds,
+                format_duration_secs(s.uptime_seconds),
+                idle,
                 s.stats.total_intercepted,
                 s.stats.total_allowed,
                 s.stats.total_queued,
@@ -231,6 +333,18 @@ pub fn cmd_exec_thin(
             [cmd] if cmd == "kill" => {
                 anyhow::bail!("usage: grith exec kill <session-id>");
             }
+            [cmd] if cmd == "prune" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let (reaped, remaining) = runtime.block_on(daemon_client.prune_sessions())?;
+                if reaped == 0 {
+                    println!("No dead sessions to prune ({remaining} active).");
+                } else {
+                    println!("Pruned {reaped} dead session(s); {remaining} remaining.");
+                }
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -240,7 +354,7 @@ pub fn cmd_exec_thin(
     }
     if attach.is_none() && command.is_empty() {
         anyhow::bail!(
-            "usage: grith exec list | grith exec kill <session-id> | \
+            "usage: grith exec list | grith exec kill <session-id> | grith exec prune | \
              grith exec [--profile <name>] [--attach <pid>] -- <command> [args...]"
         );
     }
@@ -287,10 +401,16 @@ pub fn cmd_exec_thin(
         let stdin_paused = Arc::new(AtomicBool::new(false));
         let output_paused = Arc::new(AtomicBool::new(false));
 
-        let mut exec_tui_tx: Option<std::sync::mpsc::Sender<grith_cli::tui::exec_tui::ExecEvent>> =
+        let mut exec_tui_tx: Option<crossbeam_channel::Sender<grith_cli::tui::exec_tui::ExecEvent>> =
             None;
         let mut exec_tui_rx: Option<
-            std::sync::mpsc::Receiver<grith_cli::tui::exec_tui::ExecEvent>,
+            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::ExecEvent>,
+        > = None;
+        let mut exec_permission_tx: Option<
+            crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
+        > = None;
+        let mut exec_permission_rx: Option<
+            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::PermissionEvent>,
         > = None;
         let mut exec_pty_input_tx: Option<
             std::sync::mpsc::Sender<grith_cli::tui::exec_tui::PtyInput>,
@@ -321,7 +441,8 @@ pub fn cmd_exec_thin(
                     .map_err(|e| anyhow::anyhow!("PTY spawn failed: {e}"))?;
 
                 if has_tty {
-                    let (exec_event_tx, exec_event_rx) = std::sync::mpsc::channel();
+                    let (exec_event_tx, exec_event_rx) = crossbeam_channel::unbounded();
+                    let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
                     let (pty_input_tx, pty_input_rx) =
                         std::sync::mpsc::channel::<grith_cli::tui::exec_tui::PtyInput>();
                     let event_tx_clone = exec_event_tx.clone();
@@ -329,6 +450,8 @@ pub fn cmd_exec_thin(
                     spawn_pty_writer_thread(pty_writer, pty_input_rx, pid);
                     exec_tui_tx = Some(exec_event_tx);
                     exec_tui_rx = Some(exec_event_rx);
+                    exec_permission_tx = Some(permission_tx);
+                    exec_permission_rx = Some(permission_rx);
                     exec_pty_input_tx = Some(pty_input_tx);
                     exec_tui_rows = rows;
                     exec_tui_cols = cols;
@@ -369,9 +492,18 @@ pub fn cmd_exec_thin(
                 .map(|s| s.to_string())
                 .unwrap_or_else(helpers::derive_session_name_from_cwd),
         );
+        session.cwd = capture_launch_cwd();
+        session.tty = capture_launch_tty();
         let session_id = session.id;
 
-        daemon_client.register_session(&session).await?;
+        match daemon_client.register_session_checked(&session).await? {
+            crate::daemon::client::RegisterOutcome::Registered => {}
+            crate::daemon::client::RegisterOutcome::LimitReached(rej) => {
+                let running = daemon_client.list_sessions().await.unwrap_or_default();
+                render_session_limit_upsell(&rej, &running);
+                anyhow::bail!("session limit reached");
+            }
+        }
 
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(60);
         match daemon_client.expire_stale_digests(cutoff).await {
@@ -380,10 +512,13 @@ pub fn cmd_exec_thin(
             Err(e) => tracing::warn!(error = %e, "failed to expire stale digest items in daemon"),
         }
 
-        let mut supervisor_cfg = crate::to_runtime_supervisor_config(&cfg.supervisor);
+        let mut supervisor_cfg =
+            crate::to_runtime_supervisor_config_with_audit(&cfg.supervisor, &cfg.audit);
         supervisor_cfg.syscall_log_file = syscall_log;
         supervisor_cfg.trace_syscalls_jsonl_file = trace_syscalls_jsonl;
         supervisor_cfg.reputation_config = cfg.reputation.to_proxy_config();
+        // Select the attach mechanism (traceme | seize) before the first spawn.
+        interceptor.set_attach_mode(supervisor_cfg.attach_mode);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         let (broadcast_tx, _broadcast_rx) = tokio::sync::broadcast::channel::<String>(256);
@@ -445,9 +580,9 @@ pub fn cmd_exec_thin(
         );
 
         let queue_reviewer: Option<Arc<dyn grith_supervisor::QueueReviewer>> =
-            if let Some(ref tui_tx) = exec_tui_tx {
+            if let Some(ref perm_tx) = exec_permission_tx {
                 Some(Arc::new(super::exec_reviewer::ExecTuiQueueReviewer::new(
-                    tui_tx.clone(),
+                    perm_tx.clone(),
                     digest_store.clone(),
                 )))
             } else if has_tty {
@@ -495,14 +630,19 @@ pub fn cmd_exec_thin(
         }
 
         let filter_count = daemon_client.proxy_filter_count().await.unwrap_or(0);
-        let tui_handle = if let (Some(event_rx), Some(pty_input_tx)) =
-            (exec_tui_rx.take(), exec_pty_input_tx.take())
-        {
+        let tui_handle = if let (Some(event_rx), Some(permission_rx), Some(pty_input_tx)) = (
+            exec_tui_rx.take(),
+            exec_permission_rx.take(),
+            exec_pty_input_tx.take(),
+        ) {
             let tui_tool = tool_display.clone();
             let tui_profile = scope_key.clone();
             let tui_pid = root_pid;
             let tui_rows = exec_tui_rows;
             let tui_cols = exec_tui_cols;
+            // Bare URL only — the token is handed to the browser out-of-band
+            // (auto-open / pairing), never rendered in the always-visible TUI
+            // header where it could leak into screenshots or recordings.
             let tui_dashboard_url = Some(daemon_client.base_url().to_string());
             Some(std::thread::spawn(move || {
                 let mut state = grith_cli::tui::exec_tui::ExecState::new(
@@ -514,7 +654,12 @@ pub fn cmd_exec_thin(
                     filter_count,
                 );
                 state.dashboard_url = tui_dashboard_url;
-                grith_cli::tui::exec_tui::run_exec_tui(state, event_rx, pty_input_tx)
+                grith_cli::tui::exec_tui::run_exec_tui(
+                    state,
+                    event_rx,
+                    permission_rx,
+                    pty_input_tx,
+                )
             }))
         } else {
             None
@@ -545,6 +690,10 @@ pub fn cmd_exec_thin(
             "grith exec ready — thin supervisor loop starting"
         );
 
+        let inventory_sink: std::sync::Arc<dyn grith_supervisor::InventorySink> =
+            std::sync::Arc::new(crate::daemon::client::RemoteInventorySink::new(
+                daemon_client.clone(),
+            ));
         let run_result = grith_supervisor::supervisor::run_supervisor_loop(
             &mut interceptor,
             &mut session,
@@ -565,6 +714,7 @@ pub fn cmd_exec_thin(
             Some(daemon_client.base_url().to_string()),
             Some(daemon_proxy_token),
             Some(daemon_restart),
+            Some(inventory_sink),
         )
         .await;
 
@@ -627,6 +777,22 @@ pub fn cmd_exec(
             [cmd] if cmd == "kill" => {
                 anyhow::bail!("usage: grith exec kill <session-id>");
             }
+            [cmd] if cmd == "prune" => {
+                let (reaped, remaining) = {
+                    let mut registry = daemon
+                        .supervisor_registry
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("supervisor registry lock poisoned"))?;
+                    let reaped = registry.reap_dead();
+                    (reaped, registry.count())
+                };
+                if reaped == 0 {
+                    println!("No dead sessions to prune ({remaining} active).");
+                } else {
+                    println!("Pruned {reaped} dead session(s); {remaining} remaining.");
+                }
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -637,7 +803,7 @@ pub fn cmd_exec(
 
     if attach.is_none() && command.is_empty() {
         anyhow::bail!(
-            "usage: grith exec list | grith exec kill <session-id> | \
+            "usage: grith exec list | grith exec kill <session-id> | grith exec prune | \
              grith exec [--profile <name>] [--attach <pid>] -- <command> [args...]"
         );
     }
@@ -711,10 +877,17 @@ pub fn cmd_exec(
         let output_paused = Arc::new(AtomicBool::new(false));
 
         // Exec TUI channels (set when PTY + TTY available)
-        let mut exec_tui_tx: Option<std::sync::mpsc::Sender<grith_cli::tui::exec_tui::ExecEvent>> =
-            None;
+        let mut exec_tui_tx: Option<
+            crossbeam_channel::Sender<grith_cli::tui::exec_tui::ExecEvent>,
+        > = None;
         let mut exec_tui_rx: Option<
-            std::sync::mpsc::Receiver<grith_cli::tui::exec_tui::ExecEvent>,
+            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::ExecEvent>,
+        > = None;
+        let mut exec_permission_tx: Option<
+            crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
+        > = None;
+        let mut exec_permission_rx: Option<
+            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::PermissionEvent>,
         > = None;
         let mut exec_pty_input_tx: Option<
             std::sync::mpsc::Sender<grith_cli::tui::exec_tui::PtyInput>,
@@ -749,8 +922,12 @@ pub fn cmd_exec(
                     .map_err(|e| anyhow::anyhow!("PTY spawn failed: {e}"))?;
 
                 if has_tty {
-                    // Channels for TUI ↔ PTY communication
-                    let (exec_event_tx, exec_event_rx) = std::sync::mpsc::channel();
+                    // Channels for TUI ↔ PTY communication. Bulk supervisor
+                    // events and permission requests are split across two
+                    // crossbeam channels so the TUI's biased select! can
+                    // prioritise permission prompts over PTY-output backlog.
+                    let (exec_event_tx, exec_event_rx) = crossbeam_channel::unbounded();
+                    let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
                     let (pty_input_tx, pty_input_rx) =
                         std::sync::mpsc::channel::<grith_cli::tui::exec_tui::PtyInput>();
 
@@ -764,6 +941,8 @@ pub fn cmd_exec(
                     // Store channels for the supervisor to signal process exit
                     exec_tui_tx = Some(exec_event_tx);
                     exec_tui_rx = Some(exec_event_rx);
+                    exec_permission_tx = Some(permission_tx);
+                    exec_permission_rx = Some(permission_rx);
                     exec_pty_input_tx = Some(pty_input_tx);
                     exec_tui_rows = rows;
                     exec_tui_cols = cols;
@@ -805,6 +984,8 @@ pub fn cmd_exec(
                 .map(|s| s.to_string())
                 .unwrap_or_else(helpers::derive_session_name_from_cwd),
         );
+        session.cwd = capture_launch_cwd();
+        session.tty = capture_launch_tty();
         let session_id = session.id;
 
         {
@@ -826,8 +1007,13 @@ pub fn cmd_exec(
                 ),
                 started_at: session.started_at,
                 last_synced_at: session.last_synced_at,
+                last_activity_at: session.last_activity_at,
                 stats: session.stats.clone(),
                 project_name: session.project_name.clone(),
+                cwd: session.cwd.clone(),
+                tty: session.tty.clone(),
+                wedge_reported_tids: std::collections::HashSet::new(),
+                controlling_pts: std::sync::OnceLock::new(),
             };
             registry.register(registry_view)?;
         }
@@ -842,10 +1028,15 @@ pub fn cmd_exec(
             }
         }
 
-        let mut supervisor_cfg = crate::to_runtime_supervisor_config(&daemon.config.supervisor);
+        let mut supervisor_cfg = crate::to_runtime_supervisor_config_with_audit(
+            &daemon.config.supervisor,
+            &daemon.config.audit,
+        );
         supervisor_cfg.syscall_log_file = syscall_log;
         supervisor_cfg.trace_syscalls_jsonl_file = trace_syscalls_jsonl;
         supervisor_cfg.reputation_config = daemon.config.reputation.to_proxy_config();
+        // Select the attach mechanism (traceme | seize) before the first spawn.
+        interceptor.set_attach_mode(supervisor_cfg.attach_mode);
         let shutdown_rx = daemon.subscribe_shutdown();
 
         // Event broadcast channel for proxy decisions
@@ -895,9 +1086,9 @@ pub fn cmd_exec(
         // rendered as overlay), otherwise fall back to TerminalQueueReviewer
         // for raw PTY passthrough mode.
         let queue_reviewer: Option<Arc<dyn grith_supervisor::QueueReviewer>> =
-            if let Some(ref tui_tx) = exec_tui_tx {
+            if let Some(ref perm_tx) = exec_permission_tx {
                 Some(Arc::new(super::exec_reviewer::ExecTuiQueueReviewer::new(
-                    tui_tx.clone(),
+                    perm_tx.clone(),
                     digest_store.clone(),
                 )))
             } else if has_tty {
@@ -949,9 +1140,11 @@ pub fn cmd_exec(
         }
 
         // Start the exec TUI on a separate thread if channels are set up
-        let tui_handle = if let (Some(event_rx), Some(pty_input_tx)) =
-            (exec_tui_rx.take(), exec_pty_input_tx.take())
-        {
+        let tui_handle = if let (Some(event_rx), Some(permission_rx), Some(pty_input_tx)) = (
+            exec_tui_rx.take(),
+            exec_permission_rx.take(),
+            exec_pty_input_tx.take(),
+        ) {
             let tui_tool = tool_display.clone();
             let tui_profile = scope_key.clone();
             let tui_pid = root_pid;
@@ -959,6 +1152,8 @@ pub fn cmd_exec(
             let tui_cols = exec_tui_cols;
             let filter_count = daemon.proxy.filter_count();
             let tui_dashboard_url = if daemon.config.server.enabled {
+                // Bare URL only — see the note at the other TUI construction
+                // site; the token never appears in the persistent header.
                 Some(format!(
                     "http://{}:{}",
                     daemon.config.server.host, daemon.config.server.port
@@ -976,7 +1171,7 @@ pub fn cmd_exec(
                     filter_count,
                 );
                 state.dashboard_url = tui_dashboard_url;
-                grith_cli::tui::exec_tui::run_exec_tui(state, event_rx, pty_input_tx)
+                grith_cli::tui::exec_tui::run_exec_tui(state, event_rx, permission_rx, pty_input_tx)
             }))
         } else {
             None
@@ -1008,6 +1203,7 @@ pub fn cmd_exec(
             None,
             None,
             None,
+            None, // in-process exec: SessionStateRegistry is shared here, no IPC push needed
         )
         .await;
 
@@ -1140,9 +1336,12 @@ mod tests {
             routine_destinations: vec!["api.openai.com".into()],
             routine_listen_addresses: vec!["127.0.0.1".into()],
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1170,9 +1369,12 @@ mod tests {
             routine_destinations: vec![],
             routine_listen_addresses: vec![],
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1194,9 +1396,12 @@ mod tests {
             routine_destinations: vec!["api.example.com".into()],
             routine_listen_addresses: vec!["127.0.0.1".into()],
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1220,9 +1425,12 @@ mod tests {
             routine_destinations: vec![],
             routine_listen_addresses: vec![],
             routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1248,9 +1456,12 @@ mod tests {
             routine_destinations: vec![],
             routine_listen_addresses: vec![],
             routine_exec_roots: vec!["/usr/lib/git-core/".into()],
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1272,9 +1483,12 @@ mod tests {
             routine_destinations: vec![],
             routine_listen_addresses: vec![],
             routine_exec_roots: vec!["/usr/lib/git-core".into()],
+            scratch_roots: Vec::new(),
             readonly_paths: Vec::new(),
             readonly_path_patterns: Vec::new(),
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1410,7 +1624,7 @@ fn spawn_pty_io_threads(
 #[cfg(unix)]
 fn spawn_pty_reader_thread(
     mut pty_reader: Box<dyn Read + Send>,
-    event_tx: std::sync::mpsc::Sender<grith_cli::tui::exec_tui::ExecEvent>,
+    event_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::ExecEvent>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];

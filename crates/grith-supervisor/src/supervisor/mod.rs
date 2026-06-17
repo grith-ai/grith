@@ -12,6 +12,9 @@
 //! / session-state broadcasting.
 
 mod event_handler;
+mod mass_destruction;
+#[cfg(test)]
+mod protection_tests;
 pub mod session_state;
 
 // Re-export all public types so that `crate::supervisor::Foo` continues to work.
@@ -20,7 +23,10 @@ pub use session_state::{SessionStats, SessionSummary, SupervisorRegistry, Superv
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use grith_audit::CorrelationTracker;
+use grith_audit::{
+    types::{AuditRecord, ProxyActionSummary},
+    CorrelationTracker,
+};
 use grith_proxy::engine::SecurityProxy;
 use grith_proxy::filters::session_containment::ContainmentTracker;
 use tokio::sync::broadcast;
@@ -98,6 +104,7 @@ pub async fn run_supervisor_loop(
     daemon_proxy_url: Option<String>,
     daemon_proxy_token: Option<String>,
     daemon_restart: Option<DaemonRestartConfig>,
+    inventory_sink: Option<Arc<dyn crate::inventory_sink::InventorySink>>,
 ) -> Result<()> {
     let freezer = Freezer::new(Duration::from_secs(config.freeze_timeout_seconds));
     let read_batch_tracker = Mutex::new(event_handler::ReadBatchTracker::new(
@@ -162,6 +169,38 @@ pub async fn run_supervisor_loop(
     };
     let persist_local_reputation = shared_reputation.is_some() || daemon_proxy_url.is_none();
     let daemon_restart = daemon_restart.map(event_handler::DaemonRestartState::new);
+
+    // PR 4 Phase D: resolve the profile once and reuse it for the
+    // session-pinned inventory build (Phase C) and the per-spawn
+    // provenance context (Phase D). `effective_policy_for_session`
+    // reads the config from disk each call, so we cache it here.
+    let session_policy = effective_policy_for_session(session);
+    let expanded_routine_exec_roots: Vec<String> = session_policy
+        .as_ref()
+        .map(|p| p.merged_profile.expand_routine_exec_roots())
+        .unwrap_or_default();
+    // Fix #2: profile-declared scratch_roots, expanded at session start. Writes
+    // under these are exempt from the rate-limit burst counter (only) so the
+    // tool's XDG-cache churn doesn't queue routine work.
+    let expanded_scratch_roots: Vec<String> = session_policy
+        .as_ref()
+        .map(|p| p.merged_profile.expand_scratch_roots())
+        .unwrap_or_default();
+    // PR 5 Phase C: lift the resolved profile's local_listener_policy
+    // out of the same effective-policy lookup so the loop context can
+    // serve `match_listener_policy` on every NetListen evaluation.
+    let session_local_listener_policy: Vec<crate::profiles::LocalListenerEntry> = session_policy
+        .as_ref()
+        .map(|p| p.merged_profile.local_listener_policy.clone())
+        .unwrap_or_default();
+    // PR 6 Phase C: namespace_users — canonical paths of binaries
+    // permitted to invoke unshare(2) / setns(2) silently when
+    // spawned from a routine_exec_root. Defaults to empty when no
+    // profile is resolved.
+    let session_namespace_users: Vec<String> = session_policy
+        .as_ref()
+        .map(|p| p.merged_profile.namespace_users.clone())
+        .unwrap_or_default();
 
     let loop_ctx = SupervisorLoopContext {
         proxy: &proxy,
@@ -238,28 +277,210 @@ pub async fn run_supervisor_loop(
         daemon_restart,
         persist_local_reputation,
         session_sync,
+        routine_exec_roots: expanded_routine_exec_roots.clone(),
+        scratch_roots: expanded_scratch_roots,
+        local_listener_policy: session_local_listener_policy,
+        namespace_users: session_namespace_users,
+        // The supervised tool is spawned as a child of this process and
+        // inherits its cwd, so the supervisor's cwd at session start is the
+        // project root the tool was pointed at — the mass-destruction signal's
+        // in-tree boundary.
+        working_root: std::env::current_dir().ok(),
+        mass_destruction: std::sync::Mutex::new(
+            mass_destruction::MassDestructionTracker::with_defaults(),
+        ),
     };
 
+    // PR 1 Phase F: sweep stale per-session state from any crashed previous
+    // session. Anything in `SessionStateRegistry` whose `last_seen` is older
+    // than the threshold below is evicted from the registry AND from every
+    // scoping filter (taint, rate_limit, behavioural). This is the
+    // crash-recovery counterpart to the session-end hook further down.
+    //
+    // The 60-second threshold matches the digest-item sweep window noted in
+    // MEMORY.md; keep them in sync if either is tuned.
+    {
+        use grith_proxy::session_state::SessionStateRegistry;
+        const STALE_THRESHOLD: Duration = Duration::from_secs(60);
+        let cutoff = std::time::Instant::now() - STALE_THRESHOLD;
+        let stale = SessionStateRegistry::global().snapshot_stale(cutoff);
+        if !stale.is_empty() {
+            let mut total_removed = 0usize;
+            for (stale_scope, _last_seen) in &stale {
+                total_removed += proxy.evict_session_state(*stale_scope);
+            }
+            tracing::info!(
+                stale_scopes = stale.len(),
+                filter_entries_removed = total_removed,
+                "session-start sweep evicted stale per-session state",
+            );
+        }
+    }
+
+    // PR 1 Phase G: structured session-lifecycle event. Emitted at the
+    // top of the supervisor loop alongside the human-readable "supervisor
+    // loop started" log so audit pipelines that filter on `event` get a
+    // typed marker, and the legacy text log still surfaces in tail-style
+    // log readers.
+    //
+    // `session_start` measures the *supervision* lifetime — from the point
+    // the event loop is ready to handle syscalls — not wall-clock from
+    // `grith exec` invocation. The pre-loop setup (Phase F stale sweep,
+    // DNS seeding, etc.) is deliberately excluded so `duration_secs` in
+    // `event = "session_end"` reflects how long the supervised tool ran
+    // under supervision, not startup overhead.
+    let scope = grith_proxy::types::SessionScopeKey::from_session_id(session.id);
+    let session_start = std::time::Instant::now();
+    // PR 5 Phase D: probe whether the kernel ptrace policy will let
+    // us rewrite a tracee's sockaddr at bind() entry-stop. Logged on
+    // every session start so operators can audit whether the clamp
+    // feature is usable in this environment. When false, every
+    // `allow_clamp = true` entry effectively downgrades to
+    // `allow_clamp = false` (egress_policy still queues wildcard
+    // binds even when declared).
+    let clamp_available = crate::platform::linux::clamp::clamp_capability_available();
     tracing::info!(
+        event = "session_start",
         session_id = %session.id,
+        scope = %scope,
         tool = %session.tool_name,
+        profile = session.profile_name.as_deref().unwrap_or(""),
         root_pid = session.root_pid,
-        "supervisor loop started"
+        listener_clamp_available = clamp_available,
+        "supervisor session started",
     );
+    log_session_lifecycle_audit(
+        &loop_ctx,
+        session,
+        "session_start",
+        serde_json::json!({
+            "scope": scope.to_string(),
+            "tool": &session.tool_name,
+            "profile": session.profile_name.as_deref().unwrap_or(""),
+            "root_pid": session.root_pid,
+            "listener_clamp_available": clamp_available,
+        }),
+        "supervisor session started",
+    )
+    .await;
+
+    // PR 4 Phase C: build the session-pinned binary inventory.
+    //
+    // Walks every binary under the profile's expanded `routine_exec_roots`,
+    // computes SHA-256 and ownership/permission safety, and installs the
+    // immutable snapshot on the proxy's `SessionState`. Phase D's routine
+    // signal will reject any spawn target whose canonical path either isn't
+    // in this inventory or whose hash drifts mid-session.
+    //
+    // Run via `spawn_blocking` so the FS walk + hashing doesn't stall the
+    // Tokio runtime. We intentionally do NOT await this future — the
+    // inventory is `OnceLock`-installed so a slow walk on rotational disk
+    // can finish in the background and start protecting later spawns
+    // without blocking session start. Phase D treats "inventory not yet
+    // installed" as "no routine signal" (fail-closed), so the only
+    // observable effect of a late install is a small window of routine
+    // spawns scoring `+1.0` instead of `+0.5`.
+    {
+        let expanded_roots = expanded_routine_exec_roots.clone();
+        if !expanded_roots.is_empty() {
+            // Wrap the blocking walk in `tokio::spawn` + `.await` so a
+            // panic inside the closure is surfaced via the join error
+            // rather than being silently lost. Phase D fails closed when
+            // the inventory is missing, so a panic just means "no routine
+            // signal this session" — visible in logs as an `error!`.
+            let inventory_sink_for_push = inventory_sink.clone();
+            tokio::spawn(async move {
+                let join = tokio::task::spawn_blocking(move || {
+                    use grith_proxy::session_state::SessionStateRegistry;
+                    let inventory =
+                        crate::provenance::build_session_pinned_inventory(&expanded_roots);
+                    let state = SessionStateRegistry::global().get_or_create(scope);
+                    tracing::info!(
+                        event = "session_pinned_inventory_built",
+                        scope = %scope,
+                        binaries_pinned = inventory.len(),
+                        total_scanned = inventory.total_scanned,
+                        truncated = inventory.truncated,
+                        "session-pinned binary inventory installed",
+                    );
+                    state.set_pinned_inventory(inventory.clone());
+                    inventory
+                })
+                .await;
+                match join {
+                    Ok(inventory) => {
+                        // Push to the daemon (if configured) so the
+                        // dashboard's /api/inventory endpoint, which
+                        // reads from the daemon's per-process registry,
+                        // can render this session. Failures are
+                        // non-fatal: the local registry is already
+                        // populated and the proxy reads from there.
+                        if let Some(sink) = inventory_sink_for_push {
+                            if let Err(e) = sink.install(scope, inventory).await {
+                                tracing::warn!(
+                                    scope = %scope,
+                                    error = %e,
+                                    "inventory IPC push to daemon failed; dashboard view will be unavailable",
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            scope = %scope,
+                            error = %err,
+                            "session-pinned inventory build panicked or was cancelled",
+                        );
+                    }
+                }
+            });
+        }
+    }
 
     let save_interval =
         Duration::from_secs(config.reputation_config.save_interval_seconds().max(30));
     let mut reputation_save_timer = tokio::time::interval(save_interval);
     reputation_save_timer.tick().await; // consume the first immediate tick
 
+    // Wedge-detection watchdog: every WATCHDOG_INTERVAL seconds, scan
+    // supervised tracees for ones that have been in ptrace_stop for
+    // longer than WATCHDOG_THRESHOLD without producing any event.
+    //
+    // Observation-only: surfaces wedges via a tracing::warn! + a
+    // forensic audit row, but does NOT release the tracee. Masking the
+    // wedge would also mask whichever code path failed to release it,
+    // which is the bug we want to find.
+    const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+    const WATCHDOG_THRESHOLD: Duration = Duration::from_secs(30);
+    let mut watchdog_timer = tokio::time::interval(WATCHDOG_INTERVAL);
+    watchdog_timer.tick().await; // consume the first immediate tick
+
     loop {
+        // Force a cooperative yield each iteration so the runtime can
+        // tick its time wheel and poll other tasks. Without this, when
+        // `next_event` is always immediately ready (steady-state heavy
+        // build load), the main loop never suspends, the runtime never
+        // advances time, and timer-based work — including the wedge
+        // watchdog, reputation_save_timer, and tokio::time::Instant —
+        // never fires. The pre-eda4981 audit_sink.log path used to
+        // yield naturally via `spawn_blocking + .await`; the async
+        // writer replaced that with `try_send`, removing the implicit
+        // yield. This re-adds it explicitly.
+        tokio::task::yield_now().await;
+
         // ---- Select: shutdown signal vs. syscall event vs. DNS query vs. periodic save ----
         enum LoopEvent {
             Shutdown,
             Syscall(SyscallEvent),
-            Done,
+            /// Supervised tool exited cleanly (interceptor returned `Ok(None)`).
+            ChildExit,
+            /// Interceptor returned an error mid-loop; the session ends but
+            /// distinctly from a clean child exit.
+            InterceptorError,
             DnsQuery(crate::dns_proxy::DnsQueryEvent),
             ReputationSave,
+            /// Watchdog tick — scan for wedged tracees.
+            WedgeScan,
         }
 
         let loop_event = tokio::select! {
@@ -267,14 +488,14 @@ pub async fn run_supervisor_loop(
             result = interceptor.next_event() => {
                 match result {
                     Ok(Some(ev)) => LoopEvent::Syscall(ev),
-                    Ok(None) => LoopEvent::Done,
+                    Ok(None) => LoopEvent::ChildExit,
                     Err(e) => {
                         tracing::info!(
                             session_id = %session.id,
                             error = %e,
                             "interceptor ended, exiting supervisor loop"
                         );
-                        LoopEvent::Done
+                        LoopEvent::InterceptorError
                     }
                 }
             }
@@ -292,6 +513,7 @@ pub async fn run_supervisor_loop(
                 }
             }
             _ = reputation_save_timer.tick() => LoopEvent::ReputationSave,
+            _ = watchdog_timer.tick() => LoopEvent::WedgeScan,
         };
 
         match loop_event {
@@ -302,15 +524,24 @@ pub async fn run_supervisor_loop(
                 if let Err(e) = interceptor.detach_all().await {
                     tracing::warn!(error = %e, "error during detach_all on shutdown");
                 }
+                evict_session_state_on_end(&loop_ctx, session, session_start, "shutdown").await;
                 return Ok(());
             }
-            LoopEvent::Done => {
+            LoopEvent::ChildExit => {
                 save_reputation(&loop_ctx);
                 log_final_stats(session);
                 tracing::info!(
                     session_id = %session.id,
                     "all supervised processes exited, ending supervisor loop"
                 );
+                evict_session_state_on_end(&loop_ctx, session, session_start, "child_exit").await;
+                return Ok(());
+            }
+            LoopEvent::InterceptorError => {
+                save_reputation(&loop_ctx);
+                log_final_stats(session);
+                evict_session_state_on_end(&loop_ctx, session, session_start, "interceptor_error")
+                    .await;
                 return Ok(());
             }
             LoopEvent::ReputationSave => {
@@ -324,7 +555,91 @@ pub async fn run_supervisor_loop(
                 event_handler::handle_dns_query_event(session, &loop_ctx, query_event).await;
                 sync_session_state(session, &loop_ctx).await;
             }
+            LoopEvent::WedgeScan => {
+                let wedged = interceptor.wedge_scan(WATCHDOG_THRESHOLD);
+                if !wedged.is_empty() {
+                    event_handler::report_wedged_tracees(session, &loop_ctx, &wedged).await;
+                }
+            }
         }
+    }
+}
+
+/// PR 1 Phase F: drop this session's per-scope filter state and
+/// `SessionStateRegistry` entry. Called from both Shutdown and Done exit
+/// branches of `run_supervisor_loop` so the next session starts cold even
+/// when the current one ended cleanly. The crash case is handled by the
+/// session-start stale-sweep at the top of `run_supervisor_loop`.
+///
+/// PR 1 Phase G: also emits a structured `event = "session_end"` line
+/// carrying duration, `containment_triggered`, and the eviction count.
+/// The eviction count is filters-only; the `SessionStateRegistry` entry
+/// is read for `containment_triggered` *before* eviction so we can
+/// report whether the session ever activated containment.
+async fn evict_session_state_on_end(
+    loop_ctx: &event_handler::SupervisorLoopContext<'_>,
+    session: &SupervisorSession,
+    session_start: std::time::Instant,
+    reason: &'static str,
+) {
+    let session_id = session.id;
+    let scope = grith_proxy::types::SessionScopeKey::from_session_id(session_id);
+    let containment_triggered =
+        grith_proxy::session_state::SessionStateRegistry::global().is_containment_active(scope);
+    let removed = loop_ctx.proxy.evict_session_state(scope);
+    let duration_secs = session_start.elapsed().as_secs_f64();
+    tracing::info!(
+        event = "session_end",
+        session_id = %session_id,
+        scope = %scope,
+        reason,
+        duration_secs,
+        containment_triggered,
+        filter_entries_removed = removed,
+        "supervisor session ended",
+    );
+    log_session_lifecycle_audit(
+        loop_ctx,
+        session,
+        "session_end",
+        serde_json::json!({
+            "scope": scope.to_string(),
+            "reason": reason,
+            "duration_secs": duration_secs,
+            "containment_triggered": containment_triggered,
+            "filter_entries_removed": removed,
+        }),
+        "supervisor session ended",
+    )
+    .await;
+}
+
+async fn log_session_lifecycle_audit(
+    loop_ctx: &event_handler::SupervisorLoopContext<'_>,
+    session: &SupervisorSession,
+    event_name: &str,
+    arguments: serde_json::Value,
+    reason: &str,
+) {
+    let mut record = AuditRecord::new(
+        session.id,
+        "supervisor".into(),
+        event_name.into(),
+        &arguments,
+        0.0,
+        ProxyActionSummary::Allow,
+        Vec::new(),
+        0.0,
+        Some(reason.into()),
+    )
+    .with_supervisor_source(session.tool_name.clone(), session.root_pid);
+    record.execution_result = Some(reason.into());
+    if let Err(e) = loop_ctx.audit_sink.log(record).await {
+        tracing::error!(
+            error = %e,
+            event = event_name,
+            "failed to log supervisor lifecycle audit event"
+        );
     }
 }
 
@@ -529,9 +844,6 @@ mod tests {
         let scoring = ScoringConfig {
             auto_allow_threshold: 3.0,
             auto_deny_threshold: 8.0,
-            cold_start_calls: 0,
-            cold_start_escalation_low: 2.0,
-            cold_start_escalation_high: 10.0,
         };
         Arc::new(SecurityProxy::new(
             registry,
@@ -672,6 +984,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .await;
@@ -767,6 +1080,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .await;
@@ -831,6 +1145,7 @@ mod tests {
                 None,
                 &[],
                 std::collections::HashSet::new(),
+                None,
                 None,
                 None,
                 None,
@@ -916,6 +1231,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .await;
@@ -980,6 +1296,7 @@ mod tests {
                 None,
                 &[],
                 std::collections::HashSet::new(),
+                None,
                 None,
                 None,
                 None,

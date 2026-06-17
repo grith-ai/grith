@@ -19,7 +19,7 @@ struct FiltersOutput {
 
 #[derive(Serialize)]
 struct FilterEntry {
-    /// Stable ordinal — the canonical filter number (1..=17) used in docs.
+    /// Stable ordinal — the canonical filter number (1..=18) used in docs.
     ordinal: u32,
     /// Module file name (e.g. "operation_risk").
     module: String,

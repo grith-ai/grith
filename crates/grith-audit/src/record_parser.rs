@@ -3,10 +3,47 @@
 
 //! Shared SQLite row-to-record deserialization used by storage and query modules.
 
-use crate::types::{AuditRecord, FilterResultSummary, ProxyActionSummary};
+use crate::types::{AuditRecord, FilterResultSummary, ProxyActionSummary, RecordType};
 use chrono::{DateTime, Utc};
+use rusqlite::types::ValueRef;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Read a column whose stored form may be either TEXT (legacy plaintext)
+/// or BLOB (zstd-compressed payload written post-Stage 3). rusqlite's
+/// `Vec<u8>` extractor only accepts BLOB cells; this helper reads the
+/// underlying bytes for either type so the downstream decompressor can
+/// run unchanged.
+fn read_text_or_blob(
+    row: &rusqlite::Row,
+    name: &str,
+) -> std::result::Result<Vec<u8>, crate::error::Error> {
+    match row.get_ref(name)? {
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Ok(bytes.to_vec()),
+        ValueRef::Null => Err(crate::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("audit column {name} was unexpectedly NULL"),
+        ))),
+        other => Err(crate::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("audit column {name} had unexpected type {other:?}"),
+        ))),
+    }
+}
+
+fn read_text_or_blob_opt(
+    row: &rusqlite::Row,
+    name: &str,
+) -> std::result::Result<Option<Vec<u8>>, crate::error::Error> {
+    match row.get_ref(name)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Ok(Some(bytes.to_vec())),
+        other => Err(crate::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("audit column {name} had unexpected type {other:?}"),
+        ))),
+    }
+}
 
 /// Parse a SQLite row into an [`AuditRecord`].
 ///
@@ -22,7 +59,12 @@ pub(crate) fn row_to_record(
     let id_str: String = row.get("id")?;
     let timestamp_str: String = row.get("timestamp")?;
     let session_str: String = row.get("session_id")?;
-    let filter_results_json: String = row.get("filter_results")?;
+    // Stage 3: the three big JSON columns are read via TEXT-or-BLOB
+    // because legacy rows wrote them as TEXT and post-Stage-3 rows write
+    // them as BLOB (zstd magic prefix). `decompress_string` sniffs the
+    // magic and falls back to UTF-8 for plaintext.
+    let filter_results_blob = read_text_or_blob(row, "filter_results")?;
+    let filter_results_json = crate::compression::decompress_string(&filter_results_blob)?;
 
     let proxy_action_str: String = row.get("proxy_action")?;
     let proxy_action = match proxy_action_str.as_str() {
@@ -41,7 +83,11 @@ pub(crate) fn row_to_record(
 
     let filter_results: Vec<FilterResultSummary> = serde_json::from_str(&filter_results_json)?;
 
-    let filter_scores_json: Option<String> = row.get("filter_scores")?;
+    let filter_scores_blob = read_text_or_blob_opt(row, "filter_scores")?;
+    let filter_scores_json = filter_scores_blob
+        .as_deref()
+        .map(crate::compression::decompress_string)
+        .transpose()?;
     let filter_scores: Option<HashMap<String, f64>> = filter_scores_json
         .map(|json| serde_json::from_str(&json))
         .transpose()?;
@@ -77,7 +123,10 @@ pub(crate) fn row_to_record(
         session_id,
         plugin_id: row.get("plugin_id")?,
         tool_call_type: row.get("tool_call_type")?,
-        arguments_summary: row.get("arguments_summary")?,
+        arguments_summary: {
+            let blob = read_text_or_blob(row, "arguments_summary")?;
+            crate::compression::decompress_string(&blob)?
+        },
         arguments_hash: row.get("arguments_hash")?,
         composite_score: row.get("composite_score")?,
         proxy_action,
@@ -89,6 +138,9 @@ pub(crate) fn row_to_record(
         source: row.get("source")?,
         supervised_tool: row.get("supervised_tool")?,
         supervised_pid: row.get("supervised_pid")?,
+        // `try_get` so a record loaded from a pre-migration snapshot (no
+        // column) round-trips with None instead of erroring.
+        project_name: row.get::<_, Option<String>>("project_name").ok().flatten(),
         correlation_id,
         record_hash: row.get("record_hash")?,
         prev_hash: row.get("prev_hash")?,
@@ -98,5 +150,37 @@ pub(crate) fn row_to_record(
         prompt_tokens: prompt_tokens.map(|v| v as usize),
         completion_tokens: completion_tokens.map(|v| v as usize),
         estimated_cost_usd: row.get("estimated_cost_usd")?,
+        // PR 4 Phase F: routine-spawn forensic fields. `try_get` so a
+        // record loaded from a pre-Phase-F snapshot (no columns) still
+        // round-trips with None instead of erroring.
+        spawn_sha256: row.get::<_, Option<String>>("spawn_sha256").ok().flatten(),
+        matched_routine_root: row
+            .get::<_, Option<String>>("matched_routine_root")
+            .ok()
+            .flatten(),
+        shadow_phase3_filters: row
+            .get::<_, Option<String>>("shadow_phase3_filters")
+            .ok()
+            .flatten(),
+        // PR 5 Phase E: listener-rewrite forensic fields. Same
+        // try_get pattern as the Phase F fields above so pre-Phase-E
+        // snapshots round-trip with None.
+        original_addr: row.get::<_, Option<String>>("original_addr").ok().flatten(),
+        rewritten_addr: row
+            .get::<_, Option<String>>("rewritten_addr")
+            .ok()
+            .flatten(),
+        clamp_profile_entry: row
+            .get::<_, Option<String>>("clamp_profile_entry")
+            .ok()
+            .flatten(),
+        // Compact-record classification. Older rows without the column
+        // round-trip as `Full` thanks to `RecordType::default()`.
+        record_type: row
+            .get::<_, Option<String>>("record_type")
+            .ok()
+            .flatten()
+            .map(|s| RecordType::from_str_lenient(&s))
+            .unwrap_or_default(),
     })
 }

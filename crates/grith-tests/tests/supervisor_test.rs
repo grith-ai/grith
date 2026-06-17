@@ -527,6 +527,8 @@ fn all_security_relevant_syscalls_map_or_filter() {
                 address: "0.0.0.0".into(),
                 port: 8080,
                 protocol: NetProtocol::Tcp,
+                sockaddr_ptr: None,
+                addrlen: None,
             },
             Some("NetListen"),
         ),

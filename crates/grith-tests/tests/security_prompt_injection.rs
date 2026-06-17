@@ -20,9 +20,6 @@ fn strict_scoring() -> ScoringConfig {
     ScoringConfig {
         auto_allow_threshold: 1.5,
         auto_deny_threshold: 8.0,
-        cold_start_calls: 0, // Skip cold start for predictable thresholds
-        cold_start_escalation_low: 1.0,
-        cold_start_escalation_high: 10.0,
     }
 }
 

@@ -135,6 +135,10 @@ pub(crate) async fn get_tier(State(state): State<AppState>) -> impl IntoResponse
         Ok(s) => Some((*s).clone()),
         Err(_) => None,
     };
+    // Rolling 7-day count of session-limit (429) rejections — powers the
+    // dashboard upgrade nudge. Read-only; does not record a new rejection.
+    let session_limit_rejections =
+        crate::count_recent_session_limit_rejections(&state.session_limit_rejections);
     Json(serde_json::json!({
         "tier": tier,
         "seats": seats,
@@ -143,6 +147,8 @@ pub(crate) async fn get_tier(State(state): State<AppState>) -> impl IntoResponse
         "billing_portal_url": state.billing_portal_url,
         "features": features,
         "refresh": refresh_snapshot,
+        "session_limit_rejections": session_limit_rejections,
+        "session_limit_rejection_window_days": crate::SESSION_LIMIT_REJECTION_WINDOW_DAYS,
     }))
 }
 

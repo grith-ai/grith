@@ -13,6 +13,7 @@ use grith_proxy::filters::behavioural::BehaviouralFilter;
 use grith_proxy::filters::canary::{CanaryFilter, CanaryRegistry};
 use grith_proxy::filters::capability::CapabilityFilter;
 use grith_proxy::filters::command::CommandFilter;
+use grith_proxy::filters::destructive_action::DestructiveActionFilter;
 use grith_proxy::filters::dlp_gate::{DlpGateFilter, DlpRedactor};
 use grith_proxy::filters::egress_policy::EgressPolicyFilter;
 use grith_proxy::filters::egress_rate::{EgressRateConfig, EgressRateFilter};
@@ -29,7 +30,7 @@ use grith_proxy::meta_rules::MetaRuleEngine;
 use std::sync::Arc;
 
 use super::config_loader;
-use crate::config::FilterGroupConfig;
+use crate::config::{FilterGroupConfig, ProxyConfig};
 
 /// Build the complete security filter registry with all phases.
 ///
@@ -38,7 +39,7 @@ use crate::config::FilterGroupConfig;
 /// subsystems beyond the proxy itself.
 ///
 pub(crate) fn build_filter_registry_with_config_result(
-    filter_cfg: &FilterGroupConfig,
+    proxy_cfg: &ProxyConfig,
 ) -> Result<
     (
         FilterRegistry,
@@ -48,10 +49,16 @@ pub(crate) fn build_filter_registry_with_config_result(
     ),
     crate::error::Error,
 > {
+    let filter_cfg: &FilterGroupConfig = &proxy_cfg.filters;
     let mut registry = FilterRegistry::new();
 
     // Phase 1 (Static)
-    registry.register(Box::new(OperationRiskFilter::new()));
+    // PR 4 Phase H: pass the routine_provenance_signal config flag.
+    // Default is false until operators flip it via `proxy.spawn.
+    // routine_provenance_signal = true`. See PR 4 work-doc rollout.
+    registry.register(Box::new(OperationRiskFilter::with_routine_signal(
+        proxy_cfg.spawn.routine_provenance_signal,
+    )));
     registry.register(Box::new(PathMatchFilter::new(
         config_loader::load_path_rules()?,
     )));
@@ -98,6 +105,12 @@ pub(crate) fn build_filter_registry_with_config_result(
 
     registry.register(Box::new(SecretScanFilter::new(secret_filter?)));
     registry.register(Box::new(CommandFilter::new(command_filter?)));
+    // Work item 68: destructive-action coverage. Default-on; hard-denies
+    // catastrophic host/storage destruction and escalates
+    // destructive-against-production to DENY.
+    if proxy_cfg.destructive_action.enabled {
+        registry.register(Box::new(DestructiveActionFilter::new()));
+    }
     let egress_config = egress_config?;
     if egress_config.enabled {
         registry.register(Box::new(EgressPolicyFilter::from_config(egress_config)));
@@ -120,10 +133,21 @@ pub(crate) fn build_filter_registry_with_config_result(
         registry.register(Box::new(ReputationFilter::new(malicious, safe)));
     }
     if filter_cfg.behavioural.enabled {
-        registry.register(Box::new(BehaviouralFilter::new(20)));
+        // PR 69 Change 1: honour the operator-supplied min_calls_for_baseline
+        // and deviation scores from `[proxy.filters.behavioural]` instead
+        // of the previous hard-coded `BehaviouralFilter::new(20)`.
+        registry.register(Box::new(BehaviouralFilter::from_config(
+            &filter_cfg.behavioural.to_proxy_config(),
+        )));
     }
     if filter_cfg.taint.enabled {
-        registry.register(Box::new(TaintFilter::with_defaults()));
+        registry.register(Box::new(
+            TaintFilter::with_defaults()
+                .with_spawn_data_flow_only(proxy_cfg.spawn.taint_data_flow_only)
+                .with_outbound_taint_requires_data_flow(
+                    proxy_cfg.spawn.taint_outbound_requires_data_flow,
+                ),
+        ));
     }
     let containment_config = config_loader::load_session_containment_config()?;
     let containment_tracker =
@@ -135,7 +159,13 @@ pub(crate) fn build_filter_registry_with_config_result(
             Arc::new(ContainmentTracker::with_defaults())
         };
     if filter_cfg.rate_limit.enabled {
-        registry.register(Box::new(RateLimitFilter::with_defaults()));
+        // Default is false until operators flip it via `proxy.rate_limit.
+        // risk_gated_burst` — and only after the target-aware delete-spread
+        // signal lands (see work/futurework/rate-limit-burst-redesign.md).
+        registry.register(Box::new(
+            RateLimitFilter::with_defaults()
+                .with_risk_gated_burst(proxy_cfg.rate_limit.risk_gated_burst),
+        ));
     }
     let egress_rate_config = EgressRateConfig::default();
     if egress_rate_config.enabled && filter_cfg.egress.enabled {

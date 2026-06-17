@@ -103,6 +103,9 @@ fn make_state() -> AppState {
         sync_api_key: None,
         sync_api_base_url: None,
         ipc_token: String::new(),
+        dashboard_token: String::new(),
+        dashboard_pair_code: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        session_limit_rejections: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         reputation_config: grith_proxy::reputation::ReputationConfig::default(),
     }
 }

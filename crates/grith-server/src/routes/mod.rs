@@ -8,10 +8,14 @@ mod audit;
 mod audit_ipc;
 mod canary;
 mod config;
+mod dashboard_pair;
 mod digest;
 mod digest_ipc;
 mod events;
 mod health;
+mod inventory;
+mod inventory_ipc;
+mod listener_rewrites;
 mod notifications;
 mod policies;
 mod proxy;
@@ -140,20 +144,17 @@ pub(crate) fn require_feature(
 
 // --- Sub-routers for per-bucket rate limiting ---
 
-/// Read-only / high-volume GET endpoints plus event ingestion.
-pub fn general_routes() -> Router<AppState> {
+/// Low-sensitivity status / liveness GET endpoints that stay open even when a
+/// dashboard token is configured (item 4 two-tier read gating). These reveal
+/// no user activity, tool-call content, secrets, or session/process data —
+/// only operational status — so zero-config scripting (health checks, tier
+/// probes) keeps working without a token.
+pub fn open_read_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health::health))
         .route("/tier", get(health::get_tier))
         .route("/license/status", get(health::get_license_status))
-        .route("/digest", get(digest::list_digest))
-        .route("/canaries", get(canary::list_canaries))
-        .route("/audit", get(audit::list_audit))
-        .route("/audit/export", get(audit::export_audit))
-        .route("/audit/exfil-stats", get(audit::exfil_stats))
-        .route("/audit/:id", get(audit::get_audit))
         .route("/proxy/status", get(proxy::proxy_status))
-        .route("/config", get(config::get_config))
         .route(
             "/notifications/channels",
             get(notifications::list_notification_channels),
@@ -162,25 +163,43 @@ pub fn general_routes() -> Router<AppState> {
             "/notifications/status",
             get(notifications::notification_status),
         )
-        .route(
-            "/analytics/summary",
-            get(analytics::analytics_summary),
-        )
+        .route("/sync/status", get(sync::sync_status))
+}
+
+/// Sensitive GET endpoints gated behind the dashboard token when one is
+/// configured (item 4). These expose tool-call arguments (paths/commands/
+/// possible secrets), queued decisions, canary token values, session/process
+/// metadata, security configuration, and activity analytics — none of which
+/// should be readable by another local user (who cannot read the 0600 token
+/// file) or a tokenless browser tab.
+pub fn sensitive_read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/digest", get(digest::list_digest))
+        .route("/canaries", get(canary::list_canaries))
+        .route("/audit", get(audit::list_audit))
+        .route("/audit/export", get(audit::export_audit))
+        .route("/audit/exfil-stats", get(audit::exfil_stats))
+        .route("/audit/:id", get(audit::get_audit))
+        .route("/config", get(config::get_config))
+        .route("/analytics/summary", get(analytics::analytics_summary))
         .route("/analytics/cost", get(analytics::analytics_cost))
-        .route(
-            "/analytics/activity",
-            get(analytics::analytics_activity),
-        )
+        .route("/analytics/activity", get(analytics::analytics_activity))
         .route(
             "/analytics/compliance",
             get(analytics::analytics_compliance),
         )
         .route("/policies", get(policies::list_policies))
         .route("/policies/:name", get(policies::get_policy))
-        .route("/sync/status", get(sync::sync_status))
         .route("/sync/configs", get(sync::list_synced_configs))
-        // Event ingestion is POST but high-volume — group with general.
-        .route("/events", post(events::ingest_event))
+        // PR 4 Phase G: session-pinned binary inventory ("binaries
+        // trusted this session" dashboard view).
+        .route("/inventory/:session_id", get(inventory::get_inventory))
+        // PR 5 Phase E: per-session listener rewrites — every
+        // wildcard → loopback clamp the supervisor performed.
+        .route(
+            "/sessions/:session_id/listener-rewrites",
+            get(listener_rewrites::get_listener_rewrites),
+        )
 }
 
 /// IPC endpoints used by trusted local daemon clients.
@@ -199,6 +218,10 @@ pub fn ipc_routes() -> Router<AppState> {
         .route("/proxy/evaluate", post(proxy_ipc::evaluate_proxy))
         .route("/proxy/status/full", get(proxy_ipc::proxy_status_full))
         .route("/ipc/audit/ingest", post(audit_ipc::ingest_audit))
+        .route(
+            "/ipc/inventory/install",
+            post(inventory_ipc::install_inventory),
+        )
         .route("/ipc/digest/items", post(digest_ipc::enqueue_digest))
         .route("/ipc/digest/items/:id", get(digest_ipc::get_digest))
         .route(
@@ -208,15 +231,32 @@ pub fn ipc_routes() -> Router<AppState> {
         .route("/ipc/digest/expire", post(digest_ipc::expire_digest))
         .route("/ipc/sessions", get(session_ipc::list_sessions))
         .route("/ipc/sessions", post(session_ipc::register_session))
+        .route("/ipc/sessions-prune", post(session_ipc::prune_sessions))
         .route("/ipc/sessions/:id", get(session_ipc::get_session))
         .route("/ipc/sessions/:id", put(session_ipc::update_session))
         .route("/ipc/sessions/:id", delete(session_ipc::unregister_session))
         .route("/ipc/sessions/:id/kill", post(session_ipc::kill_session))
         .route("/ipc/events", post(events::ingest_event))
+        .route(
+            "/ipc/dashboard/pair-code",
+            post(dashboard_pair::mint_pair_code),
+        )
 }
 
-/// Mutation endpoints (POST/PUT/DELETE) except proxy test.
-pub fn write_routes() -> Router<AppState> {
+/// Browser-facing dashboard mutations (POST/PUT/DELETE).
+///
+/// Every route here is driven by the dashboard SPA and must carry the
+/// dashboard CSRF header (see [`crate::csrf`]). Routes with their own auth
+/// proof — the webhook callback (nonce) and server shutdown (IPC bearer) —
+/// live in [`protected_write_routes`] so the CSRF layer is never applied to
+/// them.
+///
+/// Live-event *injection* is deliberately absent: the dashboard SPA only
+/// *receives* events (over the WebSocket), it never posts them. Both machine
+/// callers (the agent loop and the supervisor) ingest via the bearer-authed
+/// `/ipc/events` route in [`ipc_routes`], so there is no open browser-facing
+/// event-injection endpoint at all.
+pub fn dashboard_write_routes() -> Router<AppState> {
     Router::new()
         .route("/digest/:id/approve", post(digest::approve_digest))
         .route("/digest/:id/deny", post(digest::deny_digest))
@@ -234,10 +274,6 @@ pub fn write_routes() -> Router<AppState> {
             "/digest/:id/allow-always",
             post(digest::allow_always_digest),
         )
-        .route(
-            "/digest/:id/webhook-review",
-            post(digest::webhook_review_digest),
-        )
         .route("/canaries", post(canary::add_canary))
         .route("/canaries/:id", delete(canary::remove_canary))
         .route("/canaries/:id/rotate", post(canary::rotate_canary))
@@ -250,7 +286,27 @@ pub fn write_routes() -> Router<AppState> {
         .route("/policies/:name", put(policies::update_policy))
         .route("/policies/:name", delete(policies::delete_policy))
         .route("/sync/apply", post(sync::apply_synced_configs))
+}
+
+/// Mutating routes that carry their own non-CSRF authentication and therefore
+/// must **not** receive the dashboard CSRF layer:
+///
+/// - `/digest/:id/webhook-review` — external review callback, authenticated by
+///   a single-use nonce embedded in the webhook URL.
+/// - `/server/shutdown` — IPC bearer token via the `IpcAuth` extractor.
+/// - `/dashboard/pair` — single-use pairing code in the body (the browser
+///   bootstrap; must NOT require the dashboard token, which it hands out).
+///
+/// These share the write rate-limit bucket but are wired separately in
+/// [`crate::GrithServer::build_router`].
+pub fn protected_write_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/digest/:id/webhook-review",
+            post(digest::webhook_review_digest),
+        )
         .route("/server/shutdown", post(server::shutdown_server))
+        .route("/dashboard/pair", post(dashboard_pair::redeem_pair_code))
 }
 
 /// Proxy dry-run endpoint (separate bucket).
@@ -265,8 +321,10 @@ pub fn proxy_test_routes() -> Router<AppState> {
 /// Composes the three sub-routers into a single router. Kept for backward
 /// compatibility with existing tests that mount `api_router()` directly.
 pub fn api_router() -> Router<AppState> {
-    general_routes()
-        .merge(write_routes())
+    open_read_routes()
+        .merge(sensitive_read_routes())
+        .merge(dashboard_write_routes())
+        .merge(protected_write_routes())
         .merge(proxy_test_routes())
 }
 
@@ -284,7 +342,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tower::util::ServiceExt;
 
-    fn make_state() -> AppState {
+    pub(crate) fn make_state() -> AppState {
         let audit = Arc::new(Mutex::new(
             grith_audit::AuditStorage::open_in_memory().unwrap(),
         ));
@@ -357,6 +415,9 @@ mod tests {
             sync_api_key: None,
             sync_api_base_url: None,
             ipc_token: String::new(),
+            dashboard_token: String::new(),
+            dashboard_pair_code: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            session_limit_rejections: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -824,6 +885,186 @@ mod tests {
             },
         ));
         state
+    }
+
+    // --- Session-limit (429) upsell + prune tests ---
+
+    fn register_body(id: uuid::Uuid, tool: &str, pid: u32) -> Body {
+        Body::from(
+            serde_json::json!({
+                "id": id.to_string(),
+                "tool_name": tool,
+                "root_pid": pid,
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_session_register_limit_returns_structured_429() {
+        let state = make_state();
+        // Force a one-session cap and use our own (live) PID so the reaper
+        // can't reclaim the slot.
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+
+        let resp1 = router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+
+        let resp2 = router
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "codex", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "session_limit_reached");
+        assert_eq!(json["tier"], "community");
+        assert_eq!(json["current_limit"], 1);
+        assert_eq!(json["active_sessions"], 1);
+        assert!(json["upgrade_url"].is_string());
+        assert!(json["message"].as_str().unwrap().contains("Community"));
+        assert!(json["remediation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "upgrade"));
+    }
+
+    #[tokio::test]
+    async fn test_session_register_limit_text_plain_fallback() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .header("accept", "text/plain")
+                    .body(register_body(uuid::Uuid::new_v4(), "codex", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        // Plain-text body is the human message, not JSON.
+        assert!(!text.trim_start().starts_with('{'));
+        assert!(text.contains("session"));
+    }
+
+    #[tokio::test]
+    async fn test_enterprise_429_has_no_upgrade_url() {
+        let state = make_enterprise_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = router
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "codex", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["tier"], "enterprise");
+        assert!(json["upgrade_url"].is_null());
+        assert!(!json["remediation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "upgrade"));
+    }
+
+    #[tokio::test]
+    async fn test_prune_sessions_endpoint() {
+        let state = make_state();
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = router
+            .oneshot(
+                Request::post("/ipc/sessions-prune")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Live PID can't be reaped, so nothing is pruned and the session remains.
+        assert_eq!(json["reaped"], 0);
+        assert_eq!(json["remaining"], 1);
     }
 
     #[tokio::test]

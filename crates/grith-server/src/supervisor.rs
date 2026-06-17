@@ -136,8 +136,13 @@ fn session_registry_view(session: &SupervisorSession) -> SupervisorSession {
         process_tree: ProcessTree::new(session.root_pid, &session.tool_name),
         started_at: session.started_at,
         last_synced_at: session.last_synced_at,
+        last_activity_at: session.last_activity_at,
         stats: session.stats.clone(),
         project_name: session.project_name.clone(),
+        cwd: session.cwd.clone(),
+        tty: session.tty.clone(),
+        wedge_reported_tids: std::collections::HashSet::new(),
+        controlling_pts: std::sync::OnceLock::new(),
     }
 }
 
@@ -265,6 +270,7 @@ async fn launch_supervisor_task(
             None, // Dashboard sessions use in-process proxy (they ARE the daemon)
             None,
             None,
+            None, // Dashboard sessions ARE the daemon; SessionStateRegistry is shared in-process
         )
         .await;
 
@@ -803,6 +809,9 @@ async fn ws_session_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Authorization (Origin-vs-Host + dashboard token) is enforced by the
+    // `ws_auth::require_ws_auth` middleware layered on this route, so an
+    // unauthorized caller cannot even reach the session-existence probe below.
     let uuid = match Uuid::parse_str(&id) {
         Ok(u) => u,
         Err(_) => {
@@ -996,6 +1005,9 @@ mod tests {
             sync_api_key: None,
             sync_api_base_url: None,
             ipc_token: String::new(),
+            dashboard_token: String::new(),
+            dashboard_pair_code: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            session_limit_rejections: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 

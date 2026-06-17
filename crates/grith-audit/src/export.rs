@@ -34,7 +34,7 @@ pub fn export_csv(records: &[AuditRecord], writer: &mut dyn Write) -> Result<()>
     // Header
     writeln!(
         writer,
-        "id,timestamp,session_id,plugin_id,tool_call_type,composite_score,proxy_action,filter_scores,evaluation_time_ms,task_context,source,supervised_tool,supervised_pid,correlation_id,record_hash,prev_hash,chain_sequence,llm_provider,llm_model,prompt_tokens,completion_tokens,estimated_cost_usd"
+        "id,timestamp,session_id,plugin_id,tool_call_type,composite_score,proxy_action,filter_scores,evaluation_time_ms,task_context,source,supervised_tool,supervised_pid,project_name,correlation_id,record_hash,prev_hash,chain_sequence,llm_provider,llm_model,prompt_tokens,completion_tokens,estimated_cost_usd"
     )?;
     for record in records {
         let filter_scores_str = record
@@ -44,7 +44,7 @@ pub fn export_csv(records: &[AuditRecord], writer: &mut dyn Write) -> Result<()>
             .unwrap_or_default();
         writeln!(
             writer,
-            "{},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.id,
             record.timestamp.to_rfc3339(),
             record.session_id,
@@ -60,6 +60,7 @@ pub fn export_csv(records: &[AuditRecord], writer: &mut dyn Write) -> Result<()>
             record
                 .supervised_pid
                 .map_or_else(String::new, |p| p.to_string()),
+            csv_escape(record.project_name.as_deref().unwrap_or("")),
             record
                 .correlation_id
                 .map_or_else(String::new, |id| id.to_string()),

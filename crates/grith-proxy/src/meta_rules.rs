@@ -111,6 +111,11 @@ impl MetaRuleEngine {
                 ToolCallType::NetListen { .. } => "NetListen",
                 ToolCallType::ProcessSpawn { .. } => "ProcessSpawn",
                 ToolCallType::DnsQuery { .. } => "DnsQuery",
+                // PR 6 Phase B: category-2 syscalls.
+                ToolCallType::OwnershipChange { .. } => "OwnershipChange",
+                ToolCallType::FilesystemMutation { .. } => "FilesystemMutation",
+                ToolCallType::CrossProcessAccess { .. } => "CrossProcessAccess",
+                ToolCallType::NamespaceOp { .. } => "NamespaceOp",
             };
             if actual_type != expected_type {
                 return false;

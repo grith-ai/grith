@@ -19,7 +19,10 @@ pub mod token;
 
 // Re-export public items so external `use crate::daemon::*` paths remain valid.
 pub use health::format_health_report;
-pub use pid::{is_dashboard_running, remove_dashboard_pid, write_dashboard_pid};
+pub use pid::{
+    dashboard_already_opened, is_dashboard_running, mark_dashboard_opened, remove_dashboard_opened,
+    remove_dashboard_pid, write_dashboard_pid,
+};
 
 use crate::config::GrithConfig;
 use crate::error::Error;
@@ -251,7 +254,19 @@ impl Daemon {
                         let backfilled = s
                             .backfill_chain_for_legacy_rows()
                             .map_err(|e| format!("backfill: {e}"))?;
-                        let repaired = s.repair_chain().map_err(|e| format!("repair: {e}"))?;
+                        // Run incremental verify first. On a clean,
+                        // already-verified DB this is sub-millisecond and
+                        // we skip repair entirely. Only fall through to
+                        // the O(n) repair walk if verify finds a break.
+                        let verification = s
+                            .incremental_verify_chain()
+                            .map_err(|e| format!("verify: {e}"))?;
+                        let repaired = match verification {
+                            grith_audit::ChainVerification::Broken { .. } => {
+                                s.repair_chain().map_err(|e| format!("repair: {e}"))?
+                            }
+                            _ => 0,
+                        };
                         Ok((backfilled, repaired))
                     }
                     Err(_) => Err("audit storage lock poisoned".to_string()),
@@ -292,15 +307,67 @@ impl Daemon {
         tracing::info!(path = %audit_db_path.display(), "audit storage initialized");
         tracing::info!(path = %digest_db_path.display(), "digest queue initialized");
 
+        // Audit retention thread — prunes the active DB to `retain_full_days`
+        // and writes archives to `<audit_dir>/cold/`. Runs once on startup,
+        // then every `prune_interval_hours`. retain_full_days = 0 disables.
+        // Plain std::thread so this works whether or not the caller has a
+        // tokio runtime at Daemon::start time (main constructs one after).
+        if config.audit.retain_full_days > 0 {
+            let storage = Arc::clone(&audit_storage);
+            let cold_dir = audit_dir.join("cold");
+            let retain_days = config.audit.retain_full_days;
+            let cold_enabled = config.audit.cold_storage_enabled;
+            let interval_hours = config.audit.prune_interval_hours;
+            // When cloud sync is on, retention must not delete rows the
+            // server hasn't acknowledged. See audit-completeness-scaling.md
+            // Stage 2 — sync-safe guard.
+            let respect_sync_state = config.general.audit_sync;
+            std::thread::Builder::new()
+                .name("grith-audit-retention".into())
+                .spawn(move || loop {
+                    let Some(cutoff) = grith_audit::retention::cutoff_for_retention(retain_days)
+                    else {
+                        return;
+                    };
+                    let outcome = match storage.lock() {
+                        Ok(mut s) => grith_audit::retention::prune_and_archive(
+                            &mut s,
+                            cutoff,
+                            &cold_dir,
+                            cold_enabled,
+                            respect_sync_state,
+                        )
+                        .map_err(|e| e.to_string()),
+                        Err(_) => Err("audit storage lock poisoned".to_string()),
+                    };
+                    match outcome {
+                        Ok(stats) if stats.archived_rows > 0 => {
+                            tracing::info!(
+                                rows = stats.archived_rows,
+                                files = stats.archive_files,
+                                max_seq = stats.max_pruned_sequence,
+                                "audit retention: pruned + archived"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "audit retention failed"),
+                    }
+                    if interval_hours == 0 {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        interval_hours.saturating_mul(3600),
+                    ));
+                })
+                .map_err(|e| Error::Config(format!("failed to spawn retention thread: {e}")))?;
+        }
+
         // 5. Initialize security proxy
         let (registry, containment_tracker, canary_registry, dlp_redactor) =
-            build_filter_registry_with_config_result(&config.proxy.filters)?;
+            build_filter_registry_with_config_result(&config.proxy)?;
         let scoring = ScoringConfig {
             auto_allow_threshold: config.proxy.auto_allow_threshold,
             auto_deny_threshold: config.proxy.auto_deny_threshold,
-            cold_start_calls: config.proxy.cold_start_calls,
-            cold_start_escalation_low: config.proxy.cold_start_escalation_low,
-            cold_start_escalation_high: config.proxy.cold_start_escalation_high,
         };
         let meta_rules = build_meta_rule_engine_result()?;
         let filter_count = registry.count();
@@ -610,6 +677,14 @@ impl Daemon {
 }
 
 /// Set up signal handlers for graceful shutdown.
+///
+/// PR 1 Phase E: signal receipts are logged at `warn` level with a stable
+/// `event = "shutdown_signal_received"` field so the audit pipeline can
+/// pick them out. Most receipts are user-initiated (Ctrl+C or `systemctl
+/// stop`) but the LLM-attempt case (a supervised tool somehow signalling
+/// the supervisor) is the security-interesting one — surfacing every
+/// signal receipt at high severity gives the operator a clean audit trail
+/// to investigate after the fact.
 pub async fn wait_for_shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 
@@ -620,10 +695,18 @@ pub async fn wait_for_shutdown_signal() {
             Ok(mut sigterm) => {
                 tokio::select! {
                     _ = ctrl_c => {
-                        tracing::info!("received SIGINT (Ctrl+C)");
+                        tracing::warn!(
+                            event = "shutdown_signal_received",
+                            signal = "SIGINT",
+                            "supervisor received SIGINT (Ctrl+C); shutting down"
+                        );
                     }
                     _ = sigterm.recv() => {
-                        tracing::info!("received SIGTERM");
+                        tracing::warn!(
+                            event = "shutdown_signal_received",
+                            signal = "SIGTERM",
+                            "supervisor received SIGTERM; shutting down"
+                        );
                     }
                 }
             }
@@ -632,7 +715,11 @@ pub async fn wait_for_shutdown_signal() {
                 if let Err(e) = ctrl_c.await {
                     tracing::error!(error = %e, "failed to listen for Ctrl+C signal");
                 } else {
-                    tracing::info!("received SIGINT (Ctrl+C)");
+                    tracing::warn!(
+                        event = "shutdown_signal_received",
+                        signal = "SIGINT",
+                        "supervisor received SIGINT (Ctrl+C); shutting down"
+                    );
                 }
             }
         }
@@ -641,7 +728,11 @@ pub async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         match ctrl_c.await {
-            Ok(()) => tracing::info!("received Ctrl+C"),
+            Ok(()) => tracing::warn!(
+                event = "shutdown_signal_received",
+                signal = "SIGINT",
+                "supervisor received Ctrl+C; shutting down"
+            ),
             Err(e) => tracing::error!(error = %e, "failed to listen for Ctrl+C signal"),
         }
     }

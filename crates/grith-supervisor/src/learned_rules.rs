@@ -140,7 +140,63 @@ pub fn validate_persisted_rule_with_scope(pattern: &str, scope: &str) -> Result<
         }
     }
 
+    // A persisted allowlist rule is consumed BEFORE the proxy and before taint
+    // registration — it auto-allows. So a rule targeting a sensitive path (ssh
+    // keys, .env, cloud creds, /etc/shadow, …) would silently grant access to
+    // secrets for every future session, bypassing the proxy. Reject such rules
+    // outright (research doc §5.1 #6): a sensitive access must always be
+    // evaluated, never short-circuited by a learned rule.
+    if let Some(path) = pattern
+        .strip_prefix("ro:")
+        .or_else(|| pattern.strip_prefix("rw:"))
+        .or_else(|| pattern.strip_prefix("exec-prefix:"))
+        .or_else(|| pattern.strip_prefix("exec:"))
+    {
+        if path_targets_sensitive(path) {
+            return Err(Error::LearnedRuleError(format!(
+                "refusing to persist a rule targeting a sensitive path ({path}): \
+                 sensitive accesses must go through the proxy, not an auto-allow rule"
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// True when a learned-rule target path points at credential/secret material.
+/// Erring toward rejection is the safe bias for a security gate: a wrongly
+/// rejected rule just means the access goes through the proxy.
+fn path_targets_sensitive(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    // Match the actual secret MATERIAL, not the whole credential directory:
+    // `.ssh/config`/`known_hosts` are benign config (and the existing design
+    // treats `ro:~/.ssh/config` as a valid persistable rule), whereas a private
+    // key, `authorized_keys`, or `.aws/credentials` is the secret the hole was
+    // about (`rw:~/.ssh/id_rsa`). Erring toward rejection within this set.
+    const SENSITIVE_MARKERS: &[&str] = &[
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        "/.ssh/authorized_keys",
+        "/.aws/credentials",
+        "/.gnupg/", // entire gnupg home is key material
+        "/.kube/config",
+        "/.docker/config.json",
+        "/.config/gcloud/",
+        "/.git-credentials",
+        "/.netrc",
+        "/.pgpass",
+        "/.npmrc",
+        "/.pypirc",
+        "/etc/shadow",
+        "/etc/gshadow",
+        "private_key",
+        "/credentials",
+        "/secrets",
+        "/.env",
+    ];
+    SENSITIVE_MARKERS.iter().any(|m| p.contains(m))
 }
 
 fn normalize_loaded_pattern(pattern: &str) -> String {
@@ -554,6 +610,48 @@ mod tests {
     #[test]
     fn validate_accepts_ro_prefix() {
         assert!(validate_persisted_rule("ro:/home/dan/.ssh/config").is_ok());
+    }
+
+    // Protection suite (research doc §5.1 #6): a learned rule auto-allows
+    // BEFORE the proxy + taint, so one targeting secret material must be
+    // rejected — otherwise injecting `rw:~/.ssh/id_rsa` silently grants it.
+    #[test]
+    fn validate_rejects_sensitive_path_learned_rules() {
+        for pat in [
+            "rw:/home/dan/.ssh/id_rsa",
+            "ro:/home/dan/.ssh/id_ed25519",
+            "ro:/home/dan/.ssh/authorized_keys",
+            "ro:/home/dan/.aws/credentials",
+            "rw:/home/dan/.gnupg/secring.gpg",
+            "ro:/home/dan/.git-credentials",
+            "ro:/home/dan/project/.env",
+            "ro:/etc/shadow",
+            "ro:/home/dan/.kube/config",
+            "exec:/home/dan/.local/bin/id_rsa-stealer", // contains id_rsa marker
+        ] {
+            assert!(
+                validate_persisted_rule(pat).is_err(),
+                "{pat} targets sensitive material and must be rejected"
+            );
+        }
+    }
+
+    // Benign counterparts must still validate (no over-rejection of common
+    // config/data paths).
+    #[test]
+    fn validate_accepts_benign_paths_near_sensitive_dirs() {
+        for pat in [
+            "ro:/home/dan/.ssh/config",      // ssh client config (not a key)
+            "ro:/home/dan/.ssh/known_hosts", // not a key
+            "ro:/home/dan/.aws/config",      // region/profile config, not creds
+            "rw:/home/dan/project/main.rs",
+            "exec:/usr/bin/git",
+        ] {
+            assert!(
+                validate_persisted_rule(pat).is_ok(),
+                "{pat} is benign and must validate"
+            );
+        }
     }
 
     #[test]

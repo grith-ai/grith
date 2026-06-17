@@ -133,6 +133,25 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn seize_attach_mode_is_rejected_until_implemented() {
+        let mut sup = PtraceSupervisor::new();
+        // Default is traceme → spawn guard passes.
+        assert!(matches!(
+            sup.attach_mode,
+            crate::config::AttachMode::Traceme
+        ));
+        assert!(reject_unimplemented_seize(&sup).is_ok());
+        // Flipping to seize fails closed with a SpawnFailed error rather than
+        // silently using traceme.
+        sup.attach_mode = crate::config::AttachMode::Seize;
+        let err = reject_unimplemented_seize(&sup).unwrap_err();
+        assert!(
+            matches!(err, Error::SpawnFailed(msg) if msg.contains("seize")),
+            "expected a SpawnFailed mentioning seize",
+        );
+    }
+
     fn make_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -243,6 +262,23 @@ mod tests {
     }
 }
 
+/// The `PTRACE_SEIZE` attach path is scaffolded (the `attach_mode` flag is
+/// wired end-to-end) but the spawn-flow / event-loop migration (W1–W3 of
+/// `work/futurework/ptrace-seize-migration.md`) isn't implemented. Until it
+/// is, selecting `seize` fails closed with a clear message at spawn time
+/// rather than silently using `TRACEME` — so flipping the flag is observable.
+fn reject_unimplemented_seize(sup: &PtraceSupervisor) -> Result<()> {
+    if matches!(sup.attach_mode, crate::config::AttachMode::Seize) {
+        return Err(Error::SpawnFailed(
+            "attach_mode=\"seize\" is not yet implemented (PTRACE_SEIZE migration W1-W3 \
+             pending); set supervisor.attach_mode=\"traceme\" — see \
+             work/futurework/ptrace-seize-migration.md"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Spawn a child process under full ptrace supervision.
 ///
 /// Uses the classic fork-and-trace pattern:
@@ -260,6 +296,7 @@ pub(super) async fn do_spawn_supervised(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<u32> {
+    reject_unimplemented_seize(sup)?;
     // Resolve command to absolute path before forking (execve does not
     // search PATH). This also gives a clear error if the command is missing.
     let resolved = resolve_command_path(command)?;
@@ -355,6 +392,10 @@ pub(super) async fn do_spawn_supervised(
             sup.set_trace_options(child)?;
             sup.supervised.insert(child_pid);
             sup.seccomp_tracees.insert(child_pid);
+            // Spawned with a TSYNC'd seccomp filter: every descendant inherits
+            // it, so the whole session must resume via PTRACE_CONT. See
+            // PtraceSupervisor::seccomp_session / resume_tracee.
+            sup.seccomp_session = true;
             if sup.root_pid.is_none() {
                 sup.root_pid = Some(child_pid);
             }
@@ -398,6 +439,7 @@ pub(super) async fn do_spawn_supervised_pty(
     cols: u16,
     rows: u16,
 ) -> Result<PtySpawnResult> {
+    reject_unimplemented_seize(sup)?;
     // Resolve command to absolute path before forking (execve does not
     // search PATH). This also gives a clear error if the command is missing.
     let resolved = resolve_command_path(command)?;
@@ -513,6 +555,10 @@ pub(super) async fn do_spawn_supervised_pty(
             sup.set_trace_options(child)?;
             sup.supervised.insert(child_pid);
             sup.seccomp_tracees.insert(child_pid);
+            // Spawned with a TSYNC'd seccomp filter: every descendant inherits
+            // it, so the whole session must resume via PTRACE_CONT. See
+            // PtraceSupervisor::seccomp_session / resume_tracee.
+            sup.seccomp_session = true;
             if sup.root_pid.is_none() {
                 sup.root_pid = Some(child_pid);
             }

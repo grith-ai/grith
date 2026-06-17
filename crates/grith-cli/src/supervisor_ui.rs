@@ -233,8 +233,11 @@ mod tests {
             id: Uuid::new_v4(),
             tool_name: tool_name.to_string(),
             project_name: None,
+            cwd: None,
+            tty: None,
             root_pid: pid,
             uptime_seconds: uptime,
+            last_activity_seconds: 0,
             stats,
             containment_remaining_seconds: None,
         }
@@ -412,8 +415,11 @@ mod tests {
             id: Uuid::nil(),
             tool_name: "test-tool".to_string(),
             project_name: None,
+            cwd: None,
+            tty: None,
             root_pid: 1,
             uptime_seconds: 0,
+            last_activity_seconds: 0,
             stats: SessionStats::default(),
             containment_remaining_seconds: None,
         };

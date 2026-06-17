@@ -159,6 +159,11 @@ async fn simulate_tool_execution(
         source_taint: grith_proxy::types::TaintLevel::None,
         profile_name: None,
         conversation_id: None,
+        session_scope: Some(grith_proxy::types::SessionScopeKey::from_session_id(
+            session_id,
+        )),
+        spawn_provenance: None,
+        listener_policy_match: None,
     };
 
     // 3. Evaluate through proxy
@@ -383,24 +388,21 @@ async fn test_e2e_risky_tool_call_denied_and_audited() {
 
 #[tokio::test]
 async fn test_e2e_borderline_tool_call_queued_with_digest() {
-    // Use cold-start scoring so .env read (score 3.0) gets queued
-    let scoring = grith_proxy::scoring::ScoringConfig {
-        cold_start_calls: 200,
-        ..grith_proxy::scoring::ScoringConfig::default()
-    };
-    let fixtures = TestFixtures::with_scoring(scoring);
+    let fixtures = TestFixtures::with_scoring(grith_proxy::scoring::ScoringConfig::default());
     let audit_storage = Arc::new(Mutex::new(
         AuditStorage::open_in_memory().expect("audit storage"),
     ));
     let digest_queue = Arc::new(DigestQueue::open_in_memory().expect("digest queue"));
 
-    // Mock LLM returns a .env file read (borderline → QUEUE with cold-start)
+    // A .pem read scores 4.0 (path_match `*.pem`) — squarely in the QUEUE band
+    // (3.0 < score <= 8.0) under the fixed thresholds, so it exercises the
+    // queue → audit + digest path without relying on any cold-start widening.
     let mock = MockLlm::new(vec![CompletionResponse {
         content: None,
         tool_calls: vec![ToolCall {
             id: "call_borderline".into(),
             name: "fs_read".into(),
-            arguments: serde_json::json!({"path": "/project/.env"}),
+            arguments: serde_json::json!({"path": "/project/secrets/server.pem"}),
         }],
         usage: TokenUsage {
             prompt_tokens: 80,
@@ -414,7 +416,7 @@ async fn test_e2e_borderline_tool_call_queued_with_digest() {
     let router = LlmRouter::fixed("mock", Arc::new(mock));
     let request = grith_llm::CompletionRequest::new(vec![grith_llm::Message {
         role: grith_llm::Role::User,
-        content: grith_llm::Content::Text("Read the .env file".into()),
+        content: grith_llm::Content::Text("Read the server.pem file".into()),
     }]);
     let response = router.complete(&request).await.expect("LLM response");
 
@@ -428,10 +430,10 @@ async fn test_e2e_borderline_tool_call_queued_with_digest() {
     )
     .await;
 
-    // .env read with cold-start should be QUEUE
+    // .pem read (score 4.0) should QUEUE under the fixed thresholds.
     assert!(
         matches!(action, ProxyAction::Queue { .. }),
-        "cold-start .env read should be QUEUE, got {action:?} (score {score})"
+        ".pem read should be QUEUE, got {action:?} (score {score})"
     );
 
     // Verify audit record

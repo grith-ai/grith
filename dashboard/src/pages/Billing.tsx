@@ -80,6 +80,8 @@ export function BillingPage() {
 
       <RefreshBanner refresh={tier.refresh ?? null} />
 
+      <SessionLimitNudge tier={tier} />
+
       {/* Current plan card */}
       <div className="bg-white border border-grith-border rounded-xl p-5 mb-6">
         <div className="flex items-center justify-between mb-4">
@@ -180,6 +182,51 @@ export function BillingPage() {
           <code className="font-mono text-green">grith pro upgrade</code>
         </p>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Upgrade nudge shown when the user has recently hit their concurrent-session
+ * cap. The 429 is the highest-intent upgrade moment, so surface it here.
+ * Hidden for Enterprise (already top tier) and when there are no recent
+ * rejections.
+ */
+function SessionLimitNudge({ tier }: { tier: TierResponse }) {
+  const count = tier.session_limit_rejections ?? 0;
+  const windowDays = tier.session_limit_rejection_window_days ?? 7;
+  const tierKey = tier.tier.toLowerCase();
+  if (count <= 0 || tierKey === "enterprise") return null;
+
+  const headline =
+    tierKey === "pro"
+      ? `You hit your ${tier.max_sessions}-session limit ${count} time${count !== 1 ? "s" : ""} in the last ${windowDays} days.`
+      : `You hit your ${tier.max_sessions}-session limit ${count} time${count !== 1 ? "s" : ""} in the last ${windowDays} days.`;
+  const remediation =
+    tierKey === "pro"
+      ? "Add seats to run more concurrent supervised sessions."
+      : "Upgrade to Pro to run more concurrent supervised sessions (4× seats).";
+  const cta = tierKey === "pro" ? "Add seats" : "Upgrade to Pro";
+  const ctaUrl =
+    tier.billing_portal_url ??
+    (tierKey === "pro"
+      ? "https://grith.ai/dashboard/settings/billing"
+      : "https://grith.ai/pricing");
+
+  return (
+    <div className="mb-4 border border-status-queue-amber/40 bg-status-queue-amber/10 rounded-xl px-4 py-3 flex items-center justify-between gap-4">
+      <div className="text-xs text-grith-text">
+        <div className="font-semibold text-status-queue-amber">{headline}</div>
+        <div className="opacity-80 mt-0.5">{remediation}</div>
+      </div>
+      <a
+        href={ctaUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green text-white text-xs font-medium hover:bg-green-dark transition-colors"
+      >
+        {cta}
+      </a>
     </div>
   );
 }

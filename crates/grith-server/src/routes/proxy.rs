@@ -114,7 +114,6 @@ struct ProxyStatusResponse {
     allow_count: u64,
     queue_count: u64,
     deny_count: u64,
-    cold_start_remaining: u64,
     filters: Vec<FilterStatusResponse>,
 }
 
@@ -158,7 +157,6 @@ pub(crate) async fn proxy_status(State(state): State<AppState>) -> impl IntoResp
         allow_count: state.proxy.allow_count(),
         queue_count: state.proxy.queue_count(),
         deny_count: state.proxy.deny_count(),
-        cold_start_remaining: state.proxy.cold_start_remaining(),
         filters,
     })
 }
@@ -178,7 +176,6 @@ struct ProxyTestResponse {
     decision_reason: String,
     evaluation_time_ms: f64,
     filters_evaluated: usize,
-    cold_start: bool,
     filter_results: Vec<ProxyTestFilterDetail>,
 }
 
@@ -205,7 +202,6 @@ pub(crate) async fn proxy_test(
     let mut ctx = ToolCallContext::new("dashboard-test", call_type, Uuid::new_v4());
     ctx.arguments = body.tool_call;
 
-    let cold_start = state.proxy.cold_start_remaining() > 0;
     let decision = state.proxy.evaluate(&ctx).await;
 
     let action = match &decision.action {
@@ -236,7 +232,6 @@ pub(crate) async fn proxy_test(
         decision_reason: decision.decision_reason,
         evaluation_time_ms: decision.evaluation_time.as_secs_f64() * 1000.0,
         filters_evaluated: decision.filter_results.len(),
-        cold_start,
         filter_results,
     })
     .into_response()

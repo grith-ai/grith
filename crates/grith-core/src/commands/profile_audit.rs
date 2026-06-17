@@ -715,9 +715,12 @@ mod tests {
             routine_destinations: vec!["api.example.com".into()],
             routine_listen_addresses: vec![],
             routine_exec_roots: vec!["/usr/bin/".into(), "/usr/lib/git-core/".into()],
+            scratch_roots: Vec::new(),
             readonly_paths: vec![],
             readonly_path_patterns: vec![],
             launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
         }
     }
 

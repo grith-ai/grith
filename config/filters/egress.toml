@@ -7,7 +7,22 @@ enabled = true
 # - enforce: score into deny range for blocked egress
 mode = "review"
 
-# Trusted destinations reduce risk slightly.
+# Trusted destinations reduce risk slightly. Matching is subdomain-aware
+# (egress_policy.rs domain_matches: host == domain || host.ends_with(".domain")),
+# so base domains cover their subdomains.
+#
+# FP research §5.3: the ecosystems below are package registries, language
+# toolchains, LLM providers, container registries, and named deploy targets —
+# all dev-infrastructure with LOW exfil utility (publishing/pushing is
+# account-authenticated and auditable). They were missing, so the first egress
+# to each QUEUEd (review_unknown_destinations = +3.5 from call #1; thresholds
+# are fixed, so this applies uniformly). Deliberately NOT added (paired guard
+# — high exfil utility as
+# attacker-controlled buckets): generic cloud object storage wildcards
+# (amazonaws.com / *.windows.net / *.blob.core.windows.net). Those stay
+# untrusted so a benign deploy takes a one-time approval but an exfil to an
+# attacker's bucket is not silently trusted. (storage.googleapis.com below is
+# pre-existing; not widened here.)
 trusted_domains = [
   "github.com",
   "api.github.com",
@@ -26,6 +41,53 @@ trusted_domains = [
   "datadoghq.com",
   "googleapis.com",
   "storage.googleapis.com",
+  # --- FP §5.3: LLM providers ---
+  "openai.com",
+  "openrouter.ai",
+  # --- FP §5.3: language package registries / toolchains ---
+  "nuget.org",            # .NET (api.nuget.org)
+  "rubygems.org",         # Ruby
+  "maven.org",            # Maven Central (repo1.maven.org)
+  "maven.apache.org",     # Maven Central (repo.maven.apache.org)
+  "sonatype.com",         # Maven Central (central.sonatype.com)
+  "golang.org",           # Go modules (proxy.golang.org, sum.golang.org)
+  "go.dev",               # Go (pkg.go.dev)
+  "gradle.org",           # Gradle distributions (services.gradle.org)
+  "packagist.org",        # PHP Composer
+  "yarnpkg.com",          # Yarn
+  "nodejs.org",           # Node.js downloads
+  # --- FP §5.3: container registries (push-to-exfil requires authenticated
+  #     publish + is auditable — same residual as the pre-existing npm/pypi
+  #     trust; accepted. Registry hosts only, NOT the web UIs). ---
+  "ghcr.io",              # GitHub Container Registry
+  "docker.io",            # Docker Hub registry (registry-1.docker.io, auth.docker.io, index.docker.io)
+  "quay.io",              # Red Hat Quay
+  "registry.k8s.io",      # Kubernetes
+  "k8s.io",               # Kubernetes
+  "gcr.io",               # Google Container Registry
+  "mcr.microsoft.com",    # Microsoft Container Registry
+  # --- FP §5.3: build/deploy infra + named deploy targets.
+  #     IMPORTANT: only first-party API / single-host endpoints. Open-
+  #     registration shared-tenancy *deploy* domains (*.netlify.app,
+  #     *.vercel.app, *.fly.dev, *.herokuapp.com, <org>.visualstudio.com)
+  #     are deliberately EXCLUDED — anyone can host arbitrary content there
+  #     under the trusted parent, which would make them zero-auth GET-exfil
+  #     sinks under subdomain-aware matching. ---
+  "cloudflare.com",       # Cloudflare API (api.cloudflare.com) — NOT *.workers.dev
+  "hashicorp.com",        # releases.hashicorp.com
+  "registry.terraform.io",# Terraform registry
+  "fly.io",               # Fly.io API/registry — NOT *.fly.dev (user apps)
+  "vercel.com",           # Vercel API — NOT *.vercel.app (user deploys)
+  "netlify.com",          # Netlify API — NOT *.netlify.app (user deploys)
+  "heroku.com",           # Heroku API — NOT *.herokuapp.com (user apps)
+  "dev.azure.com",        # Azure DevOps (single host; orgs are path-scoped + auth'd)
+  "pkgs.dev.azure.com",   # Azure DevOps package feeds (nuget/npm/maven)
+  "pkgs.visualstudio.com",# Azure DevOps legacy package feeds (<org>.pkgs.visualstudio.com)
+  "vscode-cdn.net",       # VS Code update/asset CDN (main.vscode-cdn.net) —
+                          # read-only distribution CDN for the VS Code server
+                          # binary + updates; not user-writable, so no GET-exfil
+                          # sink (unlike *.vercel.app et al.). Hit routinely when
+                          # an AI CLI runs in the VS Code integrated terminal.
 ]
 
 # Explicit destination denies.

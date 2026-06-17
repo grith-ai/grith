@@ -27,8 +27,16 @@ pub struct DaemonClient {
 pub struct RemoteSessionSummary {
     pub id: Uuid,
     pub tool_name: String,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub tty: Option<String>,
     pub root_pid: u32,
     pub uptime_seconds: u64,
+    #[serde(default)]
+    pub last_activity_seconds: u64,
     pub stats: SessionStats,
     pub containment_remaining_seconds: Option<u64>,
 }
@@ -47,6 +55,32 @@ pub struct RemoteSessionDetail {
 #[derive(Deserialize)]
 struct SessionsResponse {
     sessions: Vec<RemoteSessionSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PruneResponse {
+    reaped: u32,
+    remaining: u32,
+}
+
+/// Structured session-limit (429) rejection returned by the daemon when the
+/// concurrency cap is reached. Drives the CLI upgrade prompt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionLimitRejection {
+    pub tier: String,
+    pub current_limit: usize,
+    pub active_sessions: usize,
+    #[serde(default)]
+    pub remediation: Vec<String>,
+    pub upgrade_url: Option<String>,
+    pub message: String,
+}
+
+/// Outcome of attempting to register a session with the daemon.
+#[derive(Debug)]
+pub enum RegisterOutcome {
+    Registered,
+    LimitReached(SessionLimitRejection),
 }
 
 #[derive(Deserialize)]
@@ -187,6 +221,28 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn install_inventory(
+        &self,
+        scope: grith_proxy::types::SessionScopeKey,
+        entries: Vec<(String, String)>,
+        total_scanned: usize,
+        truncated: bool,
+    ) -> Result<(), DaemonClientError> {
+        self.request_empty(
+            self.http
+                .post(format!("{}/api/ipc/inventory/install", self.base_url))
+                .json(&serde_json::json!({
+                    "scope": scope.to_string(),
+                    "entries": entries.into_iter()
+                        .map(|(p, h)| serde_json::json!({ "path": p, "sha256": h }))
+                        .collect::<Vec<_>>(),
+                    "total_scanned": total_scanned,
+                    "truncated": truncated,
+                })),
+        )
+        .await
+    }
+
     pub async fn enqueue_digest(&self, item: &DigestItem) -> Result<(), DaemonClientError> {
         self.request_empty(
             self.http
@@ -271,6 +327,45 @@ impl DaemonClient {
                 .json(&session_snapshot_json(session)),
         )
         .await
+    }
+
+    /// Register a session, distinguishing a session-limit rejection from other
+    /// failures so the caller can render an upgrade prompt instead of a raw
+    /// error. Parses the structured 429 envelope when present.
+    pub async fn register_session_checked(
+        &self,
+        session: &SupervisorSession,
+    ) -> Result<RegisterOutcome, DaemonClientError> {
+        let response = self
+            .http
+            .post(format!("{}/api/ipc/sessions", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&session_snapshot_json(session))
+            .send()
+            .await
+            .map_err(|e| DaemonClientError::Network(e.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(RegisterOutcome::Registered);
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let Ok(rej) = serde_json::from_str::<SessionLimitRejection>(&body) {
+                return Ok(RegisterOutcome::LimitReached(rej));
+            }
+        }
+        Err(DaemonClientError::Http(format!("{status}: {body}")))
+    }
+
+    /// Ask the daemon to reap dead sessions on demand. Returns (reaped, remaining).
+    pub async fn prune_sessions(&self) -> Result<(u32, u32), DaemonClientError> {
+        let body: PruneResponse = self
+            .request_typed(
+                self.http
+                    .post(format!("{}/api/ipc/sessions-prune", self.base_url)),
+            )
+            .await?;
+        Ok((body.reaped, body.remaining))
     }
 
     pub async fn sync_session(&self, session: &SupervisorSession) -> Result<(), DaemonClientError> {
@@ -383,6 +478,8 @@ fn session_snapshot_json(session: &SupervisorSession) -> serde_json::Value {
         "provider_overlay_name": session.provider_overlay_name.clone(),
         "root_pid": session.root_pid,
         "project_name": session.project_name.clone(),
+        "cwd": session.cwd.clone(),
+        "tty": session.tty.clone(),
         "process_tree_pids": session.process_tree.all_pids(),
         "stats": session.stats.clone(),
     })
@@ -484,6 +581,39 @@ impl grith_supervisor::AuditSink for RemoteAuditSink {
     async fn log(&self, record: AuditRecord) -> std::result::Result<(), String> {
         self.client
             .ingest_audit(&record)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Pushes the session-pinned binary inventory to the daemon so the
+/// dashboard's `/api/inventory` endpoint (which reads from the daemon's
+/// per-process `SessionStateRegistry::global()`) can render it. The
+/// supervisor's own registry is already populated by
+/// `set_pinned_inventory` — this push is purely for cross-process UI.
+pub struct RemoteInventorySink {
+    client: DaemonClient,
+}
+
+impl RemoteInventorySink {
+    pub fn new(client: DaemonClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl grith_supervisor::InventorySink for RemoteInventorySink {
+    async fn install(
+        &self,
+        scope: grith_proxy::types::SessionScopeKey,
+        inventory: grith_proxy::session_state::SessionPinnedInventory,
+    ) -> std::result::Result<(), String> {
+        let entries: Vec<(String, String)> = inventory
+            .iter()
+            .map(|(p, h)| (p.to_string(), h.to_string()))
+            .collect();
+        self.client
+            .install_inventory(scope, entries, inventory.total_scanned, inventory.truncated)
             .await
             .map_err(|e| e.to_string())
     }

@@ -92,9 +92,6 @@ async fn test_sensitive_ssh_key_read_denies() {
     let scoring = ScoringConfig {
         auto_allow_threshold: 2.0,
         auto_deny_threshold: 4.5,
-        cold_start_calls: 0, // no cold start so normal thresholds apply immediately
-        cold_start_escalation_low: 2.0,
-        cold_start_escalation_high: 10.0,
     };
     let proxy = proxy_with_scoring(scoring);
 
@@ -176,9 +173,6 @@ async fn test_pipe_to_curl_denies() {
     let scoring = ScoringConfig {
         auto_allow_threshold: 2.0,
         auto_deny_threshold: 3.5,
-        cold_start_calls: 0,
-        cold_start_escalation_low: 2.0,
-        cold_start_escalation_high: 10.0,
     };
     let proxy = proxy_with_scoring(scoring);
 
@@ -329,9 +323,6 @@ async fn test_meta_rule_ssh_key_access() {
     let scoring = ScoringConfig {
         auto_allow_threshold: 3.0,
         auto_deny_threshold: 11.0, // high enough so 10.0 doesn't early-terminate
-        cold_start_calls: 0,       // skip cold start
-        cold_start_escalation_low: 2.0,
-        cold_start_escalation_high: 12.0,
     };
     let proxy = proxy_with_meta_rules(meta_rules, scoring);
 
@@ -365,68 +356,43 @@ async fn test_meta_rule_ssh_key_access() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Cold-start threshold widening - first calls use wider thresholds
+// 8. Fixed thresholds - every call is evaluated against the same thresholds
+//    (there is no call-count "cold-start" widening).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_cold_start_widens_thresholds() {
-    let scoring = ScoringConfig {
-        cold_start_calls: 200,
-        ..ScoringConfig::default()
+async fn test_thresholds_are_fixed_across_calls() {
+    let fixtures = TestFixtures::with_scoring(ScoringConfig::default());
+
+    // The first call and a later call see identical thresholds: a `.env` read
+    // (score 3.0) sits exactly at the allow boundary (route uses `>`), so it
+    // ALLOWs on call 0 and still ALLOWs after many calls — no early-session
+    // widening that would have QUEUEd it.
+    let make = || {
+        make_tool_call_context(
+            ToolCallType::FileRead {
+                path: "/project/.env".into(),
+            },
+            serde_json::json!({}),
+        )
     };
-    let fixtures = TestFixtures::with_scoring(scoring);
 
-    // Verify we are in cold start
+    let first = fixtures.proxy.evaluate(&make()).await;
     assert!(
-        fixtures.proxy.is_cold_start(),
-        "Proxy should be in cold start at call 0"
+        first.is_allowed(),
+        "Expected ALLOW on the first call for .env at boundary (score {}), got {:?}",
+        first.composite_score,
+        first.action
     );
 
-    // During cold start, allow threshold = 2.0, deny threshold = 10.0.
-    // A score of 2.5 would ALLOW with normal thresholds (< 3.0) but
-    // should QUEUE during cold start (> 2.0).
-    //
-    // The .env file pattern gives score 3.0 which is > 2.0 (cold-start allow).
-    // With normal thresholds, 3.0 would be exactly at boundary (ALLOW since
-    // route uses > not >=). But during cold start 3.0 > 2.0 so it QUEUEs.
-    let ctx = make_tool_call_context(
-        ToolCallType::FileRead {
-            path: "/project/.env".into(),
-        },
-        serde_json::json!({}),
-    );
-
-    let decision_cold = fixtures.proxy.evaluate(&ctx).await;
-    assert!(
-        matches!(decision_cold.action, ProxyAction::Queue { .. }),
-        "Expected QUEUE during cold start for .env (score {}), got {:?}",
-        decision_cold.composite_score,
-        decision_cold.action
-    );
-
-    // Now warm up past cold-start
     warm_up_proxy(&fixtures.proxy, 200).await;
-    assert!(
-        !fixtures.proxy.is_cold_start(),
-        "Proxy should be past cold start"
-    );
 
-    // After cold start, .env score of 3.0 is exactly at boundary.
-    // route_decision uses `score > allow_threshold` => 3.0 > 3.0 is false => ALLOW.
-    // But wait, on the second call, the .env file still scores 3.0.
-    // Since 3.0 is NOT > 3.0, it should ALLOW.
-    let ctx2 = make_tool_call_context(
-        ToolCallType::FileRead {
-            path: "/project/.env".into(),
-        },
-        serde_json::json!({}),
-    );
-    let decision_warm = fixtures.proxy.evaluate(&ctx2).await;
+    let later = fixtures.proxy.evaluate(&make()).await;
     assert!(
-        decision_warm.is_allowed(),
-        "Expected ALLOW after cold start for .env at boundary (score {}), got {:?}",
-        decision_warm.composite_score,
-        decision_warm.action
+        later.is_allowed(),
+        "Expected the same ALLOW after many calls (score {}), got {:?}",
+        later.composite_score,
+        later.action
     );
 }
 
@@ -441,9 +407,6 @@ async fn test_early_termination_on_phase1_deny() {
     let scoring = ScoringConfig {
         auto_allow_threshold: 2.0,
         auto_deny_threshold: 4.0,
-        cold_start_calls: 0, // skip cold start
-        cold_start_escalation_low: 2.0,
-        cold_start_escalation_high: 10.0,
     };
     let proxy = proxy_with_scoring(scoring);
 

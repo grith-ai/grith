@@ -9,10 +9,12 @@ pub mod behavioural;
 pub mod canary;
 pub mod capability;
 pub mod command;
+pub mod destructive_action;
 pub mod dlp_gate;
 pub mod egress_policy;
 pub mod egress_rate;
 pub mod operation_risk;
+pub mod outbound_binaries;
 pub mod path_match;
 pub mod rate_limit;
 pub mod reputation;
@@ -59,6 +61,20 @@ pub trait SecurityFilter: Send + Sync {
 
     /// Evaluate a tool call and return a filter result with a score contribution.
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult>;
+
+    /// Drop any scope-keyed state for `scope`. Default implementation does
+    /// nothing — filters without per-session state can ignore this hook.
+    /// PR 1 Phase F calls this from the supervisor at session-end and from
+    /// the session-start stale-state sweep.
+    ///
+    /// Returns a best-effort entry count, for telemetry. The unit varies
+    /// per filter (taint counts registry rows + recent_sensitive_read rows,
+    /// rate_limit counts windows, behavioural counts dropped history records)
+    /// — the sum across filters is a coarse "session footprint" indicator,
+    /// not a strict byte- or row-count.
+    fn evict_session_state(&self, _scope: crate::types::SessionScopeKey) -> usize {
+        0
+    }
 }
 
 /// Per-filter evaluation metrics tracked with atomic counters.
@@ -147,6 +163,19 @@ impl FilterRegistry {
     /// Total number of registered filters.
     pub fn count(&self) -> usize {
         self.filters.len()
+    }
+
+    /// Tell every registered filter to drop any scope-keyed state for `scope`.
+    /// Returns the sum of entries removed across all filters, for telemetry.
+    ///
+    /// PR 1 Phase F calls this from the supervisor at session-end (immediate
+    /// per-scope eviction) and from the session-start sweep (for each stale
+    /// scope discovered by `SessionStateRegistry::snapshot_stale`).
+    pub fn evict_session_state(&self, scope: crate::types::SessionScopeKey) -> usize {
+        self.filters
+            .iter()
+            .map(|f| f.evict_session_state(scope))
+            .sum()
     }
 
     /// Summary information about all registered filters.

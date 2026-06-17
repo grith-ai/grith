@@ -64,6 +64,8 @@ operations = ["read", "write", "delete"]
 score = 3.0
 severity = "warning"
 message = "Access to environment file"
+# FP §5.7: committed template scaffolding holds placeholders, not secrets.
+exclude = [".env.example", ".env.sample", ".env.template", ".env.dist", ".env.defaults"]
 
 [[rules]]
 id = "env-file-variants"
@@ -72,6 +74,7 @@ operations = ["read", "write", "delete"]
 score = 3.0
 severity = "warning"
 message = "Access to environment file variant"
+exclude = [".env.example", ".env.sample", ".env.template", ".env.dist", ".env.defaults"]
 
 [[rules]]
 id = "terraform-state"

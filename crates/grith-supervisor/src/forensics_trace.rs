@@ -193,6 +193,21 @@ impl TraceSubject {
                 s.event_kind = Some("HttpRequest".into());
                 s.address = Some(url.clone());
             }
+            // PR 6 Phase B: category-2 syscalls.
+            ToolCallType::OwnershipChange { target, .. } => {
+                s.event_kind = Some("OwnershipChange".into());
+                s.path = Some(target.clone());
+            }
+            ToolCallType::FilesystemMutation { target, .. } => {
+                s.event_kind = Some("FilesystemMutation".into());
+                s.path = Some(target.clone());
+            }
+            ToolCallType::CrossProcessAccess { .. } => {
+                s.event_kind = Some("CrossProcessAccess".into());
+            }
+            ToolCallType::NamespaceOp { .. } => {
+                s.event_kind = Some("NamespaceOp".into());
+            }
         }
         s
     }

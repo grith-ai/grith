@@ -2,6 +2,7 @@ import { useState, useCallback } from "react";
 import { FilterConfig } from "@/components/FilterConfig";
 import { AdaptiveScoring } from "@/components/AdaptiveScoring";
 import { PolicyEditor, UsageAnalytics } from "@/components/ProStub";
+import { csrfHeaders } from "@/lib/csrf";
 
 export function SettingsPage() {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
@@ -14,7 +15,7 @@ export function SettingsPage() {
           `${window.location.origin}/api/config`,
           {
             method: "PUT",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...csrfHeaders() },
             body: JSON.stringify(config),
           },
         );

@@ -32,6 +32,9 @@ use serde::{Deserialize, Serialize};
 /// Top-level supervisor configuration.
 ///
 /// Lives under the `[supervisor]` key in the grith TOML config.
+// Each bool is an independent operator knob (enabled / require_sandbox /
+// pty_forwarding / pty_ownership_enforce); collapsing them would hide that.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SupervisorConfig {
@@ -88,6 +91,10 @@ pub struct SupervisorConfig {
     /// ```
     pub require_sandbox: bool,
 
+    /// Linux attach mechanism (`traceme` | `seize`). See [`AttachMode`].
+    /// Defaults to `Traceme`; `Seize` is scaffolded but not yet implemented.
+    pub attach_mode: AttachMode,
+
     /// How to handle QUEUE-range proxy decisions (score between allow and deny
     /// thresholds) in interactive PTY sessions.
     ///
@@ -114,6 +121,116 @@ pub struct SupervisorConfig {
     /// Reputation system configuration (injected at runtime, not from TOML).
     #[serde(skip)]
     pub reputation_config: grith_proxy::reputation::ReputationConfig,
+
+    /// PR 6 Phase F: per-category coverage flags for the staged
+    /// rollout of syscall-coverage expansion. See [`CoverageConfig`].
+    pub coverage: CoverageConfig,
+
+    /// Audit-completeness tier. Controls whether session-allowed,
+    /// routine-I/O, and noise-path short-circuits emit compact audit
+    /// rows. Mirrors `grith_core::config::AuditCompleteness` to avoid
+    /// a supervisor → core dependency cycle.
+    #[serde(default)]
+    pub audit_completeness: AuditCompletenessLevel,
+
+    /// H2 Option 1 (IPC-delegated authority): enforce PTY ownership. When
+    /// `false` (default), writes to a `/dev/pts/N` that is **not** the
+    /// supervised tool's own controlling terminal are detected and
+    /// forensically logged (`event = "foreign_pts_write"`) but still allowed
+    /// — audit-only, to measure the false-positive budget. When `true`, such
+    /// writes are denied (the `echo cmd > /dev/pts/<sibling-pane>` injection
+    /// vector). Default off until the FP budget is measured.
+    #[serde(default)]
+    pub pty_ownership_enforce: bool,
+}
+
+/// Linux attach mechanism (supervisor-local mirror of
+/// `grith_core::config::AttachMode`).
+///
+/// Migration knob for the `PTRACE_SEIZE` work. `Traceme` is the shipped
+/// path; `Seize` is being built behind the flag. The spawn path consults
+/// this and, while `Seize` is unimplemented, fails closed with a clear
+/// error rather than silently using `Traceme`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachMode {
+    /// `fork` + child `PTRACE_TRACEME` + `execve` (current, shipped).
+    #[default]
+    Traceme,
+    /// Parent `PTRACE_SEIZE` after a pre-exec barrier (work in progress).
+    Seize,
+}
+
+/// Audit completeness tier (supervisor-local mirror of
+/// `grith_core::config::AuditCompleteness`).
+///
+/// Ordered from least to most data. The supervisor consults this on
+/// every short-circuit path to decide whether to emit a compact audit
+/// row. The full proxy-evaluation path always writes a full row.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditCompletenessLevel {
+    /// Only proxy decisions are audited. Default historical behaviour
+    /// before the compact-record work.
+    Decisions,
+    /// + every routine `ProcessSpawn` short-circuit.
+    #[default]
+    Spawns,
+    /// + every routine file-I/O short-circuit.
+    Io,
+    /// + every noise-path short-circuit.
+    All,
+}
+
+impl AuditCompletenessLevel {
+    pub fn records_routine_spawns(&self) -> bool {
+        matches!(self, Self::Spawns | Self::Io | Self::All)
+    }
+    pub fn records_routine_io(&self) -> bool {
+        matches!(self, Self::Io | Self::All)
+    }
+    pub fn records_noise_paths(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+/// PR 6 Phase F: per-category coverage feature flags.
+///
+/// Mirrors `grith_core::config::CoverageConfig` so the supervisor
+/// owns its own type without depending on `grith-core` (avoids the
+/// dependency cycle that would otherwise force core → supervisor).
+///
+/// Defaults: categories 1 and 4 ON (extreme ops with no compatibility
+/// risk); categories 2 and 3 OFF until operator calibration.
+///
+/// The four bools are intentional — each represents an independent
+/// staged-rollout knob with its own threat model. Refactoring to a
+/// state machine or bitflag enum would hide that independence.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoverageConfig {
+    /// Category 1: hard-deny kernel-module load/unload + kexec.
+    pub category1_hard_deny: bool,
+    /// Category 2: proxy-evaluated chown / mount / ptrace family.
+    pub category2_proxy: bool,
+    /// Category 3: namespace primitives (unshare/setns) + namespace_users
+    /// carveout.
+    pub category3_namespace: bool,
+    /// Category 4: hard-deny arch-privileged ops (sethostname / iopl /
+    /// swapon / reboot, etc.).
+    pub category4_arch_priv: bool,
+}
+
+impl Default for CoverageConfig {
+    fn default() -> Self {
+        Self {
+            category1_hard_deny: true,
+            category2_proxy: false,
+            category3_namespace: false,
+            category4_arch_priv: true,
+        }
+    }
 }
 
 impl Default for SupervisorConfig {
@@ -127,11 +244,15 @@ impl Default for SupervisorConfig {
             platform: PlatformConfig::default(),
             noise_reduction: NoiseConfig::default(),
             require_sandbox: false,
+            attach_mode: AttachMode::default(),
             dns_inspection: DnsInspectionConfig::default(),
             interactive_queue_action: InteractiveQueueAction::default(),
             syscall_log_file: None,
             trace_syscalls_jsonl_file: None,
             reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            coverage: CoverageConfig::default(),
+            audit_completeness: AuditCompletenessLevel::default(),
+            pty_ownership_enforce: false,
         }
     }
 }
@@ -393,6 +514,7 @@ mod tests {
             max_concurrent_sessions: 2,
             pty_forwarding: false,
             require_sandbox: false,
+            attach_mode: AttachMode::Seize,
             platform: PlatformConfig {
                 linux_mechanism: "ebpf".into(),
                 macos_mechanism: "endpoint-security".into(),
@@ -408,6 +530,9 @@ mod tests {
             syscall_log_file: None,
             trace_syscalls_jsonl_file: None,
             reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            coverage: CoverageConfig::default(),
+            audit_completeness: AuditCompletenessLevel::default(),
+            pty_ownership_enforce: false,
         };
         let toml_str = toml::to_string(&original).unwrap();
         let parsed: SupervisorConfig = toml::from_str(&toml_str).unwrap();
@@ -543,6 +668,7 @@ mod tests {
     fn require_sandbox_round_trips_toml() {
         let original = SupervisorConfig {
             require_sandbox: true,
+            attach_mode: AttachMode::Seize,
             ..SupervisorConfig::default()
         };
         let serialized = toml::to_string(&original).unwrap();
