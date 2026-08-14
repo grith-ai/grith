@@ -403,6 +403,7 @@ impl NotificationDispatcher {
             session_id: None,
             tool_call_type: "ShellExec".into(),
             arguments_summary: "echo 'test notification from grith'".into(),
+            decision_reason: Some("test notification".into()),
             composite_score: 5.5,
             severity: grith_digest::types::ScoreSeverity::High,
             filter_breakdown: vec![],

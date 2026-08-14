@@ -130,6 +130,14 @@ pub(crate) fn row_to_record(
         arguments_hash: row.get("arguments_hash")?,
         composite_score: row.get("composite_score")?,
         proxy_action,
+        decision_reason: row
+            .get::<_, Option<String>>("decision_reason")
+            .ok()
+            .flatten(),
+        enforcement_outcome: row
+            .get::<_, Option<String>>("enforcement_outcome")
+            .ok()
+            .flatten(),
         filter_results,
         filter_scores,
         execution_result: row.get("execution_result")?,
@@ -182,5 +190,14 @@ pub(crate) fn row_to_record(
             .flatten()
             .map(|s| RecordType::from_str_lenient(&s))
             .unwrap_or_default(),
+        // B12 item 5. A missing column or a NULL value both mean the row
+        // predates hash versioning, so its hash was produced by the legacy
+        // canonical form and must be verified with it.
+        hash_version: row
+            .get::<_, Option<i64>>("hash_version")
+            .ok()
+            .flatten()
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(crate::types::LEGACY_HASH_VERSION),
     })
 }

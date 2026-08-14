@@ -145,6 +145,12 @@ impl TraceSubject {
                 s.event_kind = Some("FileDelete".into());
                 s.path = Some(path.clone());
             }
+            ToolCallType::FileLink { target, .. } => {
+                s.event_kind = Some("FileLink".into());
+                // Trace the target: reconstructing an incident needs to show
+                // what the link exposed, not the throwaway name.
+                s.path = Some(target.clone());
+            }
             ToolCallType::FileRename {
                 old_path, new_path, ..
             } => {

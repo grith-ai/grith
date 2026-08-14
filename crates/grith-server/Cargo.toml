@@ -37,3 +37,6 @@ include_dir = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

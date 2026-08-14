@@ -84,6 +84,13 @@ fn shrink_largest_tool_result(session: &mut grith_cli::ReplSession) -> bool {
 pub struct AgentLoopContext<'a> {
     pub proxy: &'a grith_proxy::engine::SecurityProxy,
     pub audit_storage: &'a std::sync::Arc<std::sync::Mutex<grith_audit::AuditStorage>>,
+    /// B12 #78: whether this process owns the audit database and may write it
+    /// directly. When false (a daemon owns it, so this process is a Reader),
+    /// records are routed to the owner via [`AgentLoopContext::audit_ingest`].
+    pub can_write_audit: bool,
+    /// Client to the audit-owning daemon, used to forward records when this
+    /// process is a Reader. `None` when unavailable.
+    pub audit_ingest: Option<&'a crate::daemon::client::DaemonClient>,
     pub digest_queue: &'a std::sync::Arc<grith_digest::DigestQueue>,
     pub dlp_redactor: &'a grith_proxy::filters::dlp_gate::DlpRedactor,
     pub correlation_tracker: &'a CorrelationTracker,
@@ -189,10 +196,20 @@ pub async fn run_agent_loop(
                 response.usage.completion_tokens,
                 cost_usd,
             );
-            if let Ok(storage) = ctx.audit_storage.lock() {
-                if let Err(e) = storage.insert_record(&cost_record) {
-                    tracing::error!(error = %e, "failed to log LLM completion audit record");
-                }
+            // B12 #78: route the cost record to the audit owner when this
+            // process is a Reader instead of dropping it against a read-only
+            // handle. Unlike an enforcement record this is Allow-only cost
+            // telemetry, so a forward failure is logged rather than aborting
+            // the run — but it is never silently swallowed.
+            if let Err(e) = tool_execution::persist_audit_record(
+                ctx.audit_storage,
+                ctx.can_write_audit,
+                ctx.audit_ingest,
+                &cost_record,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "could not persist LLM completion cost record");
             }
         }
 
@@ -252,6 +269,8 @@ pub async fn run_agent_loop(
             let mut tc_ctx = ToolCallContext {
                 proxy: ctx.proxy,
                 audit_storage: ctx.audit_storage,
+                can_write_audit: ctx.can_write_audit,
+                audit_ingest: ctx.audit_ingest,
                 digest_queue: ctx.digest_queue,
                 dlp_redactor: ctx.dlp_redactor,
                 correlation_tracker: ctx.correlation_tracker,
@@ -267,7 +286,6 @@ pub async fn run_agent_loop(
                 tui_tx: ctx.tui_tx.as_ref(),
             };
             let result = execute_tool_call(tool_call, &mut tc_ctx).await;
-            ctx.telemetry.observe_tool_result(tool_call, &result);
             session.add_tool_result(&tool_call.id, &result);
         }
 

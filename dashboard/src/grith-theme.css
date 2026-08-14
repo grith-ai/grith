@@ -1,0 +1,255 @@
+/*
+ * GENERATED COPY - do not hand-edit.
+ * Canonical source: grith-website/packages/theme/src/grith-theme.css
+ * Re-copy from the canonical file to update (plan task LD1).
+ */
+
+/*
+ * grith-theme.css - canonical Grith design tokens
+ *
+ * SINGLE SOURCE OF TRUTH for the Grith visual system across all UI surfaces.
+ * The copies in grith-docs and grith/dashboard are GENERATED from this file -
+ * do not hand-edit them; edit here and re-copy.
+ *
+ * Theming mechanism (verified against Tailwind 4.1.18 - do not "simplify"):
+ * `@theme inline { --color-bg: #0a0f0d }` bakes the literal hex into compiled
+ * utilities, so a `[data-theme]` override of `--color-*` would toggle nothing.
+ * Var indirection is required: raw `--g-*` custom properties carry the theme
+ * values (dark on `:root` as the default, light on `:root[data-theme='light']`),
+ * and `@theme inline` maps Tailwind token names onto `var(--g-*)`. Compiled
+ * utilities then emit `var(--g-*)` and the data-attribute swap works.
+ *
+ * Import order: this file must be imported after `@import 'tailwindcss';` in
+ * the consuming stylesheet.
+ *
+ * Light-theme accent handling (plan decision D13):
+ * - accent fills keep #00a870 with dark ink #05140e (6.14:1, passes AA)
+ * - accent-coloured TEXT on light backgrounds uses --g-accent-text #007a52
+ *   (measured WCAG contrast 5.00:1 on --g-bg #f5f7f6, 5.38:1 on --g-surface
+ *   #ffffff - both pass AA 4.5:1)
+ */
+
+/* ------------------------------------------------------------------ */
+/* Raw theme values - dark is the default                             */
+/* ------------------------------------------------------------------ */
+
+:root {
+  /* Surfaces */
+  --g-bg: #0a0f0d;
+  --g-surface: #111815; /* raised panel fill */
+  --g-surface-2: #0c110e; /* alternate band (code section, footer) */
+  --g-border: #1f2a24;
+  --g-border-strong: #5c665f; /* hover borders (= faint, per mock) */
+
+  /* Text */
+  --g-text: #e9f0ec;
+  --g-muted: #8b978f; /* secondary body, nav links */
+  --g-faint: #5c665f; /* eyebrows, meta, de-emphasised words */
+
+  /* Accent (brand green, plan decision D1: #00e5a0) */
+  --g-accent: #00e5a0;
+  --g-accent-strong: #00f3aa; /* hover accent: ~6% brightness lift of --g-accent */
+  --g-accent-text: #00e5a0; /* accent-coloured text; darkened on light (D13) */
+  --g-accent-ink: #05140e; /* text on accent fills - fixed both themes (11.43:1 dark, 6.14:1 light) */
+  --g-accent-tint: rgba(0, 229, 160, 0.08);
+  --g-accent-tint-border: rgba(0, 229, 160, 0.25);
+
+  /* Status - fills/glyphs fixed in both themes; *-text variants darken on
+     light because #e0a44a (2.04:1) and #ff5c5c (2.81:1) fail AA as text there */
+  --g-warning: #e0a44a; /* queue / held for review */
+  --g-warning-text: #e0a44a; /* 8.81:1 on #0a0f0d */
+  --g-warning-tint: rgba(224, 164, 74, 0.1);
+  --g-warning-tint-border: rgba(224, 164, 74, 0.25);
+  --g-danger: #ff5c5c; /* deny / blocked */
+  --g-danger-text: #ff5c5c; /* 6.38:1 on #0a0f0d */
+  --g-danger-tint: rgba(255, 92, 92, 0.08);
+  --g-danger-tint-border: rgba(255, 92, 92, 0.25);
+
+  /* Info + purple - theme-tuned (F1 disposition) */
+  --g-info: #4da6ff;
+  --g-info-tint: rgba(77, 166, 255, 0.08);
+  --g-info-tint-border: rgba(77, 166, 255, 0.25);
+  --g-purple: #b392f0;
+  --g-purple-tint: rgba(179, 146, 240, 0.08);
+  --g-purple-tint-border: rgba(179, 146, 240, 0.25);
+
+  /* Code / terminal panels - fixed in both themes (terminals stay dark;
+     the border is the exception and follows the page theme, per the mock) */
+  --g-code-bg: #0b100e;
+  --g-code-text: #c6d3cb;
+  --g-code-muted: #8b978f;
+  --g-code-subtle: #5c665f;
+  --g-code-rule: #1f2a24; /* interior hairlines + bar tracks inside code
+     panels - fixed both themes (only the OUTER panel border follows the
+     page theme via --g-border; interiors must stay dark on light) */
+  --g-code-dot: #2c3a33; /* terminal title-bar dots (mock section 3.5) -
+     fixed both themes, same rationale as --g-code-rule */
+
+  /* Shadows */
+  --g-shadow-panel: 0 30px 60px -30px rgba(0, 0, 0, 0.5); /* hero panel only */
+  --g-shadow-glow: 0 0 0 5px rgba(0, 229, 160, 0.07); /* accent glow ring */
+
+  /* Measure caps (handoff section 2.2) */
+  --g-measure-body: 56ch;
+  --g-measure-h1: 18ch;
+}
+
+/* ------------------------------------------------------------------ */
+/* Light theme overrides                                              */
+/* ------------------------------------------------------------------ */
+
+:root[data-theme="light"] {
+  --g-bg: #f5f7f6;
+  --g-surface: #ffffff;
+  --g-surface-2: #fafbfa;
+  --g-border: #e5ebe8;
+  --g-border-strong: #97a49c;
+
+  --g-text: #0d1512;
+  --g-muted: #58655d;
+  --g-faint: #97a49c;
+
+  /* Accent fills stay #00a870 with dark ink (D13 option b);
+     accent-coloured text darkens to pass AA - see header comment */
+  --g-accent: #00a870;
+  --g-accent-strong: #007a52; /* hover / emphasis = the AA accent-text green */
+  --g-accent-text: #007a52; /* measured 5.00:1 on #f5f7f6, 5.38:1 on #ffffff */
+  --g-accent-tint: rgba(0, 168, 112, 0.08);
+  --g-accent-tint-border: rgba(0, 168, 112, 0.25);
+
+  --g-info: #0969da;
+  --g-info-tint: rgba(9, 105, 218, 0.08);
+  --g-info-tint-border: rgba(9, 105, 218, 0.25);
+  --g-purple: #8250df;
+  --g-purple-tint: rgba(130, 80, 223, 0.08);
+  --g-purple-tint-border: rgba(130, 80, 223, 0.25);
+
+  --g-warning-text: #8a5c00; /* measured 5.40:1 on #f5f7f6, 5.81:1 on #ffffff */
+  --g-danger-text: #c03535; /* measured 5.13:1 on #f5f7f6, 5.52:1 on #ffffff */
+
+  /* --g-warning, --g-danger, --g-accent-ink, --g-code-* intentionally
+     not overridden: fills/glyphs are fixed in both themes */
+}
+
+/* ------------------------------------------------------------------ */
+/* Tailwind token mapping - keeps existing utility names so           */
+/* token-class usages re-skin automatically (F1 disposition table)    */
+/* ------------------------------------------------------------------ */
+
+@theme inline {
+  /* Surfaces */
+  --color-bg: var(--g-bg);
+  /* interim alias until the W2 per-usage rename */
+  --color-bg-dark: var(--g-code-bg);
+  --color-surface: var(--g-surface);
+  --color-surface-2: var(--g-surface-2);
+  --color-border: var(--g-border);
+  --color-border-dark: var(--g-border-strong);
+
+  /* Text */
+  --color-text: var(--g-text);
+  --color-text-secondary: var(--g-muted);
+  --color-text-dim: var(--g-faint);
+
+  /* Accent */
+  --color-green: var(--g-accent);
+  --color-green-dark: var(--g-accent-strong);
+  --color-green-light: var(--g-accent-tint);
+  --color-green-border: var(--g-accent-tint-border);
+  --color-accent-ink: var(--g-accent-ink);
+  --color-accent-text: var(--g-accent-text);
+
+  /* Status */
+  --color-warning: var(--g-warning);
+  --color-warning-text: var(--g-warning-text);
+  --color-warning-light: var(--g-warning-tint);
+  --color-warning-border: var(--g-warning-tint-border);
+  --color-danger: var(--g-danger);
+  --color-danger-text: var(--g-danger-text);
+  --color-danger-light: var(--g-danger-tint);
+  --color-danger-border: var(--g-danger-tint-border);
+  --color-info: var(--g-info);
+  --color-info-light: var(--g-info-tint);
+  --color-info-border: var(--g-info-tint-border);
+  --color-purple: var(--g-purple);
+  --color-purple-light: var(--g-purple-tint);
+  --color-purple-border: var(--g-purple-tint-border);
+
+  /* Terminal / code panels */
+  --color-terminal-bg: var(--g-code-bg);
+  --color-terminal-text: var(--g-code-text);
+  --color-terminal-border: var(--g-border); /* theme-reactive, per the mock */
+  --color-terminal-rule: var(--g-code-rule); /* fixed interior rules/tracks */
+  --color-terminal-muted: var(--g-code-muted);
+  --color-terminal-subtle: var(--g-code-subtle);
+  --color-terminal-dot: var(--g-code-dot);
+
+  /* Fonts (self-hosted, see grith-fonts.css) */
+  --font-heading: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-label: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  /* Radii (handoff section 2.3) */
+  --radius-btn: 8px; /* buttons, small chips */
+  --radius-code: 12px; /* code blocks */
+  --radius-card: 14px; /* feature cards, large panels */
+  --radius-pill: 999px; /* pills */
+
+  /* Shadows */
+  --shadow-panel: var(--g-shadow-panel);
+  --shadow-glow: var(--g-shadow-glow);
+
+  /* Animations (handoff section 2.4) */
+  --animate-grithpulse: grithpulse 1.6s ease-in-out infinite;
+  --animate-grithbar: grithbar 1s ease-out both;
+}
+
+/*
+ * Type ramp reference (handoff section 2.2) - applied per-component at build:
+ *   hero h1        Space Grotesk 600 - 52px/1.04 - -0.03em
+ *   section h2     Space Grotesk 600 - 34px/1.1  - -0.02em
+ *   closing h2     Space Grotesk 600 - 38px/1.1  - -0.02em
+ *   statement      Space Grotesk 400 - 23px/1.42 - -0.01em
+ *   feature h3     Space Grotesk 600 - 20px (grid) / 17-18px (tiles)
+ *   hero body      IBM Plex Sans 400 - 18px/1.6
+ *   section body   IBM Plex Sans 400 - 17px/1.6
+ *   small body     IBM Plex Sans 400 - 14-15px/1.55
+ *   eyebrow        IBM Plex Mono 500 - 12px - 0.10em - uppercase
+ *   terminal body  IBM Plex Mono 400 - 13.5-15px/1.9
+ *   filter row     IBM Plex Mono 400 - 12.5px
+ *   price numeral  Space Grotesk 600 - 40px - -0.02em
+ * Body copy capped at ~52-56ch (--g-measure-body); hero h1 at ~15-18ch
+ * (--g-measure-h1). Use `text-wrap: pretty` on paragraphs.
+ */
+
+/* ------------------------------------------------------------------ */
+/* Keyframes - the only two animations in the system                  */
+/* ------------------------------------------------------------------ */
+
+@keyframes grithpulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes grithbar {
+  from {
+    width: 0;
+  }
+}
+
+/* Bars animate to their true widths only; the dot pulses on the hero
+   panel header. Under reduced motion both are disabled: bars render at
+   final width, the dot renders static. Consumers applying these
+   keyframes via inline styles must also gate on this media query. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-grithpulse,
+  .animate-grithbar {
+    animation: none;
+  }
+}

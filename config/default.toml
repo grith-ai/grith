@@ -6,6 +6,11 @@ log_level = "info"
 audit_dir = "~/.local/share/grith/audit"
 plan_tier = "community"  # "community", "pro", or "enterprise"
 audit_sync = true         # set to false to keep audit records local-only; license checks still use grith.ai
+# onboarded = false        # managed automatically: the first-run wizard, `grith init`, and
+#                          # scripts/setup.sh set this to true. A fresh install (no user config)
+#                          # is treated as not-yet-onboarded; pre-flag configs migrate to true.
+# exec_notice_seen = false # managed automatically: set to true after the one-line `grith exec`
+#                          # first-run notice prints once.
 
 [audit]
 # Completeness tier for the audit log. Higher tiers add forensic /
@@ -57,7 +62,7 @@ taint_data_flow_only = true
 taint_outbound_requires_data_flow = true
 
 [proxy.rate_limit]
-# Gate the rate_limit filter's volume penalties (burst/per-minute/approaching)
+# Gate the rate-limit filter's volume penalties (burst/per-minute/approaching)
 # on per-op risk, so a burst of untainted routine file churn (~/.cache, .git/
 # internals, build outputs) never escalates. The supervisor's target-aware
 # mass-destruction signal backfills the one case this drops (an untainted
@@ -171,6 +176,13 @@ attach_mode = "traceme"
 # false-positive budget. Set true to DENY them (the `echo cmd > /dev/pts/<other
 # pane>` IPC-injection vector). See work/futurework/ipc-delegated-authority-escape.md.
 pty_ownership_enforce = false
+# Seconds to keep running after the daemon stops accounting for this session
+# (it answered a heartbeat with "I am not tracking you" — usually because it
+# restarted while at its session cap). 0 = never terminate: the session keeps
+# running with a loud warning and you decide. Terminating by default would
+# destroy in-progress agent work over a daemon-side event you did not cause.
+# Set a positive value in CI, where nobody is watching the warning.
+authority_lost_terminate_after_seconds = 0
 
 [supervisor.platform]
 linux_mechanism = "ptrace"
@@ -183,7 +195,50 @@ batch_rapid_reads = true
 batch_window_ms = 50
 
 [supervisor.dns_inspection]
+# In-line DNS inspection (Linux). Discovers connected and unconnected UDP DNS
+# destinations, parses every sendto/sendmsg/sendmmsg query before send, and
+# lets allowed queries reach the machine's real resolver untouched. Malformed
+# port-53 payloads fail closed. DoT (port 853) is denied.
 enabled = true
+# Observe DNS responses to populate the exact IP->domain cache the egress /
+# reputation filters use. This promotes tracked recvfrom/recvmsg/recvmmsg calls
+# to catch their exits (one tightly-scoped PTRACE_SYSCALL step per DNS receive).
+# Query blocking does not depend on this. Default on.
+observe_responses = true
+# Deny TCP-DNS, forcing resolution onto the inspected UDP path. TCP-DNS can't be
+# content-inspected (its query/response ride write()/read(), the hottest
+# syscalls, deliberately not intercepted), so leaving it enabled would let a
+# tool bypass query blocking over TCP. The rare cost is a lookup whose answer
+# exceeds EDNS0-UDP size failing (modern resolvers use EDNS0 UDP up to 4 KB, so
+# TCP fallback is seldom needed); such a case surfaces as a visible deny. Set
+# false to allow TCP-DNS uninspected. Default on.
+block_tcp_dns = true
+# Canary path for connected UDP/53 sockets whose query/response use plain
+# write()/read() and are therefore invisible to in-line inspection. Off until
+# the Phase 0 resolver, namespace, race, lifecycle, and performance gates pass.
+connected_udp_proxy = false
+# A proxy-owned upstream socket can have network access the tracee lacks due to
+# cgroups, firewall owner rules, SO_MARK/SO_BINDTODEVICE, or policy routing.
+# Set true only after that authority difference is explicitly reviewed and
+# accepted or equivalently contained. The proxy refuses to start otherwise.
+accept_proxy_network_authority = false
+# QUEUE-range policy decisions from either DNS inspection owner (the in-line
+# sendto/sendmsg path and the connected-UDP proxy) enqueue review but refuse
+# the current lookup. "forward" is an explicit compatibility mode which
+# permits DNS before review and must not be used for complete-enforcement
+# claims.
+proxy_queue_action = "refuse"
+# Bound the proxy data plane. Oversized responses fail explicitly rather than
+# being silently truncated.
+proxy_max_response_bytes = 4096
+proxy_policy_timeout_ms = 1000
+proxy_upstream_timeout_ms = 5000
+# Bounds route-task draining; the owning thread is always joined afterward.
+proxy_shutdown_timeout_ms = 2000
+proxy_route_capacity = 256
+proxy_query_capacity = 1024
+proxy_control_capacity = 256
+proxy_policy_capacity = 128
 
 [server]
 enabled = true

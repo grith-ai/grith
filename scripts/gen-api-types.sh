@@ -154,6 +154,18 @@ export interface LicenseStatusResponse {
   refresh: RefreshState;
 }
 
+/** GET /api/onboarding/status — non-secret state for the Get-started card. */
+export interface OnboardingStatus {
+  onboarded: boolean;
+  audit_sync: boolean;
+  default_provider: string;
+  tier: string;
+  trial_active: boolean;
+  notifications_configured: boolean;
+  active_sessions: number;
+  dismissed: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------
@@ -393,6 +405,9 @@ export interface WsProxyEvaluation {
   call_type?: string;
   /** The supervised tool name, e.g. "claude-code". */
   tool_name?: string;
+  /** Project name for the session (cwd basename or --project override), so a
+   *  brand-new session's rows can be labelled without waiting for the audit poll. */
+  project_name?: string | null;
   /** Human-readable reason for the decision. */
   reason?: string;
 }

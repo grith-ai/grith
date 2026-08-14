@@ -495,7 +495,7 @@ async fn test_multiple_capabilities_selective_enforcement() {
 #[tokio::test]
 async fn test_capability_plus_sensitive_path_cumulative_score() {
     // Plugin "no-caps" tries to read an SSH key file. Both the capability
-    // filter (10.0) and path_match filter (5.0) should fire. But due to
+    // filter (10.0) and path-match filter (5.0) should fire. But due to
     // early termination (10.0 > 8.0 = DENY after Phase 1), Phase 2 filters
     // won't run. The composite score should be at least 10.0.
     let proxy = make_proxy_with_capabilities(vec![CapabilityGrant {
@@ -517,7 +517,7 @@ async fn test_capability_plus_sensitive_path_cumulative_score() {
     );
     assert!(
         decision.composite_score >= 10.0,
-        "Expected composite score >= 10.0 from capability + path_match, got: {}",
+        "Expected composite score >= 10.0 from capability + path-match, got: {}",
         decision.composite_score,
     );
 }

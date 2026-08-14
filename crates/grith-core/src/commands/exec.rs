@@ -3,7 +3,7 @@
 
 //! `grith exec` subcommand — launch or attach to a process under OS-level supervision.
 
-use crate::{daemon, helpers};
+use crate::helpers;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,6 +297,7 @@ pub fn cmd_exec_thin(
     attach: Option<u32>,
     syscall_log: Option<std::path::PathBuf>,
     trace_syscalls_jsonl: Option<std::path::PathBuf>,
+    allow_queued: bool,
     command: Vec<String>,
     project_override: Option<&str>,
     config_path: Option<&std::path::Path>,
@@ -407,10 +408,10 @@ pub fn cmd_exec_thin(
             crossbeam_channel::Receiver<grith_cli::tui::exec_tui::ExecEvent>,
         > = None;
         let mut exec_permission_tx: Option<
-            crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
+            crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionMessage>,
         > = None;
         let mut exec_permission_rx: Option<
-            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::PermissionEvent>,
+            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::PermissionMessage>,
         > = None;
         let mut exec_pty_input_tx: Option<
             std::sync::mpsc::Sender<grith_cli::tui::exec_tui::PtyInput>,
@@ -418,7 +419,64 @@ pub fn cmd_exec_thin(
         let mut exec_tui_rows: u16 = 24;
         let mut exec_tui_cols: u16 = 80;
 
-        let root_pid = if let Some(pid) = attach {
+        // work/74 Phase 1 (go-live review B12 item 1): claim the capacity slot
+        // BEFORE creating the target. Admission used to run after the spawn,
+        // and both spawn paths resume the tracee before returning — so a
+        // rejection could arrive once the supervised tool had already executed
+        // code. Reserving first means a refusal happens while there is still
+        // nothing running.
+        //
+        // A daemon without the reservation route (an older build mid-upgrade)
+        // reports Unsupported; we then fall back to the legacy
+        // register-after-spawn path rather than hard-failing, because bricking
+        // a new CLI against an old daemon is a worse failure than the bug
+        // being fixed.
+        let tool_display = Path::new(&tool_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&tool_name)
+            .to_string();
+
+        let reservation_id = match daemon_client
+            .reserve_session(&tool_display, Some(profile_name.as_str()))
+            .await
+        {
+            Ok(crate::daemon::client::ReserveOutcome::Reserved(id)) => Some(id),
+            Ok(crate::daemon::client::ReserveOutcome::LimitReached(rej)) => {
+                let running = daemon_client.list_sessions().await.unwrap_or_default();
+                render_session_limit_upsell(&rej, &running);
+                anyhow::bail!("session limit reached");
+            }
+            Ok(crate::daemon::client::ReserveOutcome::Unsupported) => {
+                tracing::debug!(
+                    "daemon does not support pre-spawn reservations; \
+                     falling back to post-spawn registration"
+                );
+                None
+            }
+            Err(e) => {
+                // The daemon answered, but not in a way we understand. The
+                // readiness gate already proved it is authenticated and
+                // version-compatible, so treat this as fatal rather than
+                // silently starting an unadmitted session.
+                anyhow::bail!("failed to reserve a supervisor session slot: {e}");
+            }
+        };
+
+        // Release the seat if anything between here and activation fails.
+        let cancel_reservation = |client: crate::daemon::client::DaemonClient,
+                                  id: Option<uuid::Uuid>| async move {
+            if let Some(id) = id {
+                if let Err(e) = client.cancel_session_reservation(id).await {
+                    tracing::warn!(error = %e, "failed to release session reservation");
+                }
+            }
+        };
+
+        // Wrapped so every spawn/attach failure releases the reserved seat
+        // instead of leaking it until the TTL reaper runs.
+        let spawn_result: anyhow::Result<u32> = async {
+        Ok(if let Some(pid) = attach {
             println!("Attaching to PID {pid} with profile '{profile_name}'...");
             interceptor.attach(pid).await?;
             pid
@@ -473,13 +531,17 @@ pub fn cmd_exec_thin(
             {
                 interceptor.spawn_supervised(&cmd, &args, &[]).await?
             }
-        };
+        })
+        }
+        .await;
 
-        let tool_display = Path::new(&tool_name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&tool_name)
-            .to_string();
+        let root_pid = match spawn_result {
+            Ok(pid) => pid,
+            Err(e) => {
+                cancel_reservation(daemon_client.clone(), reservation_id).await;
+                return Err(e);
+            }
+        };
 
         let mut session =
             grith_supervisor::supervisor::SupervisorSession::new(tool_display.clone(), root_pid);
@@ -496,12 +558,23 @@ pub fn cmd_exec_thin(
         session.tty = capture_launch_tty();
         let session_id = session.id;
 
-        match daemon_client.register_session_checked(&session).await? {
-            crate::daemon::client::RegisterOutcome::Registered => {}
-            crate::daemon::client::RegisterOutcome::LimitReached(rej) => {
+        // Convert the reserved seat into a live session. When the daemon
+        // predates reservations we take the legacy path, which is the only
+        // case where a limit rejection can still arrive after the spawn.
+        let admission = match reservation_id {
+            Some(id) => daemon_client.activate_session(id, &session).await,
+            None => daemon_client.register_session_checked(&session).await,
+        };
+        match admission {
+            Ok(crate::daemon::client::RegisterOutcome::Registered) => {}
+            Ok(crate::daemon::client::RegisterOutcome::LimitReached(rej)) => {
                 let running = daemon_client.list_sessions().await.unwrap_or_default();
                 render_session_limit_upsell(&rej, &running);
                 anyhow::bail!("session limit reached");
+            }
+            Err(e) => {
+                cancel_reservation(daemon_client.clone(), reservation_id).await;
+                return Err(e.into());
             }
         }
 
@@ -517,6 +590,18 @@ pub fn cmd_exec_thin(
         supervisor_cfg.syscall_log_file = syscall_log;
         supervisor_cfg.trace_syscalls_jsonl_file = trace_syscalls_jsonl;
         supervisor_cfg.reputation_config = cfg.reputation.to_proxy_config();
+        // Non-interactive session (no dashboard overlay, no TTY): there's no
+        // reviewer to answer a Freeze dialog, so a queued op would block for
+        // `freeze_timeout_seconds` and then auto-deny. Resolve it immediately
+        // instead — fail-closed (deny) by default, or allow+log with
+        // `--allow-queued`. Interactive sessions keep the blocking dialog.
+        if exec_permission_tx.is_none() && !has_tty {
+            supervisor_cfg.interactive_queue_action = if allow_queued {
+                grith_supervisor::config::InteractiveQueueAction::Log
+            } else {
+                grith_supervisor::config::InteractiveQueueAction::Deny
+            };
+        }
         // Select the attach mechanism (traceme | seize) before the first spawn.
         interceptor.set_attach_mode(supervisor_cfg.attach_mode);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -741,508 +826,50 @@ pub fn cmd_exec_thin(
         if has_tty {
             crate::logging::restore(&cfg.general.log_level);
         }
-        println!("Supervisor session {} completed.", session_id);
+        let enable_color = has_tty && std::env::var_os("NO_COLOR").is_none();
+        let upgrade_url = daemon_client
+            .tier_summary()
+            .await
+            .ok()
+            .filter(|tier| !tier.is_paid())
+            .map(|_| format!("{}/pricing", crate::license::web_base_url()));
+        // Thin-client: audit records live in the daemon, so no local per-op
+        // breakdown — show aggregate counts only.
+        let summary = crate::agent::telemetry::SupervisorSummary {
+            tool_name: session.tool_name.clone(),
+            profile: session.profile_name.clone(),
+            project: session.project_name.clone(),
+            session_id,
+            duration: session.started_at.elapsed(),
+            intercepted: session.stats.total_intercepted,
+            noise: session.stats.total_filtered_noise,
+            allowed: session.stats.total_allowed as usize,
+            queued: session.stats.total_queued as usize,
+            denied: session.stats.total_denied as usize,
+            breakdown: std::collections::BTreeMap::new(),
+            share_url: Some(format!("{}/?share=1", daemon_client.base_url())),
+            upgrade_url,
+        };
+        crate::agent::telemetry::print_supervisor_session_summary(&summary, enable_color);
         Ok(())
     })
 }
 
-pub fn cmd_exec(
-    daemon: &daemon::Daemon,
-    profile: Option<String>,
-    attach: Option<u32>,
-    syscall_log: Option<std::path::PathBuf>,
-    trace_syscalls_jsonl: Option<std::path::PathBuf>,
-    command: Vec<String>,
-    project_override: Option<&str>,
-) -> anyhow::Result<()> {
-    let exec_start = std::time::Instant::now();
-    // Support supervisor session management aliases
-    let has_separator = std::env::args_os().any(|arg| arg == "--");
-    if attach.is_none() && profile.is_none() && !has_separator {
-        match command.as_slice() {
-            [cmd] if cmd == "list" => {
-                return super::supervisor::cmd_supervisor(
-                    daemon,
-                    Some(crate::SupervisorAction::List),
-                );
-            }
-            [cmd, session_id] if cmd == "kill" => {
-                return super::supervisor::cmd_supervisor(
-                    daemon,
-                    Some(crate::SupervisorAction::Kill {
-                        session_id: session_id.clone(),
-                    }),
-                );
-            }
-            [cmd] if cmd == "kill" => {
-                anyhow::bail!("usage: grith exec kill <session-id>");
-            }
-            [cmd] if cmd == "prune" => {
-                let (reaped, remaining) = {
-                    let mut registry = daemon
-                        .supervisor_registry
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("supervisor registry lock poisoned"))?;
-                    let reaped = registry.reap_dead();
-                    (reaped, registry.count())
-                };
-                if reaped == 0 {
-                    println!("No dead sessions to prune ({remaining} active).");
-                } else {
-                    println!("Pruned {reaped} dead session(s); {remaining} remaining.");
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
-    if !daemon.config.supervisor.enabled {
-        anyhow::bail!("supervisor is disabled in configuration (set supervisor.enabled = true)");
-    }
-
-    if attach.is_none() && command.is_empty() {
-        anyhow::bail!(
-            "usage: grith exec list | grith exec kill <session-id> | grith exec prune | \
-             grith exec [--profile <name>] [--attach <pid>] -- <command> [args...]"
-        );
-    }
-
-    let tool_name = if let Some(cmd) = command.first() {
-        cmd.clone()
-    } else {
-        format!("pid-{}", attach.unwrap_or(0))
-    };
-
-    let profile_name = profile
-        .or_else(|| grith_supervisor::profiles::SupervisorProfile::detect_profile(&tool_name))
-        .unwrap_or_else(|| daemon.config.supervisor.default_profile.clone());
-
-    validate_supervisor_startup(
-        &daemon.config.supervisor,
-        grith_supervisor::platform::platform_capability(),
-        Some(profile_name.as_str()),
-    )?;
-
-    tracing::info!(
-        %tool_name,
-        %profile_name,
-        attach = ?attach,
-        "starting supervised session"
-    );
-
-    let (command, effective_policy) =
-        prepare_command_and_effective_policy(&profile_name, attach, command)?;
-    let scope_key = effective_policy.scope_key.clone();
-    let launcher_overlay_name = effective_policy.launcher_overlay_name.clone();
-    let provider_overlay_name = effective_policy.provider_overlay_name.clone();
-    let merged_profile = effective_policy.merged_profile.clone();
-
-    {
-        let registry = daemon
-            .supervisor_registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor registry lock poisoned"))?;
-        let active = registry.count();
-        let max = registry.max_sessions();
-        if active >= max {
-            anyhow::bail!(
-                "supervisor session limit reached ({active}/{max}). \
-                 Use `grith exec list` to see active sessions."
-            );
-        }
-    }
-
-    let has_tty = std::io::IsTerminal::is_terminal(&std::io::stdout())
-        && std::io::IsTerminal::is_terminal(&std::io::stdin());
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    runtime.block_on(async {
-        let _sync_handle = if daemon.config.general.audit_sync {
-            tokio::spawn(daemon::Daemon::audit_sync_task(
-                daemon.audit_storage.clone(),
-                daemon.subscribe_shutdown(),
-            ))
-        } else {
-            tokio::spawn(async {})
-        };
-
-        refresh_team_learned_rules_cache_for_session().await;
-
-        let mut interceptor = grith_supervisor::platform::create_interceptor()?;
-        let stdin_paused = Arc::new(AtomicBool::new(false));
-        let output_paused = Arc::new(AtomicBool::new(false));
-
-        // Exec TUI channels (set when PTY + TTY available)
-        let mut exec_tui_tx: Option<
-            crossbeam_channel::Sender<grith_cli::tui::exec_tui::ExecEvent>,
-        > = None;
-        let mut exec_tui_rx: Option<
-            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::ExecEvent>,
-        > = None;
-        let mut exec_permission_tx: Option<
-            crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
-        > = None;
-        let mut exec_permission_rx: Option<
-            crossbeam_channel::Receiver<grith_cli::tui::exec_tui::PermissionEvent>,
-        > = None;
-        let mut exec_pty_input_tx: Option<
-            std::sync::mpsc::Sender<grith_cli::tui::exec_tui::PtyInput>,
-        > = None;
-        let mut exec_tui_rows: u16 = 24;
-        let mut exec_tui_cols: u16 = 80;
-
-        let root_pid = if let Some(pid) = attach {
-            println!("Attaching to PID {pid} with profile '{profile_name}'...");
-            interceptor.attach(pid).await?;
-            pid
-        } else {
-            let cmd = command
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("missing command"))?
-                .clone();
-            let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
-
-            #[cfg(unix)]
-            if daemon.config.supervisor.pty_forwarding {
-                // Reserve rows for grith's chrome (titlebar + log + statusbar).
-                // Use MINIMAL_CHROME_ROWS (log-only height) so the child gets the
-                // maximum stable PTY height; permission dialogs expand into the
-                // viewport without resizing the child.
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                let inner_rows = rows
-                    .saturating_sub(grith_cli::tui::exec_tui::MINIMAL_CHROME_ROWS)
-                    .max(4);
-                let (pid, pty_reader, pty_writer) = interceptor
-                    .spawn_supervised_pty(&cmd, &args, &[], cols, inner_rows)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("PTY spawn failed: {e}"))?;
-
-                if has_tty {
-                    // Channels for TUI ↔ PTY communication. Bulk supervisor
-                    // events and permission requests are split across two
-                    // crossbeam channels so the TUI's biased select! can
-                    // prioritise permission prompts over PTY-output backlog.
-                    let (exec_event_tx, exec_event_rx) = crossbeam_channel::unbounded();
-                    let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
-                    let (pty_input_tx, pty_input_rx) =
-                        std::sync::mpsc::channel::<grith_cli::tui::exec_tui::PtyInput>();
-
-                    // PTY reader thread → TUI
-                    let event_tx_clone = exec_event_tx.clone();
-                    spawn_pty_reader_thread(pty_reader, event_tx_clone);
-
-                    // TUI → PTY writer thread
-                    spawn_pty_writer_thread(pty_writer, pty_input_rx, pid);
-
-                    // Store channels for the supervisor to signal process exit
-                    exec_tui_tx = Some(exec_event_tx);
-                    exec_tui_rx = Some(exec_event_rx);
-                    exec_permission_tx = Some(permission_tx);
-                    exec_permission_rx = Some(permission_rx);
-                    exec_pty_input_tx = Some(pty_input_tx);
-                    exec_tui_rows = rows;
-                    exec_tui_cols = cols;
-                } else {
-                    // No TTY — fallback to raw passthrough
-                    crate::logging::suppress();
-                    spawn_pty_io_threads(
-                        pty_reader,
-                        pty_writer,
-                        stdin_paused.clone(),
-                        output_paused.clone(),
-                    );
-                }
-                pid
-            } else {
-                interceptor.spawn_supervised(&cmd, &args, &[]).await?
-            }
-
-            #[cfg(not(unix))]
-            {
-                interceptor.spawn_supervised(&cmd, &args, &[]).await?
-            }
-        };
-
-        let tool_display = Path::new(&tool_name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&tool_name)
-            .to_string();
-
-        let mut session =
-            grith_supervisor::supervisor::SupervisorSession::new(tool_display.clone(), root_pid);
-        session.profile_name = Some(profile_name.clone());
-        session.policy_scope = Some(scope_key.clone());
-        session.launcher_overlay_name = launcher_overlay_name.clone();
-        session.provider_overlay_name = provider_overlay_name.clone();
-        session.project_name = Some(
-            project_override
-                .map(|s| s.to_string())
-                .unwrap_or_else(helpers::derive_session_name_from_cwd),
-        );
-        session.cwd = capture_launch_cwd();
-        session.tty = capture_launch_tty();
-        let session_id = session.id;
-
-        {
-            let mut registry = daemon
-                .supervisor_registry
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervisor registry lock poisoned"))?;
-            let registry_view = grith_supervisor::supervisor::SupervisorSession {
-                id: session.id,
-                tool_name: session.tool_name.clone(),
-                profile_name: session.profile_name.clone(),
-                policy_scope: session.policy_scope.clone(),
-                launcher_overlay_name: session.launcher_overlay_name.clone(),
-                provider_overlay_name: session.provider_overlay_name.clone(),
-                root_pid: session.root_pid,
-                process_tree: grith_supervisor::process_tree::ProcessTree::new(
-                    root_pid,
-                    &session.tool_name,
-                ),
-                started_at: session.started_at,
-                last_synced_at: session.last_synced_at,
-                last_activity_at: session.last_activity_at,
-                stats: session.stats.clone(),
-                project_name: session.project_name.clone(),
-                cwd: session.cwd.clone(),
-                tty: session.tty.clone(),
-                wedge_reported_tids: std::collections::HashSet::new(),
-                controlling_pts: std::sync::OnceLock::new(),
-            };
-            registry.register(registry_view)?;
-        }
-
-        // Expire stale pending digest items from previous crashed sessions.
-        {
-            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(60);
-            match daemon.digest_queue.expire_before(cutoff) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(count = n, "expired stale pending digest items"),
-                Err(e) => tracing::warn!(error = %e, "failed to expire stale digest items"),
-            }
-        }
-
-        let mut supervisor_cfg = crate::to_runtime_supervisor_config_with_audit(
-            &daemon.config.supervisor,
-            &daemon.config.audit,
-        );
-        supervisor_cfg.syscall_log_file = syscall_log;
-        supervisor_cfg.trace_syscalls_jsonl_file = trace_syscalls_jsonl;
-        supervisor_cfg.reputation_config = daemon.config.reputation.to_proxy_config();
-        // Select the attach mechanism (traceme | seize) before the first spawn.
-        interceptor.set_attach_mode(supervisor_cfg.attach_mode);
-        let shutdown_rx = daemon.subscribe_shutdown();
-
-        // Event broadcast channel for proxy decisions
-        let (broadcast_tx, _broadcast_rx) = tokio::sync::broadcast::channel::<String>(256);
-        let event_tx = Some(broadcast_tx.clone());
-        let digest_store: Arc<dyn grith_supervisor::DigestStore> = Arc::new(
-            grith_supervisor::LocalDigestStore::new(daemon.digest_queue.clone()),
-        );
-        let audit_sink: Arc<dyn grith_supervisor::AuditSink> = Arc::new(
-            grith_supervisor::StorageAuditSink::new(daemon.audit_storage.clone()),
-        );
-        let session_sync: Arc<dyn grith_supervisor::SessionSync> = Arc::new(
-            grith_supervisor::RegistrySessionSync::new(daemon.supervisor_registry.clone()),
-        );
-
-        // Bridge: forward broadcast events to exec TUI as Intercept events
-        if let Some(ref tui_tx) = exec_tui_tx {
-            let mut broadcast_rx = broadcast_tx.subscribe();
-            let tui_tx_clone = tui_tx.clone();
-            tokio::spawn(async move {
-                while let Ok(json_str) = broadcast_rx.recv().await {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        let action = val["action"].as_str().unwrap_or("").to_string();
-                        let call_type = val["call_type"].as_str().unwrap_or("").to_string();
-                        let score = val["score"].as_f64().unwrap_or(0.0);
-                        let timestamp = val["timestamp"]
-                            .as_str()
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                            .map(|dt| dt.format("%H:%M:%S").to_string())
-                            .unwrap_or_default();
-
-                        let event = grith_cli::tui::exec_tui::ExecEvent::Intercept {
-                            timestamp,
-                            action,
-                            call_type,
-                            score,
-                        };
-                        if tui_tx_clone.send(event).is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Use ExecTuiQueueReviewer when exec TUI is active (permission dialog
-        // rendered as overlay), otherwise fall back to TerminalQueueReviewer
-        // for raw PTY passthrough mode.
-        let queue_reviewer: Option<Arc<dyn grith_supervisor::QueueReviewer>> =
-            if let Some(ref perm_tx) = exec_permission_tx {
-                Some(Arc::new(super::exec_reviewer::ExecTuiQueueReviewer::new(
-                    perm_tx.clone(),
-                    digest_store.clone(),
-                )))
-            } else if has_tty {
-                Some(Arc::new(super::exec_reviewer::TerminalQueueReviewer::new(
-                    digest_store.clone(),
-                    stdin_paused.clone(),
-                    output_paused.clone(),
-                    root_pid,
-                )))
-            } else {
-                None
-            };
-
-        // Get trusted domains from the egress filter TOML config for DNS cache seeding.
-        let mut dns_seed_domains =
-            crate::daemon::config_loader::load_egress_policy_config()?.trusted_domains;
-        for dest in &merged_profile.routine_destinations {
-            if !dns_seed_domains.contains(dest) {
-                dns_seed_domains.push(dest.clone());
-            }
-        }
-
-        // Build comprehensive session allowlist from the profile so routine
-        // operations bypass the proxy entirely (no scoring, no rate limiting).
-        let mut session_allowed = merged_profile.build_session_allowlist();
-
-        // Merge persistent local and team-synced learned rules into the
-        // session allowlist.
-        {
-            let (local_count, team_count) =
-                grith_supervisor::learned_rules::merge_default_cached_rules_for_profile(
-                    &mut session_allowed,
-                    &scope_key,
-                );
-            if local_count > 0 {
-                tracing::info!(
-                    count = local_count,
-                    scope = scope_key,
-                    "loaded persistent learned rules into session allowlist"
-                );
-            }
-            if team_count > 0 {
-                tracing::info!(
-                    count = team_count,
-                    scope = scope_key,
-                    "loaded team learned rules from cache into session allowlist"
-                );
-            }
-        }
-
-        // Start the exec TUI on a separate thread if channels are set up
-        let tui_handle = if let (Some(event_rx), Some(permission_rx), Some(pty_input_tx)) = (
-            exec_tui_rx.take(),
-            exec_permission_rx.take(),
-            exec_pty_input_tx.take(),
-        ) {
-            let tui_tool = tool_display.clone();
-            let tui_profile = scope_key.clone();
-            let tui_pid = root_pid;
-            let tui_rows = exec_tui_rows;
-            let tui_cols = exec_tui_cols;
-            let filter_count = daemon.proxy.filter_count();
-            let tui_dashboard_url = if daemon.config.server.enabled {
-                // Bare URL only — see the note at the other TUI construction
-                // site; the token never appears in the persistent header.
-                Some(format!(
-                    "http://{}:{}",
-                    daemon.config.server.host, daemon.config.server.port
-                ))
-            } else {
-                None
-            };
-            Some(std::thread::spawn(move || {
-                let mut state = grith_cli::tui::exec_tui::ExecState::new(
-                    tui_tool,
-                    tui_profile,
-                    tui_pid,
-                    tui_rows,
-                    tui_cols,
-                    filter_count,
-                );
-                state.dashboard_url = tui_dashboard_url;
-                grith_cli::tui::exec_tui::run_exec_tui(state, event_rx, permission_rx, pty_input_tx)
-            }))
-        } else {
-            None
-        };
-
-        tracing::info!(
-            startup_ms = exec_start.elapsed().as_millis(),
-            remote_proxy = false,
-            "grith exec ready — supervisor loop starting"
-        );
-
-        let run_result = grith_supervisor::supervisor::run_supervisor_loop(
-            &mut interceptor,
-            &mut session,
-            daemon.proxy.clone(),
-            audit_sink,
-            digest_store,
-            &daemon.dlp_redactor,
-            daemon.correlation_tracker.clone(),
-            daemon.containment_tracker.clone(),
-            &supervisor_cfg,
-            shutdown_rx,
-            event_tx,
-            queue_reviewer,
-            Some(session_sync),
-            &dns_seed_domains,
-            session_allowed,
-            Some(daemon.reputation_table.clone()),
-            None,
-            None,
-            None,
-            None, // in-process exec: SessionStateRegistry is shared here, no IPC push needed
-        )
-        .await;
-
-        {
-            let mut registry = daemon
-                .supervisor_registry
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervisor registry lock poisoned"))?;
-            registry.remove(&session_id);
-        }
-
-        // Signal the TUI that the process has exited
-        if let Some(ref tx) = exec_tui_tx {
-            let _ = tx.send(grith_cli::tui::exec_tui::ExecEvent::ProcessExited);
-        }
-
-        // Wait for the TUI thread to finish (restores terminal)
-        if let Some(handle) = tui_handle {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "exec TUI error"),
-                Err(_) => tracing::warn!("exec TUI thread panicked"),
-            }
-        } else {
-            // No TUI — restore terminal from raw mode
-            if has_tty {
-                let _ = crossterm::terminal::disable_raw_mode();
-            }
-        }
-
-        run_result.map_err(|e| anyhow::anyhow!("supervisor loop failed: {e}"))?;
-
-        if has_tty {
-            crate::logging::restore(&daemon.config.general.log_level);
-        }
-        println!("Supervisor session {} completed.", session_id);
-        Ok(())
-    })
-}
+// work/74 Phase 0 / invariant 4 — the in-process `cmd_exec` supervision path
+// was REMOVED here (2026-07-28).
+//
+// It supervised a target using a `Daemon` constructed inside this CLI process.
+// That looked like a safe degraded mode and was not: every such process built
+// its own empty `SupervisorRegistry`, so the plan's concurrent-session cap was
+// enforced per-process rather than host-wide (0 >= max never fires in a fresh
+// registry), and every such process became an additional writer on the audit
+// chain, each running its own verification and repair.
+//
+// Supervised execution now goes exclusively through `cmd_exec_thin` against an
+// authenticated daemon; see `crate::daemon::readiness::ensure_daemon_ready`.
+// If a standalone supervisor mode is ever wanted it must be an explicit
+// command that provides equivalent cross-process admission enforcement — not a
+// silent fallback reachable when the daemon is merely unreachable.
 
 #[cfg(test)]
 mod tests {
@@ -1434,13 +1061,24 @@ mod tests {
         };
 
         let allowed = profile.build_session_allowlist();
+
+        // `build_session_allowlist` resolves each routine command through $PATH
+        // (find_in_path). Whether "sh" resolves is environment-dependent, and
+        // under a parallel test runner it is *racy*: another test in this crate
+        // transiently rewrites $PATH to a temp dir with no `sh` (browser.rs),
+        // so "sh" may or may not be resolvable at the moment this runs. Asserting
+        // "a resolved path is present" therefore flakes.
+        //
+        // Assert the environment-independent contract instead: `sh` is covered
+        // by *exactly one* form — a resolved absolute path OR the bare name,
+        // never both and never neither. "Never both" is precisely the
+        // "prefer the exact path over the bare name" guarantee.
+        let has_resolved = allowed.iter().any(|entry| entry.starts_with("exec:/"));
+        let has_bare = allowed.contains("exec:sh");
         assert!(
-            allowed.iter().any(|entry| entry.starts_with("exec:/")),
-            "resolved executable path should be allowlisted when available"
-        );
-        assert!(
-            !allowed.contains("exec:sh"),
-            "bare command names must not be allowlisted when a resolved path exists"
+            has_resolved ^ has_bare,
+            "sh must be allowlisted as exactly one of a resolved path or the bare name; \
+             has_resolved={has_resolved} has_bare={has_bare}"
         );
     }
 

@@ -34,6 +34,9 @@ struct FilterResultSummary {
     filter_name: String,
     matched: bool,
     score: f64,
+    rule_id: String,
+    severity: grith_proxy::types::Severity,
+    message: String,
 }
 
 /// POST /api/proxy/evaluate
@@ -71,6 +74,9 @@ pub(crate) async fn evaluate_proxy(
             filter_name: r.filter_name.clone(),
             matched: r.matched,
             score: r.score,
+            rule_id: r.rule_id.clone(),
+            severity: r.severity,
+            message: r.message.clone(),
         })
         .collect();
 

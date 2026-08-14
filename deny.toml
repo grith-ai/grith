@@ -31,6 +31,12 @@ ignore = [
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
     "RUSTSEC-2026-0141",
+    # quick-xml 0.37.5 XML-parsing DoS (RUSTSEC-2026-0194/0195), transitive
+    # via grith-notify → notify-rust → tauri-winrt-notification (Windows-only
+    # toast notifications). Unreachable on Linux / untrusted-XML paths; no
+    # semver-compatible patch. See .cargo/audit.toml for the full rationale.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]

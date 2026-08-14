@@ -9,6 +9,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { chartColors } from "@/lib/chartPalette";
 import {
   createShareLink,
   shareIntents,
@@ -18,7 +19,14 @@ import {
 
 type Network = "x" | "threads" | "hn";
 
-export function ShareMenu({ stats }: { stats: ShareStats }) {
+export function ShareMenu({
+  stats,
+  autoOpen = false,
+}: {
+  stats: ShareStats;
+  /** Open from the CLI's explicit end-of-session dashboard deep link. */
+  autoOpen?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -27,6 +35,17 @@ export function ShareMenu({ stats }: { stats: ShareStats }) {
   const [pngLabel, setPngLabel] = useState("Download image (PNG)");
   const promiseRef = useRef<Promise<string> | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const autoOpenConsumedRef = useRef(false);
+
+  useEffect(() => {
+    if (autoOpen && !autoOpenConsumedRef.current) {
+      autoOpenConsumedRef.current = true;
+      // Do not mint a public link yet. Opening the local menu is safe; the
+      // user still chooses a network/copy action before aggregate stats leave
+      // the machine.
+      setOpen(true);
+    }
+  }, [autoOpen]);
 
   useEffect(() => {
     if (!open) return;
@@ -61,7 +80,7 @@ export function ShareMenu({ stats }: { stats: ShareStats }) {
         })
         .catch((e) => {
           promiseRef.current = null; // allow retry
-          setError("Couldn't create a share link — check your connection.");
+          setError("Couldn't create a share link - check your connection.");
           throw e;
         })
         .finally(() => setCreating(false));
@@ -131,7 +150,7 @@ export function ShareMenu({ stats }: { stats: ShareStats }) {
         title="Share your security posture"
         className="group inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.06] px-3 py-1.5 text-[12px] font-medium text-white/80 transition-colors hover:bg-[#00e5a0]/15 hover:border-[#00e5a0]/40 hover:text-white"
       >
-        <svg className="w-3.5 h-3.5 text-[#00e5a0]" viewBox="0 0 24 24" fill="none" aria-hidden>
+        <svg className="w-3.5 h-3.5" style={{ color: chartColors.accent }} viewBox="0 0 24 24" fill="none" aria-hidden>
           <circle cx="18" cy="5" r="2.5" stroke="currentColor" strokeWidth="1.6" />
           <circle cx="6" cy="12" r="2.5" stroke="currentColor" strokeWidth="1.6" />
           <circle cx="18" cy="19" r="2.5" stroke="currentColor" strokeWidth="1.6" />
@@ -144,7 +163,10 @@ export function ShareMenu({ stats }: { stats: ShareStats }) {
       </button>
 
       {open && (
-        <div className="absolute right-0 z-20 mt-2 w-60 overflow-hidden rounded-xl border border-white/10 bg-[#11151b] shadow-[0_12px_40px_-8px_rgba(0,0,0,0.6)]">
+        <div
+          className="absolute right-0 z-20 mt-2 w-60 overflow-hidden rounded-code border border-white/10"
+          style={{ backgroundColor: chartColors.surface }}
+        >
           <MenuItem onClick={() => openIntent("x")} label="Post to X" disabled={!!error} icon={<XIcon />} />
           <MenuItem onClick={() => openIntent("threads")} label="Post to Threads" disabled={!!error} icon={<ThreadsIcon />} />
           <MenuItem onClick={() => openIntent("hn")} label="Submit to Hacker News" disabled={!!error} icon={<HnIcon />} />
@@ -154,12 +176,12 @@ export function ShareMenu({ stats }: { stats: ShareStats }) {
 
           <div className="border-t border-white/8 px-3 py-2">
             {error ? (
-              <p className="text-[11px] text-[#ff5c69]">{error}</p>
+              <p className="text-[11px]" style={{ color: chartColors.danger }}>{error}</p>
             ) : creating ? (
               <p className="text-[11px] text-white/40">Preparing share link…</p>
             ) : (
               <p className="text-[11px] text-white/35">
-                Shares aggregate counts only — no paths or project names.
+                Shares aggregate counts only - no paths or project names.
               </p>
             )}
           </div>

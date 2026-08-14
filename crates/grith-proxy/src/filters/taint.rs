@@ -131,7 +131,7 @@ pub struct TaintFilter {
     /// `npm publish` QUEUE after the agent merely reads a credential it
     /// legitimately uses; genuine exfil of the tainted data still fires
     /// via conditions 1–3/5, and outbound-to-untrusted-destination is
-    /// independently scored by `egress_policy`.
+    /// independently scored by `egress-policy`.
     ///
     /// Default `false` (legacy: condition 4 fires standalone) so the
     /// builder/test baseline is unchanged; production opts in via
@@ -541,7 +541,7 @@ impl TaintFilter {
         // so on its own it false-positives the common own-credential
         // pattern (`git push` / `aws s3 ls` / `npm publish` after reading
         // a credential the tool legitimately uses). Conditions 1/2/3/5
-        // still catch genuine exfil of the tainted data, and egress_policy
+        // still catch genuine exfil of the tainted data, and egress-policy
         // independently scores outbound-to-untrusted-destination.
         if session_has_taint && !self.outbound_requires_data_flow {
             let canonical_opt =

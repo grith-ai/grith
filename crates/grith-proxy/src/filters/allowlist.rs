@@ -51,17 +51,29 @@ impl SecurityFilter for AllowlistFilter {
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
         let full_command = ctx.full_command();
         let net_target = ctx.address().map(|(addr, port)| format!("{addr}:{port}"));
-        let target = ctx
+
+        // Every path the call touches must be checked against the operator's
+        // rules, not just the primary one. Link creation carries two — the
+        // target and the new name — and a link planted AT a denylisted path
+        // slipped past a target-only check (go-live review round 2). For a
+        // non-file call there is exactly one target (url / command / net).
+        let file_paths = ctx.paths();
+        let single_target = ctx
             .path()
             .or_else(|| ctx.url())
             .or(full_command.as_deref())
             .or(net_target.as_deref())
             .unwrap_or("");
+        let targets: Vec<&str> = if file_paths.is_empty() {
+            vec![single_target]
+        } else {
+            file_paths
+        };
 
-        // Check denylist first — explicit blocks
+        // Check denylist first — explicit blocks. ANY matching path denies.
         for entry in &self.config.deny {
-            if path_matches(target, &entry.pattern)
-                && plugin_matches(&ctx.plugin_id, &entry.plugins)
+            if plugin_matches(&ctx.plugin_id, &entry.plugins)
+                && targets.iter().any(|t| path_matches(t, &entry.pattern))
             {
                 return Ok(FilterResult::matched(
                     "allowlist",
@@ -73,10 +85,10 @@ impl SecurityFilter for AllowlistFilter {
             }
         }
 
-        // Check allowlist — explicit allows reduce score
+        // Check allowlist — explicit allows reduce score.
         for entry in &self.config.allow {
-            if path_matches(target, &entry.pattern)
-                && plugin_matches(&ctx.plugin_id, &entry.plugins)
+            if plugin_matches(&ctx.plugin_id, &entry.plugins)
+                && targets.iter().any(|t| path_matches(t, &entry.pattern))
             {
                 return Ok(FilterResult::matched(
                     "allowlist",
@@ -301,6 +313,34 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert_eq!(result.rule_id, "deny-list");
+    }
+
+    /// Round-2 regression: a link planted AT a denylisted path must be
+    /// blocked. The denylist keyed on `ctx.path()` (the target for a
+    /// FileLink), so `ln -s ./mine ~/.ssh/authorized_keys` slipped past a
+    /// `*/.ssh/*` deny rule.
+    #[tokio::test]
+    async fn denylist_blocks_a_link_planted_at_a_denied_path() {
+        let filter = AllowlistFilter::new(AllowlistConfig {
+            allow: vec![],
+            deny: vec![ListEntry {
+                pattern: "*/.ssh/*".into(),
+                plugins: vec![],
+            }],
+        });
+        let ctx = make_ctx(
+            "test",
+            ToolCallType::FileLink {
+                target: "/home/u/project/mine".into(),
+                link_path: "/home/u/.ssh/authorized_keys".into(),
+                symbolic: true,
+            },
+        );
+        let r = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            r.matched && r.rule_id == "deny-list",
+            "a link planted at a denylisted path must be denied: {r:?}"
+        );
     }
 
     #[test]

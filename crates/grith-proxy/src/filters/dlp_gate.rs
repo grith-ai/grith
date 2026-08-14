@@ -209,7 +209,7 @@ impl DlpGateFilter {
 #[async_trait::async_trait]
 impl SecurityFilter for DlpGateFilter {
     fn name(&self) -> &str {
-        "dlp_gate"
+        "dlp-gate"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -218,12 +218,12 @@ impl SecurityFilter for DlpGateFilter {
 
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
         if !Self::is_outbound_sink(&ctx.call_type) {
-            return Ok(FilterResult::no_match("dlp_gate"));
+            return Ok(FilterResult::no_match("dlp-gate"));
         }
 
         let text = Self::extract_outbound_text(ctx);
         if text.is_empty() {
-            return Ok(FilterResult::no_match("dlp_gate"));
+            return Ok(FilterResult::no_match("dlp-gate"));
         }
 
         // Find all matching patterns, report the first match.
@@ -231,7 +231,7 @@ impl SecurityFilter for DlpGateFilter {
             if pattern.regex.is_match(&text) {
                 let rule_id = format!("dlp-{}", pattern.id);
                 let mut result = FilterResult::matched(
-                    "dlp_gate",
+                    "dlp-gate",
                     &rule_id,
                     self.policy_score(),
                     self.policy_severity(),
@@ -253,7 +253,7 @@ impl SecurityFilter for DlpGateFilter {
             }
         }
 
-        Ok(FilterResult::no_match("dlp_gate"))
+        Ok(FilterResult::no_match("dlp-gate"))
     }
 }
 
@@ -266,6 +266,7 @@ impl SecurityFilter for DlpGateFilter {
 /// This is a standalone component that can be used by the daemon and supervisor
 /// to redact secrets from `arguments_summary` fields before they reach the
 /// digest queue, audit log, or dashboard.
+#[derive(Clone)]
 pub struct DlpRedactor {
     patterns: Arc<Vec<CompiledDlpPattern>>,
 }
@@ -321,7 +322,7 @@ impl DlpRedactor {
 /// Check whether any filter result in a proxy decision came from the DLP gate.
 pub fn has_dlp_detection(filter_results: &[FilterResult]) -> bool {
     filter_results.iter().any(|r| {
-        r.filter_name == "dlp_gate"
+        r.filter_name == "dlp-gate"
             && r.matched
             && r.metadata
                 .get("dlp_detected")
@@ -556,7 +557,7 @@ mod tests {
     #[test]
     fn test_has_dlp_detection_true() {
         let mut result = FilterResult::matched(
-            "dlp_gate",
+            "dlp-gate",
             "dlp-aws-access-key",
             5.0,
             Severity::Error,
@@ -571,7 +572,7 @@ mod tests {
     #[test]
     fn test_has_dlp_detection_false_for_other_filters() {
         let result = FilterResult::matched(
-            "secret_scan",
+            "secret-scan",
             "aws-access-key",
             5.0,
             Severity::Critical,

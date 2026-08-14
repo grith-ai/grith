@@ -243,6 +243,45 @@ download_and_install() {
 
     ok "Checksum verified."
 
+    # Optional cosign signature verification. Proves the archive was signed by
+    # the grith release workflow at this tag (keyless Sigstore, Rekor-anchored) —
+    # a stronger guarantee than the checksum alone. Skipped when cosign is not
+    # installed or the release predates signing; a present-but-invalid signature
+    # is fatal. Override the expected signer with GRITH_COSIGN_IDENTITY_REGEXP.
+    if command -v cosign >/dev/null 2>&1; then
+        local bundle_file="${archive_file}.cosign.bundle"
+        local bundle_url="${base_url}/${bundle_file}"
+        local got_bundle=0
+        if command -v curl >/dev/null 2>&1; then
+            curl -sSL --fail -o "${tmpdir}/${bundle_file}" "${bundle_url}" 2>/dev/null && got_bundle=1
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -O "${tmpdir}/${bundle_file}" "${bundle_url}" 2>/dev/null && got_bundle=1
+        fi
+        if [ "${got_bundle}" -eq 1 ]; then
+            info "Verifying cosign signature..."
+            local identity_re="${GRITH_COSIGN_IDENTITY_REGEXP:-}"
+            if [ -z "${identity_re}" ]; then
+                identity_re="^https://github[.]com/[^/]+/grith/[.]github/workflows/release[.]yml@refs/tags/v${version}$"
+            fi
+            if cosign verify-blob \
+                --bundle "${tmpdir}/${bundle_file}" \
+                --certificate-identity-regexp "${identity_re}" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                "${tmpdir}/${archive_file}" >/dev/null 2>&1; then
+                ok "Cosign signature verified."
+            else
+                err "Cosign signature verification FAILED - refusing to install."
+                err "If you are installing a fork's build, set GRITH_COSIGN_IDENTITY_REGEXP."
+                exit 1
+            fi
+        else
+            info "No cosign signature published for this release; skipping (checksum verified)."
+        fi
+    else
+        info "cosign not found; skipping signature verification (checksum verified)."
+        info "For full supply-chain verification, install cosign: https://docs.sigstore.dev/cosign/installation/"
+    fi
+
     # Extract archive
     info "Extracting..."
     tar xzf "${tmpdir}/${archive_file}" -C "${tmpdir}"

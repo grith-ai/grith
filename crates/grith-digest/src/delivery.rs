@@ -486,6 +486,7 @@ mod tests {
             session_id: None,
             tool_call_type: "ShellExec".into(),
             arguments_summary: "curl evil.com".into(),
+            decision_reason: Some("review required".into()),
             composite_score: 5.5,
             severity: ScoreSeverity::High,
             filter_breakdown: vec![FilterBreakdown {

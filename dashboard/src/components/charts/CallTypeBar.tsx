@@ -6,6 +6,9 @@ import { useMemo } from "react";
 import * as d3Scale from "d3-scale";
 import * as d3Array from "d3-array";
 import type { AuditRecord } from "@/types/api";
+import { chartColors } from "@/lib/chartPalette";
+
+const TICK_FONT = "'IBM Plex Mono', monospace";
 
 const MARGIN = { top: 8, right: 16, bottom: 4, left: 120 };
 const BAR_HEIGHT = 22;
@@ -68,8 +71,8 @@ export function CallTypeBar({ records, width = 400 }: Props) {
                 textAnchor="end"
                 dominantBaseline="central"
                 fontSize={11}
-                fontFamily="'JetBrains Mono', monospace"
-                fill="#0d1117"
+                fontFamily={TICK_FONT}
+                fill={chartColors.text}
               >
                 {name}
               </text>
@@ -80,7 +83,7 @@ export function CallTypeBar({ records, width = 400 }: Props) {
                 width={barW}
                 height={BAR_HEIGHT}
                 rx={3}
-                fill="#00a85a"
+                fill={chartColors.accent}
                 opacity={0.75}
               />
               {/* Count */}
@@ -89,8 +92,8 @@ export function CallTypeBar({ records, width = 400 }: Props) {
                 y={y + BAR_HEIGHT / 2 + 1}
                 dominantBaseline="central"
                 fontSize={10}
-                fontFamily="'JetBrains Mono', monospace"
-                fill="#8b949e"
+                fontFamily={TICK_FONT}
+                fill={chartColors.muted}
               >
                 {count.toLocaleString()}
               </text>
@@ -100,7 +103,7 @@ export function CallTypeBar({ records, width = 400 }: Props) {
                 x2={innerW}
                 y1={y + BAR_HEIGHT + BAR_GAP / 2}
                 y2={y + BAR_HEIGHT + BAR_GAP / 2}
-                stroke="#e2e6eb"
+                stroke={chartColors.border}
                 strokeWidth={0.5}
                 opacity={i < bars.length - 1 ? 1 : 0}
               />

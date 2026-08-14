@@ -71,7 +71,7 @@ export function InventoryPage() {
   if (loading && !data) {
     return (
       <div className="p-6">
-        <p className="text-zinc-400">Loading inventory…</p>
+        <p className="text-text-secondary">Loading inventory…</p>
       </div>
     );
   }
@@ -79,8 +79,8 @@ export function InventoryPage() {
   if (error) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-semibold mb-4">Binaries trusted this session</h1>
-        <p className="text-status-deny-red">{error}</p>
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-4">Binaries trusted this session</h1>
+        <p className="text-danger-text">{error}</p>
       </div>
     );
   }
@@ -92,12 +92,12 @@ export function InventoryPage() {
   return (
     <div className="p-6">
       <div className="flex items-baseline justify-between mb-2">
-        <h1 className="text-xl font-semibold text-grith-text">
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text">
           Binaries trusted this session
         </h1>
         <button
           onClick={() => void fetchInventory()}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors"
+          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors"
         >
           Refresh
         </button>
@@ -106,35 +106,35 @@ export function InventoryPage() {
       <SessionHeader sessionId={data.session_id} basePath="/inventory" />
 
       <div className="grid grid-cols-3 gap-4 mb-4 text-sm">
-        <div className="bg-white border border-grith-border rounded-xl px-4 py-3">
-          <div className="text-grith-muted text-xs uppercase tracking-wide">
+        <div className="bg-surface border border-border rounded-card px-4 py-3">
+          <div className="font-label text-text-dim text-[11px] uppercase tracking-[0.08em]">
             Binaries pinned
           </div>
-          <div className="text-2xl font-semibold text-grith-text mt-1">
+          <div className="font-heading text-[26px] font-semibold tracking-[-0.02em] text-text mt-1">
             {data.binaries_pinned}
           </div>
         </div>
-        <div className="bg-white border border-grith-border rounded-xl px-4 py-3">
-          <div className="text-grith-muted text-xs uppercase tracking-wide">
+        <div className="bg-surface border border-border rounded-card px-4 py-3">
+          <div className="font-label text-text-dim text-[11px] uppercase tracking-[0.08em]">
             Files scanned
           </div>
-          <div className="text-2xl font-semibold text-grith-text mt-1">
+          <div className="font-heading text-[26px] font-semibold tracking-[-0.02em] text-text mt-1">
             {data.total_scanned}
           </div>
         </div>
         <div
-          className={`border rounded-xl px-4 py-3 ${
+          className={`border rounded-card px-4 py-3 ${
             data.truncated
-              ? "border-status-queue-amber bg-status-queue-light"
-              : "border-grith-border bg-white"
+              ? "border-warning-border bg-warning-light"
+              : "border-border bg-surface"
           }`}
         >
-          <div className="text-grith-muted text-xs uppercase tracking-wide">
+          <div className="font-label text-text-dim text-[11px] uppercase tracking-[0.08em]">
             Walk
           </div>
           <div
-            className={`text-2xl font-semibold mt-1 ${
-              data.truncated ? "text-status-queue-amber" : "text-grith-text"
+            className={`font-heading text-[26px] font-semibold tracking-[-0.02em] mt-1 ${
+              data.truncated ? "text-warning-text" : "text-text"
             }`}
           >
             {data.truncated ? "Truncated" : "Complete"}
@@ -143,12 +143,12 @@ export function InventoryPage() {
       </div>
 
       {data.truncated && (
-        <div className="mb-4 rounded-xl border border-status-queue-amber bg-status-queue-light px-4 py-3 text-sm text-grith-text">
-          <span className="font-medium text-status-queue-amber">
+        <div className="mb-4 rounded-card border border-warning-border bg-warning-light px-4 py-3 text-sm text-text">
+          <span className="font-medium text-warning-text">
             Walk hit the file cap.
           </span>{" "}
           Tighten the profile's{" "}
-          <code className="font-mono text-grith-text bg-white px-1 rounded">
+          <code className="font-code text-text bg-surface-2 px-1 rounded">
             routine_exec_roots
           </code>{" "}
           glob patterns so the session-start scan completes.
@@ -157,7 +157,7 @@ export function InventoryPage() {
 
       <div className="relative max-w-md mb-4">
         <svg
-          className="absolute left-3 top-2.5 w-4 h-4 text-grith-dim pointer-events-none"
+          className="absolute left-3 top-2.5 w-4 h-4 text-text-dim pointer-events-none"
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -174,13 +174,13 @@ export function InventoryPage() {
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           placeholder="Filter by path or SHA-256 prefix"
-          className="w-full pl-9 pr-3 py-2 rounded-input border border-grith-border bg-white text-sm font-mono text-grith-text placeholder:text-grith-dim focus:outline-none focus:border-accent"
+          className="w-full pl-9 pr-3 py-2 rounded-btn border border-border bg-surface text-sm font-code text-text placeholder:text-text-dim focus:outline-none focus:border-green focus:shadow-glow"
         />
       </div>
 
-      <div className="bg-white border border-grith-border rounded-xl overflow-hidden">
+      <div className="bg-surface border border-border rounded-card overflow-hidden">
         <table className="w-full text-sm">
-          <thead className="bg-grith-surface text-grith-muted text-xs uppercase tracking-wide">
+          <thead className="border-b border-border font-label text-text-dim text-[11px] uppercase tracking-[0.08em]">
             <tr>
               <th className="text-left px-4 py-2 font-medium">Path</th>
               <th className="text-left px-4 py-2 font-medium w-72">SHA-256</th>
@@ -190,13 +190,13 @@ export function InventoryPage() {
             {entries.map((entry) => (
               <tr
                 key={entry.path}
-                className="border-t border-grith-border hover:bg-grith-surface/60"
+                className="border-t border-border hover:bg-surface-2"
               >
-                <td className="px-4 py-2 font-mono text-grith-text break-all">
+                <td className="px-4 py-2 font-code text-text break-all">
                   {entry.path}
                 </td>
                 <td
-                  className="px-4 py-2 font-mono text-xs text-grith-muted truncate"
+                  className="px-4 py-2 font-code text-xs text-text-secondary truncate"
                   title={entry.sha256}
                 >
                   {entry.sha256.slice(0, 16)}…
@@ -205,9 +205,9 @@ export function InventoryPage() {
             ))}
             {entries.length === 0 && (
               <tr>
-                <td colSpan={2} className="px-4 py-8 text-center text-grith-muted">
+                <td colSpan={2} className="px-4 py-8 text-center text-text-secondary">
                   {data.entries.length === 0
-                    ? "No binaries pinned yet — the session-start scan may still be running, or this profile declares no routine_exec_roots."
+                    ? "No binaries pinned yet - the session-start scan may still be running, or this profile declares no routine_exec_roots."
                     : "No entries match the filter."}
                 </td>
               </tr>

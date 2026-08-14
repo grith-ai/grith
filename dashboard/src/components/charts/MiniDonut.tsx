@@ -4,10 +4,12 @@
 
 import * as d3Shape from "d3-shape";
 
+import { chartColors } from "@/lib/chartPalette";
+
 const COLORS = {
-  allow: "#00a85a",
-  queue: "#bf8700",
-  deny: "#d1242f",
+  allow: chartColors.accent,
+  queue: chartColors.warning,
+  deny: chartColors.danger,
 };
 
 interface Props {
@@ -27,7 +29,7 @@ export function MiniDonut({ allow, queue, deny, size = 48 }: Props) {
           cy={size / 2}
           r={size / 2 - 4}
           fill="none"
-          stroke="#e2e6eb"
+          stroke={chartColors.border}
           strokeWidth={4}
         />
       </svg>
@@ -61,14 +63,16 @@ export function MiniDonut({ allow, queue, deny, size = 48 }: Props) {
         {arcs.map((a, i) => (
           <path key={i} d={arc(a) ?? ""} fill={a.data.color} />
         ))}
-        {/* Center percentage */}
+        {/* Center percentage sits over the themed card fill, so it follows
+            the theme via currentColor rather than the fixed chart palette. */}
         <text
+          className="text-text"
           textAnchor="middle"
           dominantBaseline="central"
           fontSize={11}
-          fontFamily="'JetBrains Mono', monospace"
+          fontFamily="'IBM Plex Mono', monospace"
           fontWeight={600}
-          fill="#0d1117"
+          fill="currentColor"
         >
           {Math.round((allow / total) * 100)}%
         </text>

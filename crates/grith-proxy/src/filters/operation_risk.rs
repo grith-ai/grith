@@ -83,6 +83,16 @@ pub fn operation_risk_for_spawn(ctx: &ToolCallContext, enabled: bool) -> f64 {
     }
 }
 
+/// HTTP methods that carry a request body — data leaving the host. Weighted
+/// above read-shaped methods (GET/HEAD/OPTIONS/…) because an outbound body is
+/// the exfil-relevant shape (W3). Matches the taint filter's high-risk set.
+fn is_body_bearing_http_method(method: &str) -> bool {
+    matches!(
+        method.trim().to_ascii_uppercase().as_str(),
+        "POST" | "PUT" | "PATCH"
+    )
+}
+
 fn has_routine_signal(ctx: &ToolCallContext, enabled: bool) -> bool {
     if !enabled {
         return false;
@@ -229,7 +239,7 @@ impl Default for OperationRiskFilter {
 #[async_trait::async_trait]
 impl SecurityFilter for OperationRiskFilter {
     fn name(&self) -> &str {
-        "operation_risk"
+        "operation-risk"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -240,7 +250,7 @@ impl SecurityFilter for OperationRiskFilter {
         let (score, rule_id, severity, message) = match &ctx.call_type {
             // Safe read-only operations: no baseline risk.
             ToolCallType::FileRead { .. } | ToolCallType::DirList { .. } => {
-                return Ok(FilterResult::no_match("operation_risk"));
+                return Ok(FilterResult::no_match("operation-risk"));
             }
 
             // Mild mutations.
@@ -266,6 +276,31 @@ impl SecurityFilter for OperationRiskFilter {
                 Severity::Notice,
                 format!("File rename: {old_path} -> {new_path}"),
             ),
+            // Link creation carries the same baseline as a write: it is a
+            // routine build-system operation (node_modules, cargo caches,
+            // `ln -s` in install scripts) and must not queue on its own.
+            // What makes a link dangerous is its *target*, and `path()`
+            // returns the target so path-match / sensitive_path score it —
+            // a link to `~/.ssh/id_rsa` adds their +5.0/+4.0 on top of this
+            // baseline and lands in DENY territory, while a link inside the
+            // project stays at 0.5 and flows through.
+            ToolCallType::FileLink {
+                target,
+                link_path,
+                symbolic,
+            } => (
+                0.5,
+                if *symbolic {
+                    "symlink-create-baseline"
+                } else {
+                    "hardlink-create-baseline"
+                },
+                Severity::Notice,
+                format!(
+                    "{kind} link created: {link_path} -> {target}",
+                    kind = if *symbolic { "Symbolic" } else { "Hard" }
+                ),
+            ),
 
             // Writes and network access.
             ToolCallType::FileWrite { path, .. } => (
@@ -274,12 +309,30 @@ impl SecurityFilter for OperationRiskFilter {
                 Severity::Notice,
                 format!("File write: {path}"),
             ),
-            ToolCallType::HttpRequest { method, url } => (
-                0.5,
-                "http-request-baseline",
-                Severity::Notice,
-                format!("HTTP request: {method} {url}"),
-            ),
+            ToolCallType::HttpRequest { method, url } => {
+                // W3: a body-bearing method (POST/PUT/PATCH) pushes data OUT — the
+                // write-shaped, exfil-relevant direction — so it carries a higher
+                // baseline than a read-shaped GET/HEAD/OPTIONS. This only sharpens
+                // an already-flagged untrusted write (egress-policy owns the
+                // destination score); a write to a trusted host stays well under
+                // the queue threshold, so no new approvals. Method is visible only
+                // on Path-1 HttpRequest; supervised HTTPS is TLS-opaque.
+                if is_body_bearing_http_method(method) {
+                    (
+                        1.0,
+                        "http-write-request-baseline",
+                        Severity::Notice,
+                        format!("HTTP {method} request (carries body): {url}"),
+                    )
+                } else {
+                    (
+                        0.5,
+                        "http-request-baseline",
+                        Severity::Notice,
+                        format!("HTTP request: {method} {url}"),
+                    )
+                }
+            }
             ToolCallType::NetConnect { address, port } => (
                 0.5,
                 "net-connect-baseline",
@@ -344,8 +397,8 @@ impl SecurityFilter for OperationRiskFilter {
                 }
             }
             ToolCallType::NetListen { address, port } => {
-                // PR 69 Change 4: `operation_risk` no longer scores
-                // bind-shape exposure. PR 5's `egress_policy` is the
+                // PR 69 Change 4: `operation-risk` no longer scores
+                // bind-shape exposure. PR 5's `egress-policy` is the
                 // authoritative scorer for the loopback / wildcard /
                 // declared-clamp / specific-iface matrix; doubling the
                 // score here pushed wildcard-undeclared from QUEUE
@@ -355,7 +408,7 @@ impl SecurityFilter for OperationRiskFilter {
                 // We still want a non-zero baseline so listen ops show
                 // up in audit-log queries even when no other filter
                 // matches. The shape distinction now lives entirely in
-                // `egress_policy`.
+                // `egress-policy`.
                 (
                     0.5,
                     "net-listen-baseline",
@@ -419,7 +472,7 @@ impl SecurityFilter for OperationRiskFilter {
         };
 
         Ok(FilterResult::matched(
-            "operation_risk",
+            "operation-risk",
             rule_id,
             score,
             severity,
@@ -510,9 +563,43 @@ mod tests {
         assert_eq!(result.score, 0.5);
     }
 
+    /// W3: a body-bearing method (POST/PUT/PATCH) carries a higher baseline than
+    /// a read-shaped GET — an outbound body is the exfil-relevant direction.
+    #[tokio::test]
+    async fn test_http_write_methods_weighted_higher() {
+        let filter = OperationRiskFilter::new();
+        for method in ["POST", "put", "PATCH"] {
+            let ctx = make_ctx(ToolCallType::HttpRequest {
+                method: method.into(),
+                url: "https://example.com/upload".into(),
+            });
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert_eq!(
+                result.rule_id, "http-write-request-baseline",
+                "method {method}"
+            );
+            assert_eq!(result.score, 1.0, "method {method}");
+        }
+    }
+
+    /// Read-shaped methods keep the low baseline (no body leaves).
+    #[tokio::test]
+    async fn test_http_read_methods_keep_low_baseline() {
+        let filter = OperationRiskFilter::new();
+        for method in ["GET", "HEAD", "OPTIONS", "DELETE"] {
+            let ctx = make_ctx(ToolCallType::HttpRequest {
+                method: method.into(),
+                url: "https://example.com".into(),
+            });
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert_eq!(result.rule_id, "http-request-baseline", "method {method}");
+            assert_eq!(result.score, 0.5, "method {method}");
+        }
+    }
+
     /// PR 69 Change 4: every NetListen — loopback, wildcard, or
     /// specific interface — gets the same low baseline here. Bind-shape
-    /// exposure is owned by `egress_policy`.
+    /// exposure is owned by `egress-policy`.
     #[tokio::test]
     async fn test_net_listen_wildcard_returns_baseline_only() {
         let filter = OperationRiskFilter::new();

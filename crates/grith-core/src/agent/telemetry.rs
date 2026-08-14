@@ -9,14 +9,15 @@
 
 use crossterm::style::{Color, Stylize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::helpers::{
-    format_duration, format_provider_name, ordered_tool_breakdown, print_summary_row,
-    printable_tool_rows, quality_indicator,
+    format_duration, format_provider_name, ordered_tool_breakdown, print_summary_line,
+    print_summary_row, printable_tool_rows,
 };
 
-/// Accumulates telemetry for a single agent session (tokens, costs, tool calls, quality).
+/// Accumulates telemetry for a single agent session (tokens, costs, tool calls).
 #[derive(Debug, Default, Clone)]
 pub struct SessionTelemetry {
     pub tool_call_count: usize,
@@ -25,11 +26,6 @@ pub struct SessionTelemetry {
     pub total_completion_tokens: usize,
     pub total_tokens: usize,
     pub total_cost_usd: f64,
-    pub build_attempts: usize,
-    pub build_successes: usize,
-    pub test_attempts: usize,
-    pub test_successes: usize,
-    pub error_count: usize,
 }
 
 impl SessionTelemetry {
@@ -58,92 +54,12 @@ impl SessionTelemetry {
             self.total_cost_usd += estimate.total_cost;
         }
     }
-
-    pub fn observe_tool_result(&mut self, tool_call: &grith_llm::ToolCall, result: &str) {
-        let failed = tool_result_is_failure(result);
-        if failed {
-            self.error_count += 1;
-        }
-
-        match classify_shell_tool_call(tool_call) {
-            Some(ShellQualityKind::Build) => {
-                self.build_attempts += 1;
-                if !failed {
-                    self.build_successes += 1;
-                }
-            }
-            Some(ShellQualityKind::Test) => {
-                self.test_attempts += 1;
-                if !failed {
-                    self.test_successes += 1;
-                }
-            }
-            None => {}
-        }
-    }
 }
 
-/// Classification of a shell command for quality tracking (build vs test).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShellQualityKind {
-    Build,
-    Test,
-}
-
-/// Classify a shell_exec tool call as a build or test invocation, if applicable.
-pub fn classify_shell_tool_call(tool_call: &grith_llm::ToolCall) -> Option<ShellQualityKind> {
-    if tool_call.name != "shell_exec" {
-        return None;
-    }
-
-    let command = tool_call
-        .arguments
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_lowercase();
-    let args = parse_shell_exec_args(tool_call.arguments.get("args"))
-        .into_iter()
-        .map(|s| s.to_lowercase())
-        .collect::<Vec<_>>();
-    let joined = args.join(" ");
-
-    let is_test = (command == "cargo" && args.iter().any(|a| a == "test"))
-        || (command == "go" && args.iter().any(|a| a == "test"))
-        || command == "pytest"
-        || command == "ctest"
-        || ((command == "npm" || command == "pnpm" || command == "yarn" || command == "bun")
-            && (args.iter().any(|a| a == "test")
-                || (args.first().map(String::as_str) == Some("run")
-                    && args.get(1).map(String::as_str) == Some("test"))))
-        || joined.contains("cargo test")
-        || joined.contains("pytest");
-
-    if is_test {
-        return Some(ShellQualityKind::Test);
-    }
-
-    let is_build = (command == "cargo"
-        && args
-            .iter()
-            .any(|a| matches!(a.as_str(), "build" | "check" | "clippy")))
-        || (command == "go" && args.iter().any(|a| a == "build"))
-        || (command == "cmake" && args.iter().any(|a| a == "--build"))
-        || (command == "make" && args.iter().any(|a| a == "build"))
-        || ((command == "npm" || command == "pnpm" || command == "yarn" || command == "bun")
-            && (args.iter().any(|a| a == "build")
-                || (args.first().map(String::as_str) == Some("run")
-                    && args.get(1).map(String::as_str) == Some("build"))))
-        || joined.contains("cargo build")
-        || joined.contains("cargo check")
-        || joined.contains("npm run build");
-
-    if is_build {
-        Some(ShellQualityKind::Build)
-    } else {
-        None
-    }
-}
+// Note: build/test "quality" inference (classifying shell calls as build/test
+// and guessing success from exit codes) was removed — grith intercepts syscalls
+// and cannot truthfully attest build or test outcomes, so the session summary no
+// longer reports a "Quality" column.
 
 /// Parse the `args` field of a shell_exec tool call into a list of strings.
 pub fn parse_shell_exec_args(raw_args: Option<&serde_json::Value>) -> Vec<String> {
@@ -155,31 +71,6 @@ pub fn parse_shell_exec_args(raw_args: Option<&serde_json::Value>) -> Vec<String
         Some(serde_json::Value::String(s)) => s.split_whitespace().map(|p| p.to_string()).collect(),
         _ => Vec::new(),
     }
-}
-
-/// Heuristically determine whether a tool result string indicates failure.
-pub fn tool_result_is_failure(result: &str) -> bool {
-    let lower = result.to_lowercase();
-
-    if lower.starts_with("operation denied")
-        || lower.starts_with("operation queued")
-        || lower.starts_with("error ")
-        || lower.starts_with("http request error")
-    {
-        return true;
-    }
-
-    if lower.starts_with("exit code: ") && !lower.starts_with("exit code: 0") {
-        return true;
-    }
-    if let Some(pos) = lower.rfind("exit code: ") {
-        let suffix = &lower[pos..];
-        if !suffix.starts_with("exit code: 0") {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Aggregated proxy decision counts from a session's audit records.
@@ -219,7 +110,7 @@ pub fn collect_session_audit_summary(
     Ok(summary)
 }
 
-/// Render a formatted session summary to the terminal (tools, costs, security, quality).
+/// Render a formatted session summary to the terminal (tools, costs, security).
 pub fn print_session_summary(
     audit: &SessionAuditSummary,
     telemetry: &SessionTelemetry,
@@ -320,40 +211,627 @@ pub fn print_session_summary(
     }
 
     println!();
-    print_summary_row("Security:", "Quality:", None, true, enable_color);
-    print_summary_row(
+    print_summary_line("Security:", None, true, enable_color);
+    print_summary_line(
         &format!("├ Allowed     {:>3} ({:.0}%)", audit.allowed, allowed_pct),
-        &format!(
-            "├ Build success  {}",
-            quality_indicator(
-                telemetry.build_attempts,
-                telemetry.build_successes,
-                enable_color
-            )
-        ),
         Some(Color::DarkGrey),
         false,
         enable_color,
     );
-    print_summary_row(
+    print_summary_line(
         &format!("├ Quarantined {:>3}", audit.queued),
-        &format!(
-            "├ Tests passed   {}",
-            quality_indicator(
-                telemetry.test_attempts,
-                telemetry.test_successes,
+        Some(Color::DarkGrey),
+        false,
+        enable_color,
+    );
+    print_summary_line(
+        &format!("└ Denied      {:>3}", audit.denied),
+        Some(Color::DarkGrey),
+        false,
+        enable_color,
+    );
+}
+
+/// Data for the supervisor (`grith exec`) end-of-session summary. The supervisor
+/// observes OS syscalls of an external tool, so it has no LLM provider / model /
+/// cost — those fields are intentionally absent here.
+#[derive(Debug, Default, Clone)]
+pub struct SupervisorSummary {
+    pub tool_name: String,
+    pub profile: Option<String>,
+    /// Human-facing session name (`--project` or the working-directory name).
+    pub project: Option<String>,
+    pub session_id: uuid::Uuid,
+    pub duration: Duration,
+    /// Total OS syscalls intercepted (includes noise short-circuited pre-proxy).
+    pub intercepted: u64,
+    /// Syscalls short-circuited as routine noise before proxy evaluation.
+    pub noise: u64,
+    pub allowed: usize,
+    pub queued: usize,
+    pub denied: usize,
+    /// Per-operation-type counts of proxy-evaluated actions (from the audit log).
+    /// Empty when running thin-client (audit lives in the daemon); the tree is
+    /// then omitted and only the aggregate counts are shown.
+    pub breakdown: BTreeMap<String, usize>,
+    /// Local dashboard deep link that opens its existing social-share menu.
+    pub share_url: Option<String>,
+    /// Pricing URL for Community users; absent for paid or unknown tiers.
+    pub upgrade_url: Option<String>,
+}
+
+// Terminal equivalents of the dark-background palette in grith's brand guide.
+const BRAND_GREEN: Color = Color::Rgb {
+    r: 0,
+    g: 229,
+    b: 160,
+};
+const BRAND_TEXT: Color = Color::Rgb {
+    r: 228,
+    g: 228,
+    b: 236,
+};
+const BRAND_TEXT_SECONDARY: Color = Color::Rgb {
+    r: 148,
+    g: 150,
+    b: 168,
+};
+const BRAND_TEXT_DIM: Color = Color::Rgb {
+    r: 92,
+    g: 94,
+    b: 114,
+};
+const BRAND_AMBER: Color = Color::Rgb {
+    r: 255,
+    g: 179,
+    b: 71,
+};
+const BRAND_RED: Color = Color::Rgb {
+    r: 255,
+    g: 77,
+    b: 106,
+};
+const BRAND_BLUE: Color = Color::Rgb {
+    r: 77,
+    g: 166,
+    b: 255,
+};
+
+const METRIC_COLUMN_WIDTH: usize = 25;
+const SUMMARY_BAR_WIDTH: usize = 36;
+const ACTIVITY_BAR_WIDTH: usize = 24;
+
+fn summary_style(text: impl Into<String>, color: Color, bold: bool, enabled: bool) -> String {
+    let text = text.into();
+    if !enabled {
+        return text;
+    }
+    let styled = text.with(color);
+    if bold {
+        styled.bold().to_string()
+    } else {
+        styled.to_string()
+    }
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+fn summary_percentage(part: u64, total: u64, empty_value: f64) -> f64 {
+    if total == 0 {
+        empty_value
+    } else {
+        (part as f64 / total as f64) * 100.0
+    }
+}
+
+fn format_percentage(value: f64) -> String {
+    if (value - value.round()).abs() < 0.001 {
+        format!("{value:.0}%")
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
+fn format_summary_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Return a fixed-width eight-step progress bar as its filled and empty spans.
+fn progress_bar(ratio: f64, width: usize) -> (String, String) {
+    const PARTIAL_BLOCKS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+    let ratio = ratio.clamp(0.0, 1.0);
+    let eighths = ((ratio * (width * 8) as f64).round() as usize).max(usize::from(ratio > 0.0));
+    let full_blocks = eighths / 8;
+    let partial = eighths % 8;
+    let mut filled = "█".repeat(full_blocks);
+    if partial > 0 {
+        filled.push_str(PARTIAL_BLOCKS[partial]);
+    }
+    let occupied = full_blocks + usize::from(partial > 0);
+    let empty = "░".repeat(width.saturating_sub(occupied));
+    (filled, empty)
+}
+
+fn activity_rows(breakdown: &BTreeMap<String, usize>) -> Vec<(String, usize)> {
+    const MAX_ROWS: usize = 5;
+
+    let mut rows = breakdown
+        .iter()
+        .map(|(name, count)| (crate::helpers::display_tool_label(name), *count))
+        .collect::<Vec<_>>();
+    rows.sort_by(|(a_name, a_count), (b_name, b_count)| {
+        b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+    });
+
+    if rows.len() <= MAX_ROWS {
+        return rows;
+    }
+
+    let other = rows[MAX_ROWS - 1..]
+        .iter()
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    rows.truncate(MAX_ROWS - 1);
+    rows.push(("other".to_string(), other));
+    rows
+}
+
+/// Build the supervisor end-of-session report.
+///
+/// Keeping rendering separate from printing makes the no-colour output
+/// deterministic and lets tests protect the claims and percentages shown to
+/// operators.
+pub fn render_supervisor_session_summary(
+    summary: &SupervisorSummary,
+    enable_color: bool,
+) -> String {
+    let actions = summary.allowed + summary.queued + summary.denied;
+    let allowed_pct = summary_percentage(summary.allowed as u64, actions as u64, 100.0);
+    let noise_pct = summary_percentage(summary.noise, summary.intercepted, 0.0);
+    let policy_flags = summary.queued + summary.denied;
+    let duration = format_summary_duration(summary.duration);
+    let session_short = &summary.session_id.to_string()[..8];
+    let profile = summary.profile.as_deref().unwrap_or("default");
+    let session_name = summary.project.as_deref().unwrap_or("unnamed");
+    let mut output = String::new();
+
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "  {}  {}",
+        summary_style("◆ grith", BRAND_GREEN, true, enable_color),
+        summary_style("// SESSION REPORT", BRAND_TEXT, true, enable_color),
+    );
+    let _ = writeln!(
+        output,
+        "    {}",
+        summary_style(
+            "ZERO-TRUST SUPERVISION COMPLETE",
+            BRAND_GREEN,
+            false,
+            enable_color,
+        )
+    );
+    let _ = writeln!(output);
+
+    let _ = writeln!(
+        output,
+        "  {} {}  ·  {} {}  ·  {} {}",
+        summary_style("Session:", BRAND_TEXT_SECONDARY, false, enable_color),
+        summary_style(session_name, BRAND_TEXT, true, enable_color),
+        summary_style("ID:", BRAND_TEXT_SECONDARY, false, enable_color),
+        summary_style(session_short, BRAND_TEXT, true, enable_color),
+        summary_style("Duration:", BRAND_TEXT_SECONDARY, false, enable_color),
+        summary_style(&duration, BRAND_TEXT, true, enable_color),
+    );
+    let _ = writeln!(
+        output,
+        "  {} {}  ·  {} {}",
+        summary_style("Tool:", BRAND_TEXT_SECONDARY, false, enable_color),
+        summary_style(&summary.tool_name, BRAND_TEXT, false, enable_color),
+        summary_style("Profile:", BRAND_TEXT_SECONDARY, false, enable_color),
+        summary_style(profile, BRAND_TEXT, false, enable_color),
+    );
+    let _ = writeln!(output);
+
+    let watched = format!(
+        "{:<METRIC_COLUMN_WIDTH$}",
+        format_count(summary.intercepted)
+    );
+    let filtered = format!("{:<METRIC_COLUMN_WIDTH$}", format_count(summary.noise));
+    let decisions = format_count(actions as u64);
+    let _ = writeln!(
+        output,
+        "  {}{}{}",
+        summary_style(watched, BRAND_GREEN, true, enable_color),
+        summary_style(filtered, BRAND_BLUE, true, enable_color),
+        summary_style(decisions, BRAND_TEXT, true, enable_color),
+    );
+    let _ = writeln!(
+        output,
+        "  {:<METRIC_COLUMN_WIDTH$}{:<METRIC_COLUMN_WIDTH$}POLICY DECISIONS",
+        "SYSCALLS WATCHED", "ROUTINE NOISE FILTERED"
+    );
+    let _ = writeln!(output);
+
+    let _ = writeln!(
+        output,
+        "  {}",
+        summary_style("PROTECTION", BRAND_TEXT_SECONDARY, true, enable_color)
+    );
+    let (allowed_bar, allowed_remainder) = progress_bar(allowed_pct / 100.0, SUMMARY_BAR_WIDTH);
+    let _ = writeln!(
+        output,
+        "  {}{}  {}",
+        summary_style(allowed_bar, BRAND_GREEN, false, enable_color),
+        summary_style(allowed_remainder, BRAND_TEXT_DIM, false, enable_color),
+        summary_style(
+            format!("{} allowed automatically", format_percentage(allowed_pct)),
+            BRAND_GREEN,
+            true,
+            enable_color,
+        )
+    );
+    let _ = writeln!(
+        output,
+        "  {}  {}     {}  {}     {}  {}",
+        summary_style("✓", BRAND_GREEN, true, enable_color),
+        summary_style(
+            format!("{} allowed", format_count(summary.allowed as u64)),
+            BRAND_TEXT,
+            false,
+            enable_color,
+        ),
+        summary_style("◇", BRAND_AMBER, true, enable_color),
+        summary_style(
+            format!("{} quarantined", format_count(summary.queued as u64)),
+            BRAND_AMBER,
+            false,
+            enable_color,
+        ),
+        summary_style("◆", BRAND_RED, true, enable_color),
+        summary_style(
+            format!("{} denied", format_count(summary.denied as u64)),
+            BRAND_RED,
+            false,
+            enable_color,
+        ),
+    );
+    let protection_note = if policy_flags == 0 {
+        "No policy flags — every evaluated action stayed within policy".to_string()
+    } else {
+        format!(
+            "{} policy flags surfaced for review or enforcement",
+            format_count(policy_flags as u64)
+        )
+    };
+    let _ = writeln!(
+        output,
+        "  {}",
+        summary_style(protection_note, BRAND_TEXT_SECONDARY, false, enable_color)
+    );
+    let _ = writeln!(output);
+
+    let _ = writeln!(
+        output,
+        "  {}",
+        summary_style("QUIET BY DESIGN", BRAND_TEXT_SECONDARY, true, enable_color)
+    );
+    let (noise_bar, noise_remainder) = progress_bar(noise_pct / 100.0, SUMMARY_BAR_WIDTH);
+    let _ = writeln!(
+        output,
+        "  {}{}  {}",
+        summary_style(noise_bar, BRAND_BLUE, false, enable_color),
+        summary_style(noise_remainder, BRAND_TEXT_DIM, false, enable_color),
+        summary_style(
+            format!("{} filtered before policy", format_percentage(noise_pct)),
+            BRAND_BLUE,
+            true,
+            enable_color,
+        )
+    );
+    let _ = writeln!(
+        output,
+        "  {}",
+        summary_style(
+            format!(
+                "{} routine events handled silently, keeping the session focused",
+                format_count(summary.noise)
+            ),
+            BRAND_TEXT_SECONDARY,
+            false,
+            enable_color,
+        )
+    );
+
+    let rows = activity_rows(&summary.breakdown);
+    if !rows.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "  {}",
+            summary_style(
+                "TOP POLICY ACTIVITY",
+                BRAND_TEXT_SECONDARY,
+                true,
                 enable_color
             )
-        ),
-        Some(Color::DarkGrey),
-        false,
-        enable_color,
+        );
+        let max_count = rows.iter().map(|(_, count)| *count).max().unwrap_or(0);
+        for (tool, count) in rows {
+            let ratio = if max_count == 0 {
+                0.0
+            } else {
+                count as f64 / max_count as f64
+            };
+            let (bar, remainder) = progress_bar(ratio, ACTIVITY_BAR_WIDTH);
+            let _ = writeln!(
+                output,
+                "  {:<16} {}  {}{}",
+                tool,
+                summary_style(
+                    format!("{:>8}", format_count(count as u64)),
+                    BRAND_TEXT,
+                    false,
+                    enable_color,
+                ),
+                summary_style(bar, BRAND_GREEN, false, enable_color),
+                summary_style(remainder, BRAND_TEXT_DIM, false, enable_color),
+            );
+        }
+    }
+
+    if let Some(share_url) = &summary.share_url {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "  {}",
+            summary_style(
+                "SHARE YOUR RESULTS",
+                BRAND_TEXT_SECONDARY,
+                true,
+                enable_color
+            )
+        );
+        let _ = writeln!(
+            output,
+            "  {}  {}",
+            summary_style(
+                "↗ Open the social share menu",
+                BRAND_GREEN,
+                true,
+                enable_color
+            ),
+            summary_style(share_url, BRAND_BLUE, false, enable_color),
+        );
+    }
+
+    if let Some(upgrade_url) = &summary.upgrade_url {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "  {}",
+            summary_style(
+                "UNLOCK MORE WITH GRITH PRO",
+                BRAND_TEXT_SECONDARY,
+                true,
+                enable_color,
+            )
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            summary_style(
+                "90-day history · anomaly detection · Slack/email alerts · team policies",
+                BRAND_TEXT,
+                false,
+                enable_color,
+            )
+        );
+        let _ = writeln!(
+            output,
+            "  {}  {}",
+            summary_style("↗ See plans and upgrade", BRAND_GREEN, true, enable_color),
+            summary_style(upgrade_url, BRAND_BLUE, false, enable_color),
+        );
+    }
+
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "  {}",
+        summary_style(
+            format!("Protected end to end for {duration} · session {session_short}"),
+            BRAND_TEXT_SECONDARY,
+            false,
+            enable_color,
+        )
     );
-    print_summary_row(
-        &format!("└ Denied      {:>3}", audit.denied),
-        &format!("└ Errors         {}", telemetry.error_count),
-        Some(Color::DarkGrey),
-        false,
-        enable_color,
+
+    output
+}
+
+/// Render the supervisor end-of-session summary to the terminal.
+pub fn print_supervisor_session_summary(summary: &SupervisorSummary, enable_color: bool) {
+    print!(
+        "{}",
+        render_supervisor_session_summary(summary, enable_color)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_summary_surfaces_the_protection_work() {
+        let mut breakdown = BTreeMap::new();
+        breakdown.insert("file_read".to_string(), 37);
+        breakdown.insert("file_write".to_string(), 3_688);
+        breakdown.insert("dir_list".to_string(), 14);
+        breakdown.insert("process_spawn".to_string(), 6_570);
+        let summary = SupervisorSummary {
+            tool_name: "codex".to_string(),
+            profile: Some("codex profile".to_string()),
+            project: Some("grith".to_string()),
+            session_id: uuid::Uuid::parse_str("3f715e79-0000-0000-0000-000000000000").unwrap(),
+            duration: Duration::from_secs(1_834 * 60 + 16),
+            intercepted: 1_426_859,
+            noise: 1_412_760,
+            allowed: 10_141,
+            queued: 27,
+            denied: 16,
+            breakdown,
+            share_url: Some("http://127.0.0.1:3141/?share=1".to_string()),
+            upgrade_url: Some("https://grith.ai/pricing".to_string()),
+        };
+        let rendered = render_supervisor_session_summary(&summary, false);
+
+        assert!(rendered.contains("◆ grith  // SESSION REPORT"));
+        assert!(rendered.contains("Session: grith  ·  ID: 3f715e79  ·  Duration: 1d 6h 34m"));
+        assert!(rendered.contains("Tool: codex  ·  Profile: codex profile"));
+        assert!(rendered.contains("1,426,859"));
+        assert!(rendered.contains("1,412,760"));
+        assert!(rendered.contains("10,184"));
+        assert!(rendered.contains("99.6% allowed automatically"));
+        assert!(rendered.contains("99.0% filtered before policy"));
+        assert!(rendered.contains("43 policy flags surfaced for review or enforcement"));
+        assert!(rendered.contains("↗ Open the social share menu  http://127.0.0.1:3141/?share=1"));
+        assert!(rendered.contains("↗ See plans and upgrade  https://grith.ai/pricing"));
+        assert!(!rendered.contains("100% allowed"));
+
+        let process_spawn = rendered.find("process_spawn").unwrap();
+        let file_write = rendered.find("file_write").unwrap();
+        let file_read = rendered.find("file_read").unwrap();
+        let dir_list = rendered.find("dir_list").unwrap();
+        assert!(process_spawn < file_write);
+        assert!(file_write < file_read);
+        assert!(file_read < dir_list);
+
+        // Kept for a convenient `cargo test ... -- --nocapture` visual check.
+        println!("{rendered}");
+    }
+
+    #[test]
+    fn supervisor_summary_uses_the_website_brand_palette() {
+        let summary = SupervisorSummary {
+            tool_name: "codex".to_string(),
+            session_id: uuid::Uuid::nil(),
+            allowed: 1,
+            ..Default::default()
+        };
+        let rendered = render_supervisor_session_summary(&summary, true);
+
+        assert_eq!(
+            BRAND_GREEN,
+            Color::Rgb {
+                r: 0,
+                g: 229,
+                b: 160
+            }
+        );
+        assert_eq!(
+            BRAND_AMBER,
+            Color::Rgb {
+                r: 255,
+                g: 179,
+                b: 71
+            }
+        );
+        assert_eq!(
+            BRAND_RED,
+            Color::Rgb {
+                r: 255,
+                g: 77,
+                b: 106
+            }
+        );
+        assert!(rendered.contains("◆ grith"));
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert!(rendered.contains("\u{1b}[38;2;0;229;160m"));
+            assert!(rendered.contains("\u{1b}[38;2;255;179;71m"));
+            assert!(rendered.contains("\u{1b}[38;2;255;77;106m"));
+        }
+    }
+
+    #[test]
+    fn supervisor_summary_handles_zero_actions_and_empty_breakdown() {
+        let summary = SupervisorSummary {
+            tool_name: "codex".to_string(),
+            session_id: uuid::Uuid::nil(),
+            ..Default::default()
+        };
+        let rendered = render_supervisor_session_summary(&summary, false);
+
+        assert!(rendered.contains("100% allowed automatically"));
+        assert!(rendered.contains("0% filtered before policy"));
+        assert!(rendered.contains("No policy flags — every evaluated action stayed within policy"));
+        assert!(!rendered.contains("TOP POLICY ACTIVITY"));
+    }
+
+    #[test]
+    fn supervisor_summary_does_not_upsell_paid_accounts() {
+        let summary = SupervisorSummary {
+            tool_name: "codex".to_string(),
+            project: Some("paid-project".to_string()),
+            session_id: uuid::Uuid::nil(),
+            allowed: 42,
+            share_url: Some("http://127.0.0.1:3141/?share=1".to_string()),
+            // The caller only supplies an upgrade URL for Community accounts.
+            upgrade_url: None,
+            ..Default::default()
+        };
+        let rendered = render_supervisor_session_summary(&summary, false);
+
+        assert!(rendered.contains("SHARE YOUR RESULTS"));
+        assert!(!rendered.contains("UNLOCK MORE WITH GRITH PRO"));
+        assert!(!rendered.contains("See plans and upgrade"));
+    }
+
+    #[test]
+    fn summary_duration_and_counts_are_human_readable() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(1_426_859), "1,426,859");
+
+        assert_eq!(format_summary_duration(Duration::from_secs(12)), "12s");
+        assert_eq!(
+            format_summary_duration(Duration::from_secs(12 * 60 + 8)),
+            "12m 8s"
+        );
+        assert_eq!(
+            format_summary_duration(Duration::from_secs(3 * 3_600 + 5 * 60)),
+            "3h 5m"
+        );
+        assert_eq!(
+            format_summary_duration(Duration::from_secs(86_400 + 6 * 3_600 + 34 * 60)),
+            "1d 6h 34m"
+        );
+    }
 }

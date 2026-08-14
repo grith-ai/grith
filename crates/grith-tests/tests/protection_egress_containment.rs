@@ -190,7 +190,7 @@ async fn protection_contained_session_queues_network_egress() {
         ))
         .await;
 
-    let score = fired(&d, "session_containment", "contained-network-egress")
+    let score = fired(&d, "session-containment", "contained-network-egress")
         .expect("network egress under active containment must fire containment");
     assert!(
         (score - 4.5).abs() < f64::EPSILON,
@@ -221,7 +221,7 @@ async fn protection_uncontained_session_allows_network_egress() {
         ))
         .await;
     assert!(
-        fired(&d, "session_containment", "contained-network-egress").is_none(),
+        fired(&d, "session-containment", "contained-network-egress").is_none(),
         "an unarmed session must not be contained: {:?}",
         d.filter_results
     );
@@ -255,7 +255,7 @@ async fn protection_contained_session_queues_outbound_spawn() {
             session,
         ))
         .await;
-    let score = fired(&d, "session_containment", "contained-process-egress")
+    let score = fired(&d, "session-containment", "contained-process-egress")
         .expect("outbound-capable spawn under containment must fire");
     assert!(
         (score - 4.0).abs() < f64::EPSILON,
@@ -283,7 +283,7 @@ async fn protection_contained_session_allows_routine_local_spawn() {
         ))
         .await;
     assert!(
-        fired(&d, "session_containment", "contained-process-egress").is_none(),
+        fired(&d, "session-containment", "contained-process-egress").is_none(),
         "a routine local spawn under containment must not be penalised: {:?}",
         d.filter_results
     );
@@ -307,7 +307,7 @@ async fn protection_contained_session_queues_outbound_shell() {
             session,
         ))
         .await;
-    let score = fired(&d, "session_containment", "contained-shell-egress")
+    let score = fired(&d, "session-containment", "contained-shell-egress")
         .expect("outbound shell command under containment must fire");
     assert!(
         (score - 3.5).abs() < f64::EPSILON,
@@ -334,7 +334,7 @@ async fn protection_contained_session_allows_local_shell() {
         ))
         .await;
     assert!(
-        fired(&d, "session_containment", "contained-shell-egress").is_none(),
+        fired(&d, "session-containment", "contained-shell-egress").is_none(),
         "a local shell command under containment must not be penalised: {:?}",
         d.filter_results
     );

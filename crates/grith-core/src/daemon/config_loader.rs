@@ -348,6 +348,8 @@ pub(crate) fn to_supervisor_config(
         enabled: core.enabled,
         default_profile: core.default_profile.clone(),
         freeze_timeout_seconds: core.freeze_timeout_seconds,
+        deny_replay_seconds: core.deny_replay_seconds,
+        approve_replay_seconds: core.approve_replay_seconds,
         max_concurrent_sessions: core.max_concurrent_sessions,
         pty_forwarding: core.pty_forwarding,
         require_sandbox: core.require_sandbox,
@@ -368,6 +370,26 @@ pub(crate) fn to_supervisor_config(
         dns_inspection: grith_supervisor::config::DnsInspectionConfig {
             enabled: core.dns_inspection.enabled,
             upstream_resolver: core.dns_inspection.upstream_resolver.clone(),
+            observe_responses: core.dns_inspection.observe_responses,
+            block_tcp_dns: core.dns_inspection.block_tcp_dns,
+            connected_udp_proxy: core.dns_inspection.connected_udp_proxy,
+            accept_proxy_network_authority: core.dns_inspection.accept_proxy_network_authority,
+            proxy_queue_action: match core.dns_inspection.proxy_queue_action {
+                crate::config::SupervisorDnsProxyQueueAction::Refuse => {
+                    grith_supervisor::config::DnsProxyQueueAction::Refuse
+                }
+                crate::config::SupervisorDnsProxyQueueAction::Forward => {
+                    grith_supervisor::config::DnsProxyQueueAction::Forward
+                }
+            },
+            proxy_max_response_bytes: core.dns_inspection.proxy_max_response_bytes,
+            proxy_policy_timeout_ms: core.dns_inspection.proxy_policy_timeout_ms,
+            proxy_upstream_timeout_ms: core.dns_inspection.proxy_upstream_timeout_ms,
+            proxy_shutdown_timeout_ms: core.dns_inspection.proxy_shutdown_timeout_ms,
+            proxy_route_capacity: core.dns_inspection.proxy_route_capacity,
+            proxy_query_capacity: core.dns_inspection.proxy_query_capacity,
+            proxy_control_capacity: core.dns_inspection.proxy_control_capacity,
+            proxy_policy_capacity: core.dns_inspection.proxy_policy_capacity,
         },
         interactive_queue_action: grith_supervisor::config::InteractiveQueueAction::default(),
         syscall_log_file: None,
@@ -377,8 +399,11 @@ pub(crate) fn to_supervisor_config(
         coverage: grith_supervisor::config::CoverageConfig {
             category1_hard_deny: core.coverage.category1_hard_deny,
             category2_proxy: core.coverage.category2_proxy,
+            category2_crossprocess: core.coverage.category2_crossprocess,
             category3_namespace: core.coverage.category3_namespace,
             category4_arch_priv: core.coverage.category4_arch_priv,
+            deny_self_seccomp_notify: core.coverage.deny_self_seccomp_notify,
+            observe_self_seccomp_filter: core.coverage.observe_self_seccomp_filter,
         },
         // Default tier — callers that need an audit-completeness setting
         // should reach for `to_runtime_supervisor_config_with_audit`
@@ -386,6 +411,7 @@ pub(crate) fn to_supervisor_config(
         // and inherits today's "Spawns" default.
         audit_completeness: grith_supervisor::config::AuditCompletenessLevel::default(),
         pty_ownership_enforce: core.pty_ownership_enforce,
+        authority_lost_terminate_after_seconds: core.authority_lost_terminate_after_seconds,
     }
 }
 
@@ -542,6 +568,18 @@ mod tests {
         let mut core = crate::config::SupervisorCoreConfig::default();
         core.dns_inspection.enabled = false;
         core.dns_inspection.upstream_resolver = Some("1.1.1.1:53".to_string());
+        core.dns_inspection.connected_udp_proxy = true;
+        core.dns_inspection.accept_proxy_network_authority = true;
+        core.dns_inspection.proxy_queue_action =
+            crate::config::SupervisorDnsProxyQueueAction::Forward;
+        core.dns_inspection.proxy_max_response_bytes = 1232;
+        core.dns_inspection.proxy_policy_timeout_ms = 250;
+        core.dns_inspection.proxy_upstream_timeout_ms = 750;
+        core.dns_inspection.proxy_shutdown_timeout_ms = 500;
+        core.dns_inspection.proxy_route_capacity = 8;
+        core.dns_inspection.proxy_query_capacity = 32;
+        core.dns_inspection.proxy_control_capacity = 16;
+        core.dns_inspection.proxy_policy_capacity = 4;
 
         let mapped = to_supervisor_config(&core);
         assert!(!mapped.dns_inspection.enabled);
@@ -549,12 +587,28 @@ mod tests {
             mapped.dns_inspection.upstream_resolver.as_deref(),
             Some("1.1.1.1:53")
         );
+        assert!(mapped.dns_inspection.connected_udp_proxy);
+        assert!(mapped.dns_inspection.accept_proxy_network_authority);
+        assert_eq!(
+            mapped.dns_inspection.proxy_queue_action,
+            grith_supervisor::config::DnsProxyQueueAction::Forward
+        );
+        assert_eq!(mapped.dns_inspection.proxy_max_response_bytes, 1232);
+        assert_eq!(mapped.dns_inspection.proxy_policy_timeout_ms, 250);
+        assert_eq!(mapped.dns_inspection.proxy_upstream_timeout_ms, 750);
+        assert_eq!(mapped.dns_inspection.proxy_shutdown_timeout_ms, 500);
+        assert_eq!(mapped.dns_inspection.proxy_route_capacity, 8);
+        assert_eq!(mapped.dns_inspection.proxy_query_capacity, 32);
+        assert_eq!(mapped.dns_inspection.proxy_control_capacity, 16);
+        assert_eq!(mapped.dns_inspection.proxy_policy_capacity, 4);
     }
 
     #[test]
     fn test_load_secret_patterns_real_corpus_has_expected_count_and_is_deduplicated() {
+        // 1618 after S1 (2026-08-07) removed the two looser unanchored FaunaDB /
+        // Resend duplicates (`fauna-secret-bare`, `resend-api-key-bare`).
         let patterns = load_secret_patterns().expect("load real secret corpus");
-        assert_eq!(patterns.len(), 1620);
+        assert_eq!(patterns.len(), 1618);
 
         let ids = patterns
             .iter()

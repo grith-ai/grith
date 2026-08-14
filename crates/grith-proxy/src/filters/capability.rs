@@ -61,6 +61,10 @@ impl CapabilityFilter {
             ToolCallType::ShellExec { .. } => "shell:exec",
             ToolCallType::HttpRequest { .. } => "net:http",
             ToolCallType::FileRename { .. } => "fs:write",
+            // Link creation is a write that also grants a second name to
+            // existing data; `fs:write` is the right grant, and the
+            // sensitive-path filters score the target independently.
+            ToolCallType::FileLink { .. } => "fs:write",
             ToolCallType::FileChmod { .. } => "fs:write",
             ToolCallType::DirCreate { .. } => "fs:write",
             ToolCallType::NetConnect { .. } => "net:connect",

@@ -77,6 +77,30 @@ pub trait SecurityFilter: Send + Sync {
     }
 }
 
+/// Canonicalise a filter name, mapping the legacy snake_case names (in use
+/// before the kebab-case normalisation) to their current kebab-case
+/// equivalents. Unknown names pass through unchanged.
+///
+/// Persisted audit records are never rewritten (that would break the
+/// tamper-evident hash chain) — this helper exists for read-side call sites
+/// that match user-supplied or on-disk configuration against live filter
+/// names: meta-rule `filter` conditions, `[dashboard.filters]` toggle keys,
+/// and `notifications.routing.filter_overrides` keys.
+pub fn canonical_filter_name(name: &str) -> &str {
+    match name {
+        "operation_risk" => "operation-risk",
+        "path_match" => "path-match",
+        "sensitive_path_heuristic" => "sensitive-path-heuristic",
+        "secret_scan" => "secret-scan",
+        "egress_policy" => "egress-policy",
+        "dlp_gate" => "dlp-gate",
+        "session_containment" => "session-containment",
+        "rate_limit" => "rate-limit",
+        "egress_rate" => "egress-rate",
+        other => other,
+    }
+}
+
 /// Per-filter evaluation metrics tracked with atomic counters.
 pub struct FilterMetrics {
     evaluation_count: AtomicU64,
@@ -213,5 +237,56 @@ pub struct FilterInfo {
 impl Default for FilterRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_filter_name;
+
+    #[test]
+    fn canonical_filter_name_maps_all_legacy_snake_case_names() {
+        let legacy = [
+            ("operation_risk", "operation-risk"),
+            ("path_match", "path-match"),
+            ("sensitive_path_heuristic", "sensitive-path-heuristic"),
+            ("secret_scan", "secret-scan"),
+            ("egress_policy", "egress-policy"),
+            ("dlp_gate", "dlp-gate"),
+            ("session_containment", "session-containment"),
+            ("rate_limit", "rate-limit"),
+            ("egress_rate", "egress-rate"),
+        ];
+        for (old, new) in legacy {
+            assert_eq!(canonical_filter_name(old), new, "legacy alias for {old}");
+        }
+    }
+
+    #[test]
+    fn canonical_filter_name_passes_through_current_and_unknown_names() {
+        for name in [
+            "operation-risk",
+            "path-match",
+            "sensitive-path-heuristic",
+            "secret-scan",
+            "egress-policy",
+            "dlp-gate",
+            "session-containment",
+            "rate-limit",
+            "egress-rate",
+            "allowlist",
+            "argument",
+            "capability",
+            "command",
+            "canary",
+            "reputation",
+            "behavioural",
+            "taint",
+            "destructive-action",
+            "semantic",
+            "not-a-filter",
+        ] {
+            assert_eq!(canonical_filter_name(name), name);
+        }
     }
 }

@@ -97,10 +97,6 @@ pub struct SyscallEvent {
     pub kind: SyscallKind,
     /// Raw platform syscall number (e.g., `__NR_openat` on Linux).
     pub raw_syscall_nr: i64,
-    /// Tracee memory address of the sockaddr struct for CONNECT/SENDTO syscalls.
-    /// Used by the DNS proxy to rewrite the destination port via PTRACE_POKEDATA.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sockaddr_addr: Option<u64>,
 }
 
 /// Classification of intercepted syscalls into grith-proxy-compatible
@@ -137,6 +133,18 @@ pub enum SyscallKind {
         path: String,
     },
     /// `rename` / `renameat2` — file or directory rename.
+    /// Symbolic or hard link creation (`symlink`, `symlinkat`, `link`,
+    /// `linkat`). Routed to the proxy as `ToolCallType::FileLink`, which
+    /// scores the **target** — link creation is the point at which a
+    /// sensitive path becomes reachable under a benign name.
+    FileLink {
+        /// What the link points at.
+        target: String,
+        /// The new name being created.
+        link_path: String,
+        /// `true` for symlinks, `false` for hard links.
+        symbolic: bool,
+    },
     FileRename {
         /// Original path.
         old_path: String,
@@ -243,6 +251,23 @@ pub enum SyscallKind {
         /// Protocol number (e.g. ETH_P_ALL=3 for AF_PACKET).
         protocol: i32,
     },
+    /// A tracee attempting to install its own seccomp filter.
+    ///
+    /// A filter can out-rank grith's `SECCOMP_RET_TRACE` and hide syscalls
+    /// from it. The `NEW_LISTENER` form is an outright escape (the tracee
+    /// answers its own notifications with `USER_NOTIF_FLAG_CONTINUE` and the
+    /// syscall runs unseen); a plain filter can only make the tracee's own
+    /// syscalls fail invisibly, which blinds the audit log without granting
+    /// authority. `event_handler.rs` hard-denies the escape form and, by
+    /// default, observes the rest (go-live review round 2).
+    SeccompInstall {
+        /// Which install path fired.
+        via: SeccompInstallVia,
+        /// `true` when the install requests a userspace notification listener
+        /// (`SECCOMP_FILTER_FLAG_NEW_LISTENER`) — the escape form. Always
+        /// `false` for the `prctl` path, which has no flags argument.
+        new_listener: bool,
+    },
     /// PR 6 Phase A: kernel-module load/unload.
     ///
     /// Covers `init_module`, `finit_module`, and `delete_module`. No
@@ -344,6 +369,42 @@ pub enum SyscallKind {
         /// Which architecture-specific privileged syscall fired.
         op: ArchPrivOp,
     },
+    /// Go-live review B1: a syscall issued under a foreign ABI — either
+    /// a non-x86_64 audit arch (`int 0x80`, a 32-bit binary) or x32
+    /// syscall numbering. The seccomp filter cannot interpret these
+    /// numbers, so it fails closed and the supervisor hard-denies in
+    /// `event_handler.rs` before classification, mirroring the
+    /// kernel-module pattern.
+    ForeignAbiSyscall {
+        /// Which foreign shape fired.
+        abi: ForeignAbiKind,
+        /// Raw untranslated syscall number from `orig_rax` (foreign
+        /// table for `CompatArch`; `nr | 0x40000000` for `X32`), or
+        /// `-1` when registers were unreadable. Forensic only — must
+        /// never be looked up in the x86_64 table.
+        raw_nr: i64,
+    },
+}
+
+/// Go-live review B1: discriminator for `SyscallKind::ForeignAbiSyscall`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum ForeignAbiKind {
+    /// Non-x86_64 audit arch: `int 0x80` from a 64-bit process or a
+    /// 32-bit binary after exec.
+    CompatArch,
+    /// x32 ABI: `AUDIT_ARCH_X86_64` with syscall bit 30 set.
+    X32,
+}
+
+/// Discriminator for `SyscallKind::SeccompInstall`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SeccompInstallVia {
+    /// `seccomp(SECCOMP_SET_MODE_FILTER, flags, …)` — the modern path, and
+    /// the only one that can request a `NEW_LISTENER`.
+    Seccomp,
+    /// `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, …)` — the legacy path, no
+    /// flags, cannot create a listener.
+    Prctl,
 }
 
 /// PR 6 Phase A: discriminator for `SyscallKind::KernelModuleOp`.
@@ -523,6 +584,65 @@ pub trait SyscallInterceptor: Send + Sync {
     /// `work/futurework/ptrace-seize-migration.md`.
     fn set_attach_mode(&mut self, _mode: crate::config::AttachMode) {}
 
+    /// Enable in-line DNS inspection with a shared IP→domain cache. Default is
+    /// a no-op (only the Linux ptrace backend inspects DNS at the syscall
+    /// level). `observe_responses` gates targeted receive-exit promotion that
+    /// populates the exact-IP cache; query inspection/blocking is independent.
+    /// Called once after construction, before the loop.
+    fn set_dns_inspection(
+        &mut self,
+        _cache: std::sync::Arc<std::sync::Mutex<crate::dns_cache::DnsCache>>,
+        _observe_responses: bool,
+        _block_tcp_dns: bool,
+    ) {
+    }
+
+    /// Install the session-local connected UDP DNS proxy control plane.
+    ///
+    /// The worker itself is owned and joined by the supervisor orchestrator.
+    /// Backends must reject installation unless they can redirect connected
+    /// UDP/53 `connect` calls before any query can leave the tracee.
+    fn set_connected_dns_proxy(
+        &mut self,
+        _control: crate::connected_dns_proxy::ConnectedDnsProxyControl,
+    ) -> Result<()> {
+        Err(Error::PlatformNotSupported(
+            "connected UDP DNS proxy requires Linux seccomp-ptrace supervision".into(),
+        ))
+    }
+
+    /// Terminate every process in the supervised tree.
+    ///
+    /// Used when a mandatory enforcement component cannot start. The default
+    /// rejects the request; supported backends must implement a fail-closed
+    /// termination path.
+    async fn terminate_all(&mut self) -> Result<()> {
+        Err(Error::PlatformNotSupported(
+            "supervised process-tree termination is unavailable".into(),
+        ))
+    }
+
+    /// Take whether the current `connect` to `:53` for `tid` is on a stream
+    /// (TCP) socket and must be blocked (TCP-DNS can't be content-inspected, so
+    /// it's denied to force the inspected UDP path). The event handler calls
+    /// this on a `NetConnect` to port 53. Default `false`.
+    fn take_tcp_dns_deny(&mut self, _tid: u32) -> bool {
+        false
+    }
+
+    /// Take all parsed DNS queries (or an explicit parse failure) from the
+    /// tracee's most recent DNS send for `tid`.
+    fn take_dns_query(&mut self, _tid: u32) -> Option<DnsQueryInspection> {
+        None
+    }
+
+    /// Complete ownership of an in-line DNS inspection.
+    ///
+    /// `allowed=false` removes any response-correlation state staged while the
+    /// query was parsed, because the corresponding packet never reached the
+    /// resolver. The default is a no-op for interceptors without in-line DNS.
+    fn finish_dns_query(&mut self, _tid: u32, _allowed: bool) {}
+
     /// Attach to an existing process by PID.
     ///
     /// The process will be stopped and syscall tracing enabled. Returns an
@@ -608,22 +728,6 @@ pub trait SyscallInterceptor: Send + Sync {
         ))
     }
 
-    /// Rewrite the port field in a tracee's sockaddr struct.
-    ///
-    /// Used by the DNS inspection proxy to redirect port-53 traffic to the
-    /// local DNS proxy. Implementations may also rewrite the address to a
-    /// loopback proxy endpoint depending on socket family.
-    ///
-    /// Default implementation is a no-op (for mock/unsupported platforms).
-    async fn rewrite_sockaddr_port(
-        &mut self,
-        _pid: u32,
-        _sockaddr_addr: u64,
-        _new_port: u16,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     /// Human-readable name of the interception mechanism (e.g., `"ptrace"`,
     /// `"endpoint-security"`).
     fn mechanism_name(&self) -> &str;
@@ -644,6 +748,16 @@ pub trait SyscallInterceptor: Send + Sync {
     fn wedge_scan(&self, _threshold: Duration) -> Vec<WedgedTracee> {
         Vec::new()
     }
+}
+
+/// Result of inspecting every DNS message in one outbound syscall.
+///
+/// A parse error is explicit so positively identified UDP port-53 traffic can
+/// fail closed instead of falling through as ordinary network noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsQueryInspection {
+    pub queries: Vec<(String, String)>,
+    pub parse_error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +783,15 @@ impl std::fmt::Display for SyscallKind {
                 }
             }
             Self::FileDelete { path } => write!(f, "FileDelete({path})"),
+            Self::FileLink {
+                target,
+                link_path,
+                symbolic,
+            } => write!(
+                f,
+                "FileLink({kind} {link_path} -> {target})",
+                kind = if *symbolic { "symbolic" } else { "hard" }
+            ),
             Self::FileRename { old_path, new_path } => {
                 write!(f, "FileRename({old_path} -> {new_path})")
             }
@@ -702,6 +825,9 @@ impl std::fmt::Display for SyscallKind {
                 f,
                 "RawSocketCreate(domain={domain}, type={socket_type}, proto={protocol})"
             ),
+            Self::SeccompInstall { via, new_listener } => {
+                write!(f, "SeccompInstall({via:?}, new_listener={new_listener})")
+            }
             Self::KernelModuleOp { op } => write!(f, "KernelModuleOp({op:?})"),
             Self::KexecLoad { from_fd } => {
                 if *from_fd {
@@ -737,6 +863,9 @@ impl std::fmt::Display for SyscallKind {
                 write!(f, "NamespaceOp({syscall:?} flags={flags:#x})")
             }
             Self::ArchPrivilegedOp { op } => write!(f, "ArchPrivilegedOp({op:?})"),
+            Self::ForeignAbiSyscall { abi, raw_nr } => {
+                write!(f, "ForeignAbiSyscall({abi:?} raw_nr={raw_nr})")
+            }
         }
     }
 }
@@ -787,7 +916,6 @@ mod tests {
             timestamp: Utc::now(),
             kind,
             raw_syscall_nr: 0,
-            sockaddr_addr: None,
         }
     }
 

@@ -15,8 +15,8 @@
 //! **Note on assertions.** In production the score-routing threshold is
 //! `> 3.0 → QUEUE`. PR 2's taint rule fires at exactly +3.0, so the
 //! composite needs at least one other filter contributing to cross the
-//! threshold (operation_risk adds +1.0 in production). The default
-//! `TestFixtures::default_filter_registry` does not include operation_risk,
+//! threshold (operation-risk adds +1.0 in production). The default
+//! `TestFixtures::default_filter_registry` does not include operation-risk,
 //! so the integration tests primarily assert "the taint filter fired with
 //! the expected rule_id" rather than "decision is blocking" — the latter
 //! would require either a production-equivalent registry or a +0.01 score
@@ -163,7 +163,7 @@ async fn accept_1_routine_startup_spawns_do_not_prompt() {
             ))
             .await;
         // Confirm the taint filter specifically did not fire on this
-        // spawn. Other filters (operation_risk) may still score it, but
+        // spawn. Other filters (operation-risk) may still score it, but
         // PR 2's job is to silence the taint contribution.
         let taint_fired = decision
             .filter_results

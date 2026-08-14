@@ -49,6 +49,20 @@ pub(crate) async fn get_reputation_table(
 
 // --- POST /api/reputation/observe ---
 
+/// Largest legitimate weight for an `approved` observation. Real observations
+/// are 1.0 (user-approved) or 1.5 (learned); a client must not be able to
+/// assert a larger magnitude. Without this clamp, `"approved:1000000.0"` drives
+/// an entry's trust to ~1.0 in a single request, letting a caller
+/// self-whitelist its own future spawns/connects and bypass the QUEUE gate.
+const MAX_APPROVED_WEIGHT: f64 = 1.5;
+/// Largest legitimate weight for a `denied` observation (terminate-denied=5.0).
+/// Bounds the reverse attack (poisoning a routine key toward DENY).
+const MAX_DENIED_WEIGHT: f64 = 5.0;
+/// A single evaluated call maps to only a handful of reputation keys; cap the
+/// count + per-key length so a malicious client can't flood/bloat the table.
+const MAX_OBSERVE_KEYS: usize = 32;
+const MAX_OBSERVE_KEY_LEN: usize = 512;
+
 #[derive(Deserialize)]
 pub(crate) struct ObserveRequest {
     pub keys: Vec<(u8, String)>,
@@ -61,6 +75,11 @@ pub(crate) async fn observe_reputation(
     State(state): State<AppState>,
     Json(body): Json<ObserveRequest>,
 ) -> impl IntoResponse {
+    if body.keys.len() > MAX_OBSERVE_KEYS
+        || body.keys.iter().any(|(_, k)| k.len() > MAX_OBSERVE_KEY_LEN)
+    {
+        return (StatusCode::BAD_REQUEST, "observation exceeds bounds").into_response();
+    }
     let outcome = parse_outcome(&body.outcome);
     let Some(outcome) = outcome else {
         return (StatusCode::BAD_REQUEST, "invalid outcome format").into_response();
@@ -150,9 +169,58 @@ fn parse_outcome(s: &str) -> Option<grith_proxy::reputation::ReputationOutcome> 
         return None;
     }
     let weight: f64 = parts[1].parse().ok()?;
+    // A client must not control the observation magnitude. Reject non-finite,
+    // and clamp to the largest *legitimate* weight for the outcome kind — real
+    // observations (approved 1.0/1.5, denied 1.0/3.0/5.0) are unchanged, while
+    // a poisoning attempt (`approved:1e6`, negative weights) is neutralised.
+    if !weight.is_finite() {
+        return None;
+    }
     match parts[0] {
-        "approved" => Some(grith_proxy::reputation::ReputationOutcome::Approved(weight)),
-        "denied" => Some(grith_proxy::reputation::ReputationOutcome::Denied(weight)),
+        "approved" => Some(grith_proxy::reputation::ReputationOutcome::Approved(
+            weight.clamp(0.0, MAX_APPROVED_WEIGHT),
+        )),
+        "denied" => Some(grith_proxy::reputation::ReputationOutcome::Denied(
+            weight.clamp(0.0, MAX_DENIED_WEIGHT),
+        )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grith_proxy::reputation::ReputationOutcome;
+
+    #[test]
+    fn parse_outcome_clamps_hostile_weights_and_rejects_non_finite() {
+        // The confirmed exploit: "approved:1e6" would drive trust to ~1.0 in
+        // one request. Now clamped to the legit approved ceiling.
+        assert!(matches!(
+            parse_outcome("approved:1000000.0"),
+            Some(ReputationOutcome::Approved(w)) if w == MAX_APPROVED_WEIGHT
+        ));
+        // Legit weights pass through unchanged.
+        assert!(matches!(
+            parse_outcome("approved:1.0"),
+            Some(ReputationOutcome::Approved(w)) if w == 1.0
+        ));
+        assert!(matches!(
+            parse_outcome("denied:3.0"),
+            Some(ReputationOutcome::Denied(w)) if w == 3.0
+        ));
+        // Over-limit denied clamps to its (higher) ceiling.
+        assert!(matches!(
+            parse_outcome("denied:1000.0"),
+            Some(ReputationOutcome::Denied(w)) if w == MAX_DENIED_WEIGHT
+        ));
+        // Negative weight clamps to 0 (no-op) — never subtracts from trust.
+        assert!(matches!(
+            parse_outcome("approved:-50"),
+            Some(ReputationOutcome::Approved(w)) if w == 0.0
+        ));
+        // Non-finite is rejected outright.
+        assert!(parse_outcome("approved:inf").is_none());
+        assert!(parse_outcome("denied:NaN").is_none());
     }
 }

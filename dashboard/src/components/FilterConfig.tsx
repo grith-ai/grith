@@ -8,22 +8,22 @@ interface FilterDef {
 }
 
 const KNOWN_FILTERS: FilterDef[] = [
-  { id: "path_match", name: "Path Match", phase: "Static" },
+  { id: "path-match", name: "Path Match", phase: "Static" },
   { id: "allowlist", name: "Allowlist", phase: "Static" },
   { id: "capability", name: "Capability", phase: "Static" },
   { id: "argument", name: "Argument Structure", phase: "Static" },
-  { id: "secret_scan", name: "Secret Scan", phase: "Pattern" },
+  { id: "secret-scan", name: "Secret Scan", phase: "Pattern" },
   { id: "command", name: "Command Analysis", phase: "Pattern" },
   { id: "reputation", name: "Reputation", phase: "Context" },
   { id: "behavioural", name: "Behavioural", phase: "Context" },
   { id: "taint", name: "Taint Tracking", phase: "Context" },
-  { id: "rate_limit", name: "Rate Limit", phase: "Context" },
+  { id: "rate-limit", name: "Rate Limit", phase: "Context" },
 ];
 
 const PHASE_COLORS: Record<string, string> = {
-  Static: "text-status-allow-green bg-status-allow-green/10",
-  Pattern: "text-status-queue-amber bg-status-queue-amber/10",
-  Context: "text-green bg-green/10",
+  Static: "text-accent-text bg-green-light border-green-border",
+  Pattern: "text-warning-text bg-warning-light border-warning-border",
+  Context: "text-accent-text bg-green-light border-green-border",
 };
 
 interface FilterConfigProps {
@@ -119,14 +119,14 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
   return (
     <div className="space-y-6">
       {/* Filter list */}
-      <div className="bg-white border border-grith-border rounded-xl p-5">
+      <div className="bg-surface border border-border rounded-card p-5">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-sm font-medium text-grith-text">
+          <h2 className="font-heading text-[15px] font-semibold text-text">
             Security Filters
           </h2>
           <button
             onClick={handleSave}
-            className="px-3 py-1.5 text-xs font-medium rounded-lg bg-green/15 text-green hover:bg-green/25 transition-colors"
+            className="px-3 py-1.5 text-xs rounded-btn bg-green text-accent-ink font-heading font-semibold hover:bg-green-dark transition-colors"
           >
             Save Configuration
           </button>
@@ -136,22 +136,22 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
           {KNOWN_FILTERS.map((filter) => (
             <label
               key={filter.id}
-              className="flex items-center justify-between py-2.5 px-3 rounded-md bg-white cursor-pointer hover:bg-grith-border/30 transition-colors"
+              className="flex items-center justify-between py-2.5 px-3 rounded-btn cursor-pointer hover:bg-surface-2 transition-colors"
             >
               <div className="flex items-center gap-3">
                 <input
                   type="checkbox"
                   checked={enabledFilters[filter.id] ?? false}
                   onChange={() => handleToggle(filter.id)}
-                  className="w-4 h-4 rounded-sm border-grith-border bg-white text-green accent-green"
+                  className="w-4 h-4 rounded-sm border-border accent-green"
                 />
-                <span className="text-sm text-grith-text">{filter.name}</span>
-                <span className="text-xs font-mono text-grith-muted">
+                <span className="text-sm text-text">{filter.name}</span>
+                <span className="text-xs font-code text-text-secondary">
                   {filter.id}
                 </span>
               </div>
               <span
-                className={`text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-lg ${PHASE_COLORS[filter.phase]}`}
+                className={`font-label text-[10px] font-medium uppercase tracking-[0.08em] px-2.5 py-0.5 rounded-pill border ${PHASE_COLORS[filter.phase]}`}
               >
                 {filter.phase}
               </span>
@@ -161,8 +161,8 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
       </div>
 
       {/* Test section */}
-      <div className="bg-white border border-grith-border rounded-xl p-5">
-        <h2 className="text-sm font-medium text-grith-text mb-4">
+      <div className="bg-surface border border-border rounded-card p-5">
+        <h2 className="font-heading text-[15px] font-semibold text-text mb-4">
           Test Tool Call
         </h2>
 
@@ -171,30 +171,30 @@ export function FilterConfig({ onSave }: FilterConfigProps) {
           onChange={(e) => setTestInput(e.target.value)}
           rows={6}
           spellCheck={false}
-          className="w-full bg-white border border-grith-border rounded-lg px-3 py-2 text-xs font-mono text-grith-text placeholder:text-grith-muted focus:outline-none focus:border-green/50 resize-y"
+          className="w-full bg-bg border border-border rounded-btn px-3 py-2 text-xs font-code text-text placeholder:text-text-dim focus:outline-none focus:border-green focus:shadow-glow resize-y"
           placeholder='{"type": "FileRead", "path": "/tmp/test"}'
         />
 
         <div className="flex items-center gap-3 mt-3">
           <button
             onClick={handleRunTest}
-            className="px-4 py-1.5 text-xs font-medium rounded-lg bg-green text-white hover:bg-green-dark transition-colors"
+            className="px-4 py-1.5 text-xs rounded-btn bg-green text-accent-ink font-heading font-semibold hover:bg-green-dark transition-colors"
           >
             Run Test
           </button>
-          <span className="text-[10px] text-grith-muted">
+          <span className="text-[10px] text-text-secondary">
             Evaluates the JSON tool call against enabled filters
           </span>
         </div>
 
         {testError && (
-          <div className="mt-3 bg-status-deny-red/10 border border-status-deny-red/30 rounded-lg px-3 py-2 text-xs text-status-deny-red">
+          <div className="mt-3 bg-danger-light border border-danger-border rounded-lg px-3 py-2 text-xs text-danger-text">
             {testError}
           </div>
         )}
 
         {testResult && (
-          <div className="mt-3 bg-status-allow-green/10 border border-status-allow-green/30 rounded-lg px-3 py-2 text-xs text-status-allow-green">
+          <div className="mt-3 bg-green-light border border-green-border rounded-lg px-3 py-2 text-xs text-accent-text">
             {testResult}
           </div>
         )}

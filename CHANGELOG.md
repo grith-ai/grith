@@ -8,6 +8,12 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-13
+
+A security-hardening release. It closes the syscall-perimeter, audit-integrity,
+and egress-inspection gaps found in pre-launch review, and adds cross-process
+and kernel-surface coverage. Upgrading from 0.1.x is strongly recommended.
+
 ### Removed
 
 - **Cold-start scoring removed entirely.** The proxy no longer widens its
@@ -25,7 +31,22 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ### Fixed
 
-- **Own-credential outbound false positive in taint scoring (FP research §5.2).**
+- **Supervised tools no longer crash from spurious foreign-ABI denials.**
+  Ordinary syscalls could sporadically be misclassified as x32-ABI calls and
+  hard-denied in the supervisor's syscall-stepping path; when the denied call
+  was `futex(2)` or `restart_syscall(2)`, the injected `EPERM` made glibc abort
+  and the whole supervised session died of `SIGABRT` shortly after start. Two
+  compounding defects: the entry/exit bookkeeping could fall out of step with
+  the kernel, and the ABI check then read the ptrace event message at a stop
+  where the kernel stores its own syscall-stop codes — which numerically
+  collide with grith's foreign-ABI markers, turning every such misread into an
+  x32 verdict. The supervisor now takes entry-vs-exit and the ABI decision from
+  the kernel's authoritative syscall record, and consults the event-message
+  marker only where it is genuinely current (pre-5.3 seccomp stops). Real
+  foreign-ABI enforcement (`int 0x80`, x32 numbers, forged filter markers) is
+  unchanged and remains covered by the ptrace test suite.
+
+- **Own-credential outbound false positive in taint scoring.**
   Reading a credential and then running an outbound-capable tool that uses it
   (`git push`, `aws s3 ls`, `npm publish`) no longer QUEUEs on its own. The
   data-flow taint rule's condition 4 (outbound-capable binary under taint) was a
@@ -38,7 +59,7 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   independently scored by the egress filter. Operators can set the flag `false`
   to restore the standalone fire.
 
-- **Secret-scan false positives on benign token shapes (FP research §5.11).**
+- **Secret-scan false positives on benign token shapes.**
   The secret scanner now suppresses matches whose value is a provably-benign
   shape, so routine development no longer trips the 1,620-pattern corpus: bare
   git/SHA hex digests not in an assignment context (`git show <sha>`, file
@@ -71,8 +92,68 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ### Security
 
+- **Syscall interception hardened against evasion.** The supervisor now fails
+  closed on foreign-architecture and 32-bit-compatibility syscalls (`x32`,
+  `int 0x80`) instead of letting them pass, and resolves symlinks and `..`
+  traversal to their real target *before* policy evaluation, so a symlinked or
+  relative path can no longer launder access to a protected file. The
+  `openat2`, hardlink, and rename/truncate syscall families — previously able
+  to reach the filesystem uninspected — are now trapped and classified.
+
+- **Expanded kernel-surface coverage.** New syscall classes are intercepted:
+  kernel-module load/unload and `kexec` are hard-denied (no supervised tool has
+  a legitimate reason to replace the running kernel); architecture-privileged
+  operations (`reboot`, `swapon`, `sethostname`, direct I/O-port access) are
+  hard-denied; filesystem-mount and namespace primitives (`mount`,
+  `pivot_root`, `unshare`, `setns`) are covered, with a profile carve-out for
+  declared sandbox binaries; and cross-process memory access (`ptrace`,
+  `process_vm_readv` / `process_vm_writev`) is scored for review when it targets
+  a process **outside** the supervised tool's own process tree — closing a path
+  that could read secrets out of another application's memory without ever
+  touching a file or a socket.
+
+- **Connected-UDP egress is now inspected.** A datagram socket that connects to
+  a destination and then sends via `write` / `send` (rather than `sendto`) is
+  attributed to its real destination and scored — including across an `exec()`
+  — closing a channel that previously bypassed network policy. DNS is inspected
+  in-line at the syscall boundary; the earlier out-of-process DNS proxy is
+  retired.
+
+- **Wildcard-bind listener clamp.** When a supervised tool binds a listener to
+  a wildcard address (`0.0.0.0` / `::`), the bind is rewritten to loopback
+  according to the profile's listener policy, so a tool cannot inadvertently
+  expose a local service to the network; an undeclared wildcard bind is
+  surfaced for review.
+
+- **A tracee can no longer blind the supervisor with its own seccomp filter.**
+  Installing a user-notification "new listener" seccomp filter — which could
+  otherwise out-rank grith's interception and hide subsequent syscalls — is
+  denied.
+
+- **Tamper-evident, single-writer audit chain.** The daemon is now the
+  exclusive audit writer, enforced by a file lock; every record is covered by a
+  versioned full-record hash (the hash covers all persisted fields, including
+  its own version); concurrent writers can no longer fork the chain; archived
+  segments are re-verified by recomputation rather than by trusting a stored
+  hash; and a severed or discontinuous history is detected and classified. If
+  the chain is quarantined after tamper detection, **every** write path —
+  including the built-in agent (`grith run`) — refuses to append; and records
+  dropped under sustained overload leave a visible gap marker (with a count) in
+  the chain rather than vanishing silently. Each record now carries its decision
+  reason and enforcement outcome.
+
+- **Verifiable daemon identity + fail-closed session tracking.** Each daemon
+  instance carries a verifiable identity, so a supervised session cannot be
+  silently adopted by a different instance; a supervisor whose daemon stops
+  tracking its session fails closed and terminates after a grace period; and
+  session capacity is reserved before the target is spawned.
+
+- **Licence-signing key rotated.** The licence-signing keypair was rotated as
+  pre-launch security hygiene. A Pro user whose licence was issued before the
+  rotation should sign in again to receive a licence signed with the new key.
+
 - **IPC-delegated authority: control-socket + authority-delegating-spawn
-  detection (H2, Options 2 & 4, audit-only).** Connects to control-injection
+  detection (audit-only).** Connects to control-injection
   IPC sockets (tmux/screen panes, X11, the session D-Bus bus) now emit
   `event = "control_socket_connect"`, and spawns of authority-delegating
   binaries (docker/podman/kubectl/tmux/screen/systemctl/systemd-run/dbus-send/
@@ -80,10 +161,11 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   `event = "authority_delegating_spawn"`. Both are **audit-only** (the
   operation is still allowed) to measure the false-positive budget before
   enforcing; ssh-agent/gpg-agent sockets are already routed through the proxy
-  separately. This completes the H2 IPC-delegated-authority mitigations
-  (disclosure + Options 1–4); enforce modes are documented follow-ups.
+  separately. This completes the IPC-delegated-authority mitigations
+  (disclosure, detection, and host-escalation scoring); enforce modes are
+  documented follow-ups.
 
-- **IPC-delegated authority: PTY-ownership detection (H2, Option 1).** A write
+- **IPC-delegated authority: PTY-ownership detection.** A write
   to a `/dev/pts/N` that is not the supervised tool's own controlling terminal
   (the `echo cmd > /dev/pts/<sibling-pane>` injection vector) is now detected
   and forensically logged (`event = "foreign_pts_write"`). Default is
@@ -92,8 +174,8 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   tool's own terminal I/O is unaffected; reads and non-pts paths are not
   flagged; an unresolvable controlling terminal fails open (no flag).
 
-- **IPC-delegated authority: disclosure + container-escalation scoring (H2,
-  Option 3).** Documented the structural limit of process-tree-scoped
+- **IPC-delegated authority: disclosure + container-escalation scoring.**
+  Documented the structural limit of process-tree-scoped
   supervision in `SECURITY.md` ("Known Limitations" → IPC-delegated authority):
   actions the supervised tool *delegates* to a more-privileged peer (docker
   daemon, `tmux send-keys`, ssh-agent, D-Bus, X11) execute outside the
@@ -106,8 +188,8 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   unaffected. Control-socket gating and PTY-ownership enforcement for the tmux
   vector are tracked as follow-ups.
 
-- **Destructive-action coverage (work item 68).** A new default-on
-  `destructive-action` proxy filter (Phase 2) brings the shipped ruleset in line
+- **Destructive-action coverage.** A new default-on
+  `destructive-action` proxy filter brings the shipped ruleset in line
   with the destructive-action threat model. It **hard-denies** catastrophic
   host/storage destruction (filesystem format, raw block-device overwrite,
   signature wipe, `rm --no-preserve-root`, recursive removal of a system root or
@@ -176,9 +258,23 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   `~/.config/grith/dashboard.token` (written by the background dashboard
   server). This is a deliberate default flip from the previous open-on-loopback
   posture; pre-1.0 so no SemVer-major bump, but operators scripting the open
-  API must adapt. See `work/futurework/dashboard-localhost-auth-csrf.md`.
+  API must adapt.
 
 ### Added
+
+- **Audit maintenance commands.** `grith audit diagnose` inspects the audit
+  chain — verification status, forks, gaps, and quarantine state — and runs even
+  when the chain is quarantined. `grith audit compact` reclaims disk space after
+  a large prune (operator-invoked; it never runs on a timer). Local audit
+  storage now bounds its physical footprint, keeping a recent active window plus
+  a compressed cold archive rather than growing without limit.
+
+- **Exfil-shape egress scoring.** Outbound requests are scored on the *shape* of
+  what they carry — high-entropy or base64 bodies, oversized payloads, and
+  body-bearing HTTP methods weighted above reads — combined with destination
+  reputation and data-flow taint, plus a DNS-tunnelling signal. Routine browser
+  and developer-tool egress is quieted so the added scrutiny does not raise the
+  false-positive budget.
 
 - **Signed releases + SBOMs.** The release workflow now publishes four
   supply-chain artefacts alongside each archive:
@@ -188,11 +284,25 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   - `<archive>.cdx.json` — CycloneDX 1.5 SBOM listing every
     transitive Rust dependency resolved at build time.
   - `<archive>.cdx.json.cosign.bundle` — signature over the SBOM.
-  - SLSA v1 build-provenance attestation via GitHub&apos;s first-party
-    `actions/attest-build-provenance` (retrieve with
-    `gh attestation verify`).
-  Verification recipes are documented in `docs/RELEASE.md`. This takes
-  effect on the next tag.
+  - `<archive>.intoto.bundle` — a SLSA v1 build-provenance attestation
+    binding the archive to the workflow, source commit, and builder that
+    produced it, signed with cosign (keyless, Rekor-anchored) and
+    verifiable with `cosign verify-blob-attestation`.
+  Verification recipes are documented in `docs/RELEASE.md`.
+
+### Known limitations
+
+- **Linux x86_64 only.** The supervisor relies on `ptrace` + `seccomp` with
+  x86_64 syscall-argument extraction; no other target is built for this release.
+- **32-bit tools under supervision fail closed.** A 32-bit (i386 / x32) tracee's
+  syscalls are denied rather than interpreted — safe, but such tools are
+  effectively unusable under `grith exec`. Run 64-bit builds under supervision.
+- **Documented perimeter edge cases (low severity, no authority gain).** On
+  kernels older than 5.3 the seccomp return-data path falls back (irrelevant on
+  5.3+); sibling-thread path resolution carries an inherent time-of-check window
+  intrinsic to path-string interception; relative-symlink base resolution and
+  `openat2` ignoring `O_NOFOLLOW` are false-positive-only. None of these let a
+  supervised tool acquire authority it would otherwise be denied.
 
 ## [0.1.4] - 2026-05-18
 

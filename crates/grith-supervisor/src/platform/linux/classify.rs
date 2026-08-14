@@ -51,7 +51,15 @@ impl PtraceSupervisor {
             syscall_nr::OPEN => {
                 // open(pathname, flags, mode)
                 let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let path = Self::canonicalize_for_tracee(pid_u32, &path);
+                // O_NOFOLLOW makes the kernel refuse to follow a final-
+                // component symlink (it returns ELOOP), so scoring the
+                // target would be a false read of a file that was never
+                // opened. Resolve the link itself in that case.
+                let path = if Self::open_is_nofollow(regs.rsi) {
+                    Self::canonicalize_for_tracee_nofollow(pid_u32, &path)
+                } else {
+                    Self::canonicalize_for_tracee(pid_u32, &path)
+                };
                 let flags = Self::decode_open_flags(regs.rsi);
                 Ok(Some(SyscallKind::FileOpen { path, flags }))
             }
@@ -59,9 +67,193 @@ impl PtraceSupervisor {
                 // openat(dirfd, pathname, flags, mode)
                 let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
                 let dirfd = regs.rdi as i32;
-                let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                let path = if Self::open_is_nofollow(regs.rdx) {
+                    Self::resolve_at_path_nofollow(pid_u32, dirfd, &raw_path)
+                } else {
+                    Self::resolve_at_path(pid_u32, dirfd, &raw_path)
+                };
                 let flags = Self::decode_open_flags(regs.rdx);
                 Ok(Some(SyscallKind::FileOpen { path, flags }))
+            }
+            syscall_nr::OPENAT2 => {
+                // openat2(dirfd, pathname, how, size)
+                //
+                // `how` is a `struct open_how { __u64 flags, mode, resolve }`
+                // in tracee memory rather than a register, so both the flags
+                // and the resolution mode have to be read from the tracee.
+                //
+                // The kernel rejects `size < sizeof(struct open_how)` with
+                // EINVAL, so a short struct never reaches the filesystem;
+                // treating it as a read-only open of nothing is harmless and
+                // keeps a bad pointer from being dereferenced.
+                //
+                // The `resolve` field is deliberately NOT used to decide how
+                // the path is interpreted. It lives in tracee-writable memory,
+                // so a sibling thread — never ptrace-stopped, since only the
+                // calling thread stops at syscall-entry — can flip it between
+                // this read and the kernel's own copy (measured: a ~5ms flip
+                // inside a 30ms evaluation window). An earlier version that
+                // stripped the leading "/" under RESOLVE_IN_ROOT turned this
+                // TOCTOU into a working path DOWNGRADE: grith scored the
+                // sandbox-confined path while the kernel, after the flip,
+                // opened the real absolute path.
+                //
+                // Instead grith always scores the WORST-CASE interpretation —
+                // the path as absolute (unconfined). If the open really is
+                // confined by RESOLVE_IN_ROOT/BENEATH, scoring the absolute
+                // path only over-restricts a benign confined open (fail-safe);
+                // if it is NOT confined, grith scored exactly what the kernel
+                // opens. Whichever the kernel does, grith saw the dangerous
+                // reading.
+                //
+                // The kernel rejects `size < sizeof(struct open_how)` with
+                // EINVAL, so a short struct never opens anything; treating it
+                // as a read-only open of nothing keeps a bad pointer from
+                // being dereferenced.
+                const OPEN_HOW_SIZE: u64 = 24;
+
+                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let dirfd = regs.rdi as i32;
+                let how_ptr = regs.rdx;
+                let size = regs.r10;
+
+                let flags = if how_ptr == 0 || size < OPEN_HOW_SIZE {
+                    OpenFlags::ReadOnly
+                } else {
+                    // Fail closed: an unreadable open_how flags word is an
+                    // unclassifiable syscall, and the caller denies on Err.
+                    let raw_flags = ptrace::read(pid, how_ptr as *mut libc::c_void)
+                        .map(|w| w as u64)
+                        .map_err(|e| {
+                            Error::InterceptionError(format!(
+                                "failed to read open_how at {how_ptr:#x} for pid {pid}: {e}"
+                            ))
+                        })?;
+                    Self::decode_open_flags(raw_flags)
+                };
+
+                // `resolve_at_path` treats an absolute path as absolute — the
+                // worst case — exactly as intended.
+                let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                Ok(Some(SyscallKind::FileOpen { path, flags }))
+            }
+            syscall_nr::RMDIR => {
+                // rmdir(pathname) — the legacy directory removal. Its
+                // numeric neighbours were added for B2; leaving this out
+                // would have left the same class of gap one syscall over.
+                //
+                // rmdir does NOT follow a final symlink — it acts on the name
+                // itself and returns ENOTDIR for a symlink — so it uses the
+                // no-follow resolver like unlink/rename. Following would
+                // report a delete of the symlink's target for a syscall the
+                // kernel refuses.
+                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = Self::canonicalize_for_tracee_nofollow(pid_u32, &path);
+                Ok(Some(SyscallKind::FileDelete { path }))
+            }
+            syscall_nr::CREAT => {
+                // creat(pathname, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC)
+                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = Self::canonicalize_for_tracee(pid_u32, &path);
+                Ok(Some(SyscallKind::FileOpen {
+                    path,
+                    flags: OpenFlags::Truncate,
+                }))
+            }
+
+            // ---------------------------------------------------------------
+            // Truncation — destructive writes that never pass through
+            // open()/write().
+            // ---------------------------------------------------------------
+            syscall_nr::TRUNCATE => {
+                // truncate(pathname, length)
+                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = Self::canonicalize_for_tracee(pid_u32, &path);
+                Ok(Some(SyscallKind::FileWrite {
+                    fd: -1,
+                    path: Some(path),
+                }))
+            }
+            syscall_nr::FTRUNCATE => {
+                // ftruncate(fd, length)
+                //
+                // ftruncate is its own control point — unlike write(2), there
+                // is no earlier open to have scored the fd — so an
+                // unresolvable path must NOT vanish. `FileWrite{path: None}`
+                // maps to noise (allow-and-forget); a `<fd:N>` placeholder
+                // keeps the destructive resize visible and audited, as fchmod
+                // already does for an unresolvable fd.
+                let fd = regs.rdi as i32;
+                let path = Some(
+                    Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>")),
+                );
+                Ok(Some(SyscallKind::FileWrite { fd, path }))
+            }
+
+            // ---------------------------------------------------------------
+            // Link creation — scored by target (see SyscallKind::FileLink)
+            // ---------------------------------------------------------------
+            syscall_nr::SYMLINK => {
+                // symlink(target, linkpath)
+                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                Ok(Some(SyscallKind::FileLink {
+                    // Resolve the target the way a later open of the link
+                    // will: fully, including any symlink chain. A symlink
+                    // target is stored verbatim and resolved relative to the
+                    // link's own directory at traversal time, so this is
+                    // exact for absolute targets and for the common
+                    // cwd-relative case.
+                    target: Self::canonicalize_for_tracee(pid_u32, &target),
+                    // The new name does not exist yet and is not followed.
+                    link_path: Self::canonicalize_for_tracee_nofollow(pid_u32, &link_raw),
+                    symbolic: true,
+                }))
+            }
+            syscall_nr::SYMLINKAT => {
+                // symlinkat(target, newdirfd, linkpath)
+                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.rdx, 4096)?;
+                let newdirfd = regs.rsi as i32;
+                Ok(Some(SyscallKind::FileLink {
+                    target: Self::canonicalize_for_tracee(pid_u32, &target),
+                    link_path: Self::resolve_at_path_nofollow(pid_u32, newdirfd, &link_raw),
+                    symbolic: true,
+                }))
+            }
+            syscall_nr::LINK => {
+                // link(oldpath, newpath) — Linux does not follow oldpath, so
+                // the hard link is created against the link itself. Report
+                // what the kernel will act on.
+                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                Ok(Some(SyscallKind::FileLink {
+                    target: Self::canonicalize_for_tracee_nofollow(pid_u32, &target),
+                    link_path: Self::canonicalize_for_tracee_nofollow(pid_u32, &link_raw),
+                    symbolic: false,
+                }))
+            }
+            syscall_nr::LINKAT => {
+                // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+                //
+                // AT_SYMLINK_FOLLOW (0x400) in `flags` makes linkat resolve
+                // oldpath, which is how a hard link to a symlink's *target*
+                // is created — score what the kernel will link to.
+                let target_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.r10, 4096)?;
+                let olddirfd = regs.rdi as i32;
+                let newdirfd = regs.rdx as i32;
+                let follow = regs.r8 as i32 & libc::AT_SYMLINK_FOLLOW != 0;
+                let target = if follow {
+                    Self::resolve_at_path(pid_u32, olddirfd, &target_raw)
+                } else {
+                    Self::resolve_at_path_nofollow(pid_u32, olddirfd, &target_raw)
+                };
+                Ok(Some(SyscallKind::FileLink {
+                    target,
+                    link_path: Self::resolve_at_path_nofollow(pid_u32, newdirfd, &link_raw),
+                    symbolic: false,
+                }))
             }
 
             // ---------------------------------------------------------------
@@ -102,16 +294,16 @@ impl PtraceSupervisor {
             // File delete
             // ---------------------------------------------------------------
             syscall_nr::UNLINK => {
-                // unlink(pathname)
+                // unlink(pathname) — removes the link, never its target.
                 let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let path = Self::canonicalize_for_tracee(pid_u32, &path);
+                let path = Self::canonicalize_for_tracee_nofollow(pid_u32, &path);
                 Ok(Some(SyscallKind::FileDelete { path }))
             }
             syscall_nr::UNLINKAT => {
                 // unlinkat(dirfd, pathname, flags)
                 let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
                 let dirfd = regs.rdi as i32;
-                let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                let path = Self::resolve_at_path_nofollow(pid_u32, dirfd, &raw_path);
                 Ok(Some(SyscallKind::FileDelete { path }))
             }
 
@@ -122,8 +314,9 @@ impl PtraceSupervisor {
                 // rename(oldpath, newpath)
                 let old_path = self.read_tracee_string(pid, regs.rdi, 4096)?;
                 let new_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let old_path = Self::canonicalize_for_tracee(pid_u32, &old_path);
-                let new_path = Self::canonicalize_for_tracee(pid_u32, &new_path);
+                // rename operates on the links themselves.
+                let old_path = Self::canonicalize_for_tracee_nofollow(pid_u32, &old_path);
+                let new_path = Self::canonicalize_for_tracee_nofollow(pid_u32, &new_path);
                 Ok(Some(SyscallKind::FileRename { old_path, new_path }))
             }
             syscall_nr::RENAMEAT => {
@@ -132,8 +325,8 @@ impl PtraceSupervisor {
                 let new_raw = self.read_tracee_string(pid, regs.r10, 4096)?;
                 let old_dirfd = regs.rdi as i32;
                 let new_dirfd = regs.rdx as i32;
-                let old_path = Self::resolve_at_path(pid_u32, old_dirfd, &old_raw);
-                let new_path = Self::resolve_at_path(pid_u32, new_dirfd, &new_raw);
+                let old_path = Self::resolve_at_path_nofollow(pid_u32, old_dirfd, &old_raw);
+                let new_path = Self::resolve_at_path_nofollow(pid_u32, new_dirfd, &new_raw);
                 Ok(Some(SyscallKind::FileRename { old_path, new_path }))
             }
             syscall_nr::RENAMEAT2 => {
@@ -142,8 +335,8 @@ impl PtraceSupervisor {
                 let new_raw = self.read_tracee_string(pid, regs.r10, 4096)?;
                 let old_dirfd = regs.rdi as i32;
                 let new_dirfd = regs.rdx as i32;
-                let old_path = Self::resolve_at_path(pid_u32, old_dirfd, &old_raw);
-                let new_path = Self::resolve_at_path(pid_u32, new_dirfd, &new_raw);
+                let old_path = Self::resolve_at_path_nofollow(pid_u32, old_dirfd, &old_raw);
+                let new_path = Self::resolve_at_path_nofollow(pid_u32, new_dirfd, &new_raw);
                 Ok(Some(SyscallKind::FileRename { old_path, new_path }))
             }
 
@@ -241,7 +434,7 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Process fork / clone
             // ---------------------------------------------------------------
-            syscall_nr::FORK | syscall_nr::CLONE => {
+            syscall_nr::FORK | syscall_nr::CLONE | syscall_nr::CLONE3 => {
                 // At syscall-entry the child PID is not yet known (the
                 // kernel has not assigned it). We emit child_pid: 0 here.
                 //
@@ -330,14 +523,51 @@ impl PtraceSupervisor {
                 }
             }
 
+            // recvfrom is handled specially by the interceptor loop: on a
+            // tracked DNS socket it is promoted to catch its syscall-exit so the
+            // kernel-filled response buffer can be read for the DNS cache. Here
+            // (and for any non-DNS recvfrom) it is noise → immediately resumed.
+            syscall_nr::RECVFROM | syscall_nr::RECVMSG | syscall_nr::RECVMMSG => Ok(None),
+
+            // sendmsg/sendmmsg on a DNS or connected socket are handled in the
+            // interceptor loop before classify is reached. What reaches here
+            // is an UNCONNECTED send, and its `msg_name` is an explicit
+            // destination exactly like sendto's `dest_addr` — scoring sendto
+            // but not these left a one-syscall exfiltration path (go-live
+            // review round 2). A send with no `msg_name` (msg_namelen == 0)
+            // stays noise.
+            //
+            // sendmsg: rsi = *msghdr. sendmmsg: rsi = *mmsghdr[], and mmsghdr
+            // begins with its msghdr, so the first message's header is at the
+            // same offset — reading the first message covers the common
+            // single-message case (a full batch scan would be unbounded
+            // PEEKDATA on the hot path; documented residual).
+            syscall_nr::SENDMSG | syscall_nr::SENDMMSG => {
+                match self.read_msghdr_destination(pid, regs.rsi)? {
+                    Some((address, port)) => Ok(Some(SyscallKind::NetSendTo { address, port })),
+                    None => Ok(None),
+                }
+            }
+
+            // Socket FD lifecycle is consumed by the DNS socket tracker in
+            // events.rs. It is security-relevant only for maintaining exact
+            // attribution state and does not produce a policy event itself.
+            syscall_nr::CLOSE
+            | syscall_nr::CLOSE_RANGE
+            | syscall_nr::DUP
+            | syscall_nr::DUP2
+            | syscall_nr::DUP3
+            | syscall_nr::FCNTL => Ok(None),
+
             // ---------------------------------------------------------------
             // Raw socket creation
             //
             // socket(domain, type, protocol) is intercepted only for raw-socket
             // families. AF_PACKET (17) provides direct link-layer access —
             // a process with this socket can capture or inject arbitrary frames,
-            // bypassing the normal IP stack. AF_NETLINK (16) gives direct
-            // kernel subsystem access.
+            // bypassing the normal IP stack. AF_NETLINK (16) gives kernel
+            // subsystem access — but its routine NETLINK_ROUTE family is allowed
+            // (see below); the less-common netlink families stay denied.
             //
             // Normal socket families (AF_INET=2, AF_INET6=10, AF_UNIX=1) are
             // returned as None — they are already intercepted at connect()/bind()
@@ -351,14 +581,24 @@ impl PtraceSupervisor {
                 let protocol = regs.rdx as i32;
                 const AF_NETLINK: i32 = 16;
                 const AF_PACKET: i32 = 17;
-                if domain == AF_PACKET || domain == AF_NETLINK {
+                const NETLINK_ROUTE: i32 = 0;
+                // AF_PACKET can capture/inject raw ethernet frames — always a
+                // hard-deny. AF_NETLINK gives kernel-subsystem access, but the
+                // NETLINK_ROUTE family (protocol 0) is routine: glibc opens it on
+                // every getaddrinfo()/getifaddrs() to enumerate interfaces and
+                // pick source addresses, so denying it breaks ordinary DNS /
+                // networking (and floods the audit). Allow NETLINK_ROUTE; keep
+                // the deny for AF_PACKET and the less-common netlink families
+                // (netfilter, xfrm, …) an AI tool has no routine reason to open.
+                if domain == AF_PACKET || (domain == AF_NETLINK && protocol != NETLINK_ROUTE) {
                     Ok(Some(SyscallKind::RawSocketCreate {
                         domain,
                         socket_type,
                         protocol,
                     }))
                 } else {
-                    // AF_INET, AF_INET6, AF_UNIX — intercepted at connect/bind.
+                    // AF_INET, AF_INET6, AF_UNIX (evaluated at connect/bind) and
+                    // AF_NETLINK/NETLINK_ROUTE (routine interface enumeration).
                     Ok(None)
                 }
             }
@@ -428,6 +668,43 @@ impl PtraceSupervisor {
             | syscall_nr::IO_URING_REGISTER => Ok(Some(SyscallKind::IoUringSetup)),
 
             // ---------------------------------------------------------------
+            // Self-filter install (go-live review round 2).
+            //
+            // A tracee that installs its own seccomp filter can out-rank
+            // grith's SECCOMP_RET_TRACE. Both the op and the flags are in
+            // registers, so this decision cannot be raced by a sibling thread
+            // the way an openat2 open_how can.
+            // ---------------------------------------------------------------
+            syscall_nr::SECCOMP => {
+                // seccomp(op, flags, args) — rdi=op, rsi=flags.
+                const SECCOMP_SET_MODE_FILTER: u64 = 1;
+                const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
+                if regs.rdi != SECCOMP_SET_MODE_FILTER {
+                    // SET_MODE_STRICT / GET_ACTION_AVAIL / GET_NOTIF_SIZES —
+                    // none can hide syscalls from grith.
+                    return Ok(None);
+                }
+                Ok(Some(SyscallKind::SeccompInstall {
+                    via: crate::interceptor::SeccompInstallVia::Seccomp,
+                    new_listener: regs.rsi & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0,
+                }))
+            }
+            syscall_nr::PRCTL => {
+                // prctl(option, arg2, ...) — rdi=option, rsi=arg2.
+                // Only PR_SET_SECCOMP(SECCOMP_MODE_FILTER) installs a filter;
+                // it has no flags argument, so it can never create a listener.
+                const PR_SET_SECCOMP: u64 = 22;
+                const SECCOMP_MODE_FILTER: u64 = 2;
+                if regs.rdi != PR_SET_SECCOMP || regs.rsi != SECCOMP_MODE_FILTER {
+                    return Ok(None);
+                }
+                Ok(Some(SyscallKind::SeccompInstall {
+                    via: crate::interceptor::SeccompInstallVia::Prctl,
+                    new_listener: false,
+                }))
+            }
+
+            // ---------------------------------------------------------------
             // PR 6 Phase A: kernel-module load/unload — hard-denied
             // ---------------------------------------------------------------
             syscall_nr::INIT_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
@@ -454,10 +731,20 @@ impl PtraceSupervisor {
             // fchownat(dirfd, path, uid, gid, ..) — rdi=dirfd, rsi=path, rdx=uid, r10=gid
             // ---------------------------------------------------------------
             syscall_nr::CHOWN | syscall_nr::LCHOWN => {
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let path = Self::canonicalize_for_tracee(pid_u32, &path);
+                let raw = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let is_chown = regs.orig_rax as i64 == syscall_nr::CHOWN;
+                // `chown` follows the final symlink; `lchown` deliberately
+                // does not — it changes the link itself. Resolving lchown's
+                // final component would report an ownership change on a file
+                // the kernel never touches: the same mis-attribution this
+                // change argues against for unlink and rename.
+                let path = if is_chown {
+                    Self::canonicalize_for_tracee(pid_u32, &raw)
+                } else {
+                    Self::canonicalize_for_tracee_nofollow(pid_u32, &raw)
+                };
                 Ok(Some(SyscallKind::OwnershipChange {
-                    op: if regs.orig_rax as i64 == syscall_nr::CHOWN {
+                    op: if is_chown {
                         crate::interceptor::OwnershipOp::Chown
                     } else {
                         crate::interceptor::OwnershipOp::Lchown
@@ -481,7 +768,14 @@ impl PtraceSupervisor {
             syscall_nr::FCHOWNAT => {
                 let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
                 let dirfd = regs.rdi as i32;
-                let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
+                // AT_SYMLINK_NOFOLLOW (0x100) in `flags` (r8) makes fchownat
+                // act on the link rather than its target, exactly like lchown.
+                let follows = regs.r8 as i32 & libc::AT_SYMLINK_NOFOLLOW == 0;
+                let path = if follows {
+                    Self::resolve_at_path(pid_u32, dirfd, &raw_path)
+                } else {
+                    Self::resolve_at_path_nofollow(pid_u32, dirfd, &raw_path)
+                };
                 Ok(Some(SyscallKind::OwnershipChange {
                     op: crate::interceptor::OwnershipOp::Fchownat,
                     path,
@@ -643,13 +937,26 @@ impl PtraceSupervisor {
             // Self-target carveout: process_vm_* against the caller's
             // own pid is benign (used by some allocators for memory
             // copying); filter it out so we don't QUEUE the
-            // supervised tool's own internal use. ptrace against self
-            // is rare and we don't carve it out.
+            // supervised tool's own internal use.
+            //
+            // PTRACE_TRACEME carveout: `ptrace(PTRACE_TRACEME)` has
+            // request(rdi) == 0 and reads no other process's memory —
+            // the caller merely volunteers to be traced by its own
+            // parent (crash handlers, fork/trace/exec test harnesses).
+            // It grants no cross-process authority and would EPERM under
+            // grith anyway (grith already holds the tracer slot), so we
+            // carve it out. Note we key on the request (rdi == 0), NOT
+            // the pid argument (rsi), which TRACEME leaves as 0.
             // ---------------------------------------------------------------
-            syscall_nr::PTRACE => Ok(Some(SyscallKind::CrossProcessAccess {
-                op: crate::interceptor::CrossProcessOp::Ptrace,
-                target_pid: regs.rsi as u32,
-            })),
+            syscall_nr::PTRACE => {
+                if regs.rdi == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(SyscallKind::CrossProcessAccess {
+                    op: crate::interceptor::CrossProcessOp::Ptrace,
+                    target_pid: regs.rsi as u32,
+                }))
+            }
             syscall_nr::PROCESS_VM_READV => {
                 let target = regs.rdi as u32;
                 if target == pid_u32 {
@@ -743,9 +1050,14 @@ impl PtraceSupervisor {
             // A direct exfiltration vector — must go through the proxy.
             libc::AF_PACKET => Some("raw:af_packet"),
             // AF_NETLINK (16): kernel↔userspace messaging. Cannot send traffic
-            // off-host directly, but can manipulate routing tables, firewall
-            // rules, and interface state — surface for review.
-            libc::AF_NETLINK => Some("raw:af_netlink"),
+            // off-host, so it fits the "kernel-internal, no exfil → allow"
+            // contract above. glibc bind()s + sendto()s a NETLINK_ROUTE socket
+            // on every getaddrinfo()/getifaddrs(); treating that bind as a
+            // network "listener" (egress-policy +7.0) breaks DNS / interface
+            // enumeration. Route/firewall *mutation* needs CAP_NET_ADMIN, which
+            // a non-root supervised tool lacks, and the socket() classifier
+            // still denies AF_PACKET and non-route netlink families.
+            libc::AF_NETLINK => None,
             _ => None,
         }
     }
@@ -757,8 +1069,10 @@ impl PtraceSupervisor {
     /// - `AF_INET`  (IPv4) -- extracts dotted-quad address and port.
     /// - `AF_INET6` (IPv6) -- extracts colon-hex address and port.
     /// - `AF_UNIX`  -- extracts the socket path.
-    /// - `AF_PACKET` / `AF_NETLINK` -- returns a `raw:<family>` address so
-    ///   the proxy can score and potentially deny the operation.
+    /// - `AF_PACKET` -- returns a `raw:af_packet` address so the proxy can
+    ///   score and potentially deny the operation.
+    /// - `AF_NETLINK` -- `None` (allowed): kernel↔userspace messaging, cannot
+    ///   exfiltrate off-host; glibc uses it for getaddrinfo/getifaddrs.
     ///
     /// Returns `None` only for socket families that cannot exfiltrate data
     /// off the host and do not require proxy evaluation.
@@ -935,7 +1249,28 @@ impl PtraceSupervisor {
     ///
     /// If `path` is already absolute it is returned unchanged. Otherwise it
     /// is joined with the tracee's `/proc/<pid>/cwd` target.
+    ///
+    /// The result is then fully resolved (`..`, `.` and symlinks, including
+    /// the final component) because the overwhelming majority of callers are
+    /// syscalls that follow the final symlink. Arms that operate on the link
+    /// itself — delete, rename, and a new link's name — must call
+    /// [`canonicalize_for_tracee_nofollow`](Self::canonicalize_for_tracee_nofollow)
+    /// instead. Defaulting to the stronger resolution means an arm added
+    /// later without thinking about symlinks still gets protection.
     pub(super) fn canonicalize_for_tracee(pid: u32, path: &str) -> String {
+        Self::resolve_follow(&Self::absolutise_for_tracee(pid, path))
+    }
+
+    /// As [`canonicalize_for_tracee`](Self::canonicalize_for_tracee) but
+    /// leaves the final component unresolved — for syscalls that act on the
+    /// link rather than its target.
+    pub(super) fn canonicalize_for_tracee_nofollow(pid: u32, path: &str) -> String {
+        Self::resolve_nofollow(&Self::absolutise_for_tracee(pid, path))
+    }
+
+    /// Make `path` absolute against the tracee's cwd, without resolving
+    /// symlinks or `..`.
+    fn absolutise_for_tracee(pid: u32, path: &str) -> String {
         if path.starts_with('/') {
             return path.to_string();
         }
@@ -945,17 +1280,146 @@ impl PtraceSupervisor {
         }
     }
 
+    /// True for paths whose resolution is pointless or actively wrong.
+    ///
+    /// `/proc` entries are per-process and frequently magic symlinks whose
+    /// targets are meaningless to a filter (`/proc/self/fd/3` →
+    /// `socket:[12345]`), and `/proc/self` resolved in the *supervisor*
+    /// would name the supervisor, not the tracee. `/sys` and `/dev` are
+    /// high-traffic pseudo-filesystems where the lstat walk buys nothing.
+    fn skip_resolution(path: &str) -> bool {
+        // A path with a `..` component is NOT skipped even under /proc, /sys
+        // or /dev: `truncate("/proc/self/../../home/u/.ssh/id_rsa")` escapes
+        // the pseudo-filesystem, and because `is_noise_path` treats anything
+        // under `/proc/` as noise, skipping resolution would auto-allow the
+        // laundered real target with no evaluation (proven: a private key
+        // destroyed through the /proc noise exemption). Resolving collapses
+        // the `..` and reveals the target; a genuine /proc access has no
+        // `..` and stays skipped so it is not rewritten to the supervisor's
+        // own identity.
+        if Self::has_parent_traversal(path) {
+            return false;
+        }
+        path.starts_with("/proc/") || path.starts_with("/sys/") || path.starts_with("/dev/")
+    }
+
+    /// True when `path` contains a `..` path component.
+    fn has_parent_traversal(path: &str) -> bool {
+        path.split('/').any(|c| c == "..")
+    }
+
+    /// Resolve `..`, `.` and symlinks **including the final component**.
+    ///
+    /// Used for syscalls that follow the final symlink — the open family,
+    /// `truncate`, `chmod`, and a link's *target*. This is what closes the
+    /// path-string laundering hole (go-live review B3):
+    /// `ln -s ~/.ssh/id_rsa /tmp/x && cat /tmp/x` previously reached the
+    /// filters as the literal string `/tmp/x`, matching nothing.
+    ///
+    /// A path that does not exist yet (an `O_CREAT` open of a new file) is
+    /// resolved via its parent so `..` traversal and symlinked parent
+    /// directories are still collapsed. If even the parent cannot be
+    /// resolved the input is returned unchanged — that is exactly today's
+    /// behaviour, so resolution can never score *less* than before.
+    ///
+    /// Resolution happens in the supervisor's mount namespace. A tracee in
+    /// its own namespace (e.g. under `bwrap`) may see a different target;
+    /// resolving in ours is strictly better than not resolving, and the
+    /// no-follow variant keeps the divergence from mis-attributing deletes.
+    pub(super) fn resolve_follow(path: &str) -> String {
+        if Self::skip_resolution(path) {
+            return path.to_string();
+        }
+        let resolved = match std::fs::canonicalize(path) {
+            Ok(resolved) => resolved.to_string_lossy().into_owned(),
+            Err(_) => Self::resolve_parent_only(path),
+        };
+        Self::post_resolve(path, resolved)
+    }
+
+    /// Resolve `..`, `.` and symlinks in the **parent directories only**,
+    /// leaving the final component as written.
+    ///
+    /// Used for syscalls that operate on the link itself rather than what it
+    /// points at: `unlink`/`unlinkat`, `rename`, and the *new name* of a
+    /// link being created. Resolving the final component here would be a
+    /// mis-attribution — `rm /tmp/x` where `/tmp/x -> ~/.ssh/id_rsa` deletes
+    /// the link, not the key, and reporting it as a delete of the key would
+    /// be both a false positive and a false audit record.
+    pub(super) fn resolve_nofollow(path: &str) -> String {
+        if Self::skip_resolution(path) {
+            return path.to_string();
+        }
+        Self::post_resolve(path, Self::resolve_parent_only(path))
+    }
+
+    /// Common post-processing for a resolved path.
+    ///
+    /// * **Trailing slash** — `canonicalize` drops it, but a tracee that
+    ///   opened `~/.ssh/` (an `O_DIRECTORY` open) means the directory, and the
+    ///   credential-directory rules match on `"/.ssh/"` *with* the slash. Drop
+    ///   it and the read is auto-allowed as noise. Re-append it so the
+    ///   resolved form still matches.
+    /// * **Result inside `/proc`** — resolving in the supervisor's own process
+    ///   turns a `/proc/self/*` symlink into the *supervisor's* identity
+    ///   (`/etc/mtab` → `/proc/<supervisor-pid>/mounts`), which would attribute
+    ///   the supervisor's `/proc/<pid>/environ`/`mem` to the tracee. If
+    ///   resolution lands in `/proc` and the input did not, keep the input.
+    fn post_resolve(input: &str, resolved: String) -> String {
+        let mut resolved = resolved;
+        if resolved.starts_with("/proc/") && !input.starts_with("/proc/") {
+            return input.to_string();
+        }
+        if input.ends_with('/') && !resolved.ends_with('/') {
+            resolved.push('/');
+        }
+        resolved
+    }
+
+    /// Canonicalize the parent directory and re-append the final component.
+    fn resolve_parent_only(path: &str) -> String {
+        // `Path::parent`/`file_name` ignore a trailing slash, so strip it
+        // first and restore it via `post_resolve`.
+        let trimmed = path.strip_suffix('/').unwrap_or(path);
+        let p = std::path::Path::new(trimmed);
+        match (p.parent(), p.file_name()) {
+            (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+                Ok(dir) => dir.join(name).to_string_lossy().into_owned(),
+                Err(_) => path.to_string(),
+            },
+            // No parent (the path is `/`) or no final component (a trailing
+            // `..`): nothing safe to do beyond what we already have.
+            _ => path.to_string(),
+        }
+    }
+
     /// Resolve a path argument from a `*at` syscall that takes a `dirfd`.
     ///
     /// The `*at` family of syscalls (openat, unlinkat, mkdirat, fchmodat,
     /// renameat2) interpret their path relative to `dirfd`. If `dirfd` is
     /// `AT_FDCWD` (-100) the path is relative to the process CWD. If the
     /// path is absolute, `dirfd` is ignored entirely.
+    ///
+    /// Symlink-resolving, like
+    /// [`canonicalize_for_tracee`](Self::canonicalize_for_tracee); use
+    /// [`resolve_at_path_nofollow`](Self::resolve_at_path_nofollow) for
+    /// syscalls that act on the link itself.
     pub(super) fn resolve_at_path(pid: u32, dirfd: i32, raw_path: &str) -> String {
+        Self::resolve_follow(&Self::absolutise_at_path(pid, dirfd, raw_path))
+    }
+
+    /// As [`resolve_at_path`](Self::resolve_at_path) but leaves the final
+    /// component unresolved.
+    pub(super) fn resolve_at_path_nofollow(pid: u32, dirfd: i32, raw_path: &str) -> String {
+        Self::resolve_nofollow(&Self::absolutise_at_path(pid, dirfd, raw_path))
+    }
+
+    /// Make a `*at` path argument absolute, without resolving symlinks.
+    fn absolutise_at_path(pid: u32, dirfd: i32, raw_path: &str) -> String {
         if raw_path.starts_with('/') {
             raw_path.to_string()
         } else if dirfd == libc::AT_FDCWD {
-            Self::canonicalize_for_tracee(pid, raw_path)
+            Self::absolutise_for_tracee(pid, raw_path)
         } else {
             match Self::resolve_fd_path(pid, dirfd) {
                 Some(dir) => format!("{dir}/{raw_path}"),
@@ -969,6 +1433,46 @@ impl PtraceSupervisor {
     /// The precedence is: access mode first (`O_RDONLY`, `O_WRONLY`, `O_RDWR`),
     /// then modifier flags (`O_APPEND` > `O_TRUNC` > `O_CREAT`) for write-mode
     /// opens.
+    /// Read the explicit destination from a `struct msghdr` at `msghdr_ptr`.
+    ///
+    /// `struct msghdr` on x86_64 begins `void *msg_name; socklen_t
+    /// msg_namelen;` — `msg_name` at offset 0, `msg_namelen` at offset 8. A
+    /// zero `msg_namelen` (or NULL `msg_name`) means the send carries no
+    /// destination — the field must be honoured, or a msghdr reused from
+    /// recvmsg with stale bytes yields a fabricated destination scored as
+    /// egress. Returns `None` for such sends and for a loopback/empty
+    /// destination.
+    pub(super) fn read_msghdr_destination(
+        &self,
+        pid: Pid,
+        msghdr_ptr: u64,
+    ) -> Result<Option<(String, u16)>> {
+        if msghdr_ptr == 0 {
+            return Ok(None);
+        }
+        let name_ptr = ptrace::read(pid, msghdr_ptr as *mut libc::c_void)
+            .map(|w| w as u64)
+            .unwrap_or(0);
+        // msg_namelen is the low 32 bits of the word at offset 8.
+        let namelen = ptrace::read(pid, (msghdr_ptr + 8) as *mut libc::c_void)
+            .map(|w| (w as u64) as u32)
+            .unwrap_or(0);
+        if name_ptr == 0 || namelen == 0 {
+            return Ok(None);
+        }
+        match self.read_sockaddr(pid, name_ptr, namelen as usize, None)? {
+            Some((address, port, _)) if !address.is_empty() => Ok(Some((address, port))),
+            _ => Ok(None),
+        }
+    }
+
+    /// True when an open's `flags` word requests `O_NOFOLLOW` — the kernel
+    /// will refuse to follow a final-component symlink (ELOOP), so grith
+    /// should score the link, not its target.
+    fn open_is_nofollow(raw: u64) -> bool {
+        raw as i32 & libc::O_NOFOLLOW != 0
+    }
+
     pub(super) fn decode_open_flags(raw: u64) -> OpenFlags {
         let access_mode = (raw as i32) & libc::O_ACCMODE;
         if access_mode == libc::O_RDONLY {
@@ -1223,6 +1727,47 @@ mod tests {
         assert!(is_security_relevant(syscall_nr::KEXEC_FILE_LOAD));
     }
 
+    // -- B2: open/truncate/link family coverage --------------------------
+    //
+    // Inverted from the go-live review's verification snippet
+    // (`work/verification/b1-b2-seccomp-arch-tests.rs.txt`), which asserted
+    // every one of these was *absent* from the trap set. Each was a way to
+    // reach the filesystem without passing the file policy.
+
+    #[test]
+    fn b2_syscall_numbers_are_correct() {
+        assert_eq!(syscall_nr::OPENAT2, 437);
+        assert_eq!(syscall_nr::CREAT, 85);
+        assert_eq!(syscall_nr::TRUNCATE, 76);
+        assert_eq!(syscall_nr::FTRUNCATE, 77);
+        assert_eq!(syscall_nr::SYMLINK, 88);
+        assert_eq!(syscall_nr::SYMLINKAT, 266);
+        assert_eq!(syscall_nr::LINK, 86);
+        assert_eq!(syscall_nr::LINKAT, 265);
+    }
+
+    #[test]
+    fn b2_open_truncate_and_link_family_are_security_relevant() {
+        for nr in [
+            syscall_nr::OPENAT2,
+            syscall_nr::CREAT,
+            syscall_nr::TRUNCATE,
+            syscall_nr::FTRUNCATE,
+            syscall_nr::SYMLINK,
+            syscall_nr::SYMLINKAT,
+            syscall_nr::LINK,
+            syscall_nr::LINKAT,
+            syscall_nr::RMDIR,
+        ] {
+            assert!(
+                is_security_relevant(nr),
+                "syscall {nr} must be intercepted — it reaches the filesystem"
+            );
+        }
+        // Control: openat was already covered.
+        assert!(is_security_relevant(syscall_nr::OPENAT));
+    }
+
     // -- PR 6 Phase B: ownership / fs / cross-process syscall numbers ----
 
     #[test]
@@ -1432,11 +1977,11 @@ mod tests {
 
     #[test]
     fn common_non_security_syscalls_are_not_relevant() {
-        // read(0), write(1), close(3), fstat(5), lseek(8),
+        // read(0), write(1), fstat(5), lseek(8),
         // mprotect(10), brk(12), ioctl(16), access(21), nanosleep(35),
         // exit_group(231).
         // Note: mmap(9) is now security-relevant (file-backed mmaps).
-        let innocuous = [0, 1, 3, 5, 8, 10, 12, 16, 21, 35, 100, 200, 231, 500];
+        let innocuous = [0, 1, 5, 8, 10, 12, 16, 21, 35, 100, 200, 231, 500];
         for nr in &innocuous {
             assert!(
                 !is_security_relevant(*nr),
@@ -1457,7 +2002,13 @@ mod tests {
         //   - PR 6 Phase D: 7 architecture-specific privileged ops
         //     (sethostname, setdomainname, iopl, ioperm, swapon, swapoff,
         //     reboot).
-        assert_eq!(SECURITY_RELEVANT.len(), 63);
+        //   - Go-live review B2: 8 file-family syscalls that reached the
+        //     filesystem without passing the file policy (openat2, creat,
+        //     truncate, ftruncate, symlink, symlinkat, link, linkat).
+        // DNS hardening adds recvmsg/recvmmsg plus six FD-lifecycle forms;
+        // clone3 is included so modern thread creation cannot bypass the
+        // entry-time FD-table inheritance snapshot.
+        assert_eq!(SECURITY_RELEVANT.len(), 86);
     }
 
     #[test]
@@ -1589,6 +2140,191 @@ mod tests {
         );
     }
 
+    // -- B3: symlink / `..` resolution --------------------------------------
+
+    #[test]
+    fn resolve_follow_resolves_symlink_to_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, "key").unwrap();
+        let link = dir.path().join("notes.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let resolved = PtraceSupervisor::resolve_follow(link.to_str().unwrap());
+        assert!(
+            resolved.ends_with("id_rsa"),
+            "an open through a symlink must be scored on the target, got {resolved}"
+        );
+    }
+
+    /// The mis-attribution guard: `rm /tmp/x` where `/tmp/x -> ~/.ssh/id_rsa`
+    /// deletes the link. Reporting a delete of the key would be a false
+    /// positive AND a false audit record.
+    #[test]
+    fn resolve_nofollow_keeps_the_link_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, "key").unwrap();
+        let link = dir.path().join("notes.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let resolved = PtraceSupervisor::resolve_nofollow(link.to_str().unwrap());
+        assert!(
+            resolved.ends_with("notes.txt"),
+            "unlink/rename act on the link, got {resolved}"
+        );
+    }
+
+    #[test]
+    fn resolution_collapses_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("project");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "key").unwrap();
+
+        let traversal = format!("{}/../id_rsa", sub.to_str().unwrap());
+        let resolved = PtraceSupervisor::resolve_follow(&traversal);
+        assert!(!resolved.contains(".."), "`..` must collapse: {resolved}");
+        assert!(resolved.ends_with("id_rsa"));
+    }
+
+    /// An `O_CREAT` open of a file that does not exist yet still gets its
+    /// parent resolved, so traversal through a symlinked directory cannot
+    /// hide a write.
+    #[test]
+    fn nonexistent_target_resolves_through_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let linked_dir = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &linked_dir).unwrap();
+
+        let resolved =
+            PtraceSupervisor::resolve_follow(&format!("{}/new.txt", linked_dir.to_str().unwrap()));
+        assert!(
+            resolved.contains("/real/") && resolved.ends_with("new.txt"),
+            "the symlinked parent must resolve even when the file is new, got {resolved}"
+        );
+    }
+
+    /// Resolution must never *lose* information: an unresolvable path falls
+    /// back to the string we would have scored before B3.
+    #[test]
+    fn unresolvable_path_falls_back_to_input() {
+        let input = "/nonexistent-root-xyz/deeper/file.txt";
+        assert_eq!(PtraceSupervisor::resolve_follow(input), input);
+        assert_eq!(PtraceSupervisor::resolve_nofollow(input), input);
+    }
+
+    /// `/proc/self/*` resolved in the supervisor would name the *supervisor*,
+    /// not the tracee, and `/proc/self/fd/N` targets are not filesystem paths.
+    #[test]
+    fn pseudo_filesystems_are_not_resolved() {
+        assert_eq!(
+            PtraceSupervisor::resolve_follow("/proc/self/environ"),
+            "/proc/self/environ"
+        );
+        assert_eq!(
+            PtraceSupervisor::resolve_follow("/sys/kernel/security/x"),
+            "/sys/kernel/security/x"
+        );
+        assert_eq!(PtraceSupervisor::resolve_follow("/dev/pts/3"), "/dev/pts/3");
+    }
+
+    /// Round-2 regression: a `/proc/…/..` path escapes the pseudo-filesystem,
+    /// and skipping its resolution auto-allowed the laundered real target
+    /// (a private key was destroyed through the /proc noise exemption). The
+    /// `..` must be collapsed so the true target is what gets scored.
+    #[test]
+    fn proc_traversal_escaping_proc_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, "key").unwrap();
+        // Build "/proc/self/../..<abs path to the real secret>", which the
+        // kernel collapses to the secret.
+        let laundered = format!("/proc/self/../..{}", secret.to_str().unwrap());
+        let resolved = PtraceSupervisor::resolve_follow(&laundered);
+        assert!(
+            !resolved.starts_with("/proc/"),
+            "the /proc/.. escape must not stay a /proc path (which is noise): {resolved}"
+        );
+        assert!(
+            resolved.ends_with("id_rsa"),
+            "the collapsed path must name the real target: {resolved}"
+        );
+        // And skip_resolution itself must refuse to skip it.
+        assert!(!PtraceSupervisor::skip_resolution(&laundered));
+        assert!(PtraceSupervisor::skip_resolution("/proc/self/environ"));
+    }
+
+    /// Round-2 regression: canonicalize drops a trailing slash, but the
+    /// credential-directory rules match on `"/.ssh/"` *with* the slash, so an
+    /// `O_DIRECTORY` open of `~/.ssh/` stopped matching and was auto-allowed.
+    /// The resolved form must keep the trailing slash.
+    #[test]
+    fn resolution_preserves_a_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sensitive");
+        std::fs::create_dir(&sub).unwrap();
+        let with_slash = format!("{}/", sub.to_str().unwrap());
+        let resolved = PtraceSupervisor::resolve_follow(&with_slash);
+        assert!(
+            resolved.ends_with('/'),
+            "a directory open with a trailing slash must keep it: {resolved}"
+        );
+    }
+
+    /// Round-2 regression: resolving in the supervisor's own process turns a
+    /// `/proc/self`-terminating symlink into the *supervisor's* identity.
+    /// `/etc/mtab` → `/proc/<supervisor-pid>/mounts` on this machine; the
+    /// result must fall back to the input rather than attribute the
+    /// supervisor's pid to the tracee.
+    #[test]
+    fn resolution_into_proc_falls_back_to_input() {
+        // /etc/mtab is a symlink to /proc/self/mounts on typical distros.
+        if std::fs::symlink_metadata("/etc/mtab")
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let resolved = PtraceSupervisor::resolve_follow("/etc/mtab");
+            assert_eq!(
+                resolved, "/etc/mtab",
+                "a path resolving into /proc must keep the input, not the supervisor identity"
+            );
+        }
+    }
+
+    #[test]
+    fn open_nofollow_flag_is_detected() {
+        assert!(PtraceSupervisor::open_is_nofollow(
+            (libc::O_RDONLY | libc::O_NOFOLLOW) as u64
+        ));
+        assert!(!PtraceSupervisor::open_is_nofollow(libc::O_RDONLY as u64));
+    }
+
+    /// End-to-end through `classify_syscall`: an openat of a symlink must
+    /// produce the target path in the emitted `SyscallKind`.
+    #[test]
+    fn classify_openat_resolves_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, "key").unwrap();
+        let link = dir.path().join("notes.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        // `resolve_at_path` is the function the openat arm uses; drive it
+        // directly rather than fabricating tracee memory for the path read.
+        let resolved = PtraceSupervisor::resolve_at_path(
+            std::process::id(),
+            libc::AT_FDCWD,
+            link.to_str().unwrap(),
+        );
+        assert!(
+            resolved.ends_with("id_rsa"),
+            "openat through a symlink must classify as the target, got {resolved}"
+        );
+    }
+
     // -- mmap classification ------------------------------------------------
 
     /// mmap with fd=-1 and MAP_ANONYMOUS → anonymous allocation, not security-relevant.
@@ -1609,6 +2345,42 @@ mod tests {
             result.is_none(),
             "anonymous mmap should return None, got {result:?}"
         );
+    }
+
+    /// AF_NETLINK/NETLINK_ROUTE (glibc getaddrinfo/getifaddrs) is routine and
+    /// must be allowed; AF_PACKET and other netlink families stay hard-denied.
+    #[test]
+    fn classify_netlink_route_allowed_packet_and_other_netlink_denied() {
+        use nix::libc;
+        let sup = PtraceSupervisor::new();
+        let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
+
+        let socket_regs = |domain: u64, proto: u64| {
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.orig_rax = syscall_nr::SOCKET as u64;
+            regs.rdi = domain;
+            regs.rsi = 3; // SOCK_RAW
+            regs.rdx = proto;
+            regs
+        };
+
+        // AF_NETLINK (16) + NETLINK_ROUTE (0) → allowed (routine DNS/iface enum).
+        assert!(
+            sup.classify_syscall(pid, &socket_regs(16, 0))
+                .unwrap()
+                .is_none(),
+            "NETLINK_ROUTE socket must be allowed"
+        );
+        // AF_PACKET (17) → RawSocketCreate (frame capture/injection).
+        assert!(matches!(
+            sup.classify_syscall(pid, &socket_regs(17, 0)).unwrap(),
+            Some(SyscallKind::RawSocketCreate { .. })
+        ));
+        // AF_NETLINK (16) + non-ROUTE family (NETLINK_NETFILTER=12) → denied.
+        assert!(matches!(
+            sup.classify_syscall(pid, &socket_regs(16, 12)).unwrap(),
+            Some(SyscallKind::RawSocketCreate { .. })
+        ));
     }
 
     /// mmap with MAP_ANONYMOUS cleared even if fd looks valid → still anonymous
@@ -1798,12 +2570,15 @@ mod tests {
     }
 
     #[test]
-    fn raw_socket_label_af_netlink_is_16() {
+    fn raw_socket_label_af_netlink_is_none() {
+        // AF_NETLINK is kernel↔userspace messaging (glibc getaddrinfo/
+        // getifaddrs), not an off-host exfil vector, so it is allowed (None)
+        // rather than routed through the egress filter as a raw address.
         assert_eq!(nix::libc::AF_NETLINK, 16);
         assert_eq!(
             PtraceSupervisor::raw_socket_label(16),
-            Some("raw:af_netlink"),
-            "AF_NETLINK (16) must map to raw:af_netlink"
+            None,
+            "AF_NETLINK (16) must be allowed (None), not raw-labelled"
         );
     }
 
@@ -1838,9 +2613,21 @@ mod tests {
             syscall_nr::PIPE,
             syscall_nr::CONNECT,
             syscall_nr::SENDTO,
+            syscall_nr::RECVFROM,
+            syscall_nr::SENDMSG,
+            syscall_nr::SENDMMSG,
+            syscall_nr::RECVMSG,
+            syscall_nr::RECVMMSG,
+            syscall_nr::CLOSE,
+            syscall_nr::CLOSE_RANGE,
+            syscall_nr::DUP,
+            syscall_nr::DUP2,
+            syscall_nr::DUP3,
+            syscall_nr::FCNTL,
             syscall_nr::BIND,
             syscall_nr::SOCKETPAIR,
             syscall_nr::CLONE,
+            syscall_nr::CLONE3,
             syscall_nr::FORK,
             syscall_nr::EXECVE,
             syscall_nr::RENAME,
@@ -1856,9 +2643,21 @@ mod tests {
             syscall_nr::FCHMODAT,
             syscall_nr::PIPE2,
             syscall_nr::RENAMEAT2,
+            // Go-live review B2: open/truncate/link family.
+            syscall_nr::OPENAT2,
+            syscall_nr::RMDIR,
+            syscall_nr::CREAT,
+            syscall_nr::TRUNCATE,
+            syscall_nr::FTRUNCATE,
+            syscall_nr::SYMLINK,
+            syscall_nr::SYMLINKAT,
+            syscall_nr::LINK,
+            syscall_nr::LINKAT,
             syscall_nr::IO_URING_SETUP,
             syscall_nr::IO_URING_ENTER,
             syscall_nr::IO_URING_REGISTER,
+            syscall_nr::SECCOMP,
+            syscall_nr::PRCTL,
             syscall_nr::SENDFILE,
             syscall_nr::SPLICE,
             syscall_nr::TEE,
@@ -1951,9 +2750,11 @@ mod tests {
         }
     }
 
-    /// socket(AF_NETLINK, ...) → RawSocketCreate (kernel netlink access).
+    /// socket(AF_NETLINK, <non-route family>) → RawSocketCreate (kernel netlink
+    /// access). The routine NETLINK_ROUTE family is allowed instead — see
+    /// `classify_netlink_route_allowed_packet_and_other_netlink_denied`.
     #[test]
-    fn classify_socket_af_netlink_returns_raw_socket_create() {
+    fn classify_socket_af_netlink_nonroute_returns_raw_socket_create() {
         use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
@@ -1963,12 +2764,12 @@ mod tests {
         regs.orig_rax = syscall_nr::SOCKET as u64;
         regs.rdi = 16; // AF_NETLINK
         regs.rsi = 3; // SOCK_RAW
-        regs.rdx = 0;
+        regs.rdx = 12; // NETLINK_NETFILTER (not NETLINK_ROUTE)
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
             result.is_some(),
-            "AF_NETLINK socket() should return Some(...)"
+            "non-route AF_NETLINK socket() should return Some(...)"
         );
         assert!(matches!(
             result.unwrap(),
@@ -2037,6 +2838,97 @@ mod tests {
             result.is_none(),
             "AF_UNIX socket() should return None, got {result:?}"
         );
+    }
+
+    // ---- PR 6 Phase B: cross-process access carveouts ----
+
+    /// ptrace(PTRACE_TRACEME) — request(rdi) == 0 — is carved out (None): the
+    /// caller volunteers to be traced by its parent and reads no other
+    /// process's memory. Keyed on rdi, NOT on rsi (which TRACEME leaves 0).
+    #[test]
+    fn classify_ptrace_traceme_returns_none() {
+        use nix::libc;
+        let sup = PtraceSupervisor::new();
+        let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
+
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.orig_rax = syscall_nr::PTRACE as u64;
+        regs.rdi = 0; // PTRACE_TRACEME
+        regs.rsi = 0; // pid arg ignored
+
+        let result = sup.classify_syscall(pid, &regs).unwrap();
+        assert!(
+            result.is_none(),
+            "PTRACE_TRACEME must be carved out (None), got {result:?}"
+        );
+    }
+
+    /// ptrace(PTRACE_ATTACH, target) — a real cross-process attach — classifies
+    /// as CrossProcessAccess carrying the target pid from rsi.
+    #[test]
+    fn classify_ptrace_attach_returns_cross_process() {
+        use nix::libc;
+        let sup = PtraceSupervisor::new();
+        let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
+        let target = std::process::id() + 1;
+
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.orig_rax = syscall_nr::PTRACE as u64;
+        regs.rdi = 16; // PTRACE_ATTACH
+        regs.rsi = u64::from(target);
+
+        match sup.classify_syscall(pid, &regs).unwrap() {
+            Some(SyscallKind::CrossProcessAccess { op, target_pid }) => {
+                assert!(matches!(op, crate::interceptor::CrossProcessOp::Ptrace));
+                assert_eq!(target_pid, target);
+            }
+            other => panic!("expected CrossProcessAccess, got {other:?}"),
+        }
+    }
+
+    /// process_vm_readv against the caller's OWN pid is carved out (None) —
+    /// benign intra-process memory copying.
+    #[test]
+    fn classify_process_vm_readv_self_returns_none() {
+        use nix::libc;
+        let sup = PtraceSupervisor::new();
+        let our_pid = std::process::id();
+        let pid = nix::unistd::Pid::from_raw(our_pid as i32);
+
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.orig_rax = syscall_nr::PROCESS_VM_READV as u64;
+        regs.rdi = u64::from(our_pid); // target == self
+
+        let result = sup.classify_syscall(pid, &regs).unwrap();
+        assert!(
+            result.is_none(),
+            "process_vm_readv against self must be carved out (None), got {result:?}"
+        );
+    }
+
+    /// process_vm_readv against a DIFFERENT pid classifies as CrossProcessAccess.
+    #[test]
+    fn classify_process_vm_readv_other_returns_cross_process() {
+        use nix::libc;
+        let sup = PtraceSupervisor::new();
+        let our_pid = std::process::id();
+        let pid = nix::unistd::Pid::from_raw(our_pid as i32);
+        let target = our_pid + 1;
+
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.orig_rax = syscall_nr::PROCESS_VM_READV as u64;
+        regs.rdi = u64::from(target); // target != self
+
+        match sup.classify_syscall(pid, &regs).unwrap() {
+            Some(SyscallKind::CrossProcessAccess { op, target_pid }) => {
+                assert!(matches!(
+                    op,
+                    crate::interceptor::CrossProcessOp::ProcessVmReadv
+                ));
+                assert_eq!(target_pid, target);
+            }
+            other => panic!("expected CrossProcessAccess, got {other:?}"),
+        }
     }
 
     // ---- PR 5 Phase A: sockaddr address-byte → string contract ----

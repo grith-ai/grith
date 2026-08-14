@@ -59,6 +59,79 @@ pub enum ReviewOutcome {
     TimedOut,
 }
 
+/// A directory-scoped, operation-specific permission requested by a reviewer.
+///
+/// Scoped permissions are session-only in v1. The `persist` field is retained
+/// in the wire format so a future persistence flow can add an explicit opt-in
+/// without changing the action schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ScopedAllowRequest {
+    /// Directory whose subtree should be allowed.
+    pub directory: String,
+    /// Allow file reads and directory listings.
+    pub read: bool,
+    /// Allow file writes, appends, and directory creation.
+    pub write: bool,
+    /// Allow file deletion and rename removal from the directory.
+    pub delete: bool,
+    /// Whether the rule should be persisted for the active profile.
+    pub persist: bool,
+}
+
+/// Structured action returned by an interactive permission reviewer.
+///
+/// Existing actions continue to be stored as their legacy string values.
+/// Scoped actions are stored as JSON so their directory and operation bits
+/// survive the digest queue round trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "scope", rename_all = "snake_case")]
+pub enum PermissionReviewAction {
+    /// Allow only the current request.
+    Approve,
+    /// Deny the current request.
+    Deny,
+    /// Allow the current request and persist its exact learned rule.
+    ApproveAndLearn,
+    /// Allow the current request and add session-scoped directory rules.
+    ScopedAllow(ScopedAllowRequest),
+    /// Deny the request and terminate the supervised process.
+    DenyAndTerminate,
+}
+
+impl PermissionReviewAction {
+    /// Whether this action allows the current request to proceed.
+    pub fn is_approved(&self) -> bool {
+        matches!(
+            self,
+            Self::Approve | Self::ApproveAndLearn | Self::ScopedAllow(_)
+        )
+    }
+
+    /// Serialize for the existing `digest_queue.review_action` text column.
+    pub fn to_storage_value(&self) -> String {
+        match self {
+            Self::Approve => "approve".to_string(),
+            Self::Deny => "deny".to_string(),
+            Self::ApproveAndLearn => "approve_and_learn".to_string(),
+            Self::DenyAndTerminate => "deny_and_terminate".to_string(),
+            Self::ScopedAllow(_) => serde_json::to_string(self)
+                .expect("PermissionReviewAction serialization cannot fail"),
+        }
+    }
+
+    /// Parse either a legacy action string or a structured JSON action.
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "approve" => Some(Self::Approve),
+            "deny" => Some(Self::Deny),
+            "approve_and_learn" => Some(Self::ApproveAndLearn),
+            "deny_and_terminate" => Some(Self::DenyAndTerminate),
+            _ => serde_json::from_str(value).ok(),
+        }
+    }
+}
+
 /// The action a reviewer can take on a digest item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +212,8 @@ pub struct DigestItem {
     pub session_id: Option<Uuid>,
     pub tool_call_type: String,
     pub arguments_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
     pub composite_score: f64,
     pub severity: ScoreSeverity,
     pub filter_breakdown: Vec<FilterBreakdown>,
@@ -216,6 +291,43 @@ mod tests {
     }
 
     #[test]
+    fn permission_review_action_preserves_legacy_storage_values() {
+        for (action, stored) in [
+            (PermissionReviewAction::Approve, "approve"),
+            (PermissionReviewAction::Deny, "deny"),
+            (PermissionReviewAction::ApproveAndLearn, "approve_and_learn"),
+            (
+                PermissionReviewAction::DenyAndTerminate,
+                "deny_and_terminate",
+            ),
+        ] {
+            assert_eq!(action.to_storage_value(), stored);
+            assert_eq!(
+                PermissionReviewAction::from_storage_value(stored),
+                Some(action)
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_permission_review_action_round_trips_as_json() {
+        let action = PermissionReviewAction::ScopedAllow(ScopedAllowRequest {
+            directory: "/repo/target/debug/deps/".to_string(),
+            read: false,
+            write: false,
+            delete: true,
+            persist: false,
+        });
+
+        let stored = action.to_storage_value();
+        assert!(stored.starts_with('{'));
+        assert_eq!(
+            PermissionReviewAction::from_storage_value(&stored),
+            Some(action)
+        );
+    }
+
+    #[test]
     fn test_human_summary() {
         let item = DigestItem {
             id: Uuid::new_v4(),
@@ -223,6 +335,7 @@ mod tests {
             session_id: None,
             tool_call_type: "ShellExec".into(),
             arguments_summary: "rm -rf /tmp/test".into(),
+            decision_reason: Some("review required".into()),
             composite_score: 5.0,
             severity: ScoreSeverity::Medium,
             filter_breakdown: vec![],
@@ -247,6 +360,7 @@ mod tests {
             session_id: None,
             tool_call_type: "FileRead".into(),
             arguments_summary: "test".into(),
+            decision_reason: None,
             composite_score: 5.0,
             severity: ScoreSeverity::Medium,
             filter_breakdown: vec![],

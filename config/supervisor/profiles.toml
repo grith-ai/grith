@@ -244,6 +244,25 @@ routine_paths = [
     "${HOME}/.config/Code/**",
     "${HOME}/.vscode/**",
     "${HOME}/.vscode-server/**",
+    # Headless-browser app state (web-dev / screenshot testing). Chrome/Chromium
+    # rewrite these on every launch; they are the browser's own profile/cache,
+    # not user secrets. The NSS certificate store (~/.pki/nssdb) is handled
+    # read-only via readonly_path_patterns below so a CA-injection *write* still
+    # runs the full proxy.
+    "${HOME}/.config/google-chrome/**",
+    "${HOME}/.config/chromium/**",
+    "${HOME}/.cache/google-chrome/**",
+    "${HOME}/.cache/chromium/**",
+    "/tmp/.org.chromium.Chromium.*",
+    "/tmp/.com.google.Chrome.*",
+]
+
+# Browser NSS certificate DB: reads are pure startup noise, but a WRITE could
+# inject a trusted CA (TLS MITM). Only FileReads are auto-allowed here; writes,
+# deletes and renames still run the full proxy pipeline so CA changes stay
+# visible. `*` is a single-segment wildcard (matches cert9.db, key4.db, …).
+readonly_path_patterns = [
+    "${HOME}/.pki/nssdb/*",
 ]
 
 routine_commands = [
@@ -267,6 +286,8 @@ routine_commands = [
     "tmux", "seq", "yes", "timeout", "nproc",
     # VS Code CLI (extension listing, editor integration)
     "code",
+    # Headless browser automation (web-dev / screenshot testing)
+    "chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "firefox",
 ]
 
 routine_destinations = [
@@ -309,6 +330,15 @@ routine_destinations = [
     # the VS Code server binary and updates when Claude Code runs in the
     # integrated terminal). Base domain for subdomain matching.
     "vscode-cdn.net",
+    # Headless-browser infrastructure — Google-CONTROLLED CDN/service hosts.
+    # Safe-browsing / update / optimization-guide are already covered by the
+    # `googleapis.com` base above; these are the remaining CDN hosts. NEVER add
+    # a bare `googleusercontent.com` wildcard (user content = exfil channel) —
+    # only the specific Google-run `clients2.googleusercontent.com` is listed.
+    "clients2.google.com",
+    "clients2.googleusercontent.com",
+    "gvt1.com",
+    "gstatic.com",
 ]
 
 routine_listen_addresses = []
@@ -373,6 +403,25 @@ routine_paths = [
     "${HOME}/.config/codex/**",
     "${HOME}/.npm/**",
     "/tmp/codex-*",
+    # Headless-browser app state (web-dev / screenshot testing). Chrome/Chromium
+    # rewrite these on every launch; they are the browser's own profile/cache,
+    # not user secrets. The NSS certificate store (~/.pki/nssdb) is handled
+    # read-only via readonly_path_patterns below so a CA-injection *write* still
+    # runs the full proxy.
+    "${HOME}/.config/google-chrome/**",
+    "${HOME}/.config/chromium/**",
+    "${HOME}/.cache/google-chrome/**",
+    "${HOME}/.cache/chromium/**",
+    "/tmp/.org.chromium.Chromium.*",
+    "/tmp/.com.google.Chrome.*",
+]
+
+# Browser NSS certificate DB: reads are pure startup noise, but a WRITE could
+# inject a trusted CA (TLS MITM). Only FileReads are auto-allowed here; writes,
+# deletes and renames still run the full proxy pipeline so CA changes stay
+# visible. `*` is a single-segment wildcard (matches cert9.db, key4.db, …).
+readonly_path_patterns = [
+    "${HOME}/.pki/nssdb/*",
 ]
 
 routine_commands = [
@@ -388,6 +437,8 @@ routine_commands = [
     "tar", "gzip", "gunzip", "unzip",
     # System utilities
     "seq", "nproc", "timeout", "yes",
+    # Headless browser automation (web-dev / screenshot testing)
+    "chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "firefox",
 ]
 
 routine_destinations = [
@@ -408,6 +459,19 @@ routine_destinations = [
     # Python packages
     "pypi.org",
     "files.pythonhosted.org",
+    # Headless-browser infrastructure — Google-CONTROLLED service endpoints only
+    # (component update, safe-browsing, optimization-guide, CDN). These are
+    # fixed hosts the agent cannot influence. NEVER add a bare
+    # `googleusercontent.com` wildcard: it serves user content (Drive/Sites/
+    # script exec) and would hand every tool an exfil channel — only the
+    # specific Google-run `clients2.googleusercontent.com` host is listed.
+    "safebrowsing.googleapis.com",
+    "update.googleapis.com",
+    "optimizationguide-pa.googleapis.com",
+    "clients2.google.com",
+    "clients2.googleusercontent.com",
+    "gvt1.com",
+    "gstatic.com",
 ]
 
 # Changed from ["0.0.0.0"] — investigation confirmed no default Codex

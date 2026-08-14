@@ -152,15 +152,16 @@ impl DigestQueue {
         conn.execute(
             "INSERT INTO digest_queue (
                 id, created_at, session_id, tool_call_type, arguments_summary,
-                composite_score, filter_breakdown, task_context, plugin_id,
+                decision_reason, composite_score, filter_breakdown, task_context, plugin_id,
                 status, informational_only
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 item.id.to_string(),
                 item.created_at.to_rfc3339(),
                 item.session_id.map(|id| id.to_string()),
                 item.tool_call_type,
                 item.arguments_summary,
+                item.decision_reason,
                 item.composite_score,
                 breakdown_json,
                 item.task_context,
@@ -263,6 +264,23 @@ impl DigestQueue {
         Ok(rows)
     }
 
+    /// Clear all actionable items — an operator "dismiss all" that removes
+    /// every pending and escalated item from the queue without approving
+    /// (executing) or denying them. Marks them `expired` but stamps
+    /// `reviewed_at` + `review_action = 'clear'`, so the audit trail
+    /// distinguishes an operator clear from a TTL expiry (which leaves
+    /// `reviewed_at` / `review_action` NULL). Returns the number cleared.
+    pub fn bulk_clear_pending(&self) -> Result<usize> {
+        let conn = self.conn()?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE digest_queue SET status = 'expired', reviewed_at = ?1, review_action = 'clear'
+             WHERE status IN ('pending', 'escalated')",
+            params![now],
+        )?;
+        Ok(rows)
+    }
+
     /// Set an item's status to escalated with metadata.
     pub fn update_escalation(&self, id: &Uuid, escalated_by: Option<&str>) -> Result<()> {
         let conn = self.conn()?;
@@ -327,6 +345,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             session_id TEXT,
             tool_call_type TEXT NOT NULL,
             arguments_summary TEXT NOT NULL,
+            decision_reason TEXT,
             composite_score REAL NOT NULL,
             filter_breakdown TEXT NOT NULL,
             task_context TEXT,
@@ -356,6 +375,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
     }
     if !columns.contains(&"session_id".to_string()) {
         conn.execute_batch("ALTER TABLE digest_queue ADD COLUMN session_id TEXT;")?;
+    }
+    if !columns.contains(&"decision_reason".to_string()) {
+        conn.execute_batch("ALTER TABLE digest_queue ADD COLUMN decision_reason TEXT;")?;
     }
 
     Ok(())
@@ -446,6 +468,7 @@ fn row_to_item_inner(row: &rusqlite::Row) -> std::result::Result<DigestItem, Row
         session_id: session_str.and_then(|s| Uuid::parse_str(&s).ok()),
         tool_call_type: row.get("tool_call_type")?,
         arguments_summary: row.get("arguments_summary")?,
+        decision_reason: row.get("decision_reason")?,
         composite_score,
         severity: ScoreSeverity::from_score(composite_score),
         filter_breakdown,
@@ -483,6 +506,7 @@ mod tests {
             session_id: None,
             tool_call_type: "ShellExec".into(),
             arguments_summary: "ls -la".into(),
+            decision_reason: Some("test decision".into()),
             composite_score: score,
             severity: ScoreSeverity::from_score(score),
             filter_breakdown: vec![FilterBreakdown {
@@ -513,6 +537,7 @@ mod tests {
         let retrieved = queue.get_by_id(&id).unwrap();
         assert_eq!(retrieved.id, id);
         assert_eq!(retrieved.composite_score, 5.0);
+        assert_eq!(retrieved.decision_reason.as_deref(), Some("test decision"));
         assert_eq!(retrieved.status, DigestStatus::Pending);
     }
 
@@ -621,6 +646,28 @@ mod tests {
         queue.update_escalation(&id, None).unwrap();
         assert_eq!(queue.count_escalated().unwrap(), 1);
         assert_eq!(queue.count_actionable().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_bulk_clear_pending_clears_pending_and_escalated() {
+        let queue = DigestQueue::open_in_memory().unwrap();
+        let pending1 = make_item(4.0, false);
+        let pending2 = make_item(5.0, false);
+        let escalated = make_item(6.0, false);
+        let esc_id = escalated.id;
+        queue.enqueue(&pending1).unwrap();
+        queue.enqueue(&pending2).unwrap();
+        queue.enqueue(&escalated).unwrap();
+        queue.update_escalation(&esc_id, None).unwrap();
+
+        // 2 pending + 1 escalated = 3 actionable before clearing.
+        assert_eq!(queue.count_actionable().unwrap(), 3);
+
+        // Clear all removes both pending and escalated items.
+        let cleared = queue.bulk_clear_pending().unwrap();
+        assert_eq!(cleared, 3);
+        assert_eq!(queue.count_actionable().unwrap(), 0);
+        assert!(queue.get_actionable(10, 0).unwrap().is_empty());
     }
 
     #[test]

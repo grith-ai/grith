@@ -60,7 +60,7 @@ pub struct ToolCallContext {
     pub call_sequence_number: u64,
     pub source_taint: TaintLevel,
     /// The supervisor profile name for this session, if any (e.g., "claude-code").
-    /// Used by filters like `egress_policy` to apply per-profile destination policies.
+    /// Used by filters like `egress-policy` to apply per-profile destination policies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_name: Option<String>,
     /// Optional conversation-level identifier for long-running daemon contexts (e.g. OpenClaw).
@@ -84,7 +84,7 @@ pub struct ToolCallContext {
     pub spawn_provenance: Option<SpawnProvenance>,
     /// PR 5 Phase C: match against the supervisor profile's
     /// `local_listener_policy`. `None` means the bind was not
-    /// pre-declared by the profile (egress_policy treats as
+    /// pre-declared by the profile (egress-policy treats as
     /// queue/deny). `Some(_)` means the bind matched a declared
     /// `(port, family)` entry — `allow_clamp` controls whether
     /// `0.0.0.0`/`::` binds are rewritten to loopback (Phase D)
@@ -207,6 +207,21 @@ pub enum ToolCallType {
     FileRename {
         old_path: String,
         new_path: String,
+    },
+    /// Symbolic or hard link creation (`symlink`/`symlinkat`/`link`/`linkat`).
+    ///
+    /// Scored by the link **target**, not the link path: creating
+    /// `/tmp/x -> ~/.ssh/id_rsa` is the moment a sensitive path becomes
+    /// reachable under a benign name, so `path()` returns the target and
+    /// every path-based filter evaluates what is being exposed rather than
+    /// where it is being exposed to (go-live review B2/B3).
+    FileLink {
+        /// What the link points at — the sensitive side.
+        target: String,
+        /// The new name being created.
+        link_path: String,
+        /// `true` for `symlink`/`symlinkat`, `false` for `link`/`linkat`.
+        symbolic: bool,
     },
     FileChmod {
         path: String,
@@ -429,9 +444,29 @@ impl ToolCallContext {
             | ToolCallType::FileChmod { path, .. }
             | ToolCallType::DirCreate { path } => Some(path),
             ToolCallType::FileRename { old_path, .. } => Some(old_path),
-            ToolCallType::OwnershipChange { target, .. }
+            // Link creation is scored by what it exposes, not by the new
+            // name — see the `FileLink` variant docs.
+            ToolCallType::FileLink { target, .. }
+            | ToolCallType::OwnershipChange { target, .. }
             | ToolCallType::FilesystemMutation { target, .. } => Some(target),
             _ => None,
+        }
+    }
+
+    /// Every path this call touches that policy must see, not just the
+    /// primary one from [`path`](Self::path).
+    ///
+    /// Link creation has two: the target it exposes, and the name being
+    /// created. Scoring only the target would make `ln -s ./mine
+    /// ~/.ssh/authorized_keys` cheaper than writing that file directly —
+    /// link creation would become the preferred way to plant one. Filters
+    /// that decide by path evaluate all of these and take the worst.
+    pub fn paths(&self) -> Vec<&str> {
+        match &self.call_type {
+            ToolCallType::FileLink {
+                target, link_path, ..
+            } => vec![target.as_str(), link_path.as_str()],
+            _ => self.path().into_iter().collect(),
         }
     }
 
@@ -596,6 +631,107 @@ mod duration_ms {
     }
 }
 
+impl ToolCallType {
+    /// Resolve `..`, `.` and symlinks in every path this call carries, so
+    /// filters match on what will actually be touched rather than on the
+    /// string that was requested (go-live review B3).
+    ///
+    /// For the LLM path this is exact: the built-in agent executes the
+    /// operation in this process, so resolving here both closes the
+    /// laundering hole and removes the window between scoring one path and
+    /// executing another. Supervisor-originated calls arrive already
+    /// resolved against the tracee's cwd and are unaffected by a second
+    /// pass.
+    ///
+    /// Follow semantics match the kernel's: operations that act on a link
+    /// itself (delete, rename, and a new link's name) keep their final
+    /// component, so a delete is never reported as a delete of the target.
+    #[must_use]
+    pub fn resolve_paths(self) -> Self {
+        use crate::path_resolution::{resolve_follow, resolve_nofollow};
+        match self {
+            Self::FileRead { path } => Self::FileRead {
+                path: resolve_follow(&path),
+            },
+            Self::FileWrite { path, content_hash } => Self::FileWrite {
+                path: resolve_follow(&path),
+                content_hash,
+            },
+            Self::FileAppend { path } => Self::FileAppend {
+                path: resolve_follow(&path),
+            },
+            Self::DirList { path } => Self::DirList {
+                path: resolve_follow(&path),
+            },
+            Self::DirCreate { path } => Self::DirCreate {
+                path: resolve_follow(&path),
+            },
+            Self::FileChmod { path, mode } => Self::FileChmod {
+                path: resolve_follow(&path),
+                mode,
+            },
+            // Acts on the link, not its target.
+            Self::FileDelete { path } => Self::FileDelete {
+                path: resolve_nofollow(&path),
+            },
+            Self::FileRename { old_path, new_path } => Self::FileRename {
+                old_path: resolve_nofollow(&old_path),
+                new_path: resolve_nofollow(&new_path),
+            },
+            // The target is what a later open will follow; the new name does
+            // not exist yet.
+            Self::FileLink {
+                target,
+                link_path,
+                symbolic,
+            } => Self::FileLink {
+                target: resolve_follow(&target),
+                link_path: resolve_nofollow(&link_path),
+                symbolic,
+            },
+            // No path component.
+            other => other,
+        }
+    }
+}
+
+/// Render ambiguous shared-IP DNS attribution candidates as the canonical
+/// JSON string array carried in `NetConnect.address` (for example
+/// `["a.example.com","b.example.com"]`). The supervisor produces this form
+/// when a connect targets an IP that multiple observed hostnames resolve to;
+/// consumers recover the candidates with [`parse_dns_candidate_array`].
+pub fn format_dns_candidate_array(candidates: &[String]) -> String {
+    serde_json::to_string(candidates).unwrap_or_else(|_| {
+        format!(
+            "[{}]",
+            candidates
+                .iter()
+                .map(|candidate| format!("{candidate:?}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    })
+}
+
+/// Parse a `NetConnect` address (or a `net:`-stripped allowlist key) that may
+/// carry the ambiguous DNS attribution array produced by
+/// [`format_dns_candidate_array`].
+///
+/// Returns `None` for anything that is not a well-formed, non-empty JSON
+/// string array — including an empty `[]` — so malformed input degrades to
+/// being treated as an opaque single host (which scores as an unknown
+/// destination downstream) rather than silently matching nothing.
+pub fn parse_dns_candidate_array(value: &str) -> Option<Vec<String>> {
+    if !value.starts_with('[') {
+        return None;
+    }
+    let candidates: Vec<String> = serde_json::from_str(value).ok()?;
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(candidates)
+}
+
 impl std::fmt::Display for ToolCallType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -611,6 +747,15 @@ impl std::fmt::Display for ToolCallType {
             Self::FileRename {
                 old_path, new_path, ..
             } => write!(f, "FileRename({old_path} -> {new_path})"),
+            Self::FileLink {
+                target,
+                link_path,
+                symbolic,
+            } => write!(
+                f,
+                "FileLink({kind} {link_path} -> {target})",
+                kind = if *symbolic { "symbolic" } else { "hard" }
+            ),
             Self::FileChmod { path, mode } => write!(f, "FileChmod({path}, {mode:o})"),
             Self::DirCreate { path } => write!(f, "DirCreate({path})"),
             Self::NetConnect { address, port } => write!(f, "NetConnect({address}:{port})"),
@@ -723,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_filter_result_no_match() {
-        let result = FilterResult::no_match("path_match");
+        let result = FilterResult::no_match("path-match");
         assert!(!result.matched);
         assert_eq!(result.score, 0.0);
     }
@@ -731,7 +876,7 @@ mod tests {
     #[test]
     fn test_filter_result_matched() {
         let result = FilterResult::matched(
-            "path_match",
+            "path-match",
             "ssh-private-key",
             5.0,
             Severity::Critical,
@@ -1161,5 +1306,21 @@ mod tests {
             .to_string(),
             "ProcessSpawn(node app.js)"
         );
+    }
+
+    #[test]
+    fn dns_candidate_array_round_trip() {
+        let candidates = vec!["a.example.com".to_string(), "b.example.com".to_string()];
+        let rendered = format_dns_candidate_array(&candidates);
+        assert_eq!(rendered, r#"["a.example.com","b.example.com"]"#);
+        assert_eq!(parse_dns_candidate_array(&rendered), Some(candidates));
+    }
+
+    #[test]
+    fn dns_candidate_array_rejects_non_array_empty_and_malformed() {
+        assert_eq!(parse_dns_candidate_array("api.example.com"), None);
+        assert_eq!(parse_dns_candidate_array("[]"), None);
+        assert_eq!(parse_dns_candidate_array(r#"["broken"#), None);
+        assert_eq!(parse_dns_candidate_array(r#"[1,2]"#), None);
     }
 }

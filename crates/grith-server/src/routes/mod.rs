@@ -17,6 +17,7 @@ mod inventory;
 mod inventory_ipc;
 mod listener_rewrites;
 mod notifications;
+mod onboarding;
 mod policies;
 mod proxy;
 mod proxy_ipc;
@@ -155,6 +156,7 @@ pub fn open_read_routes() -> Router<AppState> {
         .route("/tier", get(health::get_tier))
         .route("/license/status", get(health::get_license_status))
         .route("/proxy/status", get(proxy::proxy_status))
+        .route("/onboarding/status", get(onboarding::get_onboarding_status))
         .route(
             "/notifications/channels",
             get(notifications::list_notification_channels),
@@ -231,6 +233,20 @@ pub fn ipc_routes() -> Router<AppState> {
         .route("/ipc/digest/expire", post(digest_ipc::expire_digest))
         .route("/ipc/sessions", get(session_ipc::list_sessions))
         .route("/ipc/sessions", post(session_ipc::register_session))
+        // work/74 Phase 1: reserve capacity BEFORE the target is spawned, so
+        // a limit rejection can never arrive after the tool has run code.
+        .route(
+            "/ipc/session-reservations",
+            post(session_ipc::reserve_session),
+        )
+        .route(
+            "/ipc/session-reservations/:id/activate",
+            post(session_ipc::activate_session),
+        )
+        .route(
+            "/ipc/session-reservations/:id",
+            delete(session_ipc::cancel_session_reservation),
+        )
         .route("/ipc/sessions-prune", post(session_ipc::prune_sessions))
         .route("/ipc/sessions/:id", get(session_ipc::get_session))
         .route("/ipc/sessions/:id", put(session_ipc::update_session))
@@ -258,6 +274,7 @@ pub fn ipc_routes() -> Router<AppState> {
 /// event-injection endpoint at all.
 pub fn dashboard_write_routes() -> Router<AppState> {
     Router::new()
+        .route("/digest/clear-all", post(digest::clear_all_digest))
         .route("/digest/:id/approve", post(digest::approve_digest))
         .route("/digest/:id/deny", post(digest::deny_digest))
         .route("/digest/:id/learn", post(digest::learn_digest))
@@ -278,6 +295,7 @@ pub fn dashboard_write_routes() -> Router<AppState> {
         .route("/canaries/:id", delete(canary::remove_canary))
         .route("/canaries/:id/rotate", post(canary::rotate_canary))
         .route("/config", put(config::update_config))
+        .route("/onboarding/dismiss", post(onboarding::dismiss_onboarding))
         .route(
             "/notifications/test/:channel",
             post(notifications::test_notification),
@@ -386,6 +404,8 @@ mod tests {
             canary_registry,
             notification_dispatcher,
             start_time: std::time::Instant::now(),
+            instance_id: None,
+            protocol_version: None,
             version: "0.1.0-test".into(),
             ws_tx,
             shutdown_tx: None,
@@ -424,6 +444,61 @@ mod tests {
     fn make_router() -> Router {
         let state = make_state();
         api_router().with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_onboarding_status_and_dismiss() {
+        // Share one state (and its temp config_dir) across both calls.
+        let state = make_state();
+        let router = api_router().with_state(state);
+
+        // Fresh: no config file → onboarded false, community tier, not dismissed.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::get("/onboarding/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["onboarded"], false);
+        assert_eq!(json["tier"], "community");
+        assert_eq!(json["trial_active"], false);
+        assert_eq!(json["dismissed"], false);
+        assert_eq!(json["default_provider"], "ollama");
+
+        // Dismiss the checklist card.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/onboarding/dismiss")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Status now reports dismissed.
+        let resp = router
+            .oneshot(
+                Request::get("/onboarding/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["dismissed"], true);
     }
 
     #[tokio::test]
@@ -756,6 +831,7 @@ mod tests {
             session_id: None,
             tool_call_type: "FileRead".into(),
             arguments_summary: "/etc/shadow".into(),
+            decision_reason: None,
             composite_score: 5.0,
             severity: ScoreSeverity::Medium,
             filter_breakdown: vec![],
@@ -898,6 +974,117 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_update_unknown_session_adopts_on_heartbeat() {
+        // Simulate a daemon that just restarted: the registry is empty, but a
+        // supervised process is still running and sends its next heartbeat PUT.
+        // The daemon should ADOPT (re-register) the session, not 404 it.
+        let state = make_state();
+        let router = ipc_routes().with_state(state.clone());
+        let id = uuid::Uuid::new_v4();
+        let live_pid = std::process::id();
+
+        let resp = router
+            .oneshot(
+                Request::put(format!("/ipc/sessions/{id}"))
+                    .header("content-type", "application/json")
+                    .body(register_body(id, "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reg = state.supervisor_registry.lock().unwrap();
+        assert_eq!(
+            reg.count(),
+            1,
+            "unknown-id heartbeat should adopt the session"
+        );
+        assert!(reg.get(&id).is_some());
+    }
+
+    /// work/74 Phase 3: at capacity the daemon must say so. Answering 200
+    /// told the client everything was fine while the daemon accounted for
+    /// nothing — the session kept running untracked, outside the licensed
+    /// cap and invisible to `grith exec list`.
+    #[tokio::test]
+    async fn test_unadoptable_heartbeat_returns_409_not_200() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+
+        // Fill the single slot with a live session that cannot be reaped.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // An orphan heartbeats; there is no room to adopt it.
+        let orphan = uuid::Uuid::new_v4();
+        let resp = router
+            .oneshot(
+                Request::put(format!("/ipc/sessions/{orphan}"))
+                    .header("content-type", "application/json")
+                    .body(register_body(orphan, "codex", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "session_not_tracked");
+        assert_eq!(json["reason"], "capacity");
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains(&orphan.to_string()));
+
+        // And the registry did not quietly grow past its cap.
+        assert_eq!(state.supervisor_registry.lock().unwrap().count(), 1);
+    }
+
+    /// With room, adoption still succeeds — the 409 is specifically the
+    /// at-capacity case, not a general refusal to adopt orphans.
+    #[tokio::test]
+    async fn test_adoptable_heartbeat_still_returns_200() {
+        let state = make_state();
+        let router = ipc_routes().with_state(state.clone());
+        let orphan = uuid::Uuid::new_v4();
+
+        let resp = router
+            .oneshot(
+                Request::put(format!("/ipc/sessions/{orphan}"))
+                    .header("content-type", "application/json")
+                    .body(register_body(orphan, "claude", std::process::id()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state
+            .supervisor_registry
+            .lock()
+            .unwrap()
+            .get(&orphan)
+            .is_some());
     }
 
     #[tokio::test]
@@ -1065,6 +1252,323 @@ mod tests {
         // Live PID can't be reaped, so nothing is pruned and the session remains.
         assert_eq!(json["reaped"], 0);
         assert_eq!(json["remaining"], 1);
+    }
+
+    // -- work/74 Phase 1: pre-spawn capacity reservations ------------------
+
+    fn reserve_body(tool: &str) -> Body {
+        Body::from(
+            serde_json::json!({ "tool_name": tool, "profile_name": "claude-code" }).to_string(),
+        )
+    }
+
+    async fn reserve(router: &axum::Router, tool: &str) -> axum::response::Response {
+        router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/session-reservations")
+                    .header("content-type", "application/json")
+                    .body(reserve_body(tool))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The whole point of B12 item 1: at capacity the refusal arrives from the
+    /// reservation call, i.e. before the CLI has spawned anything.
+    #[tokio::test]
+    async fn test_reservation_refuses_at_capacity_before_any_session_exists() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+
+        let first = reserve(&router, "claude").await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        {
+            let reg = state.supervisor_registry.lock().unwrap();
+            assert_eq!(reg.count(), 0, "no session registered yet");
+            assert_eq!(reg.reservation_count(), 1, "but the seat is held");
+        }
+
+        let second = reserve(&router, "codex").await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "session_limit_reached");
+        assert_eq!(json["current_limit"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_reservation_activate_registers_the_session() {
+        let state = make_state();
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+
+        let resp = reserve(&router, "claude").await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reservation_id = json["reservation_id"].as_str().unwrap().to_string();
+        assert!(json["expires_in_seconds"].as_u64().unwrap() > 0);
+
+        let session_id = uuid::Uuid::new_v4();
+        let activate = router
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/ipc/session-reservations/{reservation_id}/activate"
+                ))
+                .header("content-type", "application/json")
+                .body(register_body(session_id, "claude", live_pid))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(activate.status(), StatusCode::CREATED);
+
+        let reg = state.supervisor_registry.lock().unwrap();
+        assert_eq!(reg.count(), 1);
+        assert_eq!(reg.reservation_count(), 0, "lease consumed by activation");
+        assert!(reg.get(&session_id).is_some());
+    }
+
+    /// A retried activation (lost response) must not consume a second seat.
+    #[tokio::test]
+    async fn test_reservation_activate_is_idempotent() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+
+        let resp = reserve(&router, "claude").await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reservation_id = json["reservation_id"].as_str().unwrap().to_string();
+        let session_id = uuid::Uuid::new_v4();
+
+        for _ in 0..2 {
+            let activate = router
+                .clone()
+                .oneshot(
+                    Request::post(format!(
+                        "/ipc/session-reservations/{reservation_id}/activate"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(register_body(session_id, "claude", live_pid))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(activate.status(), StatusCode::CREATED);
+        }
+
+        let reg = state.supervisor_registry.lock().unwrap();
+        assert_eq!(reg.count(), 1, "retry must not create a second session");
+    }
+
+    #[tokio::test]
+    async fn test_reservation_cancel_releases_the_seat() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+
+        let resp = reserve(&router, "claude").await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reservation_id = json["reservation_id"].as_str().unwrap().to_string();
+
+        let cancel = router
+            .clone()
+            .oneshot(
+                Request::delete(format!("/ipc/session-reservations/{reservation_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+
+        // The seat is immediately reusable.
+        assert_eq!(
+            reserve(&router, "codex").await.status(),
+            StatusCode::CREATED
+        );
+    }
+
+    /// Cancelling an unknown lease is a no-op success, not a 404 — the
+    /// caller's intent (stop holding this seat) is satisfied either way.
+    #[tokio::test]
+    async fn test_cancel_unknown_reservation_is_a_noop_success() {
+        let state = make_state();
+        let router = ipc_routes().with_state(state);
+        let resp = router
+            .oneshot(
+                Request::delete(format!(
+                    "/ipc/session-reservations/{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// A quarantined audit chain must refuse the reservation with the
+    /// quarantine envelope, not a bogus "upgrade for more sessions" prompt.
+    #[tokio::test]
+    async fn test_reservation_refused_while_audit_quarantined() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_audit_quarantine(Some("chain broken at seq 42".into()));
+        }
+        let router = ipc_routes().with_state(state);
+
+        let resp = reserve(&router, "claude").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "audit_chain_quarantined");
+        assert_eq!(json["remediation"], "grith audit diagnose");
+    }
+
+    /// A daemon whose audit database is read-only (another process owns the
+    /// writer lock) must refuse the reservation with the read-only envelope —
+    /// not a bogus capacity 429, and not a mislabelled quarantine.
+    #[tokio::test]
+    async fn test_reservation_refused_while_audit_read_only() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_audit_read_only(Some("another process owns the audit database".into()));
+        }
+        let router = ipc_routes().with_state(state);
+
+        let resp = reserve(&router, "claude").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "audit_read_only");
+        assert_eq!(json["remediation"], "grith daemon restart");
+    }
+
+    /// The legacy register path must refuse with the same envelope.
+    #[tokio::test]
+    async fn test_register_refused_while_audit_read_only() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_audit_read_only(Some("another process owns the audit database".into()));
+        }
+        let router = ipc_routes().with_state(state);
+
+        let resp = router
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", 4242))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "audit_read_only");
+        assert_eq!(json["remediation"], "grith daemon restart");
+    }
+
+    /// An ingest against a read-only audit handle must return the structured
+    /// read-only 503, not a raw SQLITE_READONLY 500 the client cannot
+    /// distinguish from a transient failure.
+    #[tokio::test]
+    async fn test_ingest_refused_while_audit_read_only() {
+        let state = make_state();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.db");
+        // An owner creates the database; the server then holds it read-only,
+        // exactly as a daemon that lost the writer-lock race would.
+        drop(grith_audit::AuditStorage::open(&db).unwrap());
+        *state.audit_storage.lock().unwrap() =
+            grith_audit::AuditStorage::open_read_only(&db).unwrap();
+        let router = ipc_routes().with_state(state);
+
+        let record = grith_audit::AuditRecord::new(
+            uuid::Uuid::new_v4(),
+            "test".into(),
+            "FileRead(/tmp/x)".into(),
+            &serde_json::json!({}),
+            0.0,
+            grith_audit::ProxyActionSummary::Allow,
+            Vec::new(),
+            0.0,
+            None,
+        );
+        let resp = router
+            .oneshot(
+                Request::post("/ipc/audit/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "record": record }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "audit_read_only");
+    }
+
+    /// Ten racing reservations against a cap of two yield exactly two seats.
+    #[tokio::test]
+    async fn test_concurrent_reservations_respect_the_cap() {
+        let state = make_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(2);
+        }
+        let router = ipc_routes().with_state(state.clone());
+
+        let mut granted = 0;
+        let mut refused = 0;
+        for _ in 0..10 {
+            match reserve(&router, "claude").await.status() {
+                StatusCode::CREATED => granted += 1,
+                StatusCode::TOO_MANY_REQUESTS => refused += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert_eq!(granted, 2, "cap must hold across repeated reservations");
+        assert_eq!(refused, 8);
     }
 
     #[tokio::test]

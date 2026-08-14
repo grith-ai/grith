@@ -11,6 +11,7 @@ pub mod exec;
 pub mod exec_reviewer;
 pub mod log;
 pub mod notifications;
+pub mod onboarding;
 pub mod pro;
 pub mod profile_audit;
 pub mod proxy;

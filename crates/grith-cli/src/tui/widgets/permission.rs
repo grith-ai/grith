@@ -5,12 +5,110 @@
 
 use crate::tui::state::PermissionRequest;
 use crate::tui::theme::*;
+use grith_digest::{PermissionReviewAction, ScopedAllowRequest};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
+
+/// Mutable state for the second-step scoped permission editor.
+#[derive(Debug, Clone)]
+pub struct ScopeDialogState {
+    /// Operation bits and editable directory.
+    pub request: ScopedAllowRequest,
+    focus: usize,
+    /// Inline validation error from the last apply attempt.
+    pub error: Option<String>,
+}
+
+impl ScopeDialogState {
+    const FOCUS_COUNT: usize = 5;
+
+    /// Create the safe operation-specific default for a permission request.
+    pub fn for_request(req: &PermissionRequest) -> Option<Self> {
+        if !req.scope_enabled {
+            return None;
+        }
+        Some(Self {
+            request: grith_supervisor::scoped_permissions::default_scoped_allow(&req.tool)?,
+            focus: 0,
+            error: None,
+        })
+    }
+
+    /// Move focus to the next field or duration choice.
+    pub fn focus_next(&mut self) {
+        self.focus = (self.focus + 1) % Self::FOCUS_COUNT;
+        self.error = None;
+    }
+
+    /// Move focus to the previous field or duration choice.
+    pub fn focus_previous(&mut self) {
+        self.focus = (self.focus + Self::FOCUS_COUNT - 1) % Self::FOCUS_COUNT;
+        self.error = None;
+    }
+
+    /// Whether the editable directory field has focus.
+    pub fn directory_focused(&self) -> bool {
+        self.focus == 0
+    }
+
+    /// Whether the fixed session-duration choice has focus.
+    pub fn duration_focused(&self) -> bool {
+        self.focus == 4
+    }
+
+    /// Append a character to the directory field.
+    pub fn push_directory_char(&mut self, ch: char) {
+        self.request.directory.push(ch);
+        self.error = None;
+    }
+
+    /// Remove the final character from the directory field.
+    pub fn pop_directory_char(&mut self) {
+        self.request.directory.pop();
+        self.error = None;
+    }
+
+    /// Clear the directory field.
+    pub fn clear_directory(&mut self) {
+        self.request.directory.clear();
+        self.error = None;
+    }
+
+    /// Toggle the focused operation checkbox.
+    pub fn toggle_focused(&mut self) {
+        match self.focus {
+            1 => self.request.read = !self.request.read,
+            2 => self.request.write = !self.request.write,
+            3 => self.request.delete = !self.request.delete,
+            // Persistence is not implemented, so selecting the duration row
+            // reaffirms the only supported choice instead of silently
+            // changing the wire request.
+            4 => self.request.persist = false,
+            _ => {}
+        }
+        self.error = None;
+    }
+
+    /// Validate the proposal and return its canonical structured action.
+    pub fn apply(&mut self, req: &PermissionRequest) -> Option<PermissionReviewAction> {
+        match grith_supervisor::scoped_permissions::validate_scoped_allow(&self.request, &req.tool)
+        {
+            Ok(validated) => {
+                self.request.directory = validated.directory;
+                self.error = None;
+                Some(PermissionReviewAction::ScopedAllow(self.request.clone()))
+            }
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+}
 
 pub fn render_permission_dialog(
     frame: &mut Frame,
@@ -43,6 +141,330 @@ pub fn render_permission_dialog(
     });
 
     render_dialog_body(frame, inner, req, is_deny, show_inspect);
+}
+
+/// Render the scoped permission editor as a centered terminal dialog.
+pub fn render_scope_permission_dialog(
+    frame: &mut Frame,
+    req: &PermissionRequest,
+    state: &ScopeDialogState,
+) {
+    let area = centered_rect(76, 60, frame.area());
+    frame.render_widget(Clear, area);
+    render_scope_container(frame, area, req, state);
+}
+
+/// Render the scoped permission editor inside the exec TUI panel.
+pub fn render_scope_permission_panel(
+    frame: &mut Frame,
+    area: Rect,
+    req: &PermissionRequest,
+    state: &ScopeDialogState,
+) {
+    frame.render_widget(Clear, area);
+    render_scope_container(frame, area, req, state);
+}
+
+/// Render the key-reference help as a centered terminal dialog.
+pub fn render_permission_help_dialog(frame: &mut Frame, req: &PermissionRequest, is_deny: bool) {
+    let area = centered_rect(76, 60, frame.area());
+    frame.render_widget(Clear, area);
+    render_help_container(frame, area, req, is_deny);
+}
+
+/// Render the key-reference help inside the exec TUI panel.
+pub fn render_permission_help_panel(
+    frame: &mut Frame,
+    area: Rect,
+    req: &PermissionRequest,
+    is_deny: bool,
+) {
+    frame.render_widget(Clear, area);
+    render_help_container(frame, area, req, is_deny);
+}
+
+fn render_help_container(frame: &mut Frame, area: Rect, req: &PermissionRequest, is_deny: bool) {
+    let border_color = if is_deny { RED } else { AMBER };
+    let block = Block::default()
+        .title(" PERMISSION KEYS ")
+        .title_style(Style::new().fg(border_color).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(border_color))
+        .style(Style::new().bg(BG_PANEL));
+    frame.render_widget(block, area);
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    render_help_body(frame, inner, req, is_deny);
+}
+
+fn help_line(key: &str, key_color: ratatui::style::Color, text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {key:<7}"),
+            Style::new().fg(key_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(text.to_string(), Style::new().fg(TEXT_MID)),
+    ])
+}
+
+fn render_help_body(frame: &mut Frame, area: Rect, req: &PermissionRequest, is_deny: bool) {
+    let mut lines: Vec<Line> = Vec::new();
+    if is_deny {
+        lines.push(help_line(
+            "[c]",
+            TEXT_MID,
+            "Acknowledge the block and continue",
+        ));
+        lines.push(help_line(
+            "[i]",
+            TEXT_MID,
+            "Show the full record of what was blocked",
+        ));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " This operation scored above the auto-deny threshold and was blocked.",
+            Style::new().fg(TEXT_DIM),
+        )));
+    } else {
+        lines.push(help_line(
+            "[a]",
+            GREEN_HI,
+            "Allow this request; the exact target stays allowed for this session",
+        ));
+        lines.push(help_line(
+            "[d]",
+            RED,
+            "Block this request; identical retries are blocked for a short window",
+        ));
+        lines.push(help_line(
+            "[l]",
+            BLUE,
+            "Allow and save a permanent rule for this exact target",
+        ));
+        if ScopeDialogState::for_request(req).is_some() {
+            lines.push(help_line(
+                "[s]",
+                AMBER,
+                "Allow a directory for operations you pick, this session only",
+            ));
+        }
+        lines.push(help_line("[t]", RED, "Deny and stop the supervised tool"));
+        lines.push(help_line(
+            "[i]",
+            TEXT_MID,
+            "Show raw arguments and the request id",
+        ));
+        lines.push(help_line("[esc]", TEXT_MID, "Deny this request"));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " Nothing outlives the session unless saved with [l]; sensitive targets are never saved.",
+            Style::new().fg(TEXT_DIM),
+        )));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " [h/esc] Back to the request",
+        Style::new().fg(TEXT_DIM),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::new().bg(BG_PANEL))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_scope_container(
+    frame: &mut Frame,
+    area: Rect,
+    req: &PermissionRequest,
+    state: &ScopeDialogState,
+) {
+    let block = Block::default()
+        .title(" SCOPE PERMISSION ")
+        .title_style(Style::new().fg(AMBER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(AMBER))
+        .style(Style::new().bg(BG_PANEL));
+    frame.render_widget(block, area);
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    render_scope_body(frame, inner, req, state);
+}
+
+fn render_scope_body(
+    frame: &mut Frame,
+    area: Rect,
+    req: &PermissionRequest,
+    state: &ScopeDialogState,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let width = area.width as usize;
+    let field_style = if state.directory_focused() {
+        Style::new().fg(WHITE).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(TEXT_MID)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("directory: ", Style::new().fg(TEXT_DIM)),
+            Span::styled(
+                truncate(
+                    &state.request.directory,
+                    width.saturating_sub("directory: ".len() + 1),
+                ),
+                field_style,
+            ),
+            Span::styled(
+                if state.directory_focused() { "▏" } else { "" },
+                Style::new().fg(AMBER),
+            ),
+        ]))
+        .style(Style::new().bg(BG_PANEL)),
+        chunks[0],
+    );
+
+    let preview =
+        grith_supervisor::scoped_permissions::preview_scope_path(&state.request.directory);
+    let (resolved, preview_error, exists) = match preview {
+        Ok(preview) => (preview.resolved_directory, None, preview.exists),
+        Err(error) => (String::new(), Some(error), false),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("resolved:  ", Style::new().fg(TEXT_DIM)),
+            Span::styled(
+                truncate(&resolved, width.saturating_sub("resolved:  ".len())),
+                Style::new().fg(TEXT_MID),
+            ),
+        ]))
+        .style(Style::new().bg(BG_PANEL)),
+        chunks[1],
+    );
+
+    let operation_line = Line::from(vec![
+        checkbox_span("read", state.request.read, state.focus == 1),
+        Span::raw("   "),
+        checkbox_span("write/create", state.request.write, state.focus == 2),
+        Span::raw("   "),
+        checkbox_span("delete/rename", state.request.delete, state.focus == 3),
+    ]);
+    frame.render_widget(
+        Paragraph::new(operation_line).style(Style::new().bg(BG_PANEL)),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "(*) this session only",
+                Style::new()
+                    .fg(if state.duration_focused() {
+                        WHITE
+                    } else {
+                        GREEN_HI
+                    })
+                    .add_modifier(if state.duration_focused() {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled("   not saved to the profile", Style::new().fg(TEXT_DIM)),
+        ]))
+        .style(Style::new().bg(BG_PANEL)),
+        chunks[4],
+    );
+
+    let rename_detail = if let Some(body) = req
+        .tool
+        .strip_prefix("FileRename(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        body.split_once(" -> ").map(|(old, new)| {
+            let old_path = std::path::Path::new(old);
+            let new_path = std::path::Path::new(new);
+            let old_parent = old_path.parent().unwrap_or(old_path);
+            let new_parent = new_path.parent().unwrap_or(new_path);
+            format!(
+                "removes from: {}  creates in: {}",
+                old_parent.display(),
+                new_parent.display()
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(detail) = rename_detail {
+        frame.render_widget(
+            Paragraph::new(truncate(&detail, width)).style(Style::new().fg(TEXT_DIM).bg(BG_PANEL)),
+            chunks[5],
+        );
+    }
+
+    let message = state
+        .error
+        .clone()
+        .or(preview_error)
+        .or_else(|| (!exists).then(|| "Warning: directory does not exist yet".to_string()));
+    if let Some(message) = message {
+        frame.render_widget(
+            Paragraph::new(truncate(&message, width)).style(
+                Style::new()
+                    .fg(if state.error.is_some() { RED } else { AMBER })
+                    .bg(BG_PANEL),
+            ),
+            chunks[6],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" [tab/↑↓] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Select  ", Style::new().fg(TEXT_DIM)),
+            Span::styled("[space] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Toggle  ", Style::new().fg(TEXT_DIM)),
+            Span::styled("[enter] ", Style::new().fg(GREEN_HI)),
+            Span::styled("Apply scope  ", Style::new().fg(TEXT_MID)),
+            Span::styled("[esc] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Back", Style::new().fg(TEXT_DIM)),
+        ]))
+        .style(Style::new().bg(BG_PANEL))
+        .wrap(Wrap { trim: true }),
+        chunks[8],
+    );
+}
+
+fn checkbox_span(label: &str, checked: bool, focused: bool) -> Span<'static> {
+    Span::styled(
+        format!("[{}] {label}", if checked { 'x' } else { ' ' }),
+        Style::new()
+            .fg(if checked { GREEN_HI } else { TEXT_MID })
+            .add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+    )
 }
 
 fn render_dialog_body(
@@ -112,24 +534,18 @@ fn render_dialog_body(
     );
 
     // Type line — category + detail from inside the parentheses of tool string.
-    // Extract content between first '(' and last ')'.
-    let detail = req
-        .tool
-        .find('(')
-        .and_then(|open| {
-            req.tool.rfind(')').map(|close| {
-                if close > open + 1 {
-                    req.tool[open + 1..close].trim()
-                } else {
-                    ""
-                }
-            })
-        })
-        .unwrap_or("");
+    let detail = tool_call_detail(&req.tool);
     let type_desc = if detail.is_empty() {
         req.call_type.clone()
     } else {
-        format!("{} — {}", req.call_type, detail)
+        let detail_budget = max_title_len
+            .saturating_sub(req.call_type.chars().count())
+            .saturating_sub(3);
+        format!(
+            "{} — {}",
+            req.call_type,
+            shorten_tool_detail(detail, detail_budget)
+        )
     };
     let type_line = Line::from(vec![
         Span::styled("type  ", Style::new().fg(TEXT_DIM)),
@@ -164,23 +580,20 @@ fn render_dialog_body(
     );
 
     let mut detail_text = summary_lines(req);
+    if let Some(note) = unresolved_ip_note_line(&req.tool) {
+        detail_text.push(note);
+    }
     if !req.context.is_empty() {
         detail_text.push(Line::from(vec![
             Span::styled("context: ", Style::new().fg(TEXT_DIM)),
             Span::styled(req.context.as_str(), Style::new().fg(TEXT_MID)),
         ]));
     }
-    if !req.reasons.is_empty() {
+    for reason in visible_reasons(req).into_iter().take(2) {
         detail_text.push(Line::from(vec![
             Span::styled("why queued: ", Style::new().fg(TEXT_DIM)),
-            Span::styled(req.reasons[0].as_str(), Style::new().fg(TEXT_MID)),
+            Span::styled(reason, Style::new().fg(TEXT_MID)),
         ]));
-        if req.reasons.len() > 1 {
-            detail_text.push(Line::from(vec![
-                Span::styled("why queued: ", Style::new().fg(TEXT_DIM)),
-                Span::styled(req.reasons[1].as_str(), Style::new().fg(TEXT_MID)),
-            ]));
-        }
     }
     if show_inspect {
         detail_text.push(Line::from(vec![
@@ -206,13 +619,21 @@ fn render_dialog_body(
 
     // Action row — only for QUEUE, not AUTO-DENY
     if !is_deny {
-        let actions = Line::from(vec![
+        let mut actions = vec![
             Span::styled(" [a] ", Style::new().fg(GREEN_HI)),
             Span::styled("Approve   ", Style::new().fg(TEXT_MID)),
             Span::styled(" [d] ", Style::new().fg(RED)),
             Span::styled("Deny   ", Style::new().fg(TEXT_MID)),
             Span::styled(" [l] ", Style::new().fg(BLUE)),
             Span::styled("Always allow  ", Style::new().fg(TEXT_MID)),
+        ];
+        if ScopeDialogState::for_request(req).is_some() {
+            actions.extend([
+                Span::styled(" [s] ", Style::new().fg(AMBER)),
+                Span::styled("Scope...  ", Style::new().fg(TEXT_MID)),
+            ]);
+        }
+        actions.extend([
             Span::styled(" [i] ", Style::new().fg(TEXT_MID)),
             Span::styled(
                 if show_inspect {
@@ -222,9 +643,11 @@ fn render_dialog_body(
                 },
                 Style::new().fg(TEXT_DIM),
             ),
+            Span::styled("  [h] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Help", Style::new().fg(TEXT_DIM)),
         ]);
         frame.render_widget(
-            Paragraph::new(actions)
+            Paragraph::new(Line::from(actions))
                 .style(Style::new().bg(BG_PANEL))
                 .wrap(Wrap { trim: true }),
             chunks[10],
@@ -244,6 +667,8 @@ fn render_dialog_body(
                 },
                 Style::new().fg(TEXT_DIM),
             ),
+            Span::styled("  [h] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Help", Style::new().fg(TEXT_DIM)),
         ]);
         frame.render_widget(
             Paragraph::new(actions)
@@ -673,23 +1098,19 @@ fn render_panel_body(
     );
 
     // Type — detail (truncated, no wrap)
-    let detail = req
-        .tool
-        .find('(')
-        .and_then(|open| {
-            req.tool.rfind(')').map(|close| {
-                if close > open + 1 {
-                    req.tool[open + 1..close].trim()
-                } else {
-                    ""
-                }
-            })
-        })
-        .unwrap_or("");
+    let detail = tool_call_detail(&req.tool);
     let type_desc = if detail.is_empty() {
         req.call_type.clone()
     } else {
-        format!("{} \u{2014} {}", req.call_type, detail)
+        let detail_budget = max_w
+            .saturating_sub(6)
+            .saturating_sub(req.call_type.chars().count())
+            .saturating_sub(3);
+        format!(
+            "{} \u{2014} {}",
+            req.call_type,
+            shorten_tool_detail(detail, detail_budget)
+        )
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -745,11 +1166,14 @@ fn render_panel_body(
             Span::styled(target, bold_white),
         ]));
     }
-    if !req.reasons.is_empty() {
+    if let Some(reason) = primary_reason(req) {
         detail_lines.push(Line::from(vec![
             Span::styled("why: ", Style::new().fg(TEXT_DIM)),
-            Span::styled(req.reasons[0].clone(), Style::new().fg(TEXT_MID)),
+            Span::styled(reason, Style::new().fg(TEXT_MID)),
         ]));
+    }
+    if let Some(note) = unresolved_ip_note_line(&req.tool) {
+        detail_lines.push(note);
     }
     if !req.context.is_empty() {
         detail_lines.push(Line::from(vec![
@@ -795,13 +1219,21 @@ fn render_panel_body(
 
     // Action keys (chunks[9])
     let actions = if !is_deny {
-        Line::from(vec![
+        let mut actions = vec![
             Span::styled(" [a] ", Style::new().fg(GREEN_HI)),
             Span::styled("Approve  ", Style::new().fg(TEXT_MID)),
             Span::styled(" [d] ", Style::new().fg(RED)),
             Span::styled("Deny  ", Style::new().fg(TEXT_MID)),
             Span::styled(" [l] ", Style::new().fg(BLUE)),
             Span::styled("Always allow  ", Style::new().fg(TEXT_MID)),
+        ];
+        if ScopeDialogState::for_request(req).is_some() {
+            actions.extend([
+                Span::styled(" [s] ", Style::new().fg(AMBER)),
+                Span::styled("Scope...  ", Style::new().fg(TEXT_MID)),
+            ]);
+        }
+        actions.extend([
             Span::styled(" [i] ", Style::new().fg(TEXT_MID)),
             Span::styled(
                 if show_inspect {
@@ -811,7 +1243,10 @@ fn render_panel_body(
                 },
                 Style::new().fg(TEXT_DIM),
             ),
-        ])
+            Span::styled("  [h] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Help", Style::new().fg(TEXT_DIM)),
+        ]);
+        Line::from(actions)
     } else {
         Line::from(vec![
             Span::styled(" [c] ", Style::new().fg(TEXT_MID)),
@@ -827,6 +1262,8 @@ fn render_panel_body(
                 },
                 Style::new().fg(TEXT_DIM),
             ),
+            Span::styled("  [h] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Help", Style::new().fg(TEXT_DIM)),
         ])
     };
     frame.render_widget(
@@ -871,7 +1308,7 @@ fn title_with_provenance(tool: &str, args: &str, max_len: usize) -> Line<'static
     };
 
     let available = max_len.saturating_sub(suffix.len());
-    let tool_text = truncate(tool, available);
+    let tool_text = shorten_tool_call(tool, available);
 
     if suffix.is_empty() {
         Line::from(vec![Span::styled(tool_text, bold)])
@@ -898,13 +1335,249 @@ fn centered_rect(width: u16, height_pct: u16, r: Rect) -> Rect {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else if max > 3 {
-        format!("{}...", &s[..max - 3])
+        format!("{}...", take_chars(s, max - 3))
     } else {
-        s[..max].to_string()
+        take_chars(s, max)
     }
+}
+
+/// Note shown when a network request is still displayed as a bare IP address.
+///
+/// By the time a `NetConnect` reaches a review dialog its address has already
+/// been through every name-attribution source — DNS answers observed during
+/// the session, a fresh re-resolve of the profile's trusted destinations, and
+/// reverse DNS. A bare IP here means all of them came up empty. Saying so
+/// makes the raw address read as a deliberate finding rather than a display
+/// bug. (Hostname and candidate-list attributions never parse as an IP, so
+/// they get no note.)
+const UNRESOLVED_IP_NOTE: &str = "unresolved IP \u{2014} not seen in any DNS answer this session, \
+     no reverse-DNS name, and not matching the profile's trusted destinations";
+
+/// Whether this request is a `NetConnect` whose destination is a bare IP.
+fn is_unresolved_ip_net_connect(tool: &str) -> bool {
+    if !tool.starts_with("NetConnect") {
+        return false;
+    }
+    let detail = tool_call_detail(tool);
+    if detail.is_empty() {
+        return false;
+    }
+    // Strip a trailing ":port"; unbracketed IPv6 with a port also parses as an
+    // IPv6 literal on its own, so checking both forms covers every rendering.
+    let host = detail.rsplit_once(':').map_or(detail, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.parse::<std::net::IpAddr>().is_ok() || detail.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn unresolved_ip_note_line(tool: &str) -> Option<Line<'static>> {
+    is_unresolved_ip_net_connect(tool).then(|| {
+        Line::from(vec![
+            Span::styled("dns: ", Style::new().fg(TEXT_DIM)),
+            Span::styled(UNRESOLVED_IP_NOTE, Style::new().fg(TEXT_DIM)),
+        ])
+    })
+}
+
+fn tool_call_detail(tool: &str) -> &str {
+    tool.find('(')
+        .and_then(|open| {
+            tool.rfind(')').map(|close| {
+                if close > open + 1 {
+                    tool[open + 1..close].trim()
+                } else {
+                    ""
+                }
+            })
+        })
+        .unwrap_or("")
+}
+
+fn shorten_tool_call(tool: &str, max: usize) -> String {
+    if tool.chars().count() <= max {
+        return tool.to_string();
+    }
+    let Some(open) = tool.find('(') else {
+        return truncate(tool, max);
+    };
+    let Some(close) = tool.rfind(')') else {
+        return truncate(tool, max);
+    };
+    if close <= open {
+        return truncate(tool, max);
+    }
+
+    let prefix = &tool[..=open];
+    let suffix = &tool[close..];
+    let fixed = prefix.chars().count() + suffix.chars().count();
+    if fixed >= max {
+        return truncate(tool, max);
+    }
+
+    let detail = &tool[open + 1..close];
+    let detail_budget = max - fixed;
+    format!(
+        "{prefix}{}{suffix}",
+        shorten_tool_detail(detail.trim(), detail_budget)
+    )
+}
+
+fn shorten_tool_detail(detail: &str, max: usize) -> String {
+    if detail.chars().count() <= max {
+        return detail.to_string();
+    }
+    // Rename-style details ("<old> -> <new>") first: they both start with a
+    // path and contain whitespace, so they must not fall into the single-path
+    // or command-line branches below.
+    if let Some((left, right)) = detail.split_once(" -> ") {
+        let sep = " -> ";
+        let sep_len = sep.chars().count();
+        if max > sep_len + 8 {
+            let side_budget = (max - sep_len) / 2;
+            let left = if is_path_like(left.trim()) {
+                shorten_path_middle(left.trim(), side_budget)
+            } else {
+                truncate(left.trim(), side_budget)
+            };
+            let right_budget = max
+                .saturating_sub(sep_len)
+                .saturating_sub(left.chars().count());
+            let right = if is_path_like(right.trim()) {
+                shorten_path_middle(right.trim(), right_budget)
+            } else {
+                truncate(right.trim(), right_budget)
+            };
+            return format!("{left}{sep}{right}");
+        }
+        return truncate(detail, max);
+    }
+    if is_path_like(detail) {
+        // A spawn/exec detail is "<binary path> <args…>" — a string that
+        // merely *starts* with a path. Middle-shortening it as one path keeps
+        // whatever follows the final '/' anywhere in the args (e.g. a URL's
+        // trailing slash) and can swallow the binary name entirely, rendering
+        // "ProcessSpawn(/tmp/…/chromiu…/)". Split and shorten the two parts
+        // separately so the binary basename always stays visible.
+        if let Some((cmd, cmd_args)) = detail.split_once(char::is_whitespace) {
+            return shorten_command_line(cmd, cmd_args, max);
+        }
+        return shorten_path_middle(detail, max);
+    }
+    truncate(detail, max)
+}
+
+/// Shorten a "<binary path> <args…>" detail so the binary's basename stays
+/// visible and the tail of the arguments (usually the target URL or final
+/// path) survives truncation.
+fn shorten_command_line(cmd: &str, args: &str, max: usize) -> String {
+    let args = args.trim();
+    if args.is_empty() {
+        return shorten_path_middle(cmd, max);
+    }
+    // Reserve roughly a third of the budget (at least 16 columns when the
+    // budget allows) for the arguments; the binary path takes the rest and
+    // keeps its basename via middle-shortening.
+    let args_reserve = (max / 3).max(16).min(max.saturating_sub(8));
+    let cmd_budget = max.saturating_sub(args_reserve + 1);
+    let cmd_short = shorten_path_middle(cmd, cmd_budget);
+    let args_budget = max
+        .saturating_sub(cmd_short.chars().count())
+        .saturating_sub(1);
+    if args_budget < 4 {
+        return truncate(&format!("{cmd_short} {args}"), max);
+    }
+    format!("{cmd_short} {}", truncate_middle(args, args_budget))
+}
+
+/// Keep the head and tail of `s`, dropping the middle. For argument lists the
+/// tail (the target URL or final path) is usually the informative part.
+fn truncate_middle(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 3 {
+        return take_chars(s, max);
+    }
+    let keep = max - 3;
+    let head = keep / 2;
+    let tail = keep - head;
+    format!("{}...{}", take_chars(s, head), take_last_chars(s, tail))
+}
+
+fn shorten_path_middle(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    if max <= 3 {
+        return ".".repeat(max);
+    }
+
+    // Search from the last *non-empty* component so a trailing slash
+    // ("/long/path/dir/") keeps "dir/" visible instead of reducing the
+    // preserved suffix to just "/".
+    let trimmed = path.trim_end_matches('/');
+    let search = if trimmed.is_empty() { path } else { trimmed };
+    let Some(last_slash) = search.rfind('/') else {
+        return truncate(path, max);
+    };
+    let suffix = &path[last_slash..];
+    let suffix_len = suffix.chars().count();
+
+    if suffix_len + 3 >= max {
+        let filename = &path[last_slash + 1..];
+        if filename.chars().count() + 4 <= max {
+            return format!(".../{filename}");
+        }
+        return format!("...{}", take_last_chars(filename, max - 3));
+    }
+
+    let prefix_budget = max - suffix_len - 3;
+    format!("{}...{suffix}", take_chars(path, prefix_budget))
+}
+
+fn is_path_like(s: &str) -> bool {
+    s.starts_with('/') || s.starts_with("~/")
+}
+
+fn take_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn take_last_chars(s: &str, n: usize) -> String {
+    let mut chars = s.chars().rev().take(n).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+fn primary_reason(req: &PermissionRequest) -> Option<String> {
+    let decision_reason = req.decision_reason.trim();
+    if !decision_reason.is_empty() {
+        return Some(decision_reason.to_string());
+    }
+    req.reasons
+        .iter()
+        .find(|reason| !reason.trim().is_empty())
+        .map(|reason| reason.trim().to_string())
+}
+
+fn visible_reasons(req: &PermissionRequest) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(reason) = primary_reason(req) {
+        out.push(reason);
+    }
+    for reason in req
+        .reasons
+        .iter()
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty())
+    {
+        if !out.iter().any(|existing| existing == reason) {
+            out.push(reason.to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -914,6 +1587,33 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use uuid::Uuid;
+
+    #[test]
+    fn unresolved_ip_note_only_for_raw_ip_net_connects() {
+        // Raw IPv4 and IPv6 destinations get the note.
+        assert!(is_unresolved_ip_net_connect(
+            "NetConnect(20.26.156.210:443)"
+        ));
+        assert!(is_unresolved_ip_net_connect(
+            "NetConnect(2607:6bc0::10:443)"
+        ));
+        assert!(is_unresolved_ip_net_connect(
+            "NetConnect([2607:6bc0::10]:443)"
+        ));
+        assert!(is_unresolved_ip_net_connect("NetConnect(20.26.156.210)"));
+
+        // Attributed hostnames, ambiguous candidate arrays, and non-network
+        // calls do not.
+        assert!(!is_unresolved_ip_net_connect(
+            "NetConnect(api.github.com:443)"
+        ));
+        assert!(!is_unresolved_ip_net_connect(
+            "NetConnect([\"anthropic.com\", \"claude.ai\"]:443)"
+        ));
+        assert!(!is_unresolved_ip_net_connect("NetConnect(localhost:443)"));
+        assert!(!is_unresolved_ip_net_connect("FileRead(/etc/passwd)"));
+        assert!(!is_unresolved_ip_net_connect("NetConnect()"));
+    }
 
     fn make_request(is_deny: bool) -> PermissionRequest {
         PermissionRequest {
@@ -935,6 +1635,7 @@ mod tests {
                 "Routine shell execution".to_string(),
                 "Unknown outbound destination from command".to_string(),
             ],
+            decision_reason: "review required".to_string(),
             context: "Task: modernise date formatting utilities".to_string(),
             severity: if is_deny {
                 "CRITICAL".to_string()
@@ -944,6 +1645,7 @@ mod tests {
             call_type: "shell \u{2013} package install".to_string(),
             item_number: 1,
             total_items: 2,
+            scope_enabled: false,
         }
     }
 
@@ -985,6 +1687,102 @@ mod tests {
     }
 
     #[test]
+    fn long_file_path_is_shortened_in_the_middle() {
+        let text = shorten_tool_call(
+            "FileDelete(/home/dan/projects/PersonalProjects/Grith/grith/target/debug/deps/fp_legitimate_network.rs)",
+            58,
+        );
+        assert!(text.starts_with("FileDelete(/home/"), "{text}");
+        assert!(text.contains("..."), "{text}");
+        assert!(text.ends_with("/fp_legitimate_network.rs)"), "{text}");
+        assert!(text.chars().count() <= 58, "{text}");
+    }
+
+    /// The reported bug: a ProcessSpawn detail is "<binary path> <args…>",
+    /// and the args ended in a URL with a trailing slash. Single-path
+    /// middle-shortening preserved only that final "/" — swallowing the
+    /// binary name ("ProcessSpawn(/tmp/…/chromiu…/)"). The binary basename
+    /// and the tail of the args must both stay visible.
+    #[test]
+    fn spawn_command_line_keeps_binary_basename_and_args_tail() {
+        let text = shorten_tool_call(
+            "ProcessSpawn(/tmp/claude-1000/-home-dan-projects-VdepotPelygoProjects-nucleus-wms/752e1529-b778-4917-9c3f-20a74c88f5c2/scratchpad/chromium-92.0.4515.107/chrome-linux/chrome --headless --disable-gpu --screenshot=/tmp/shot.png --window-size=1280,1024 http://localhost:5173/)",
+            120,
+        );
+        assert!(text.contains("/chrome "), "binary basename lost: {text}");
+        assert!(
+            text.ends_with("localhost:5173/)"),
+            "args tail (target URL) lost: {text}"
+        );
+        assert!(text.chars().count() <= 120, "{text}");
+    }
+
+    /// A spawn with no args still middle-shortens as a single path.
+    #[test]
+    fn spawn_bare_binary_path_keeps_basename() {
+        let text = shorten_tool_detail(
+            "/tmp/claude-1000/some/very/long/scratchpad/path/chromium-92.0.4515.107/chrome-linux/chrome",
+            48,
+        );
+        assert!(text.ends_with("/chrome"), "{text}");
+        assert!(text.contains("..."), "{text}");
+    }
+
+    /// A single path with a trailing slash keeps its last component visible
+    /// rather than reducing the preserved suffix to "/".
+    #[test]
+    fn trailing_slash_path_keeps_last_component() {
+        let text = shorten_path_middle(
+            "/tmp/claude-1000/-home-dan-projects/752e1529-b778-4917/scratchpad/chromium-92.0.4515.107/",
+            48,
+        );
+        assert!(
+            text.ends_with("/chromium-92.0.4515.107/"),
+            "last component lost: {text}"
+        );
+        assert!(text.chars().count() <= 48, "{text}");
+    }
+
+    /// Rename details between two absolute paths must keep both basenames
+    /// (the " -> " branch is checked before the path/command-line branches).
+    #[test]
+    fn rename_detail_keeps_both_basenames() {
+        let text = shorten_tool_detail(
+            "/home/dan/.pki/nssdb/very-long-directory-name-for-testing/pkcs11.txu -> /home/dan/.pki/nssdb/very-long-directory-name-for-testing/pkcs11.txt",
+            80,
+        );
+        assert!(text.contains("/pkcs11.txu"), "{text}");
+        assert!(text.contains(" -> "), "{text}");
+        assert!(text.ends_with("/pkcs11.txt"), "{text}");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        assert_eq!(truncate_middle("hello", 10), "hello");
+        let out = truncate_middle("--headless --disable-gpu http://localhost:5173/", 30);
+        assert!(out.starts_with("--headless"), "{out}");
+        assert!(out.ends_with("host:5173/"), "{out}");
+        assert!(out.chars().count() <= 30, "{out}");
+    }
+
+    #[test]
+    fn visible_reasons_prefer_decision_reason_and_skip_blanks() {
+        let mut req = make_request(false);
+        req.decision_reason = "mass-destruction signal: 25 distinct out-of-tree deletions".into();
+        req.reasons = vec![String::new(), "File delete requires review".into()];
+
+        let reasons = visible_reasons(&req);
+        assert_eq!(
+            reasons.first().map(String::as_str),
+            Some("mass-destruction signal: 25 distinct out-of-tree deletions")
+        );
+        assert_eq!(
+            reasons.get(1).map(String::as_str),
+            Some("File delete requires review")
+        );
+    }
+
+    #[test]
     fn test_permission_panel() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1018,6 +1816,157 @@ mod tests {
                 render_filter_bars(frame, frame.area(), &filters);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn scoped_permission_panel_fits_compact_exec_height() {
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut req = make_request(false);
+        req.tool = "FileDelete(/repo/target/debug/deps/foo.o)".to_string();
+        req.call_type = "FileDelete".to_string();
+        req.scope_enabled = true;
+        let state = ScopeDialogState::for_request(&req).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_scope_permission_panel(frame, frame.area(), &req, &state);
+            })
+            .unwrap();
+
+        let contents: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(contents.contains("SCOPE PERMISSION"));
+        assert!(contents.contains("delete/rename"));
+        assert!(contents.contains("this session only"));
+        assert!(contents.contains("not saved to the profile"));
+        assert!(contents.contains("Apply scope"));
+    }
+
+    fn buffer_contents(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn help_panel_explains_every_review_key() {
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let req = make_request(false);
+
+        terminal
+            .draw(|frame| render_permission_help_panel(frame, frame.area(), &req, false))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("PERMISSION KEYS"));
+        assert!(contents.contains("stays allowed for this session"));
+        assert!(contents.contains("blocked for a short window"));
+        assert!(contents.contains("permanent rule"));
+        assert!(contents.contains("stop the supervised tool"));
+        assert!(contents.contains("Back to the request"));
+        // scope_enabled is false on the fixture — no [s] row.
+        assert!(!contents.contains("[s]"));
+    }
+
+    #[test]
+    fn help_panel_lists_scope_key_for_file_operations() {
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut req = make_request(false);
+        req.tool = "FileDelete(/repo/target/debug/deps/foo.o)".to_string();
+        req.call_type = "FileDelete".to_string();
+        req.scope_enabled = true;
+
+        terminal
+            .draw(|frame| render_permission_help_panel(frame, frame.area(), &req, false))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("[s]"));
+        assert!(contents.contains("this session only"));
+    }
+
+    #[test]
+    fn help_dialog_deny_variant_explains_continue() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let req = make_request(true);
+
+        terminal
+            .draw(|frame| render_permission_help_dialog(frame, &req, true))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("Acknowledge the block"));
+        assert!(contents.contains("what was blocked"));
+        // Decision keys must not be advertised on the auto-deny help.
+        assert!(!contents.contains("permanent rule"));
+    }
+
+    #[test]
+    fn action_rows_advertise_the_help_key() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let req = make_request(false);
+        terminal
+            .draw(|frame| render_permission_panel(frame, frame.area(), &req, false, false))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("[h]"), "panel action row must list Help");
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_dialog(frame, &req, false, false))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("[h]"), "dialog action row must list Help");
+    }
+
+    #[test]
+    fn scope_focus_reaches_session_duration_and_wraps() {
+        let mut req = make_request(false);
+        req.tool = "FileRead(/repo/src/lib.rs)".to_string();
+        req.call_type = "FileRead".to_string();
+        req.scope_enabled = true;
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+
+        assert!(state.directory_focused());
+        for _ in 0..4 {
+            state.focus_next();
+        }
+        assert!(state.duration_focused());
+
+        state.toggle_focused();
+        assert!(!state.request.persist);
+        state.focus_next();
+        assert!(state.directory_focused());
+        state.focus_previous();
+        assert!(state.duration_focused());
+    }
+
+    #[test]
+    fn invalid_scope_stays_in_editor_with_inline_error() {
+        let mut req = make_request(false);
+        req.tool = "FileRead(/repo/src/lib.rs)".to_string();
+        req.call_type = "FileRead".to_string();
+        req.scope_enabled = true;
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        state.request.directory = "/".to_string();
+
+        assert!(state.apply(&req).is_none());
+        assert!(state.error.is_some());
     }
 
     #[test]

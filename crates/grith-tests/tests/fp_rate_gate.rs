@@ -215,8 +215,10 @@ fn fixed_vector_corpus() -> Vec<(&'static str, &'static str, ToolCallType)> {
 ///     carve these.
 ///   * `test-fixture` — reading a `.pem`/key test fixture. The §4.7 secret-scan-
 ///     false-match class (§5.11-HELD).
-///   * `secret-scan` — `git show <40-hex-sha>` → base64-chunking on the hex run
-///     (§5.11-HELD / base64-content class).
+///   * `secret-scan` — `git show <40-hex-sha>`: FORMERLY base64-chunking on the
+///     hex run. Carved by W2 (2026-08-06) — shape scoring on a ShellExec/
+///     ProcessSpawn now requires an untrusted destination, so a bare SHA arg
+///     with no egress target no longer FPs. Kept in the corpus, verified non-FP.
 fn known_residual_corpus() -> Vec<(&'static str, &'static str, ToolCallType)> {
     vec![
         // benign egress to non-pre-trusted hosts (the dominant real FP class)
@@ -277,7 +279,10 @@ const EXPECTED_RESIDUAL_FPS: &[&str] = &[
     "cred-read/read ~/.aws/config",
     "cred-read/read ~/.docker/config.json",
     "test-fixture/read fixture .pem",
-    "secret-scan/git show sha",
+    // W2 (2026-08-06): `git show <sha>` no longer FPs — egress-policy now
+    // shape-scores a ShellExec/ProcessSpawn only when it targets an untrusted
+    // *destination*, so a bare hex SHA arg with no egress target no longer trips
+    // base64-chunking. The scenario stays in the corpus (verified non-FP).
 ];
 
 async fn count_fps(corpus: &[(&str, &str, ToolCallType)]) -> Vec<(String, String, f64, String)> {

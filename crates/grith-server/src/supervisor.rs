@@ -142,7 +142,10 @@ fn session_registry_view(session: &SupervisorSession) -> SupervisorSession {
         cwd: session.cwd.clone(),
         tty: session.tty.clone(),
         wedge_reported_tids: std::collections::HashSet::new(),
+        spawn_recorded: std::collections::HashSet::new(),
         controlling_pts: std::sync::OnceLock::new(),
+        recent_denials: std::collections::HashMap::new(),
+        recent_approvals: std::collections::HashMap::new(),
     }
 }
 
@@ -454,6 +457,30 @@ async fn create_session(
                 .into_response();
             }
         };
+        // Refuse audit-unrecordable admission BEFORE anything is attached or
+        // spawned. The registry gate at registration time still backstops
+        // this, but by then the target process exists — refused registration
+        // there would abandon a frozen, unmanaged, unauditable process
+        // (work/74 Phase 1: the refusal must happen while there is still
+        // nothing running).
+        if let Some(reason) = registry.audit_quarantine() {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("audit chain quarantined, refusing new sessions: {reason}"),
+                "AUDIT_QUARANTINED",
+            )
+            .into_response();
+        }
+        if let Some(reason) = registry.audit_read_only() {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "audit database is read-only for this process, refusing new sessions: {reason}"
+                ),
+                "AUDIT_READ_ONLY",
+            )
+            .into_response();
+        }
         registry.config().clone()
     };
 
@@ -670,6 +697,20 @@ async fn create_session(
         };
         match registry.register(session_registry_view(&session)) {
             Ok(()) => {}
+            // Audit refusals are not capacity problems: rendering them as a
+            // 429 would show the dashboard a bogus "session limit" message
+            // for a condition no upgrade or retry fixes.
+            Err(
+                e @ (grith_supervisor::Error::AuditQuarantined(_)
+                | grith_supervisor::Error::AuditReadOnly(_)),
+            ) => {
+                let code = match e {
+                    grith_supervisor::Error::AuditQuarantined(_) => "AUDIT_QUARANTINED",
+                    _ => "AUDIT_READ_ONLY",
+                };
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string(), code)
+                    .into_response();
+            }
             Err(e) => {
                 return api_error(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -978,6 +1019,8 @@ mod tests {
             canary_registry,
             notification_dispatcher,
             start_time: std::time::Instant::now(),
+            instance_id: None,
+            protocol_version: None,
             version: "0.1.0-test".into(),
             ws_tx,
             shutdown_tx: None,
@@ -1102,7 +1145,6 @@ mod tests {
                 flags: OpenFlags::ReadOnly,
             },
             raw_syscall_nr: 257,
-            sockaddr_addr: None,
         }
     }
 

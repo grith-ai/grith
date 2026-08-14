@@ -32,7 +32,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.2"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.88"
@@ -42,7 +42,12 @@ repository = "https://github.com/grith-ai/grith"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: without it serde_json's fast float parser can land a
+# ULP away from the value that was written, so a filter score of
+# 3.8000000000000003 reads back as 3.8. That silently rewrites audit
+# evidence, and it makes any full-record hash unverifiable — the
+# recomputed hash of a persisted row would not match the stored one.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
 aho-corasick = "1"

@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, global = true)]
     project: Option<String>,
 
+    /// Skip the first-run onboarding flow (also via GRITH_SKIP_ONBOARDING)
+    #[arg(long, global = true)]
+    skip_onboarding: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -53,6 +57,9 @@ enum Command {
         /// The task to execute
         task: String,
     },
+    /// Run the interactive first-run setup (welcome, provider, trial, guide)
+    #[command(alias = "onboarding")]
+    Setup,
     /// Create default configuration
     Init,
     /// Show or modify configuration
@@ -97,6 +104,12 @@ enum Command {
         /// Write raw pre-filter syscall forensics records to a JSONL file
         #[arg(long)]
         trace_syscalls_jsonl: Option<std::path::PathBuf>,
+
+        /// In a non-interactive session (no terminal), allow + log queued
+        /// operations instead of the default fail-closed auto-deny. Has no
+        /// effect in an interactive session (the approval dialog is shown).
+        #[arg(long)]
+        allow_queued: bool,
 
         /// The command and arguments to supervise (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -165,6 +178,8 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum AuditAction {
+    /// Inspect the audit chain: verification outcome, forks, gaps (read-only)
+    Diagnose,
     /// Export audit logs as JSON or CSV
     Export {
         /// Output format
@@ -176,6 +191,14 @@ enum AuditAction {
         /// Maximum number of records to return
         #[arg(long, default_value = "1000")]
         limit: usize,
+    },
+    /// Reclaim free pages left by pruning: rewrites + atomically swaps the audit
+    /// database. A manual maintenance op (never automatic); requires that no
+    /// daemon is running and the chain is not quarantined.
+    Compact {
+        /// Proceed without the interactive confirmation prompt (for scripts).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -236,6 +259,8 @@ enum DaemonAction {
     Start,
     /// Stop the running daemon
     Stop,
+    /// Restart the daemon (stop the running one, then start this build)
+    Restart,
     /// Check if the daemon is running
     Status,
     /// Authorise a browser for the dashboard (mints a single-use pairing link)
@@ -262,6 +287,9 @@ enum ProAction {
     Sync,
     /// Open the upgrade/pricing page in the default browser
     Upgrade,
+    /// Start a free Pro trial (one-click when available, else opens signup)
+    #[command(name = "start-trial")]
+    StartTrial,
     /// Show current plan and billing details; open billing portal in browser
     Billing,
 }
@@ -335,6 +363,68 @@ fn command_supports_profile_refresh(command: Option<&Command>) -> bool {
     )
 }
 
+/// Whether the first-run onboarding wizard should auto-trigger. Restricted to
+/// the interactive entry points (REPL / `grith run`) on a real TTY, when the
+/// install is not yet onboarded and the user has not opted out.
+#[allow(clippy::fn_params_excessive_bools)]
+fn should_auto_run_onboarding(
+    command: Option<&Command>,
+    onboarded: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    skip: bool,
+) -> bool {
+    !onboarded
+        && !skip
+        && stdin_is_tty
+        && stdout_is_tty
+        && matches!(command, None | Some(Command::Run { .. }))
+}
+
+/// Whether a `grith exec` invocation is actually launching/attaching to a
+/// supervised tool (as opposed to a session-management alias like
+/// `grith exec list|kill|prune`). Mirrors the management-verb dispatch in
+/// `commands::exec`, which only treats bare verbs as management when there is
+/// no `--` separator, profile, or attach target.
+fn exec_launches_supervised_tool(
+    profile: Option<&str>,
+    attach: Option<u32>,
+    command: &[String],
+    has_separator: bool,
+) -> bool {
+    if attach.is_some() {
+        return true; // attaching to a live pid is supervision
+    }
+    if profile.is_some() || has_separator {
+        return !command.is_empty();
+    }
+    // No profile / attach / separator: a bare management verb is not a launch.
+    let is_management = matches!(command, [v] if v == "list" || v == "kill" || v == "prune")
+        || matches!(command, [v, _] if v == "kill");
+    !command.is_empty() && !is_management
+}
+
+/// The tool name to surface in the exec first-run notice, if one is being
+/// launched (the first non-separator argument).
+fn exec_tool_name(command: &[String]) -> Option<&str> {
+    command.first().map(String::as_str)
+}
+
+/// Whether an environment variable is set to a truthy value
+/// (`1`/`true`/`yes`/`on`, case-insensitive). Absent or any other value
+/// (including `0`/`false`) is falsy.
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| value_is_truthy(&v))
+}
+
+/// Pure truthiness check for a config/env string value.
+fn value_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn should_refresh_profiles(
     command: Option<&Command>,
     profile_update_check_enabled: bool,
@@ -400,10 +490,35 @@ fn main() -> anyhow::Result<()> {
     let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let exec_quiet =
         matches!(&cli.command, Some(Command::Exec { .. })) && stdout_is_tty && stdin_is_tty;
-    if !exec_quiet {
+    // `grith setup` is a clean interactive screen — suppress the startup log
+    // line so it doesn't print above the welcome.
+    let setup_quiet = matches!(&cli.command, Some(Command::Setup));
+    if !exec_quiet && !setup_quiet {
         tracing::info!(version = env!("CARGO_PKG_VERSION"), "grith starting");
     } else {
         logging::suppress();
+    }
+
+    // Onboarding opt-out, resolved once (CLI flag or truthy env var).
+    let skip_onboarding = cli.skip_onboarding || env_truthy("GRITH_SKIP_ONBOARDING");
+
+    // First-run notice for `grith exec`: a single non-blocking line, never a
+    // wizard. Shown at most once, then the supervised tool launches normally.
+    if let Some(Command::Exec {
+        profile,
+        attach,
+        command,
+        ..
+    }) = &cli.command
+    {
+        let has_separator = std::env::args_os().any(|a| a == "--");
+        if !cfg.general.onboarded
+            && !cfg.general.exec_notice_seen
+            && !skip_onboarding
+            && exec_launches_supervised_tool(profile.as_deref(), *attach, command, has_separator)
+        {
+            commands::onboarding::show_exec_notice_once(&mut cfg, exec_tool_name(command));
+        }
     }
 
     // Check for updates on REPL / `run` launches when interactive and enabled.
@@ -430,6 +545,9 @@ fn main() -> anyhow::Result<()> {
 
     // Handle commands that don't need daemon initialization
     match &cli.command {
+        Some(Command::Setup) => {
+            return commands::onboarding::run_setup(&mut cfg, enable_color);
+        }
         Some(Command::Config { action: None }) => {
             println!("{}", cfg.to_toml()?);
             return Ok(());
@@ -440,12 +558,25 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Daemon {
             action: DaemonAction::Stop,
         }) => {
-            return commands::dashboard::cmd_dashboard_stop();
+            return commands::dashboard::cmd_dashboard_stop(cfg.server.port);
+        }
+        Some(Command::Daemon {
+            action: DaemonAction::Restart,
+        }) => {
+            if !cfg.server.enabled {
+                println!("Dashboard server is disabled (server.enabled = false in config).");
+                return Ok(());
+            }
+            return commands::dashboard::cmd_dashboard_restart(
+                cfg.server.port,
+                cfg.server.auto_open_dashboard,
+                cli.config.as_deref(),
+            );
         }
         Some(Command::Daemon {
             action: DaemonAction::Status,
         }) => {
-            return commands::dashboard::cmd_dashboard_status();
+            return commands::dashboard::cmd_dashboard_status(cfg.server.port);
         }
         Some(Command::Daemon {
             action: DaemonAction::Pair,
@@ -491,6 +622,9 @@ fn main() -> anyhow::Result<()> {
             action: ProAction::Upgrade,
         }) => return commands::pro::cmd_pro_upgrade(),
         Some(Command::Pro {
+            action: ProAction::StartTrial,
+        }) => return commands::pro::cmd_pro_start_trial(),
+        Some(Command::Pro {
             action: ProAction::Billing,
         }) => return commands::pro::cmd_pro_billing(),
         Some(Command::Profile {
@@ -510,21 +644,64 @@ fn main() -> anyhow::Result<()> {
             | Some(Command::Reputation { .. })
     );
     if thin_client_command && cfg.server.enabled {
-        let _ = commands::dashboard::ensure_dashboard_running_with_port(
-            cfg.server.port,
-            cfg.server.auto_open_dashboard,
-            // Auto-started for `grith exec`/supervisor — idle-shutdown after the
-            // session ends.
-            false,
-            cli.config.as_deref(),
-        );
-        if let Some(daemon_client) = crate::daemon::client::DaemonClient::connect() {
+        // work/74 Phase 0: `grith exec` must fail closed. Establish an
+        // authenticated, version-compatible daemon connection or refuse to
+        // run — never fall through to an in-process daemon, which would give
+        // this process its own empty session registry (bypassing the plan's
+        // concurrent-session cap) and a second writer on the audit chain.
+        let is_exec = matches!(cli.command, Some(Command::Exec { .. }));
+        let config_path = cli.config.clone();
+        let server_port = cfg.server.port;
+        let auto_open = cfg.server.auto_open_dashboard;
+        let readiness = crate::daemon::readiness::ensure_daemon_ready(server_port, || {
+            commands::dashboard::ensure_dashboard_running_with_port(
+                server_port,
+                auto_open,
+                // Auto-started for `grith exec`/supervisor — idle-shutdown
+                // after the session ends.
+                false,
+                config_path.as_deref(),
+            )
+            .map(|_| ())
+            .ok_or_else(|| "daemon auto-start did not report a listener".to_string())
+        });
+
+        let daemon_client = match readiness {
+            Ok(client) => Some(client),
+            Err(unready) => {
+                if is_exec {
+                    // Fail closed: no in-process fallback, no target started.
+                    tracing::error!(
+                        event = "daemon_unready_exec_refused",
+                        code = unready.code(),
+                        "refusing to start a supervised session without a daemon"
+                    );
+                    eprintln!("{}", unready.user_message());
+                    return Err(anyhow::anyhow!(
+                        "daemon not ready ({}) — no supervised session was started",
+                        unready.code()
+                    ));
+                }
+                // Non-exec thin commands (`supervisor`, `reputation`) are
+                // read-mostly and may still run locally; they do not admit
+                // sessions. Surface why the remote path was unavailable.
+                tracing::warn!(
+                    event = "daemon_unready",
+                    code = unready.code(),
+                    "daemon unavailable for thin-client command"
+                );
+                None
+            }
+        };
+
+        if let Some(daemon_client) = daemon_client {
             match cli.command {
                 Some(Command::Exec {
                     profile,
                     attach,
                     syscall_log,
                     trace_syscalls_jsonl,
+                    allow_queued,
                     command,
                 }) => {
                     return commands::exec::cmd_exec_thin(
@@ -534,6 +711,7 @@ fn main() -> anyhow::Result<()> {
                         attach,
                         syscall_log,
                         trace_syscalls_jsonl,
+                        allow_queued,
                         command,
                         project_override.as_deref(),
                         cli.config.as_deref(),
@@ -548,15 +726,40 @@ fn main() -> anyhow::Result<()> {
                 _ => {}
             }
         }
-        if matches!(cli.command, Some(Command::Exec { .. })) {
-            tracing::warn!(
-                "daemon unavailable after auto-start attempt — falling back to in-process exec"
-            );
-        }
     }
 
-    // Initialize the daemon for commands that need subsystems
-    let init_result = daemon::Daemon::start(cfg)?;
+    // First-run onboarding auto-trigger. Runs only on the interactive entry
+    // points (REPL / `grith run`) on a real TTY, before the daemon starts —
+    // so any provider / audit-sync choices apply to this same process. The
+    // flow persists `onboarded = true` so it does not re-trigger.
+    if should_auto_run_onboarding(
+        cli.command.as_ref(),
+        cfg.general.onboarded,
+        stdin_is_tty,
+        stdout_is_tty,
+        skip_onboarding,
+    ) {
+        commands::onboarding::run_onboarding(&mut cfg, enable_color)?;
+    }
+
+    // Initialize the daemon for commands that need subsystems.
+    //
+    // The `daemon start` command only reaches this point as the detached
+    // serving child, which must own the audit database or fail loudly: a
+    // daemon that cannot write audit records breaks every session it admits
+    // (required DNS audit records fail, and DNS is denied fail-closed).
+    // Every other command degrades to a read-only audit view as before.
+    let start_options = if matches!(
+        cli.command,
+        Some(Command::Daemon {
+            action: DaemonAction::Start
+        })
+    ) {
+        daemon::StartOptions::serving_daemon()
+    } else {
+        daemon::StartOptions::default()
+    };
+    let init_result = daemon::Daemon::start(cfg, start_options)?;
 
     for warning in &init_result.warnings {
         tracing::warn!("{warning}");
@@ -659,6 +862,11 @@ fn main() -> anyhow::Result<()> {
 
         let (license_handle, sync_handle, mut notification_handles) = runtime.block_on(async {
             let license_handle = daemon.spawn_license_revalidation();
+            // Re-apply the license gate immediately on SIGHUP (sent by
+            // `grith pro login`/`refresh` after writing a new license), so a
+            // fresh upgrade takes effect without a 24h wait or restart. The
+            // task detaches and self-terminates on the shutdown broadcast.
+            let _regate_handle = daemon.spawn_license_regate_on_sighup();
             let sync_handle = if daemon.config.general.audit_sync {
                 daemon.spawn_audit_sync()
             } else {
@@ -749,21 +957,24 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Digest { action }) => commands::digest::cmd_digest(&daemon, action),
         Some(Command::Canary { action }) => commands::canary::cmd_canary(&daemon, action),
         Some(Command::Proxy { action }) => commands::proxy::cmd_proxy(&daemon, action),
-        Some(Command::Exec {
-            profile,
-            attach,
-            syscall_log,
-            trace_syscalls_jsonl,
-            command,
-        }) => commands::exec::cmd_exec(
-            &daemon,
-            profile,
-            attach,
-            syscall_log,
-            trace_syscalls_jsonl,
-            command,
-            project_override.as_deref(),
-        ),
+        // work/74 Phase 0 + invariant 4: there is no in-process fallback for
+        // supervised execution. Reaching here means the thin-client block
+        // above did not run — which only happens when the server is disabled
+        // in config, since any other failure already returned a fail-closed
+        // error. Supervision without a daemon cannot enforce a host-wide
+        // session cap or keep a single audit writer, so refuse rather than
+        // silently supervising with weaker guarantees.
+        Some(Command::Exec { .. }) => {
+            eprintln!(
+                "Supervised execution requires the local Grith daemon, but `server.enabled` \
+                 is false in your configuration.\n\n\
+                 No supervised session was started.\n\
+                 Set `server.enabled = true` (or remove the override) and retry."
+            );
+            Err(anyhow::anyhow!(
+                "server.enabled = false — no supervised session was started"
+            ))
+        }
         Some(Command::Supervisor { action }) => {
             commands::supervisor::cmd_supervisor(&daemon, action)
         }
@@ -780,7 +991,8 @@ fn main() -> anyhow::Result<()> {
         }) => commands::log::cmd_log(&daemon, tail, session.as_deref(), limit, enable_color),
         Some(Command::Reputation { action }) => cmd_reputation(action),
         // Already handled above
-        Some(Command::Init)
+        Some(Command::Setup)
+        | Some(Command::Init)
         | Some(Command::Completions { .. })
         | Some(Command::Config { .. })
         | Some(Command::Daemon { .. })
@@ -841,9 +1053,53 @@ fn cmd_init() -> anyhow::Result<()> {
             anyhow::anyhow!("required config/default.toml unavailable: {last_error}")
         })?
     };
+    // A manual `grith init` is an explicit setup action, so mark the config
+    // as onboarded — otherwise the next interactive `grith` would launch the
+    // first-run wizard on top of the config the user just created. Text
+    // insertion (rather than parse/serialize) preserves the template's
+    // documentation comments.
+    let default_toml = insert_general_flag(&default_toml, "onboarded", "true");
     std::fs::write(&path, default_toml)?;
     println!("Created default config at {}", path.display());
     Ok(())
+}
+
+/// Insert `key = value` into the `[general]` table of a TOML document while
+/// preserving comments and layout. No-op if an active (non-comment)
+/// declaration of `key` already exists. If there is no `[general]` table, one
+/// is prepended.
+fn insert_general_flag(toml_text: &str, key: &str, value: &str) -> String {
+    // The declaration scan is intentionally table-agnostic: it is only ever
+    // called with `key = "onboarded"` against the grith config template, where
+    // no other table declares that key. A bare-key TOML document before the
+    // first table header is not produced by any grith code path.
+    let already_declared = toml_text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with('#')
+            && trimmed.starts_with(key)
+            && trimmed[key.len()..].trim_start().starts_with('=')
+    });
+    if already_declared {
+        return toml_text.to_string();
+    }
+
+    let mut out = String::with_capacity(toml_text.len() + key.len() + value.len() + 8);
+    let mut inserted = false;
+    for line in toml_text.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !inserted && line.trim() == "[general]" {
+            out.push_str(key);
+            out.push_str(" = ");
+            out.push_str(value);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    if !inserted {
+        return format!("[general]\n{key} = {value}\n\n{toml_text}");
+    }
+    out
 }
 
 fn cmd_config_set(cfg: &mut config::GrithConfig, key: &str, value: &str) -> anyhow::Result<()> {
@@ -1032,6 +1288,8 @@ fn to_runtime_supervisor_config_with_audit(
         enabled: core.enabled,
         default_profile: core.default_profile.clone(),
         freeze_timeout_seconds: core.freeze_timeout_seconds,
+        deny_replay_seconds: core.deny_replay_seconds,
+        approve_replay_seconds: core.approve_replay_seconds,
         max_concurrent_sessions: core.max_concurrent_sessions,
         pty_forwarding: core.pty_forwarding,
         require_sandbox: core.require_sandbox,
@@ -1052,6 +1310,26 @@ fn to_runtime_supervisor_config_with_audit(
         dns_inspection: grith_supervisor::config::DnsInspectionConfig {
             enabled: core.dns_inspection.enabled,
             upstream_resolver: core.dns_inspection.upstream_resolver.clone(),
+            observe_responses: core.dns_inspection.observe_responses,
+            block_tcp_dns: core.dns_inspection.block_tcp_dns,
+            connected_udp_proxy: core.dns_inspection.connected_udp_proxy,
+            accept_proxy_network_authority: core.dns_inspection.accept_proxy_network_authority,
+            proxy_queue_action: match core.dns_inspection.proxy_queue_action {
+                config::SupervisorDnsProxyQueueAction::Refuse => {
+                    grith_supervisor::config::DnsProxyQueueAction::Refuse
+                }
+                config::SupervisorDnsProxyQueueAction::Forward => {
+                    grith_supervisor::config::DnsProxyQueueAction::Forward
+                }
+            },
+            proxy_max_response_bytes: core.dns_inspection.proxy_max_response_bytes,
+            proxy_policy_timeout_ms: core.dns_inspection.proxy_policy_timeout_ms,
+            proxy_upstream_timeout_ms: core.dns_inspection.proxy_upstream_timeout_ms,
+            proxy_shutdown_timeout_ms: core.dns_inspection.proxy_shutdown_timeout_ms,
+            proxy_route_capacity: core.dns_inspection.proxy_route_capacity,
+            proxy_query_capacity: core.dns_inspection.proxy_query_capacity,
+            proxy_control_capacity: core.dns_inspection.proxy_control_capacity,
+            proxy_policy_capacity: core.dns_inspection.proxy_policy_capacity,
         },
         interactive_queue_action: grith_supervisor::config::InteractiveQueueAction::default(),
         syscall_log_file: None,
@@ -1061,8 +1339,11 @@ fn to_runtime_supervisor_config_with_audit(
         coverage: grith_supervisor::config::CoverageConfig {
             category1_hard_deny: core.coverage.category1_hard_deny,
             category2_proxy: core.coverage.category2_proxy,
+            category2_crossprocess: core.coverage.category2_crossprocess,
             category3_namespace: core.coverage.category3_namespace,
             category4_arch_priv: core.coverage.category4_arch_priv,
+            deny_self_seccomp_notify: core.coverage.deny_self_seccomp_notify,
+            observe_self_seccomp_filter: core.coverage.observe_self_seccomp_filter,
         },
         audit_completeness: match audit.completeness {
             config::AuditCompleteness::Decisions => {
@@ -1075,6 +1356,7 @@ fn to_runtime_supervisor_config_with_audit(
             config::AuditCompleteness::All => grith_supervisor::config::AuditCompletenessLevel::All,
         },
         pty_ownership_enforce: core.pty_ownership_enforce,
+        authority_lost_terminate_after_seconds: core.authority_lost_terminate_after_seconds,
     }
 }
 
@@ -1086,22 +1368,23 @@ mod session_summary_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn shell_call(command: &str, args: &[&str]) -> grith_llm::ToolCall {
-        grith_llm::ToolCall {
-            id: "call_1".to_string(),
-            name: "shell_exec".to_string(),
-            arguments: serde_json::json!({
-                "command": command,
-                "args": args,
-            }),
-        }
-    }
-
     #[test]
     fn to_runtime_supervisor_config_maps_dns_inspection() {
         let mut core = crate::config::SupervisorCoreConfig::default();
         core.dns_inspection.enabled = false;
         core.dns_inspection.upstream_resolver = Some("9.9.9.9".to_string());
+        core.dns_inspection.connected_udp_proxy = true;
+        core.dns_inspection.accept_proxy_network_authority = true;
+        core.dns_inspection.proxy_queue_action =
+            crate::config::SupervisorDnsProxyQueueAction::Forward;
+        core.dns_inspection.proxy_max_response_bytes = 1232;
+        core.dns_inspection.proxy_policy_timeout_ms = 250;
+        core.dns_inspection.proxy_upstream_timeout_ms = 750;
+        core.dns_inspection.proxy_shutdown_timeout_ms = 500;
+        core.dns_inspection.proxy_route_capacity = 8;
+        core.dns_inspection.proxy_query_capacity = 32;
+        core.dns_inspection.proxy_control_capacity = 16;
+        core.dns_inspection.proxy_policy_capacity = 4;
 
         let mapped = super::to_runtime_supervisor_config(&core);
         assert!(!mapped.dns_inspection.enabled);
@@ -1109,6 +1392,20 @@ mod session_summary_tests {
             mapped.dns_inspection.upstream_resolver.as_deref(),
             Some("9.9.9.9")
         );
+        assert!(mapped.dns_inspection.connected_udp_proxy);
+        assert!(mapped.dns_inspection.accept_proxy_network_authority);
+        assert_eq!(
+            mapped.dns_inspection.proxy_queue_action,
+            grith_supervisor::config::DnsProxyQueueAction::Forward
+        );
+        assert_eq!(mapped.dns_inspection.proxy_max_response_bytes, 1232);
+        assert_eq!(mapped.dns_inspection.proxy_policy_timeout_ms, 250);
+        assert_eq!(mapped.dns_inspection.proxy_upstream_timeout_ms, 750);
+        assert_eq!(mapped.dns_inspection.proxy_shutdown_timeout_ms, 500);
+        assert_eq!(mapped.dns_inspection.proxy_route_capacity, 8);
+        assert_eq!(mapped.dns_inspection.proxy_query_capacity, 32);
+        assert_eq!(mapped.dns_inspection.proxy_control_capacity, 16);
+        assert_eq!(mapped.dns_inspection.proxy_policy_capacity, 4);
     }
 
     #[test]
@@ -1121,6 +1418,7 @@ mod session_summary_tests {
             attach: None,
             syscall_log: None,
             trace_syscalls_jsonl: None,
+            allow_queued: false,
             command: vec!["echo".to_string(), "hi".to_string()],
         };
         let config = super::Command::Config { action: None };
@@ -1184,27 +1482,6 @@ mod session_summary_tests {
             crate::helpers::normalize_tool_call_type_label("DirList(.)"),
             "dir_list"
         );
-    }
-
-    #[test]
-    fn test_classify_shell_tool_call() {
-        assert_eq!(
-            classify_shell_tool_call(&shell_call("cargo", &["test", "--workspace"])),
-            Some(ShellQualityKind::Test)
-        );
-        assert_eq!(
-            classify_shell_tool_call(&shell_call("cargo", &["check"])),
-            Some(ShellQualityKind::Build)
-        );
-    }
-
-    #[test]
-    fn test_tool_result_failure_detection() {
-        assert!(tool_result_is_failure(
-            "Operation denied by security proxy: blocked"
-        ));
-        assert!(tool_result_is_failure("stderr: panic\nExit code: 1"));
-        assert!(!tool_result_is_failure("stdout\nExit code: 0"));
     }
 
     #[test]
@@ -1334,6 +1611,8 @@ mod session_summary_tests {
                 let mut ctx = tool_execution::ToolCallContext {
                     proxy: &proxy,
                     audit_storage: &audit_storage,
+                    can_write_audit: true,
+                    audit_ingest: None,
                     digest_queue: &digest_queue,
                     dlp_redactor: &dlp_redactor,
                     correlation_tracker: &correlation_tracker,
@@ -1412,6 +1691,8 @@ mod session_summary_tests {
                 let mut ctx = tool_execution::ToolCallContext {
                     proxy: &proxy,
                     audit_storage: &audit_storage,
+                    can_write_audit: true,
+                    audit_ingest: None,
                     digest_queue: &digest_queue,
                     dlp_redactor: &dlp_redactor,
                     correlation_tracker: &correlation_tracker,
@@ -1471,6 +1752,7 @@ mod profile_refresh_tests {
             attach: None,
             syscall_log: None,
             trace_syscalls_jsonl: None,
+            allow_queued: false,
             command: vec!["echo".into()],
         };
         assert!(command_supports_profile_refresh(Some(&cmd)));
@@ -1517,5 +1799,214 @@ mod profile_refresh_tests {
     fn no_tty_still_refreshes() {
         // Unlike binary update check, profile refresh has no TTY requirement.
         assert!(should_refresh_profiles(None, true, false));
+    }
+}
+
+#[cfg(test)]
+mod init_onboarding_tests {
+    use super::*;
+
+    #[test]
+    fn insert_general_flag_inserts_under_general_header() {
+        let input = "[general]\nlog_level = \"info\"\n\n[proxy]\nx = 1\n";
+        let out = insert_general_flag(input, "onboarded", "true");
+        assert!(out.contains("[general]\nonboarded = true\n"));
+        // Existing content preserved.
+        assert!(out.contains("log_level = \"info\""));
+        assert!(out.contains("[proxy]"));
+        // The value parses back as the active general.onboarded key.
+        let parsed: toml::Value = out.parse().unwrap();
+        assert_eq!(parsed["general"]["onboarded"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn insert_general_flag_noop_when_already_declared() {
+        let input = "[general]\nonboarded = false\nlog_level = \"info\"\n";
+        let out = insert_general_flag(input, "onboarded", "true");
+        // An explicit declaration is respected; we do not add a duplicate.
+        assert_eq!(out, input);
+        assert_eq!(out.matches("onboarded").count(), 1);
+    }
+
+    #[test]
+    fn insert_general_flag_ignores_commented_declaration() {
+        let input = "[general]\n# onboarded = false\nlog_level = \"info\"\n";
+        let out = insert_general_flag(input, "onboarded", "true");
+        let parsed: toml::Value = out.parse().unwrap();
+        assert_eq!(parsed["general"]["onboarded"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn insert_general_flag_prepends_section_when_absent() {
+        let input = "[proxy]\nx = 1\n";
+        let out = insert_general_flag(input, "onboarded", "true");
+        let parsed: toml::Value = out.parse().unwrap();
+        assert_eq!(parsed["general"]["onboarded"].as_bool(), Some(true));
+        assert_eq!(parsed["proxy"]["x"].as_integer(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod onboarding_gate_tests {
+    use super::*;
+
+    fn run_cmd() -> Command {
+        Command::Run { task: "x".into() }
+    }
+
+    fn exec_cmd(command: Vec<&str>) -> Command {
+        Command::Exec {
+            profile: None,
+            attach: None,
+            syscall_log: None,
+            trace_syscalls_jsonl: None,
+            allow_queued: false,
+            command: command.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn auto_onboarding_fires_for_fresh_interactive_repl() {
+        // None command (REPL), TTY, not onboarded, not skipped → fire.
+        assert!(should_auto_run_onboarding(None, false, true, true, false));
+        // `grith run` is also interactive.
+        assert!(should_auto_run_onboarding(
+            Some(&run_cmd()),
+            false,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn auto_onboarding_suppressed_when_already_onboarded_or_opted_out() {
+        assert!(!should_auto_run_onboarding(None, true, true, true, false)); // onboarded
+        assert!(!should_auto_run_onboarding(None, false, true, true, true)); // skip flag
+    }
+
+    #[test]
+    fn auto_onboarding_requires_tty() {
+        assert!(!should_auto_run_onboarding(None, false, false, true, false)); // no stdin tty
+        assert!(!should_auto_run_onboarding(None, false, true, false, false)); // no stdout tty
+    }
+
+    #[test]
+    fn auto_onboarding_never_fires_for_exec_or_management() {
+        assert!(!should_auto_run_onboarding(
+            Some(&exec_cmd(vec!["claude-code"])),
+            false,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn exec_notice_fires_for_real_tool_launch() {
+        // `grith exec -- claude-code "task"` → separator present, real tool.
+        assert!(exec_launches_supervised_tool(
+            None,
+            None,
+            &["claude-code".into(), "task".into()],
+            true
+        ));
+        // Even without an explicit separator, a non-management binary launches.
+        assert!(exec_launches_supervised_tool(
+            None,
+            None,
+            &["aider".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn exec_notice_skips_management_verbs() {
+        for verb in [vec!["list"], vec!["prune"], vec!["kill"]] {
+            assert!(
+                !exec_launches_supervised_tool(
+                    None,
+                    None,
+                    &verb.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    false
+                ),
+                "expected management verb {verb:?} to be skipped"
+            );
+        }
+        // `kill <session-id>` form.
+        assert!(!exec_launches_supervised_tool(
+            None,
+            None,
+            &["kill".into(), "abc123".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn exec_notice_management_verb_is_a_launch_with_separator_or_profile() {
+        // With a `--` separator a tool literally named "list" is supervised.
+        assert!(exec_launches_supervised_tool(
+            None,
+            None,
+            &["list".into()],
+            true
+        ));
+        // A profile forces tool-launch interpretation too.
+        assert!(exec_launches_supervised_tool(
+            Some("codex"),
+            None,
+            &["list".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn exec_notice_fires_for_attach() {
+        assert!(exec_launches_supervised_tool(None, Some(4242), &[], false));
+    }
+
+    #[test]
+    fn exec_notice_skips_empty_command() {
+        assert!(!exec_launches_supervised_tool(None, None, &[], false));
+    }
+
+    #[test]
+    fn env_truthiness() {
+        assert!(value_is_truthy("1"));
+        assert!(value_is_truthy("true"));
+        assert!(value_is_truthy("YES"));
+        assert!(value_is_truthy(" on "));
+        assert!(!value_is_truthy("0"));
+        assert!(!value_is_truthy("false"));
+        assert!(!value_is_truthy(""));
+    }
+
+    #[test]
+    fn exec_tool_name_is_first_arg() {
+        assert_eq!(
+            exec_tool_name(&["claude-code".into(), "task".into()]),
+            Some("claude-code")
+        );
+        assert_eq!(exec_tool_name(&[]), None);
+    }
+
+    #[test]
+    fn setup_is_network_free() {
+        // `grith setup` must not trigger update checks or profile refreshes —
+        // it runs in the daemon-free early path.
+        assert!(!command_supports_update_check(Some(&Command::Setup)));
+        assert!(!command_supports_profile_refresh(Some(&Command::Setup)));
+    }
+
+    #[test]
+    fn pro_start_trial_subcommand_parses() {
+        // The hyphenated subcommand name resolves to ProAction::StartTrial.
+        let cli = Cli::try_parse_from(["grith", "pro", "start-trial"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pro {
+                action: ProAction::StartTrial
+            })
+        ));
     }
 }

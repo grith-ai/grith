@@ -22,9 +22,9 @@
 //! Works with any tool (Claude Code, Codex, Aider, vim, etc.).
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
-    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver as CbReceiver, Select, TryRecvError};
+use grith_digest::PermissionReviewAction;
 
 use super::fullscreen_scrollback::FullscreenScrollback;
 use super::theme::*;
@@ -103,7 +104,18 @@ pub enum ExecEvent {
 /// regardless of `ExecEvent` queue depth.
 pub struct PermissionEvent {
     pub request: super::state::PermissionRequest,
-    pub response_tx: std::sync::mpsc::SyncSender<&'static str>,
+    pub response_tx: std::sync::mpsc::SyncSender<PermissionReviewAction>,
+}
+
+/// Messages on the dedicated permission channel.
+pub enum PermissionMessage {
+    /// A new permission request awaiting an operator decision.
+    Request(Box<PermissionEvent>),
+    /// The reviewer stopped waiting for the identified request (the review
+    /// timed out and the operation was denied). The dialog is stale —
+    /// answering it would change nothing — so the TUI drops it, letting any
+    /// queued prompts surface instead of stacking behind a dead one.
+    Cancel(uuid::Uuid),
 }
 
 /// Supervisor-event drain budget per loop iteration. After `DRAIN_BUDGET`
@@ -179,6 +191,18 @@ pub struct ExecState {
     /// movement into cursor-key input. Grith has to emulate that translation
     /// because the outer terminal's mouse capture sends wheel events to us.
     alternate_scroll_mode: bool,
+    /// DECSET ?1004 focus-event reporting requested by the child.
+    ///
+    /// The vt100 parser swallows the request, so grith must play the
+    /// terminal's role: reply with the current focus state when the mode is
+    /// enabled and forward host focus transitions while it stays on.
+    /// Claude Code gates prompt-suggestion generation on a focus-in report —
+    /// without this, focus stays "unknown" and suggestions never appear.
+    focus_reporting_mode: bool,
+    /// Last known host-terminal focus state. Defaults to focused: the user
+    /// just launched us from this terminal, and a host that doesn't support
+    /// ?1004 will never report a transition.
+    host_focused: bool,
     /// Tail bytes retained so the ?1007 scanner handles CSI sequences split
     /// across PTY chunks.
     mode_scan_tail: Vec<u8>,
@@ -202,8 +226,12 @@ pub struct ExecState {
 /// State for an active permission review dialog.
 struct PermissionDialog {
     request: super::state::PermissionRequest,
-    response_tx: std::sync::mpsc::SyncSender<&'static str>,
+    response_tx: std::sync::mpsc::SyncSender<PermissionReviewAction>,
     show_inspect: bool,
+    scope: Option<widgets::permission::ScopeDialogState>,
+    /// The key-reference overlay is showing. Modal: while open, decision
+    /// keys are inert so nobody approves by accident mid-read.
+    show_help: bool,
 }
 
 impl ExecState {
@@ -243,6 +271,8 @@ impl ExecState {
             vterm_rows,
             vterm_cols: cols,
             alternate_scroll_mode: false,
+            focus_reporting_mode: false,
+            host_focused: true,
             mode_scan_tail: Vec::new(),
             last_ctrl_c: None,
             dashboard_url: None,
@@ -323,7 +353,11 @@ impl ExecState {
         let mut combined = Vec::with_capacity(self.mode_scan_tail.len() + bytes.len());
         combined.extend_from_slice(&self.mode_scan_tail);
         combined.extend_from_slice(bytes);
-        update_alternate_scroll_mode(&combined, &mut self.alternate_scroll_mode);
+        update_private_modes(
+            &combined,
+            &mut self.alternate_scroll_mode,
+            &mut self.focus_reporting_mode,
+        );
 
         const MODE_SCAN_TAIL_MAX: usize = 48;
         let keep = combined.len().min(MODE_SCAN_TAIL_MAX);
@@ -333,7 +367,7 @@ impl ExecState {
     }
 }
 
-fn update_alternate_scroll_mode(bytes: &[u8], enabled: &mut bool) {
+fn update_private_modes(bytes: &[u8], alternate_scroll: &mut bool, focus_reporting: &mut bool) {
     let mut i = 0;
     while i + 3 < bytes.len() {
         if bytes[i] != 0x1b || bytes[i + 1] != b'[' || bytes[i + 2] != b'?' {
@@ -345,8 +379,14 @@ fn update_alternate_scroll_mode(bytes: &[u8], enabled: &mut bool) {
         while j < bytes.len() {
             let b = bytes[j];
             if (0x40..=0x7e).contains(&b) {
-                if matches!(b, b'h' | b'l') && csi_params_include_1007(&bytes[i + 3..j]) {
-                    *enabled = b == b'h';
+                if matches!(b, b'h' | b'l') {
+                    let params = &bytes[i + 3..j];
+                    if csi_params_include(params, b"1007") {
+                        *alternate_scroll = b == b'h';
+                    }
+                    if csi_params_include(params, b"1004") {
+                        *focus_reporting = b == b'h';
+                    }
                 }
                 i = j;
                 break;
@@ -357,8 +397,18 @@ fn update_alternate_scroll_mode(bytes: &[u8], enabled: &mut bool) {
     }
 }
 
-fn csi_params_include_1007(params: &[u8]) -> bool {
-    params.split(|b| *b == b';').any(|part| part == b"1007")
+fn csi_params_include(params: &[u8], mode: &[u8]) -> bool {
+    params.split(|b| *b == b';').any(|part| part == mode)
+}
+
+/// The focus report a terminal sends for the given focus state:
+/// `CSI I` (focus in) or `CSI O` (focus out).
+fn focus_report_bytes(focused: bool) -> &'static [u8] {
+    if focused {
+        b"\x1b[I"
+    } else {
+        b"\x1b[O"
+    }
 }
 
 fn resize_exec_surface(state: &mut ExecState, pty_tx: &mpsc::Sender<PtyInput>, rows: u16) {
@@ -427,7 +477,7 @@ fn process_pty_bytes_resilient(state: &mut ExecState, bytes: &[u8]) {
 pub fn run_exec_tui(
     mut state: ExecState,
     event_rx: CbReceiver<ExecEvent>,
-    permission_rx: CbReceiver<PermissionEvent>,
+    permission_rx: CbReceiver<PermissionMessage>,
     pty_tx: mpsc::Sender<PtyInput>,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -439,7 +489,15 @@ pub fn run_exec_tui(
     // terminal as escape sequences (otherwise terminals in alternate-screen
     // mode translate wheel to arrow keys, which Claude Code rejects with
     // "Scroll wheel is sending arrow keys").
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // EnableFocusChange asks the host for ?1004 focus reports so we can
+    // relay real focus transitions to the child. Hosts without support
+    // simply never report; `host_focused` then stays at its focused default.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
 
     // Request keyboard disambiguation so the host terminal reports
     // Ctrl+Enter / Shift+Enter as distinct events. Legacy terminals send a
@@ -494,6 +552,7 @@ pub fn run_exec_tui(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableFocusChange,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -517,7 +576,7 @@ fn exec_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut ExecState,
     event_rx: &CbReceiver<ExecEvent>,
-    permission_rx: &CbReceiver<PermissionEvent>,
+    permission_rx: &CbReceiver<PermissionMessage>,
     input_rx: &CbReceiver<Event>,
     pty_tx: &mpsc::Sender<PtyInput>,
 ) -> anyhow::Result<()> {
@@ -542,8 +601,11 @@ fn exec_event_loop(
         // Permission prompts are user-facing and block the supervised tool
         // until answered. Drain ahead of bulk events so a 256-event PTY-out
         // backlog never delays a prompt.
-        while let Ok(perm) = permission_rx.try_recv() {
-            enqueue_permission(state, perm);
+        while let Ok(msg) = permission_rx.try_recv() {
+            match msg {
+                PermissionMessage::Request(perm) => enqueue_permission(state, *perm),
+                PermissionMessage::Cancel(id) => cancel_permission(state, id),
+            }
             dirty = true;
         }
 
@@ -567,7 +629,21 @@ fn exec_event_loop(
             match event_rx.try_recv() {
                 Ok(ExecEvent::PtyOutput(bytes)) => {
                     state.last_pty_activity = Instant::now();
+                    let focus_reporting_was_on = state.focus_reporting_mode;
                     state.observe_pty_modes(&bytes);
+                    // The child just enabled ?1004 focus reporting. A real
+                    // terminal reports the current focus state on enable, so
+                    // do the same — Claude Code waits on this focus-in before
+                    // it will generate prompt suggestions.
+                    if !focus_reporting_was_on && state.focus_reporting_mode {
+                        dbg_log(&format!(
+                            "child enabled ?1004; synthesizing focus report focused={}",
+                            state.host_focused
+                        ));
+                        let _ = pty_tx.send(PtyInput::Bytes(
+                            focus_report_bytes(state.host_focused).to_vec(),
+                        ));
+                    }
                     state.fullscreen_scrollback.observe_bytes(&bytes);
                     let pre_alt = state.vterm.screen().alternate_screen();
                     process_pty_bytes_resilient(state, &bytes);
@@ -719,12 +795,39 @@ fn enqueue_permission(state: &mut ExecState, perm: PermissionEvent) {
         request: perm.request,
         response_tx: perm.response_tx,
         show_inspect: false,
+        scope: None,
+        show_help: false,
     };
     if state.permission_dialog.is_some() {
         state.pending_permissions.push(dialog);
     } else {
         state.permission_dialog = Some(dialog);
     }
+}
+
+/// Drop a stale permission dialog whose review the supervisor abandoned
+/// (timeout). The active dialog is replaced by the next queued one; a
+/// queued dialog is removed in place. A decision the user is about to make
+/// on a cancelled dialog would be sent into a closed channel and ignored —
+/// dropping the dialog makes that visible instead of silent.
+fn cancel_permission(state: &mut ExecState, id: uuid::Uuid) {
+    dbg_log(&format!(
+        "PermissionCancel: id={id}, pending={}",
+        state.pending_permissions.len(),
+    ));
+    if state
+        .permission_dialog
+        .as_ref()
+        .is_some_and(|d| d.request.id == id)
+    {
+        state.permission_dialog = if state.pending_permissions.is_empty() {
+            None
+        } else {
+            Some(state.pending_permissions.remove(0))
+        };
+        return;
+    }
+    state.pending_permissions.retain(|d| d.request.id != id);
 }
 
 /// Handle a single keyboard/mouse/resize event from the input thread.
@@ -748,15 +851,80 @@ fn handle_input_event(
                         if last.elapsed() < Duration::from_secs(1) {
                             // Deny all pending dialogs before exiting.
                             if let Some(dialog) = state.permission_dialog.take() {
-                                let _ = dialog.response_tx.send("deny");
+                                let _ = dialog.response_tx.send(PermissionReviewAction::Deny);
                             }
                             for dialog in state.pending_permissions.drain(..) {
-                                let _ = dialog.response_tx.send("deny");
+                                let _ = dialog.response_tx.send(PermissionReviewAction::Deny);
                             }
                             return Ok(InputOutcome::Exit);
                         }
                     }
                     state.last_ctrl_c = Some(Instant::now());
+                    *dirty = true;
+                    return Ok(InputOutcome::Continue);
+                }
+                // Help overlay: modal — only closing keys act; everything
+                // else is swallowed so a decision can't be made blind.
+                if state
+                    .permission_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.show_help)
+                {
+                    if let Some(dialog) = state.permission_dialog.as_mut() {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char('h')
+                                | KeyCode::Char('H')
+                                | KeyCode::Char('q')
+                                | KeyCode::Esc
+                        ) {
+                            dialog.show_help = false;
+                        }
+                    }
+                    *dirty = true;
+                    return Ok(InputOutcome::Continue);
+                }
+                if state
+                    .permission_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.scope.is_some())
+                {
+                    let mut applied = None;
+                    if let Some(dialog) = state.permission_dialog.as_mut() {
+                        let scope = dialog.scope.as_mut().expect("scope checked above");
+                        match key.code {
+                            KeyCode::Esc => dialog.scope = None,
+                            KeyCode::Enter => {
+                                applied = scope.apply(&dialog.request);
+                            }
+                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                scope.focus_previous();
+                            }
+                            KeyCode::Tab | KeyCode::Down => scope.focus_next(),
+                            KeyCode::BackTab | KeyCode::Up => scope.focus_previous(),
+                            KeyCode::Backspace if scope.directory_focused() => {
+                                scope.pop_directory_char();
+                            }
+                            KeyCode::Char('u')
+                                if scope.directory_focused()
+                                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                scope.clear_directory();
+                            }
+                            KeyCode::Char(' ') if !scope.directory_focused() => {
+                                scope.toggle_focused();
+                            }
+                            KeyCode::Char(ch)
+                                if scope.directory_focused() && key.modifiers.is_empty() =>
+                            {
+                                scope.push_directory_char(ch);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(action) = applied {
+                        dismiss_permission_dialog(state, action);
+                    }
                     *dirty = true;
                     return Ok(InputOutcome::Continue);
                 }
@@ -766,6 +934,20 @@ fn handle_input_event(
                             dialog.show_inspect = !dialog.show_inspect;
                         }
                     }
+                    KeyCode::Char('h') | KeyCode::Char('H') => {
+                        if let Some(dialog) = state.permission_dialog.as_mut() {
+                            dialog.show_help = true;
+                        }
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if let Some(dialog) = state.permission_dialog.as_mut() {
+                            if dialog.request.score <= 8.0 {
+                                dialog.scope = widgets::permission::ScopeDialogState::for_request(
+                                    &dialog.request,
+                                );
+                            }
+                        }
+                    }
                     _ => {
                         let is_deny_dialog = state
                             .permission_dialog
@@ -773,34 +955,26 @@ fn handle_input_event(
                             .map(|dialog| dialog.request.score > 8.0)
                             .unwrap_or(false);
                         let action = match key.code {
-                            KeyCode::Char('a') | KeyCode::Char('A') => Some("approve"),
-                            KeyCode::Char('d') | KeyCode::Char('D') => Some("deny"),
-                            KeyCode::Char('l') | KeyCode::Char('L') => Some("approve_and_learn"),
-                            KeyCode::Char('t') | KeyCode::Char('T') => Some("deny_and_terminate"),
-                            KeyCode::Char('c') | KeyCode::Char('C') if is_deny_dialog => {
-                                Some("deny")
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                Some(PermissionReviewAction::Approve)
                             }
-                            KeyCode::Esc => Some("deny"),
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                Some(PermissionReviewAction::Deny)
+                            }
+                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                                Some(PermissionReviewAction::ApproveAndLearn)
+                            }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                Some(PermissionReviewAction::DenyAndTerminate)
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') if is_deny_dialog => {
+                                Some(PermissionReviewAction::Deny)
+                            }
+                            KeyCode::Esc => Some(PermissionReviewAction::Deny),
                             _ => None,
                         };
                         if let Some(action) = action {
-                            if let Some(dialog) = state.permission_dialog.take() {
-                                dbg_log(&format!(
-                                    "Dialog dismiss: action={action}, pending={}",
-                                    state.pending_permissions.len(),
-                                ));
-                                // Send the review decision back to the supervisor.
-                                // The intercepted syscall thread will be resumed
-                                // (allowed or denied) — no SIGCONT needed since
-                                // the process was never frozen.
-                                let _ = dialog.response_tx.send(action);
-                            }
-                            // Advance to the next queued dialog, if any.
-                            state.permission_dialog = if state.pending_permissions.is_empty() {
-                                None
-                            } else {
-                                Some(state.pending_permissions.remove(0))
-                            };
+                            dismiss_permission_dialog(state, action);
                         }
                     }
                 }
@@ -925,10 +1099,43 @@ fn handle_input_event(
             let vterm_rows = rows.saturating_sub(MINIMAL_CHROME_ROWS).max(4);
             resize_exec_surface(state, pty_tx, vterm_rows);
         }
+        Event::FocusGained | Event::FocusLost => {
+            let focused = matches!(ev, Event::FocusGained);
+            dbg_log(&format!(
+                "host focus event: focused={focused} child_1004={}",
+                state.focus_reporting_mode
+            ));
+            state.host_focused = focused;
+            // Relay host focus transitions, but only while the child has
+            // ?1004 reporting on — a tool that never asked would see stray
+            // `CSI I`/`CSI O` bytes as keyboard input.
+            if state.focus_reporting_mode {
+                let _ = pty_tx.send(PtyInput::Bytes(focus_report_bytes(focused).to_vec()));
+            }
+            return Ok(InputOutcome::Continue);
+        }
         _ => {}
     }
     *dirty = true;
     Ok(InputOutcome::Continue)
+}
+
+fn dismiss_permission_dialog(state: &mut ExecState, action: PermissionReviewAction) {
+    if let Some(dialog) = state.permission_dialog.take() {
+        dbg_log(&format!(
+            "Dialog dismiss: action={}, pending={}",
+            action.to_storage_value(),
+            state.pending_permissions.len(),
+        ));
+        // Send the review decision back to the supervisor. The intercepted
+        // syscall thread resumes after the digest status is updated.
+        let _ = dialog.response_tx.send(action);
+    }
+    state.permission_dialog = if state.pending_permissions.is_empty() {
+        None
+    } else {
+        Some(state.pending_permissions.remove(0))
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,13 +1632,29 @@ fn render_exec(frame: &mut Frame, state: &ExecState) {
             height: overlay_height,
         };
         frame.render_widget(Clear, overlay_area);
-        widgets::permission::render_permission_panel(
-            frame,
-            overlay_area,
-            &dialog.request,
-            dialog.request.score > 8.0,
-            dialog.show_inspect,
-        );
+        if dialog.show_help {
+            widgets::permission::render_permission_help_panel(
+                frame,
+                overlay_area,
+                &dialog.request,
+                dialog.request.score > 8.0,
+            );
+        } else if let Some(scope) = &dialog.scope {
+            widgets::permission::render_scope_permission_panel(
+                frame,
+                overlay_area,
+                &dialog.request,
+                scope,
+            );
+        } else {
+            widgets::permission::render_permission_panel(
+                frame,
+                overlay_area,
+                &dialog.request,
+                dialog.request.score > 8.0,
+                dialog.show_inspect,
+            );
+        }
     }
 }
 
@@ -2102,6 +2325,41 @@ mod tests {
     }
 
     #[test]
+    fn focus_reporting_mode_toggles_on_1004_sequences() {
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        assert!(!state.focus_reporting_mode);
+
+        state.observe_pty_modes(b"\x1b[?1004h");
+        assert!(state.focus_reporting_mode);
+
+        state.observe_pty_modes(b"\x1b[?1004l");
+        assert!(!state.focus_reporting_mode);
+
+        // Split across chunks, like Claude Code's startup burst.
+        state.observe_pty_modes(b"\x1b[?10");
+        state.observe_pty_modes(b"04h");
+        assert!(state.focus_reporting_mode);
+    }
+
+    #[test]
+    fn focus_reporting_and_alternate_scroll_track_independently() {
+        let mut state = ExecState::new("test".into(), "default".into(), 1, 24, 80, 0);
+        state.observe_pty_modes(b"\x1b[?1004h\x1b[?1007h");
+        assert!(state.focus_reporting_mode);
+        assert!(state.alternate_scroll_mode);
+
+        state.observe_pty_modes(b"\x1b[?1007l");
+        assert!(state.focus_reporting_mode);
+        assert!(!state.alternate_scroll_mode);
+    }
+
+    #[test]
+    fn focus_report_bytes_match_terminal_encoding() {
+        assert_eq!(focus_report_bytes(true), b"\x1b[I");
+        assert_eq!(focus_report_bytes(false), b"\x1b[O");
+    }
+
+    #[test]
     fn codex_mouse_wheel_forwards_sgr_event_not_arrow_keys() {
         // Codex enables raw mouse reporting (mode 1006) and handles
         // wheel events natively in its TUI. grith must forward the
@@ -2260,13 +2518,17 @@ mod tests {
                 score: 5.0,
                 filters: vec![],
                 reasons: vec![],
+                decision_reason: String::new(),
                 context: String::new(),
                 severity: "medium".into(),
                 item_number: 1,
                 total_items: 1,
+                scope_enabled: true,
             },
             response_tx: tx,
             show_inspect: false,
+            scope: None,
+            show_help: false,
         });
 
         // Content is still live and visible behind the dialog overlay
@@ -2311,17 +2573,98 @@ mod tests {
         );
     }
 
+    fn dialog_with_id(id: uuid::Uuid) -> PermissionDialog {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        PermissionDialog {
+            request: super::super::state::PermissionRequest {
+                id,
+                tool: "FileWrite".into(),
+                call_type: "FileWrite".into(),
+                args: "/tmp/test".into(),
+                score: 5.0,
+                filters: vec![],
+                reasons: vec![],
+                decision_reason: String::new(),
+                context: String::new(),
+                severity: "medium".into(),
+                item_number: 1,
+                total_items: 1,
+                scope_enabled: true,
+            },
+            response_tx: tx,
+            show_inspect: false,
+            scope: None,
+            show_help: false,
+        }
+    }
+
+    /// Cancelling the ACTIVE dialog promotes the next queued prompt; the
+    /// stale one never lingers on screen soaking up an answer that would go
+    /// nowhere.
+    #[test]
+    fn cancel_active_dialog_promotes_next_pending() {
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1234, 30, 80, 0);
+        let stale = uuid::Uuid::new_v4();
+        let queued = uuid::Uuid::new_v4();
+        state.permission_dialog = Some(dialog_with_id(stale));
+        state.pending_permissions.push(dialog_with_id(queued));
+
+        cancel_permission(&mut state, stale);
+
+        assert_eq!(
+            state.permission_dialog.as_ref().map(|d| d.request.id),
+            Some(queued),
+            "the queued prompt must surface when the stale one is cancelled"
+        );
+        assert!(state.pending_permissions.is_empty());
+    }
+
+    /// Cancelling a QUEUED dialog removes it in place; the active dialog is
+    /// untouched. Cancelling an unknown id is a no-op.
+    #[test]
+    fn cancel_queued_dialog_removes_in_place() {
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1234, 30, 80, 0);
+        let active = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        state.permission_dialog = Some(dialog_with_id(active));
+        state.pending_permissions.push(dialog_with_id(stale));
+
+        cancel_permission(&mut state, stale);
+        assert_eq!(
+            state.permission_dialog.as_ref().map(|d| d.request.id),
+            Some(active)
+        );
+        assert!(state.pending_permissions.is_empty());
+
+        // Unknown id: nothing changes.
+        cancel_permission(&mut state, uuid::Uuid::new_v4());
+        assert_eq!(
+            state.permission_dialog.as_ref().map(|d| d.request.id),
+            Some(active)
+        );
+    }
+
+    /// Cancelling the last dialog leaves no dialog showing.
+    #[test]
+    fn cancel_last_dialog_clears_overlay() {
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1234, 30, 80, 0);
+        let stale = uuid::Uuid::new_v4();
+        state.permission_dialog = Some(dialog_with_id(stale));
+
+        cancel_permission(&mut state, stale);
+        assert!(state.permission_dialog.is_none());
+        assert!(state.pending_permissions.is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Fullscreen-repaint scrollback integration tests (Phase F).
     // -----------------------------------------------------------------------
 
-    /// Drive `state.fullscreen_scrollback` end-to-end through bytes that
-    /// emulate a repainting TUI: an initial frame is committed via a
-    /// synchronized-output batch, then a second frame is rendered the same
-    /// way. After scrolling back one frame, the rendered panel must reflect
-    /// the older frame's content rather than the latest live screen.
+    /// Drive `state.fullscreen_scrollback` end-to-end through two overlapping
+    /// Codex-style repaints. Scrolling back must reveal the row displaced from
+    /// the first screen without duplicating the rows present in both screens.
     #[test]
-    fn fullscreen_history_renders_older_frame_when_scrolled_back() {
+    fn fullscreen_history_reconstructs_overlapping_codex_repaints() {
         let total_rows = 24u16;
         let mut state = ExecState::new("codex".into(), "codex".into(), 7777, total_rows, 80, 0);
         state.screen_populated = true;
@@ -2333,36 +2676,44 @@ mod tests {
                 .capture_if_boundary_reached(s.vterm.screen(), s.last_pty_activity);
         };
 
-        // Frame 1: enter alt screen, clear, home, type a unique marker,
-        // close sync update — this should trigger one capture.
+        // Frame 1 contains one row that will leave the viewport plus three
+        // stable transcript rows.
         emit(
             &mut state,
-            b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[H\x1b[1;24rFRAME_ONE\x1b[?2026l",
+            b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[H\x1b[1;24r\
+              OLDEST_ROW\r\nSHARED_ALPHA\r\nSHARED_BETA\r\nSHARED_GAMMA\x1b[?2026l",
         );
         assert!(state.fullscreen_scrollback.repaint_mode());
         assert_eq!(state.fullscreen_scrollback.frames_pushed(), 1);
 
-        // Frame 2: another sync batch with different content. Capture again.
-        emit(&mut state, b"\x1b[?2026h\x1b[2J\x1b[HFRAME_TWO\x1b[?2026l");
+        // Frame 2 moves the shared rows upward and adds one new bottom row.
+        emit(
+            &mut state,
+            b"\x1b[?2026h\x1b[2J\x1b[H\
+              SHARED_ALPHA\r\nSHARED_BETA\r\nSHARED_GAMMA\r\nNEWEST_ROW\x1b[?2026l",
+        );
         assert_eq!(state.fullscreen_scrollback.frames_pushed(), 2);
 
-        // Live view shows FRAME_TWO.
+        // Live rendering is still the untouched vt100 screen.
         let live = render_terminal_panel(&state);
         assert!(
-            live.contains("FRAME_TWO"),
+            live.contains("NEWEST_ROW"),
             "live screen should show latest frame, got:\n{live}"
         );
-        assert!(!live.contains("FRAME_ONE"));
+        assert!(!live.contains("OLDEST_ROW"));
 
-        // Scrolling back via scroll_offset drives the synthetic-parser
-        // render path. After scrolling far enough back, FRAME_ONE's
-        // content should appear in the rendered panel.
+        // Scrolling to the oldest reconstructed row surfaces OLDEST_ROW.
         let viewport_rows = state.vterm_rows as usize;
         state.scroll_offset = state.fullscreen_scrollback.max_scroll_offset(viewport_rows);
         let backed = render_terminal_panel(&state);
         assert!(
-            backed.contains("FRAME_ONE"),
+            backed.contains("OLDEST_ROW"),
             "scrolling to top should reveal first frame's content, got:\n{backed}"
+        );
+        assert_eq!(
+            backed.matches("SHARED_ALPHA").count(),
+            1,
+            "overlapping transcript rows must not repeat in scrollback:\n{backed}"
         );
     }
 
@@ -2490,5 +2841,38 @@ mod tests {
         assert!(!state.fullscreen_scrollback.is_empty());
         // ...but Claude Code is excluded, so it uses vt100 line scrollback.
         assert!(!state.use_fullscreen_history());
+    }
+
+    /// Protect the actual Claude wheel/render path, not only the routing
+    /// predicate: even after Claude trips repaint detection and captures a
+    /// frame, wheel-up must reveal its native vt100 transcript.
+    #[test]
+    fn claude_code_wheel_still_renders_native_line_scrollback() {
+        let mut state = ExecState::new("claude".into(), "claude-code".into(), 1234, 24, 80, 0);
+        for i in 0..40 {
+            state
+                .vterm
+                .process(format!("CLAUDE_TRANSCRIPT_{i:02}\r\n").as_bytes());
+        }
+        state.screen_populated = true;
+
+        // Claude's input/status repaint can activate frame capture, but must
+        // never switch this profile away from native line scrollback.
+        state
+            .fullscreen_scrollback
+            .observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r\x1b[?2026h\x1b[?2026l");
+        state
+            .fullscreen_scrollback
+            .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+        assert!(!state.use_fullscreen_history());
+
+        let mut dirty = false;
+        scroll_local_scrollback(&mut state, MouseEventKind::ScrollUp, &mut dirty);
+        let backed = render_terminal_panel(&state);
+        assert!(dirty);
+        assert!(
+            backed.contains("CLAUDE_TRANSCRIPT_23"),
+            "Claude wheel must render native vt100 history, got:\n{backed}"
+        );
     }
 }

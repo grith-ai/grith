@@ -48,4 +48,16 @@ ignore = [
     # bump with that). Used by grith-notify + grith-digest for email
     # delivery, not on the hot security-evaluation path.
     "RUSTSEC-2026-0141",
+
+    # ----- quick-xml 0.37.5 (transitive, Windows-only toast notifications) -----
+    # RUSTSEC-2026-0194 (quadratic-time duplicate-attribute check) and
+    # RUSTSEC-2026-0195 (unbounded namespace allocation → memory-exhaustion
+    # DoS) are XML-parsing DoS bugs. quick-xml is pulled ONLY via
+    # grith-notify → notify-rust → tauri-winrt-notification (Windows toast
+    # notifications) — unreachable on Linux builds and never on an
+    # untrusted-XML path. No semver-compatible patch (0.37.5 is the latest
+    # 0.37.x; the fix is in a later minor). Remove when notify-rust bumps its
+    # quick-xml; folds into the same dep-bump sweep as the entries above.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]

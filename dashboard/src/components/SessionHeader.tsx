@@ -28,15 +28,15 @@ export function SessionHeader({ sessionId, basePath }: SessionHeaderProps) {
     <div className="mb-4 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm">
       {summary ? (
         <>
-          <span className="font-mono text-grith-text font-medium">
+          <span className="font-code text-text font-medium">
             {summary.tool_name}
           </span>
           {summary.project_name && (
-            <span className="text-grith-muted">· {summary.project_name}</span>
+            <span className="text-text-secondary">· {summary.project_name}</span>
           )}
-          <span className="text-grith-muted text-xs">pid {summary.root_pid}</span>
+          <span className="text-text-secondary text-xs">pid {summary.root_pid}</span>
           <span
-            className="text-grith-dim text-xs font-mono truncate"
+            className="text-text-dim text-xs font-code truncate"
             title={sessionId}
           >
             {sessionId.slice(0, 8)}…
@@ -44,7 +44,7 @@ export function SessionHeader({ sessionId, basePath }: SessionHeaderProps) {
         </>
       ) : (
         <span
-          className="font-mono text-xs text-grith-dim truncate"
+          className="font-code text-xs text-text-dim truncate"
           title={sessionId}
         >
           Session {sessionId.slice(0, 8)}… (not in active registry)
@@ -52,7 +52,7 @@ export function SessionHeader({ sessionId, basePath }: SessionHeaderProps) {
       )}
       <Link
         to={basePath}
-        className="ml-auto text-xs text-grith-muted hover:text-grith-text"
+        className="ml-auto text-xs text-text-secondary hover:text-text"
       >
         Switch session ↗
       </Link>

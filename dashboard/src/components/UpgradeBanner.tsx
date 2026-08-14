@@ -19,18 +19,18 @@ export function UpgradeBanner({ tierState }: { tierState: TierState }) {
 
   const isPro = tierState.tierKey === "pro";
   const headline = isPro
-    ? "You're on Pro — unlock org-wide policy & SSO with Enterprise"
+    ? "You're on Pro - unlock org-wide policy & SSO with Enterprise"
     : "You're seeing the last 24 hours. Pro keeps 90 days and watches for anomalies.";
   const cta = isPro ? "Talk to sales" : "Upgrade to Pro";
 
   return (
     <a
       href={tierState.billingUrl}
-      className="group relative block overflow-hidden rounded-xl border border-green/40 bg-gradient-to-r from-green-light to-white px-5 py-4 mb-8 transition-colors hover:border-green"
+      className="group relative block overflow-hidden rounded-card border border-green-border bg-green-light px-5 py-4 mb-8 transition-colors hover:border-green"
     >
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-3 min-w-0">
-          <span className="flex-shrink-0 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-green/15 text-green">
+          <span className="flex-shrink-0 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-green-light text-accent-text">
             <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" aria-hidden>
               <path
                 d="M12 3l2.5 5.2 5.7.8-4.1 4 1 5.7L12 21l-5.1 2.5 1-5.7-4.1-4 5.7-.8L12 3z"
@@ -41,17 +41,17 @@ export function UpgradeBanner({ tierState }: { tierState: TierState }) {
             </svg>
           </span>
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-grith-text truncate">
+            <p className="text-sm font-semibold text-text truncate">
               {headline}
             </p>
             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
               {PERKS.map((p) => (
                 <span
                   key={p}
-                  className="inline-flex items-center gap-1 text-[11px] text-grith-muted"
+                  className="inline-flex items-center gap-1 text-[11px] text-text-secondary"
                 >
                   <svg
-                    className="h-3 w-3 text-green"
+                    className="h-3 w-3 text-accent-text"
                     viewBox="0 0 24 24"
                     fill="none"
                     aria-hidden
@@ -70,7 +70,7 @@ export function UpgradeBanner({ tierState }: { tierState: TierState }) {
             </div>
           </div>
         </div>
-        <span className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-lg bg-green px-4 py-2 text-xs font-semibold text-white transition-transform group-hover:translate-x-0.5">
+        <span className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-btn bg-green px-4 py-2 text-xs font-heading font-semibold text-accent-ink transition-transform group-hover:translate-x-0.5">
           {cta}
           <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" aria-hidden>
             <path

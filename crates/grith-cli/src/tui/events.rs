@@ -370,12 +370,12 @@ mod tests {
         let decision = Decision::Deny {
             score: 9.2,
             filters: vec![FilterHit {
-                name: "path_match".to_string(),
+                name: "path-match".to_string(),
                 delta: 5.0,
             }],
         };
         let detail = format_intercept_detail(&decision);
-        assert!(detail.contains("path_match +5.0"));
+        assert!(detail.contains("path-match +5.0"));
         assert!(detail.contains("score 9.2"));
     }
 

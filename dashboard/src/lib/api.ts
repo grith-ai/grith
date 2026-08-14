@@ -32,6 +32,7 @@ import type {
   SessionListResponse,
   LicenseStatusResponse,
   TierResponse,
+  OnboardingStatus,
 } from "@/types/api";
 import { csrfHeaders } from "./csrf";
 
@@ -200,6 +201,21 @@ export function learnDigest(
   });
 }
 
+/**
+ * Clear all actionable digest items (pending + escalated) in one atomic call.
+ * Dismisses them without approving (executing) or denying — for wiping a
+ * backlog of stale items. Returns how many were cleared.
+ */
+export function clearAllDigest(): Promise<{
+  status: string;
+  cleared: number;
+}> {
+  return request<{ status: string; cleared: number }>(
+    `/api/digest/clear-all`,
+    { method: "POST" },
+  );
+}
+
 export function escalateDigest(
   id: string,
   notes?: string,
@@ -247,6 +263,16 @@ export function getTier(): Promise<TierResponse> {
 
 export function getLicenseStatus(): Promise<LicenseStatusResponse> {
   return request<LicenseStatusResponse>("/api/license/status");
+}
+
+export function getOnboardingStatus(): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/onboarding/status");
+}
+
+export function dismissOnboarding(): Promise<{ dismissed: boolean }> {
+  return request<{ dismissed: boolean }>("/api/onboarding/dismiss", {
+    method: "POST",
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@
 
 import { useMemo } from "react";
 
+import { chartColors } from "@/lib/chartPalette";
+
 export interface SessionRow {
   id: string;
   label: string;
@@ -30,7 +32,7 @@ export function SessionComparison({ sessions }: { sessions: SessionRow[] }) {
 
   if (rows.length === 0) {
     return (
-      <p className="py-4 text-center text-xs text-grith-muted">
+      <p className="py-4 text-center text-xs text-text-secondary">
         No session activity to compare yet.
       </p>
     );
@@ -45,26 +47,26 @@ export function SessionComparison({ sessions }: { sessions: SessionRow[] }) {
         return (
           <div key={s.id}>
             <div className="mb-1 flex items-baseline justify-between gap-2">
-              <span className="truncate text-xs font-medium text-grith-text">
+              <span className="truncate text-xs font-medium text-text">
                 {s.label}
               </span>
-              <span className="flex flex-shrink-0 items-center gap-2 font-mono text-[11px]">
-                <span className="text-status-allow-green">{allowPct.toFixed(0)}%</span>
+              <span className="flex flex-shrink-0 items-center gap-2 font-code text-[11px]">
+                <span className="text-accent-text">{allowPct.toFixed(0)}%</span>
                 {s.deny > 0 && (
-                  <span className="text-status-deny-red">{s.deny} denied</span>
+                  <span className="text-danger-text">{s.deny} denied</span>
                 )}
-                <span className="text-grith-dim">{s.total.toLocaleString()}</span>
+                <span className="text-text-dim">{s.total.toLocaleString()}</span>
               </span>
             </div>
-            <div className="flex h-2.5 overflow-hidden rounded-full bg-grith-surface">
+            <div className="flex h-2.5 overflow-hidden rounded-full bg-border">
               {allowPct > 0 && (
-                <div style={{ width: `${allowPct}%`, backgroundColor: "#00a85a" }} />
+                <div style={{ width: `${allowPct}%`, backgroundColor: chartColors.accent }} />
               )}
               {queuePct > 0 && (
-                <div style={{ width: `${queuePct}%`, backgroundColor: "#bf8700" }} />
+                <div style={{ width: `${queuePct}%`, backgroundColor: chartColors.warning }} />
               )}
               {denyPct > 0 && (
-                <div style={{ width: `${denyPct}%`, backgroundColor: "#d1242f" }} />
+                <div style={{ width: `${denyPct}%`, backgroundColor: chartColors.danger }} />
               )}
             </div>
           </div>

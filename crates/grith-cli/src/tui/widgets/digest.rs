@@ -134,11 +134,13 @@ mod tests {
                 delta: 2.0,
             }],
             reasons: vec!["Package install requires review".to_string()],
+            decision_reason: "Package install requires review".to_string(),
             context: "test".to_string(),
             severity: "medium".to_string(),
             call_type: "shell".to_string(),
             item_number: 1,
             total_items: 1,
+            scope_enabled: false,
         });
         terminal
             .draw(|frame| render_digest_overlay(frame, frame.area(), &state))

@@ -535,11 +535,33 @@ fn all_security_relevant_syscalls_map_or_filter() {
         (SyscallKind::PipeCreate, None),
         (SyscallKind::SocketPair, None),
         (
+            // Go-live review B13: an explicit remote destination on an
+            // unconnected datagram socket used to be filtered ("for now"),
+            // which let `sendto(fd, secret, ..., &attacker_addr, ...)` egress
+            // unevaluated and unaudited. It is scored as egress now.
             SyscallKind::NetSendTo {
                 address: "1.2.3.4".into(),
                 port: 53,
             },
-            None, // Filtered for now
+            Some("NetConnect"),
+        ),
+        (
+            // Still filtered: a connected send carries no explicit
+            // destination and is surfaced against its recorded peer before
+            // classification, so scoring it here would double-count.
+            SyscallKind::NetSendTo {
+                address: String::new(),
+                port: 0,
+            },
+            None,
+        ),
+        (
+            // Still filtered: loopback is not egress.
+            SyscallKind::NetSendTo {
+                address: "127.0.0.53".into(),
+                port: 53,
+            },
+            None,
         ),
     ];
 

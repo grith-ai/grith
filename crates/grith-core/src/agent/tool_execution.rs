@@ -25,6 +25,15 @@ const TRUNCATION_KEEP_CHARS: usize = 200;
 pub struct ToolCallContext<'a> {
     pub proxy: &'a grith_proxy::engine::SecurityProxy,
     pub audit_storage: &'a std::sync::Arc<std::sync::Mutex<grith_audit::AuditStorage>>,
+    /// B12 #78: whether this process owns the audit database (holds the writer
+    /// lock) and may write it directly. When false, records must be routed to
+    /// the owning daemon via [`ToolCallContext::audit_ingest`] instead of
+    /// hitting a read-only handle whose insert silently fails.
+    pub can_write_audit: bool,
+    /// Client to the daemon that owns the audit database, used to forward
+    /// records when this process is a Reader. `None` when unavailable — in
+    /// which case an unrecordable call fails closed rather than executing.
+    pub audit_ingest: Option<&'a crate::daemon::client::DaemonClient>,
     pub digest_queue: &'a std::sync::Arc<grith_digest::DigestQueue>,
     pub dlp_redactor: &'a grith_proxy::filters::dlp_gate::DlpRedactor,
     pub correlation_tracker: &'a CorrelationTracker,
@@ -48,6 +57,8 @@ pub async fn execute_tool_call(
 ) -> String {
     let proxy = ctx.proxy;
     let audit_storage = ctx.audit_storage;
+    let can_write_audit = ctx.can_write_audit;
+    let audit_ingest = ctx.audit_ingest;
     let digest_queue = ctx.digest_queue;
     let dlp_redactor = ctx.dlp_redactor;
     let correlation_tracker = ctx.correlation_tracker;
@@ -135,10 +146,24 @@ pub async fn execute_tool_call(
     if let Some(id) = correlation_id {
         audit_record = audit_record.with_correlation(id);
     }
-    if let Ok(storage) = audit_storage.lock() {
-        if let Err(e) = storage.insert_record(&audit_record) {
-            tracing::error!(error = %e, "failed to log audit record");
-        }
+    // B12 #78: persist the evaluation record BEFORE enforcing the decision.
+    // As a Reader (a daemon owns the audit DB), a direct insert would fail
+    // read-only and, previously, was logged and dropped — leaving the security
+    // audit trail with silent holes. Route to the owning daemon instead, and
+    // if the record cannot be recorded either way, fail closed: refuse to run
+    // the operation rather than execute it unlogged. The decision is enforced
+    // below (`match &decision.action`), so returning here never runs the call.
+    if let Err(e) =
+        persist_audit_record(audit_storage, can_write_audit, audit_ingest, &audit_record).await
+    {
+        tracing::error!(
+            error = %e,
+            "refusing to execute tool call: its audit record could not be persisted"
+        );
+        return format!(
+            "Error: refusing to execute this tool call because grith could not record it \
+             in the audit log ({e}). grith does not run operations it cannot audit."
+        );
     }
 
     // Broadcast event to dashboard (in-process WebSocket or remote HTTP POST)
@@ -193,6 +218,37 @@ pub async fn execute_tool_call(
     }
 }
 
+/// B12 #78: persist an audit record without ever silently dropping it.
+///
+/// `grith run` may execute while a daemon owns the audit database, in which
+/// case this process is a Reader and a direct insert fails read-only. Route
+/// the record to the owning daemon over IPC instead. When neither a local
+/// write nor a forward can record the call, return an error so the caller
+/// fails closed rather than proceeding as if the call had been logged.
+pub(crate) async fn persist_audit_record(
+    audit_storage: &std::sync::Arc<std::sync::Mutex<grith_audit::AuditStorage>>,
+    can_write_local: bool,
+    forward: Option<&crate::daemon::client::DaemonClient>,
+    record: &grith_audit::AuditRecord,
+) -> anyhow::Result<()> {
+    if can_write_local {
+        let storage = audit_storage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audit storage lock poisoned"))?;
+        storage.insert_record(record)?;
+        return Ok(());
+    }
+    match forward {
+        Some(client) => client.ingest_audit(record).await.map_err(|e| {
+            anyhow::anyhow!("failed to forward audit record to the owning daemon: {e}")
+        }),
+        None => Err(anyhow::anyhow!(
+            "this process does not own the audit database and no owning daemon is reachable \
+             to receive the record"
+        )),
+    }
+}
+
 async fn handle_allowed_call(
     decision: &grith_proxy::types::ProxyDecision,
     call_type: &grith_proxy::types::ToolCallType,
@@ -243,6 +299,8 @@ async fn handle_queued_call(
         session_id: Some(ctx.session_id),
         tool_call_type: ctx.call_type.to_string(),
         arguments_summary: summary,
+        decision_reason: (!decision.decision_reason.is_empty())
+            .then(|| decision.decision_reason.clone()),
         composite_score: decision.composite_score,
         severity: grith_digest::types::ScoreSeverity::from_score(decision.composite_score),
         filter_breakdown: decision
@@ -416,7 +474,23 @@ fn handle_denied_call(
 }
 
 /// Parse an LLM tool call into a proxy ToolCallType and a human-readable description.
+///
+/// Paths are resolved (`..`, `.` and symlinks) before the call is returned, so
+/// the proxy scores what will actually be touched and `execute_operation`
+/// then acts on that same resolved path — closing the laundering hole in
+/// go-live review B3 and the score-one-path/execute-another window with it.
+///
+/// The description keeps the path the model asked for, since that is what the
+/// user recognises in the transcript; the audit record carries the resolved
+/// form via the call type.
 pub fn parse_tool_call(
+    tool_call: &grith_llm::ToolCall,
+) -> anyhow::Result<(grith_proxy::types::ToolCallType, String)> {
+    let (call_type, description) = parse_tool_call_unresolved(tool_call)?;
+    Ok((call_type.resolve_paths(), description))
+}
+
+fn parse_tool_call_unresolved(
     tool_call: &grith_llm::ToolCall,
 ) -> anyhow::Result<(grith_proxy::types::ToolCallType, String)> {
     let args = &tool_call.arguments;
@@ -729,7 +803,7 @@ pub async fn execute_operation(
         }
         grith_proxy::types::ToolCallType::HttpRequest { method, url } => {
             let client = reqwest::Client::new();
-            let builder = match method.to_uppercase().as_str() {
+            let mut builder = match method.to_uppercase().as_str() {
                 "GET" => client.get(url),
                 "POST" => client.post(url),
                 "PUT" => client.put(url),
@@ -738,16 +812,31 @@ pub async fn execute_operation(
                 "HEAD" => client.head(url),
                 _ => return format!("Unsupported HTTP method: {method}"),
             };
+            // Attach the request body for body-bearing methods. It is already in
+            // `ctx.arguments` (== the tool call args), so secret_scan / dlp_gate
+            // have already scanned it before this executes (C1) — a proxy DENY
+            // never reaches this path.
+            if let Some(body) = arguments.get("body").and_then(|v| v.as_str()) {
+                if matches!(method.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+                    builder = builder.body(body.to_string());
+                }
+            }
             match builder.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     match resp.text().await {
                         Ok(body) if body.len() > 10000 => {
+                            // Truncate at a UTF-8 char boundary — a raw `&body[..5000]`
+                            // byte slice panics when byte 5000 lands mid-codepoint.
+                            let mut end = 5000.min(body.len());
+                            while end > 0 && !body.is_char_boundary(end) {
+                                end -= 1;
+                            }
                             format!(
                                 "HTTP {} ({} bytes)\n{}...[truncated]",
                                 status,
                                 body.len(),
-                                &body[..5000]
+                                &body[..end]
                             )
                         }
                         Ok(body) => format!("HTTP {status}\n{body}"),
@@ -798,6 +887,18 @@ pub async fn execute_operation(
                 Ok(()) => format!("Renamed {old_path} -> {new_path}"),
                 Err(e) => format!("Error renaming {old_path} -> {new_path}: {e}"),
             }
+        }
+        grith_proxy::types::ToolCallType::FileLink {
+            target,
+            link_path,
+            symbolic,
+        } => {
+            // Supervisor-originated call type: the built-in agent exposes no
+            // link-creation tool, so this is only reachable if one is added
+            // later. Refuse rather than silently creating a link, since a
+            // link is a durable alias to data the proxy scored once.
+            let kind = if *symbolic { "symbolic" } else { "hard" };
+            format!("Link creation is not an executable operation for the built-in agent ({kind} link {link_path} -> {target})")
         }
         grith_proxy::types::ToolCallType::FileChmod { path, mode } => {
             #[cfg(unix)]
@@ -1142,5 +1243,55 @@ mod tests {
         };
         let res = execute_operation(&chmod, &serde_json::Value::Null).await;
         assert!(res.contains("not supported"));
+    }
+
+    fn sample_audit_record() -> grith_audit::AuditRecord {
+        grith_audit::AuditRecord::new(
+            uuid::Uuid::new_v4(),
+            "agent".into(),
+            "FileRead(/tmp/x)".into(),
+            &serde_json::json!({}),
+            0.0,
+            grith_audit::ProxyActionSummary::Allow,
+            vec![],
+            0.0,
+            None,
+        )
+    }
+
+    /// B12 #78: the Owner writes the record to its local database.
+    #[tokio::test]
+    async fn persist_audit_record_owner_writes_locally() {
+        use std::sync::{Arc, Mutex};
+        let storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let record = sample_audit_record();
+        persist_audit_record(&storage, true, None, &record)
+            .await
+            .expect("owner must write locally");
+        assert_eq!(storage.lock().unwrap().count().unwrap(), 1);
+    }
+
+    /// B12 #78: a Reader with no reachable owner fails closed — it returns an
+    /// error (so the caller refuses to run the call) and writes nothing
+    /// locally, rather than silently dropping the record.
+    #[tokio::test]
+    async fn persist_audit_record_reader_without_forward_fails_closed() {
+        use std::sync::{Arc, Mutex};
+        let storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let record = sample_audit_record();
+        let result = persist_audit_record(&storage, false, None, &record).await;
+        assert!(
+            result.is_err(),
+            "a reader with no forward client must fail closed"
+        );
+        assert_eq!(
+            storage.lock().unwrap().count().unwrap(),
+            0,
+            "fail-closed must not write locally"
+        );
     }
 }

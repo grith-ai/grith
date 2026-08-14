@@ -69,7 +69,7 @@ async fn assert_allowed(proxy: &SecurityProxy, call: ToolCallType) {
 /// routing action: the proxy routes with a strict `>` at the 3.0 boundary
 /// (`scoring.rs`), so a single filter contributing exactly 3.0 routes to Allow
 /// in isolation; production crosses the boundary via the additional filters
-/// (operation_risk, taint, …) that are out of scope for this filter-isolated
+/// (operation-risk, taint, …) that are out of scope for this filter-isolated
 /// test. The sensitive-band score is what this filter controls.
 async fn assert_in_sensitive_band(proxy: &SecurityProxy, call: ToolCallType) {
     let label = format!("{call:?}");

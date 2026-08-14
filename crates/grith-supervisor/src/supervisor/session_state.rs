@@ -55,6 +55,11 @@ pub struct SessionStats {
     pub total_denied: u64,
     /// Events filtered out as noise before reaching the proxy.
     pub total_filtered_noise: u64,
+    /// Foreign-ABI syscalls denied in this session. A tracee can loop such a
+    /// syscall ~30k times/second, so the durable audit record is throttled
+    /// (see `record_foreign_abi_denial`) while this counter records the true
+    /// total; it is the number the throttled records reference.
+    pub foreign_abi_denied: u64,
 }
 
 impl SessionStats {
@@ -69,6 +74,21 @@ impl SessionStats {
     /// signal that drives the session's idle age — noise must not reset idle.
     pub fn proxy_evals(&self) -> u64 {
         self.total_allowed + self.total_queued + self.total_denied
+    }
+
+    /// Record one foreign-ABI denial and decide whether it should write a
+    /// durable audit record.
+    ///
+    /// A foreign-ABI syscall grants no authority (it is always denied), so the
+    /// only value in the audit record is that the attempt happened — and a
+    /// tracee can force tens of thousands per second, which would evict
+    /// genuine records from the bounded audit channel. Full records for the
+    /// first few, then exponentially sparser (powers of two), keeps the
+    /// evidence that it is happening and its scale without the flood.
+    pub(crate) fn record_foreign_abi_denial(&mut self) -> bool {
+        self.foreign_abi_denied += 1;
+        let n = self.foreign_abi_denied;
+        n <= 8 || n.is_power_of_two()
     }
 }
 
@@ -125,12 +145,37 @@ pub struct SupervisorSession {
     /// session. Avoids spamming the log + audit DB on every 10s scan when
     /// the same tid stays stuck. Cleared at session end.
     pub wedge_reported_tids: std::collections::HashSet<u32>,
+    /// Provenance-synthesis dedup: process TGIDs for which we've already
+    /// emitted a spawn/provenance audit record. The first security-relevant
+    /// syscall from a TGID with no prior `ProcessSpawn` gets a synthesized
+    /// provenance record so the audit trail always answers "which actor did
+    /// this, and where did it come from" — including in-process engines that
+    /// never `execve` (e.g. an agent's code-execution runtime) and
+    /// `posix_spawn`'d children whose exec event slipped past tagging.
+    /// One entry per process; cleared at session end.
+    pub spawn_recorded: std::collections::HashSet<u32>,
     /// H2 Option 1: the supervised tool's own controlling terminal (e.g.
     /// `/dev/pts/3`), resolved once (lazily) from `/proc/<root_pid>/fd/0` and
     /// cached. `Some(None)` means "resolved, but not a pts" (redirected
     /// stdin). Used to distinguish writes to the tool's own terminal from
     /// writes injected into a sibling pane's pts.
     pub controlling_pts: std::sync::OnceLock<Option<String>>,
+    /// Deny-replay memory: exact call identities (the `ToolCallType`
+    /// Display string) the operator denied — or let time out — and when.
+    /// Consulted by `queue_and_wait` so a tool retrying the identical
+    /// operation inside the replay window is denied again without a fresh
+    /// prompt. Entries expire by timestamp (`deny_replay_seconds`); the map
+    /// only grows on human-reviewed outcomes, and expired entries are purged
+    /// on insert. Cleared with the session.
+    pub recent_denials: std::collections::HashMap<String, Instant>,
+    /// Approve-replay memory: exact call identities the operator approved
+    /// and when. Consulted by `queue_and_wait` so a tool retrying the
+    /// identical operation inside the replay window is allowed without a
+    /// fresh prompt — the safety net for approvals whose session-allowlist
+    /// grant cannot match (exec provenance rejections, unresolvable paths).
+    /// Entries expire by timestamp (`approve_replay_seconds`); expired
+    /// entries are purged on insert. Cleared with the session.
+    pub recent_approvals: std::collections::HashMap<String, Instant>,
 }
 
 impl SupervisorSession {
@@ -156,7 +201,10 @@ impl SupervisorSession {
             cwd: None,
             tty: None,
             wedge_reported_tids: std::collections::HashSet::new(),
+            spawn_recorded: std::collections::HashSet::new(),
             controlling_pts: std::sync::OnceLock::new(),
+            recent_denials: std::collections::HashMap::new(),
+            recent_approvals: std::collections::HashMap::new(),
         }
     }
 
@@ -247,12 +295,60 @@ pub struct SessionSummary {
 // Session registry
 // ---------------------------------------------------------------------------
 
+/// How long a capacity reservation stays valid before it is reaped.
+///
+/// Long enough to cover a slow PTY spawn of a heavy tool, short enough that a
+/// CLI that dies between reserving and activating cannot hold a seat hostage
+/// for a noticeable time. No lease heartbeat: a renewal protocol would buy
+/// only the tail of a pathological spawn, and the reaper already bounds the
+/// damage.
+pub const RESERVATION_TTL: Duration = Duration::from_secs(30);
+
+/// A capacity reservation held between "the CLI asked for a slot" and "the
+/// supervised process is registered" (work/74 Phase 1).
+///
+/// Admission used to happen *after* the target was spawned and resumed, so a
+/// capacity rejection could arrive once the tool had already executed code.
+/// A reservation moves the decision in front of the spawn: the seat is
+/// counted against the cap from the moment it is issued.
+#[derive(Debug, Clone)]
+pub struct SessionReservation {
+    /// Lease identifier. Deliberately distinct from the eventual session id —
+    /// the session UUID is minted by the CLI after the spawn succeeds.
+    pub id: Uuid,
+    /// Tool name as known at reserve time, for operator-facing diagnostics.
+    pub tool_name: String,
+    /// Resolved profile name, if any.
+    pub profile_name: Option<String>,
+    /// When the lease was issued; drives TTL expiry.
+    pub created_at: Instant,
+}
+
 /// Thread-safe registry that tracks all active supervisor sessions and
 /// enforces the configured concurrency limit.
 pub struct SupervisorRegistry {
     sessions: HashMap<Uuid, SupervisorSession>,
+    /// Outstanding capacity reservations. Counted against `max_sessions`
+    /// alongside live sessions so two concurrent `grith exec` invocations
+    /// cannot both pass the check and overshoot the cap.
+    reservations: HashMap<Uuid, SessionReservation>,
     config: SupervisorConfig,
     max_sessions: usize,
+    /// When set, the audit chain failed verification and no new session may
+    /// be admitted. work/74 Phase 5.
+    ///
+    /// This lives on the registry rather than on either caller because both
+    /// admission paths — the in-process `grith exec` path and the daemon's
+    /// IPC route — funnel through [`SupervisorRegistry::register`]. Gating
+    /// here means neither can be forgotten.
+    audit_quarantine: Option<String>,
+    /// When set, this process opened the audit database read-only (another
+    /// process owns the exclusive writer lock) and no new session may be
+    /// admitted: every audit write for the session would fail, and the
+    /// required DNS audit records failing denies the session's DNS
+    /// fail-closed. Lives on the registry for the same reason as
+    /// `audit_quarantine` — every admission path funnels through here.
+    audit_read_only: Option<String>,
 }
 
 impl SupervisorRegistry {
@@ -261,21 +357,167 @@ impl SupervisorRegistry {
         let max_sessions = config.max_concurrent_sessions;
         Self {
             sessions: HashMap::new(),
+            reservations: HashMap::new(),
             config,
             max_sessions,
+            audit_quarantine: None,
+            audit_read_only: None,
         }
+    }
+
+    /// Quarantine (or clear quarantine on) session admission.
+    ///
+    /// Set from the daemon's startup chain-verification outcome. While set,
+    /// [`SupervisorRegistry::register`] refuses every session.
+    pub fn set_audit_quarantine(&mut self, reason: Option<String>) {
+        self.audit_quarantine = reason;
+    }
+
+    /// The current audit-quarantine reason, if any.
+    #[must_use]
+    pub fn audit_quarantine(&self) -> Option<&str> {
+        self.audit_quarantine.as_deref()
+    }
+
+    /// Refuse (or re-allow) session admission because this process cannot
+    /// write the audit database.
+    ///
+    /// Set from the daemon's startup writer-lock outcome. While set,
+    /// [`SupervisorRegistry::register`], [`SupervisorRegistry::reserve`] and
+    /// [`SupervisorRegistry::activate`] refuse every session.
+    pub fn set_audit_read_only(&mut self, reason: Option<String>) {
+        self.audit_read_only = reason;
+    }
+
+    /// The current audit-read-only reason, if any.
+    #[must_use]
+    pub fn audit_read_only(&self) -> Option<&str> {
+        self.audit_read_only.as_deref()
+    }
+
+    /// The admission gate shared by every entry point: quarantine first (the
+    /// more specific condition — the chain itself is broken), then
+    /// read-only.
+    fn check_audit_admissible(&self) -> Result<()> {
+        if let Some(reason) = &self.audit_quarantine {
+            return Err(Error::AuditQuarantined(reason.clone()));
+        }
+        if let Some(reason) = &self.audit_read_only {
+            return Err(Error::AuditReadOnly(reason.clone()));
+        }
+        Ok(())
     }
 
     /// Register a new session.
     ///
     /// Returns `Error::SessionLimitReached` if the concurrency limit would be
     /// exceeded.
+    ///
+    /// Outstanding reservations count towards the limit, so a legacy
+    /// (unreserved) registration cannot claim a seat another caller is
+    /// already holding for a spawn in flight.
     pub fn register(&mut self, session: SupervisorSession) -> Result<()> {
-        if self.sessions.len() >= self.max_sessions {
+        // work/74 Phase 5: refuse admission while audit records cannot be
+        // durably written (quarantined chain, or a read-only handle because
+        // another process owns the database). A session whose decisions
+        // cannot be verifiably recorded is not a supervised session, so
+        // starting one would be worse than refusing.
+        self.check_audit_admissible()?;
+        self.reap_expired_reservations();
+        if self.occupancy() >= self.max_sessions {
             return Err(Error::SessionLimitReached(self.max_sessions));
         }
         self.sessions.insert(session.id, session);
         Ok(())
+    }
+
+    /// Reserve a capacity slot before the target process is created
+    /// (work/74 Phase 1).
+    ///
+    /// The lease is counted against the cap immediately, so the "am I allowed
+    /// to run?" question is answered while there is still nothing to clean up.
+    /// Callers must follow up with [`activate`](Self::activate) on success or
+    /// [`cancel`](Self::cancel) on spawn failure; a lease that receives
+    /// neither expires after [`RESERVATION_TTL`].
+    pub fn reserve(&mut self, tool_name: &str, profile_name: Option<&str>) -> Result<Uuid> {
+        self.check_audit_admissible()?;
+        self.reap_expired_reservations();
+        // Only pay for the dead-session sweep when it can change the answer.
+        if self.occupancy() >= self.max_sessions {
+            self.reap_dead();
+        }
+        if self.occupancy() >= self.max_sessions {
+            return Err(Error::SessionLimitReached(self.max_sessions));
+        }
+        let reservation = SessionReservation {
+            id: Uuid::new_v4(),
+            tool_name: tool_name.to_string(),
+            profile_name: profile_name.map(str::to_string),
+            created_at: Instant::now(),
+        };
+        let id = reservation.id;
+        self.reservations.insert(id, reservation);
+        Ok(id)
+    }
+
+    /// Convert a reservation into a live session.
+    ///
+    /// Idempotent for retry safety: if the session is already registered (a
+    /// response was lost and the client retried) this succeeds without
+    /// changing anything.
+    ///
+    /// A lease that expired mid-spawn does not fail outright — the slot is
+    /// re-checked against the cap and the session is admitted if capacity is
+    /// still available. Killing a tool that has already started because its
+    /// lease aged out by a second would be a worse outcome than a brief
+    /// overshoot, which the cap check still prevents.
+    pub fn activate(&mut self, reservation_id: Uuid, session: SupervisorSession) -> Result<()> {
+        self.check_audit_admissible()?;
+        if self.sessions.contains_key(&session.id) {
+            // Already activated — a retried request, not a second session.
+            self.reservations.remove(&reservation_id);
+            return Ok(());
+        }
+        let had_reservation = self.reservations.remove(&reservation_id).is_some();
+        if !had_reservation {
+            // Lease expired or was never issued: fall back to a normal
+            // capacity check rather than trusting an unverified claim.
+            self.reap_expired_reservations();
+            if self.occupancy() >= self.max_sessions {
+                return Err(Error::SessionLimitReached(self.max_sessions));
+            }
+        }
+        self.sessions.insert(session.id, session);
+        Ok(())
+    }
+
+    /// Release a reservation without registering a session (spawn failed, or
+    /// the CLI bailed out). Returns whether a lease was actually held.
+    pub fn cancel(&mut self, reservation_id: Uuid) -> bool {
+        self.reservations.remove(&reservation_id).is_some()
+    }
+
+    /// Seats currently spoken for: live sessions plus outstanding leases.
+    #[must_use]
+    pub fn occupancy(&self) -> usize {
+        self.sessions.len() + self.reservations.len()
+    }
+
+    /// Number of outstanding (unexpired) reservations.
+    #[must_use]
+    pub fn reservation_count(&self) -> usize {
+        self.reservations.len()
+    }
+
+    /// Drop reservations older than [`RESERVATION_TTL`].
+    ///
+    /// A CLI that is SIGKILLed between reserving and spawning leaves a lease
+    /// behind; without this the seat would leak until the daemon restarts.
+    pub fn reap_expired_reservations(&mut self) -> usize {
+        let before = self.reservations.len();
+        self.reservations
+            .retain(|_, r| r.created_at.elapsed() < RESERVATION_TTL);
+        before - self.reservations.len()
     }
 
     /// Get an immutable reference to a session by ID.
@@ -385,6 +627,7 @@ mod tests {
             total_queued: 15,
             total_denied: 3,
             total_filtered_noise: 2,
+            ..Default::default()
         };
         let json = serde_json::to_string(&stats).unwrap();
         let parsed: SessionStats = serde_json::from_str(&json).unwrap();
@@ -469,6 +712,7 @@ mod tests {
                 total_queued: 1,
                 total_denied: 1,
                 total_filtered_noise: 0,
+                ..Default::default()
             },
             containment_remaining_seconds: None,
         };
@@ -643,5 +887,194 @@ mod tests {
         assert_eq!(reg.max_sessions(), test_config().max_concurrent_sessions);
         reg.set_max_sessions(1);
         assert_eq!(reg.max_sessions(), 1);
+    }
+
+    // -- work/74 Phase 1: pre-spawn capacity reservations -------------------
+
+    fn registry_with_cap(max: usize) -> SupervisorRegistry {
+        let mut config = test_config();
+        config.max_concurrent_sessions = max;
+        SupervisorRegistry::new(config)
+    }
+
+    /// The core guarantee: the seat is gone the moment it is reserved, so a
+    /// second caller is refused *before* it spawns anything.
+    #[test]
+    fn reservation_occupies_a_seat_immediately() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", Some("claude-code")).unwrap();
+
+        assert_eq!(reg.count(), 0, "no session exists yet");
+        assert_eq!(reg.occupancy(), 1, "but the seat is spoken for");
+
+        match reg.reserve("codex", None).unwrap_err() {
+            Error::SessionLimitReached(max) => assert_eq!(max, 1),
+            other => panic!("expected SessionLimitReached, got: {other}"),
+        }
+        // And a legacy direct register cannot steal the reserved seat either.
+        assert!(reg.register(SupervisorSession::new("codex", 2)).is_err());
+
+        reg.cancel(lease);
+        assert_eq!(reg.occupancy(), 0);
+        assert!(reg.register(SupervisorSession::new("codex", 2)).is_ok());
+    }
+
+    #[test]
+    fn activate_converts_the_lease_into_a_session_without_double_counting() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", None).unwrap();
+        reg.activate(lease, SupervisorSession::new("claude", 1))
+            .unwrap();
+
+        assert_eq!(reg.count(), 1);
+        assert_eq!(reg.reservation_count(), 0, "lease consumed");
+        assert_eq!(reg.occupancy(), 1, "seat counted once, not twice");
+    }
+
+    /// A lost response must not cost a second seat.
+    #[test]
+    fn activate_is_idempotent() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", None).unwrap();
+        let session = SupervisorSession::new("claude", 1);
+        let id = session.id;
+
+        reg.activate(lease, session).unwrap();
+        let mut retry = SupervisorSession::new("claude", 1);
+        retry.id = id;
+        reg.activate(lease, retry).expect("retry must succeed");
+
+        assert_eq!(reg.count(), 1, "retry must not create a second session");
+    }
+
+    #[test]
+    fn cancel_releases_the_seat_and_reports_whether_it_held_one() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", None).unwrap();
+        assert!(reg.cancel(lease), "held lease reports true");
+        assert!(!reg.cancel(lease), "second cancel is a no-op");
+        assert_eq!(reg.occupancy(), 0);
+    }
+
+    /// A CLI killed between reserve and spawn must not hold a seat forever.
+    #[test]
+    fn expired_reservations_are_reaped() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", None).unwrap();
+        // Age the lease past its TTL.
+        reg.reservations.get_mut(&lease).unwrap().created_at =
+            Instant::now() - RESERVATION_TTL - Duration::from_secs(1);
+
+        assert_eq!(reg.reap_expired_reservations(), 1);
+        assert_eq!(reg.occupancy(), 0);
+        assert!(
+            reg.reserve("codex", None).is_ok(),
+            "the leaked seat must be reclaimable"
+        );
+    }
+
+    /// A slow spawn whose lease aged out is still admitted when there is room:
+    /// killing an already-running tool over a second of clock skew would be
+    /// worse than the brief overshoot the cap check still prevents.
+    #[test]
+    fn activate_after_expiry_succeeds_when_capacity_allows() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", None).unwrap();
+        reg.reservations.get_mut(&lease).unwrap().created_at =
+            Instant::now() - RESERVATION_TTL - Duration::from_secs(1);
+        reg.reap_expired_reservations();
+
+        reg.activate(lease, SupervisorSession::new("claude", 1))
+            .expect("should still admit when a seat is free");
+        assert_eq!(reg.count(), 1);
+    }
+
+    /// ...but not when the seat was taken in the meantime.
+    #[test]
+    fn activate_after_expiry_fails_when_at_capacity() {
+        let mut reg = registry_with_cap(1);
+        let lease = reg.reserve("claude", None).unwrap();
+        reg.reservations.get_mut(&lease).unwrap().created_at =
+            Instant::now() - RESERVATION_TTL - Duration::from_secs(1);
+        reg.reap_expired_reservations();
+        reg.register(SupervisorSession::new("other", 99)).unwrap();
+
+        match reg
+            .activate(lease, SupervisorSession::new("claude", 1))
+            .unwrap_err()
+        {
+            Error::SessionLimitReached(max) => assert_eq!(max, 1),
+            other => panic!("expected SessionLimitReached, got: {other}"),
+        }
+    }
+
+    /// A quarantined audit chain must refuse the reservation, not wait until
+    /// activation — the whole point is to refuse before anything is spawned.
+    #[test]
+    fn reserve_refuses_while_audit_quarantined() {
+        let mut reg = registry_with_cap(4);
+        reg.set_audit_quarantine(Some("chain broken at seq 42".into()));
+        match reg.reserve("claude", None).unwrap_err() {
+            Error::AuditQuarantined(reason) => assert!(reason.contains("seq 42")),
+            other => panic!("expected AuditQuarantined, got: {other}"),
+        }
+    }
+
+    /// A read-only audit handle must refuse admission on every entry point:
+    /// a session this process cannot record must never start.
+    #[test]
+    fn all_admission_paths_refuse_while_audit_read_only() {
+        let mut reg = registry_with_cap(4);
+        reg.set_audit_read_only(Some("another process owns the audit database".into()));
+
+        match reg.reserve("claude", None).unwrap_err() {
+            Error::AuditReadOnly(reason) => assert!(reason.contains("owns the audit database")),
+            other => panic!("expected AuditReadOnly from reserve, got: {other}"),
+        }
+        match reg
+            .register(SupervisorSession::new("claude", 1))
+            .unwrap_err()
+        {
+            Error::AuditReadOnly(_) => {}
+            other => panic!("expected AuditReadOnly from register, got: {other}"),
+        }
+        match reg
+            .activate(Uuid::new_v4(), SupervisorSession::new("claude", 1))
+            .unwrap_err()
+        {
+            Error::AuditReadOnly(_) => {}
+            other => panic!("expected AuditReadOnly from activate, got: {other}"),
+        }
+
+        // Clearing the flag re-admits.
+        reg.set_audit_read_only(None);
+        assert!(reg.reserve("claude", None).is_ok());
+    }
+
+    /// N concurrent reservations against a cap of 2 must yield exactly 2.
+    #[test]
+    fn concurrent_reservations_never_overshoot_the_cap() {
+        use std::sync::{Arc, Mutex};
+
+        let reg = Arc::new(Mutex::new(registry_with_cap(2)));
+        let granted = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let reg = Arc::clone(&reg);
+            let granted = Arc::clone(&granted);
+            handles.push(std::thread::spawn(move || {
+                if let Ok(lease) = reg.lock().unwrap().reserve("claude", None) {
+                    granted.lock().unwrap().push(lease);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            granted.lock().unwrap().len(),
+            2,
+            "exactly two of ten racing reservations may win"
+        );
     }
 }

@@ -30,6 +30,19 @@ pub struct AuditRecord {
     pub composite_score: f64,
     /// Final proxy decision (allow / queue / deny).
     pub proxy_action: ProxyActionSummary,
+    /// Redacted human-readable reason for the final policy decision.
+    ///
+    /// Optional for backwards compatibility and for callers that do not
+    /// produce a stable reason. Security-sensitive callers should redact this
+    /// field before constructing the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    /// Stable description of what enforcement did after policy evaluation.
+    ///
+    /// This is distinct from `proxy_action`: a queued DNS decision, for
+    /// example, may be refused or forwarded depending on compatibility policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement_outcome: Option<String>,
     /// Per-filter breakdown of the evaluation.
     pub filter_results: Vec<FilterResultSummary>,
     /// Simplified per-filter score map (filter_name → score) for quick querying,
@@ -155,10 +168,36 @@ pub struct AuditRecord {
     /// of a fully-evaluated record.
     #[serde(default)]
     pub record_type: RecordType,
+
+    /// Which canonical form produced `record_hash` (B12 item 5).
+    ///
+    /// * `1` — the legacy 9-field pipe-joined form. Covers only id,
+    ///   timestamp, session, plugin, call type, arguments hash, score,
+    ///   action and `prev_hash`; every other field could be rewritten
+    ///   while verification stayed green.
+    /// * `2` — [`AuditRecord::compute_record_hash_v2`], covering every
+    ///   persisted evidence field.
+    ///
+    /// Rows written before this field existed deserialize (and read back
+    /// from a NULL column) as `1`, so archived history keeps verifying
+    /// without a single row being rewritten. New records stamp
+    /// [`CURRENT_HASH_VERSION`].
+    #[serde(default = "default_hash_version")]
+    pub hash_version: u8,
 }
 
 fn default_source() -> String {
     "wasm".to_string()
+}
+
+/// Canonical form used for records written by this build.
+pub const CURRENT_HASH_VERSION: u8 = 2;
+
+/// Canonical form assumed for rows that predate `hash_version`.
+pub const LEGACY_HASH_VERSION: u8 = 1;
+
+fn default_hash_version() -> u8 {
+    LEGACY_HASH_VERSION
 }
 
 /// Classification of an audit row by what it carries.
@@ -258,6 +297,115 @@ pub enum ChainVerification {
     },
     /// No chained records exist (empty or pre-chaining database).
     Empty,
+    /// The active segment does not begin at sequence 1 and no archive
+    /// boundary anchor is available to prove it continues an archived prefix.
+    ///
+    /// work/74 §9: this is the state that previously produced a false
+    /// `Broken` and triggered destructive `repair_chain()`. It is **not**
+    /// evidence of tampering — the anchor is missing, not the data. It is
+    /// recoverable without rewriting a single row by re-deriving the boundary
+    /// from cold archives (`retention::resolve_boundary_from_archives`).
+    Unanchored {
+        /// Lowest `chain_sequence` present in the active database.
+        first_sequence: i64,
+    },
+    /// An archive boundary anchor exists but does not link to the active
+    /// segment. Unlike `Unanchored`, this *is* a genuine discontinuity: the
+    /// archived history and the active segment cannot be joined.
+    AnchorMismatch {
+        /// Terminal sequence recorded by the archive boundary.
+        boundary_sequence: i64,
+        /// Terminal record hash recorded by the archive boundary.
+        expected_prev_hash: String,
+        /// `prev_hash` actually found on the first active row.
+        found_prev_hash: Option<String>,
+        /// Lowest `chain_sequence` present in the active database.
+        first_sequence: i64,
+    },
+}
+
+impl ChainVerification {
+    /// True when the chain is in a state the daemon may write to.
+    ///
+    /// `Unanchored` is deliberately **not** healthy: the daemon should first
+    /// attempt boundary recovery from cold archives, and quarantine only if
+    /// that fails. It is separated from `Broken` so an operator can tell a
+    /// missing anchor apart from actual tampering.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, Self::Valid { .. } | Self::Empty)
+    }
+
+    /// True when the outcome represents genuine evidence of corruption or
+    /// tampering, as opposed to a recoverable missing anchor.
+    #[must_use]
+    pub fn is_tamper_evidence(&self) -> bool {
+        matches!(self, Self::Broken { .. } | Self::AnchorMismatch { .. })
+    }
+
+    /// Short stable identifier for logs, metrics and diagnostics.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Valid { .. } => "valid",
+            Self::Broken { .. } => "broken",
+            Self::Empty => "empty",
+            Self::Unanchored { .. } => "unanchored",
+            Self::AnchorMismatch { .. } => "anchor_mismatch",
+        }
+    }
+}
+
+/// Durable link from the archived (cold) prefix to the active segment.
+///
+/// work/74 Phase 6. Before this existed, the *only* thing tying the active
+/// database to its archived prefix was the `verified_head` performance
+/// checkpoint — and `repair_chain()` deletes that, so a single false break
+/// was enough to sever the chain permanently (§9).
+///
+/// This anchor is written atomically with the prune that creates it and is
+/// never removed by verification or repair. It is the authority for "the
+/// active segment legitimately starts above sequence 1".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveBoundary {
+    /// Highest `chain_sequence` that was moved to cold storage.
+    pub last_archived_sequence: i64,
+    /// `record_hash` of that terminal archived record. The first surviving
+    /// active row must carry this as its `prev_hash`.
+    pub last_archived_record_hash: String,
+    /// When this boundary was last written.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Durable record that the local audit history spans more than one
+/// segment (B12 item 7).
+///
+/// The 0.1.4 automatic `repair_chain()` could leave an archived prefix
+/// ending at one sequence while the active database restarted from
+/// sequence 1 with `prev_hash = NULL`. Verification reads that active
+/// segment as a legitimate genesis and reports `Valid`, which is true of
+/// the segment but silent about the discontinuity — the compliance claim
+/// "one unbroken chain" does not hold on such a machine.
+///
+/// Recording the fact is the honest response: the history is not
+/// reconnectable without rewriting records, and rewriting evidence to make
+/// a verifier happy is the behaviour that caused the incident. Operators
+/// and `grith audit diagnose` can then see two segments and say so.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentHistory {
+    /// Highest `chain_sequence` found in cold archives at classification.
+    pub archive_terminal_sequence: i64,
+    /// `record_hash` of that archived terminal record, when it carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_terminal_hash: Option<String>,
+    /// Lowest `chain_sequence` in the active segment (1 for a re-genesis).
+    pub active_genesis_sequence: i64,
+    /// Machine-readable cause, e.g. `"active_regenesis_with_archives"`.
+    pub cause: String,
+    /// Human-readable explanation shown by diagnose.
+    pub reason: String,
+    /// When the discontinuity was classified.
+    pub classified_at: DateTime<Utc>,
 }
 
 /// Compute SHA-256 hash of arbitrary data, returning hex string.
@@ -265,6 +413,72 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+/// Length-prefixed canonical encoder for the v2 record hash.
+///
+/// Every entry is written as `name<US>tag<byte-len><US>value<RS>`, so the
+/// byte length delimits each value and no field content can forge a
+/// boundary — unlike a delimiter-joined form, where a value containing the
+/// delimiter lets an attacker shift content between fields while keeping
+/// the concatenation (and therefore the hash) identical.
+struct Canonical {
+    buf: String,
+}
+
+const UNIT_SEP: char = '\u{1f}';
+const REC_SEP: char = '\u{1e}';
+
+impl Canonical {
+    fn new(domain: &str) -> Self {
+        let mut buf = String::with_capacity(1024);
+        buf.push_str(domain);
+        buf.push(REC_SEP);
+        Self { buf }
+    }
+
+    /// A present string value.
+    fn text(&mut self, name: &str, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(
+            self.buf,
+            "{name}{UNIT_SEP}+{}{UNIT_SEP}{value}{REC_SEP}",
+            value.len()
+        );
+    }
+
+    /// An explicitly absent optional value. Distinct from `text(name, "")`
+    /// because the tag differs, so `None` and `Some("")` never collide.
+    fn absent(&mut self, name: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.buf, "{name}{UNIT_SEP}-{UNIT_SEP}{REC_SEP}");
+    }
+
+    fn opt_text(&mut self, name: &str, value: Option<&str>) {
+        match value {
+            Some(v) => self.text(name, v),
+            None => self.absent(name),
+        }
+    }
+
+    /// A float, encoded as its IEEE-754 bit pattern.
+    ///
+    /// Bits rather than a decimal rendering: the encoding is then exact by
+    /// construction, independent of any formatting behaviour that could
+    /// drift between Rust versions, and it keeps `0.0`/`-0.0` distinct.
+    fn float(&mut self, name: &str, value: f64) {
+        self.text(name, &format!("{:016x}", value.to_bits()));
+    }
+
+    /// Element count for a sequence, so a truncated sequence cannot hash
+    /// the same as the original.
+    fn count(&mut self, name: &str, n: usize) {
+        self.text(&format!("{name}.len"), &n.to_string());
+    }
+
+    fn finish(self) -> String {
+        self.buf
+    }
 }
 
 /// Default argument-summary truncation limit (bytes). Tuned for the
@@ -348,6 +562,8 @@ impl AuditRecord {
             arguments_hash,
             composite_score,
             proxy_action,
+            decision_reason: None,
+            enforcement_outcome: None,
             filter_results,
             filter_scores,
             execution_result: None,
@@ -373,6 +589,7 @@ impl AuditRecord {
             rewritten_addr: None,
             clamp_profile_entry: None,
             record_type: RecordType::Full,
+            hash_version: CURRENT_HASH_VERSION,
         }
     }
 
@@ -405,6 +622,8 @@ impl AuditRecord {
             arguments_hash,
             composite_score: 0.0,
             proxy_action: action,
+            decision_reason: None,
+            enforcement_outcome: None,
             filter_results: Vec::new(),
             filter_scores: None,
             execution_result: None,
@@ -430,6 +649,7 @@ impl AuditRecord {
             rewritten_addr: None,
             clamp_profile_entry: None,
             record_type: RecordType::Compact,
+            hash_version: CURRENT_HASH_VERSION,
         }
     }
 
@@ -447,6 +667,17 @@ impl AuditRecord {
         self.original_addr = Some(original_addr.into());
         self.rewritten_addr = Some(rewritten_addr.into());
         self.clamp_profile_entry = Some(clamp_profile_entry.into());
+        self
+    }
+
+    /// Attach the redacted policy reason and final enforcement outcome.
+    pub fn with_decision_enforcement(
+        mut self,
+        decision_reason: Option<String>,
+        enforcement_outcome: impl Into<String>,
+    ) -> Self {
+        self.decision_reason = decision_reason;
+        self.enforcement_outcome = Some(enforcement_outcome.into());
         self
     }
 
@@ -473,9 +704,27 @@ impl AuditRecord {
 
     /// Compute a deterministic hash of this record's content for chain integrity.
     ///
-    /// The hash covers all immutable fields that constitute the record's identity
-    /// and content. Uses `arguments_hash` rather than raw arguments for determinism.
+    /// Dispatches on [`AuditRecord::hash_version`] so a database holding
+    /// both legacy and current rows verifies end to end without rewriting
+    /// history. An unrecognised version yields a non-hash marker string,
+    /// which can never equal a stored SHA-256 and therefore surfaces as a
+    /// loud `Broken` at that row rather than being silently accepted.
     pub fn compute_record_hash(&self) -> String {
+        match self.hash_version {
+            LEGACY_HASH_VERSION => self.compute_record_hash_v1(),
+            CURRENT_HASH_VERSION => self.compute_record_hash_v2(),
+            other => format!("UNSUPPORTED_HASH_VERSION:{other}"),
+        }
+    }
+
+    /// The original canonical form. Frozen — every archived record ever
+    /// written depends on these exact bytes.
+    ///
+    /// Covers nine fields; `filter_results`, scores, decision reason,
+    /// enforcement outcome, execution result, record type, provenance and
+    /// the forensic spawn/clamp columns are all absent, which is why v2
+    /// exists (B12 item 5).
+    fn compute_record_hash_v1(&self) -> String {
         let prev = self.prev_hash.as_deref().unwrap_or("GENESIS");
         let canonical = format!(
             "{}|{}|{}|{}|{}|{}|{}|{}|{}",
@@ -490,6 +739,112 @@ impl AuditRecord {
             prev,
         );
         sha256_hex(canonical.as_bytes())
+    }
+
+    /// Full-record canonical form: every persisted evidence field.
+    ///
+    /// Excludes only `record_hash` (this function's own output). There is
+    /// no sync bookkeeping on the model — `synced_at` lives in the schema
+    /// alone — so nothing mutable is covered and a sync pass never
+    /// invalidates a hash.
+    ///
+    /// `hash_version` is itself hashed, so an attacker cannot downgrade a
+    /// v2 row to v1 to gain access to the fields v1 leaves uncovered.
+    ///
+    /// Encoding is length-prefixed rather than delimiter-joined: each
+    /// field contributes `name<US>tag<len><US>value<RS>`, so no field
+    /// value can forge a boundary by containing the separator (a latent
+    /// weakness of the v1 pipe-join). `HashMap` fields are emitted in
+    /// sorted key order because iteration order is not stable across
+    /// processes.
+    fn compute_record_hash_v2(&self) -> String {
+        let mut c = Canonical::new("grith-audit-record-v2");
+
+        c.text("id", &self.id.to_string());
+        c.text("timestamp", &self.timestamp.to_rfc3339());
+        c.text("session_id", &self.session_id.to_string());
+        c.text("plugin_id", &self.plugin_id);
+        c.text("tool_call_type", &self.tool_call_type);
+        c.text("arguments_summary", &self.arguments_summary);
+        c.text("arguments_hash", &self.arguments_hash);
+        c.float("composite_score", self.composite_score);
+        c.text("proxy_action", &self.proxy_action.to_string());
+        c.opt_text("decision_reason", self.decision_reason.as_deref());
+        c.opt_text("enforcement_outcome", self.enforcement_outcome.as_deref());
+
+        // Ordered: filter order is meaningful evidence and is preserved
+        // through persistence.
+        c.count("filter_results", self.filter_results.len());
+        for fr in &self.filter_results {
+            c.text("fr.filter_name", &fr.filter_name);
+            c.text("fr.matched", if fr.matched { "1" } else { "0" });
+            c.float("fr.score", fr.score);
+            c.text("fr.rule_id", &fr.rule_id);
+            c.text("fr.severity", &fr.severity);
+            c.text("fr.message", &fr.message);
+        }
+
+        match &self.filter_scores {
+            None => c.absent("filter_scores"),
+            Some(scores) => {
+                let mut keys: Vec<&String> = scores.keys().collect();
+                keys.sort();
+                c.count("filter_scores", keys.len());
+                for k in keys {
+                    c.text("fs.key", k);
+                    c.float("fs.score", scores[k]);
+                }
+            }
+        }
+
+        c.opt_text("execution_result", self.execution_result.as_deref());
+        c.float("evaluation_time_ms", self.evaluation_time_ms);
+        c.opt_text("task_context", self.task_context.as_deref());
+        c.text("source", &self.source);
+        c.opt_text("supervised_tool", self.supervised_tool.as_deref());
+        c.opt_text(
+            "supervised_pid",
+            self.supervised_pid.map(|v| v.to_string()).as_deref(),
+        );
+        c.opt_text("project_name", self.project_name.as_deref());
+        c.opt_text(
+            "correlation_id",
+            self.correlation_id.map(|v| v.to_string()).as_deref(),
+        );
+        c.opt_text("prev_hash", self.prev_hash.as_deref());
+        c.opt_text(
+            "chain_sequence",
+            self.chain_sequence.map(|v| v.to_string()).as_deref(),
+        );
+
+        c.opt_text("llm_provider", self.llm_provider.as_deref());
+        c.opt_text("llm_model", self.llm_model.as_deref());
+        c.opt_text(
+            "prompt_tokens",
+            self.prompt_tokens.map(|v| v.to_string()).as_deref(),
+        );
+        c.opt_text(
+            "completion_tokens",
+            self.completion_tokens.map(|v| v.to_string()).as_deref(),
+        );
+        match self.estimated_cost_usd {
+            None => c.absent("estimated_cost_usd"),
+            Some(v) => c.float("estimated_cost_usd", v),
+        }
+
+        c.opt_text("spawn_sha256", self.spawn_sha256.as_deref());
+        c.opt_text("matched_routine_root", self.matched_routine_root.as_deref());
+        c.opt_text(
+            "shadow_phase3_filters",
+            self.shadow_phase3_filters.as_deref(),
+        );
+        c.opt_text("original_addr", self.original_addr.as_deref());
+        c.opt_text("rewritten_addr", self.rewritten_addr.as_deref());
+        c.opt_text("clamp_profile_entry", self.clamp_profile_entry.as_deref());
+        c.text("record_type", &self.record_type.to_string());
+        c.text("hash_version", &self.hash_version.to_string());
+
+        sha256_hex(c.finish().as_bytes())
     }
 
     /// Set the correlation ID linking this event to a source→sink chain.
@@ -618,7 +973,7 @@ mod tests {
             0.5,
             ProxyActionSummary::Allow,
             vec![FilterResultSummary {
-                filter_name: "path_match".into(),
+                filter_name: "path-match".into(),
                 matched: false,
                 score: 0.0,
                 rule_id: String::new(),

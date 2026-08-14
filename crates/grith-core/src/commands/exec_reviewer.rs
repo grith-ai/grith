@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use grith_digest::types::{DigestItem, DigestStatus, ReviewOutcome};
+use grith_digest::types::{DigestItem, DigestStatus, PermissionReviewAction, ReviewOutcome};
 use grith_supervisor::reviewer::{DigestStore, PollingQueueReviewer, QueueReviewer};
 
 // ---------------------------------------------------------------------------
@@ -34,13 +34,13 @@ use grith_supervisor::reviewer::{DigestStore, PollingQueueReviewer, QueueReviewe
 /// backlog of supervisor `ExecEvent`s (PTY output, intercept entries)
 /// under heavy syscall load cannot delay a user-facing prompt.
 pub struct ExecTuiQueueReviewer {
-    permission_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
+    permission_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionMessage>,
     digest_store: Arc<dyn DigestStore>,
 }
 
 impl ExecTuiQueueReviewer {
     pub fn new(
-        permission_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionEvent>,
+        permission_tx: crossbeam_channel::Sender<grith_cli::tui::exec_tui::PermissionMessage>,
         digest_store: Arc<dyn DigestStore>,
     ) -> Self {
         Self {
@@ -88,22 +88,30 @@ impl QueueReviewer for ExecTuiQueueReviewer {
                 .iter()
                 .map(|f| f.message.clone())
                 .collect(),
+            decision_reason: item.decision_reason.clone().unwrap_or_default(),
             context: item.task_context.clone().unwrap_or_default(),
             severity: severity.to_string(),
             call_type: call_type_category,
             item_number: 1,
             total_items: 1,
+            scope_enabled: true,
         };
 
         // Create a response channel.
-        let (response_tx, response_rx) = std::sync::mpsc::sync_channel::<&'static str>(1);
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel::<PermissionReviewAction>(1);
 
         // Send the request to the TUI on the dedicated permission channel.
         let event = grith_cli::tui::exec_tui::PermissionEvent {
             request: req,
             response_tx,
         };
-        if self.permission_tx.send(event).is_err() {
+        if self
+            .permission_tx
+            .send(grith_cli::tui::exec_tui::PermissionMessage::Request(
+                Box::new(event),
+            ))
+            .is_err()
+        {
             return ReviewOutcome::Denied;
         }
 
@@ -111,15 +119,16 @@ impl QueueReviewer for ExecTuiQueueReviewer {
         // so we don't block the tokio runtime).
         let digest_store = self.digest_store.clone();
         let item_id = item.id;
+        let cancel_tx = self.permission_tx.clone();
 
         let handle = tokio::task::spawn_blocking(move || match response_rx.recv_timeout(timeout) {
             Ok(action) => {
-                let (status, outcome) = match action {
-                    "approve" | "approve_and_learn" => {
-                        (DigestStatus::Approved, ReviewOutcome::Approved)
-                    }
-                    _ => (DigestStatus::Denied, ReviewOutcome::Denied),
+                let (status, outcome) = if action.is_approved() {
+                    (DigestStatus::Approved, ReviewOutcome::Approved)
+                } else {
+                    (DigestStatus::Denied, ReviewOutcome::Denied)
                 };
+                let action = action.to_storage_value();
                 let note = format!("{action} via exec TUI dialog");
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -128,13 +137,32 @@ impl QueueReviewer for ExecTuiQueueReviewer {
                     let _ = rt.block_on(digest_store.update_status(
                         item_id,
                         status,
-                        Some(action),
+                        Some(&action),
                         Some(&note),
                     ));
                 }
                 outcome
             }
-            Err(_) => ReviewOutcome::TimedOut,
+            Err(_) => {
+                // The operator never answered. Record the auto-deny on the
+                // digest item (parity with the polling reviewer) and tell
+                // the TUI to drop the now-stale dialog so queued prompts
+                // surface instead of stacking behind a dead one.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(rt) = rt {
+                    let _ = rt.block_on(digest_store.update_status(
+                        item_id,
+                        DigestStatus::Denied,
+                        Some("auto_deny_timeout"),
+                        Some("auto denied after exec TUI review timeout"),
+                    ));
+                }
+                let _ =
+                    cancel_tx.send(grith_cli::tui::exec_tui::PermissionMessage::Cancel(item_id));
+                ReviewOutcome::TimedOut
+            }
         });
 
         match handle.await {
@@ -224,11 +252,13 @@ impl QueueReviewer for TerminalQueueReviewer {
                 .iter()
                 .map(|f| f.message.clone())
                 .collect(),
+            decision_reason: item.decision_reason.clone().unwrap_or_default(),
             context: item.task_context.clone().unwrap_or_default(),
             severity: severity.to_string(),
             call_type: call_type_category,
             item_number: 1,
             total_items: 1,
+            scope_enabled: true,
         };
 
         let digest_store = self.digest_store.clone();
@@ -242,16 +272,16 @@ impl QueueReviewer for TerminalQueueReviewer {
             // Disable it so run_review_dialog can manage its own raw mode.
             let _ = crossterm::terminal::disable_raw_mode();
 
-            let action = grith_cli::tui::run_review_dialog(&req);
+            let action =
+                grith_cli::tui::run_review_dialog(&req).unwrap_or(PermissionReviewAction::Deny);
 
-            let (status, outcome) = match action.unwrap_or("deny") {
-                "approve" | "approve_and_learn" => {
-                    (DigestStatus::Approved, ReviewOutcome::Approved)
-                }
-                _ => (DigestStatus::Denied, ReviewOutcome::Denied),
+            let (status, outcome) = if action.is_approved() {
+                (DigestStatus::Approved, ReviewOutcome::Approved)
+            } else {
+                (DigestStatus::Denied, ReviewOutcome::Denied)
             };
 
-            let action_str = action.unwrap_or("deny");
+            let action_str = action.to_storage_value();
             let note = format!("{action_str} via TUI dialog");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -260,7 +290,7 @@ impl QueueReviewer for TerminalQueueReviewer {
                 let _ = rt.block_on(digest_store.update_status(
                     item_id,
                     status,
-                    Some(action_str),
+                    Some(&action_str),
                     Some(&note),
                 ));
             }
@@ -300,5 +330,116 @@ impl QueueReviewer for TerminalQueueReviewer {
                 ReviewOutcome::Denied
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use grith_digest::types::{ScopedAllowRequest, ScoreSeverity};
+    use grith_supervisor::reviewer::LocalDigestStore;
+    use uuid::Uuid;
+
+    fn file_delete_item() -> DigestItem {
+        DigestItem {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            session_id: Some(Uuid::new_v4()),
+            tool_call_type: "FileDelete(/repo/target/debug/deps/foo.o)".to_string(),
+            arguments_summary: String::new(),
+            decision_reason: Some("review required".to_string()),
+            composite_score: 5.0,
+            severity: ScoreSeverity::Medium,
+            filter_breakdown: Vec::new(),
+            task_context: None,
+            plugin_id: "supervisor:test".to_string(),
+            status: DigestStatus::Pending,
+            reviewed_at: None,
+            review_action: None,
+            reviewer_notes: None,
+            informational_only: false,
+            escalated_at: None,
+            escalated_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_tui_reviewer_preserves_scoped_action_bits_in_digest() {
+        let queue = Arc::new(grith_digest::DigestQueue::open_in_memory().unwrap());
+        let item = file_delete_item();
+        queue.enqueue(&item).unwrap();
+        let store: Arc<dyn DigestStore> = Arc::new(LocalDigestStore::new(queue.clone()));
+        let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
+        let reviewer = Arc::new(ExecTuiQueueReviewer::new(permission_tx, store));
+
+        let review_item = item.clone();
+        let review_task =
+            tokio::spawn(
+                async move { reviewer.review(&review_item, Duration::from_secs(2)).await },
+            );
+        let msg = tokio::task::spawn_blocking(move || {
+            permission_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        })
+        .await
+        .unwrap();
+        let grith_cli::tui::exec_tui::PermissionMessage::Request(event) = msg else {
+            panic!("expected a permission request message");
+        };
+        assert!(event.request.scope_enabled);
+
+        let action = PermissionReviewAction::ScopedAllow(ScopedAllowRequest {
+            directory: "/repo/target/debug/deps/".to_string(),
+            read: false,
+            write: false,
+            delete: true,
+            persist: false,
+        });
+        event.response_tx.send(action.clone()).unwrap();
+
+        assert_eq!(review_task.await.unwrap(), ReviewOutcome::Approved);
+        let reviewed = queue.get_by_id(&item.id).unwrap();
+        assert_eq!(
+            reviewed
+                .review_action
+                .as_deref()
+                .and_then(PermissionReviewAction::from_storage_value),
+            Some(action)
+        );
+    }
+
+    /// A review nobody answers must (1) return TimedOut, (2) record the
+    /// auto-deny on the digest item (polling-reviewer parity), and (3) send
+    /// a Cancel for the stale dialog so the TUI drops it instead of letting
+    /// later prompts stack behind a dead one.
+    #[tokio::test]
+    async fn exec_tui_reviewer_timeout_cancels_stale_dialog() {
+        let queue = Arc::new(grith_digest::DigestQueue::open_in_memory().unwrap());
+        let item = file_delete_item();
+        queue.enqueue(&item).unwrap();
+        let store: Arc<dyn DigestStore> = Arc::new(LocalDigestStore::new(queue.clone()));
+        let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
+        let reviewer = Arc::new(ExecTuiQueueReviewer::new(permission_tx, store));
+
+        let outcome = reviewer.review(&item, Duration::from_millis(50)).await;
+        assert_eq!(outcome, ReviewOutcome::TimedOut);
+
+        // First message is the request; the follow-up is the cancel.
+        let msg = permission_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            msg,
+            grith_cli::tui::exec_tui::PermissionMessage::Request(_)
+        ));
+        let msg = permission_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match msg {
+            grith_cli::tui::exec_tui::PermissionMessage::Cancel(id) => assert_eq!(id, item.id),
+            grith_cli::tui::exec_tui::PermissionMessage::Request(_) => {
+                panic!("expected a cancel message after timeout")
+            }
+        }
+
+        let reviewed = queue.get_by_id(&item.id).unwrap();
+        assert_eq!(reviewed.status, grith_digest::DigestStatus::Denied);
+        assert_eq!(reviewed.review_action.as_deref(), Some("auto_deny_timeout"));
     }
 }

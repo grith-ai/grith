@@ -149,6 +149,7 @@ mod tests {
             session_id: None,
             tool_call_type: "FileRead".into(),
             arguments_summary: "/etc/shadow".into(),
+            decision_reason: None,
             composite_score: 5.0,
             severity: ScoreSeverity::Medium,
             filter_breakdown: vec![],

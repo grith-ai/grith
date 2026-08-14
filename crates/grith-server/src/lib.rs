@@ -122,6 +122,13 @@ pub struct AppState {
     pub notification_dispatcher: Arc<NotificationDispatcher>,
     pub start_time: std::time::Instant,
     pub version: String,
+    /// Instance UUID of this daemon process, surfaced on `/api/health` so a
+    /// CLI can distinguish this daemon from one that replaced it
+    /// (go-live review H-20). `None` in tests and embedded uses that have no
+    /// published identity.
+    pub instance_id: Option<String>,
+    /// IPC contract version advertised alongside `instance_id`.
+    pub protocol_version: Option<u32>,
     pub ws_tx: broadcast::Sender<String>,
     /// Optional shutdown sender — when present, allows API-driven shutdown.
     pub shutdown_tx: Option<broadcast::Sender<()>>,
@@ -254,6 +261,8 @@ impl AppState {
             notification_dispatcher: deps.notification_dispatcher,
             start_time: std::time::Instant::now(),
             version: version.into(),
+            instance_id: None,
+            protocol_version: None,
             ws_tx,
             shutdown_tx: None,
             plan_tier: "community".into(),
@@ -341,6 +350,14 @@ pub struct GrithServer {
     config: ServerConfig,
     state: AppState,
     shutdown_rx: broadcast::Receiver<()>,
+    /// Invoked once, immediately after the listener is bound.
+    ///
+    /// The daemon publishes its instance identity here rather than before
+    /// `run()`, because an identity file written before the socket exists is a
+    /// claim the daemon cannot yet honour — a failed start that clobbered the
+    /// PID file pre-bind is what produced the unkillable orphan in the
+    /// stale-daemon lockout incident.
+    on_listening: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl GrithServer {
@@ -357,7 +374,31 @@ impl GrithServer {
             config,
             state,
             shutdown_rx,
+            on_listening: None,
         }
+    }
+
+    /// Advertise this daemon's instance identity on `/api/health`
+    /// (go-live review H-20).
+    #[must_use]
+    pub fn with_instance_identity(
+        mut self,
+        instance_id: impl Into<String>,
+        protocol_version: u32,
+    ) -> Self {
+        self.state.instance_id = Some(instance_id.into());
+        self.state.protocol_version = Some(protocol_version);
+        self
+    }
+
+    /// Register a callback to run once the listener is bound and accepting.
+    ///
+    /// Used to publish the identity file only after the daemon can actually
+    /// serve — see [`GrithServer::on_listening`].
+    #[must_use]
+    pub fn with_on_listening(mut self, f: impl FnOnce() + Send + 'static) -> Self {
+        self.on_listening = Some(Box::new(f));
+        self
     }
 
     /// Build the Axum router with all routes and middleware.
@@ -617,6 +658,9 @@ impl GrithServer {
                     .map_err(|e| Error::Server(format!("failed to load TLS config: {e}")))?;
 
             tracing::info!(address = %addr, "grith-server listening (TLS)");
+            if let Some(f) = self.on_listening.take() {
+                f();
+            }
 
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
@@ -641,6 +685,10 @@ impl GrithServer {
                 .map_err(|e| Error::Server(format!("failed to bind to {addr}: {e}")))?;
 
             tracing::info!(address = %addr, "grith-server listening");
+            // Bound and about to serve: safe to advertise this instance.
+            if let Some(f) = self.on_listening.take() {
+                f();
+            }
 
             axum::serve(
                 listener,
@@ -1212,6 +1260,40 @@ mod tests {
         let app = csrf_test_server_with_token("a-token").build_router();
         let resp = app
             .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn onboarding_dismiss_is_csrf_gated_status_is_open() {
+        // Regression guard for the onboarding route auth placement: dismiss is
+        // a write (CSRF-gated) and status is an open, non-secret read. This
+        // asserts against the real build_router() auth layers, which the
+        // handler-level routes::tests bypass.
+        let token = "onboarding-gate-token";
+
+        // POST /onboarding/dismiss with no CSRF header → forbidden.
+        let app = csrf_test_server_with_token(token).build_router();
+        let resp = app
+            .oneshot(
+                Request::post("/api/onboarding/dismiss")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // GET /onboarding/status stays open even with a token configured
+        // (it is an open read, not a sensitive/token-gated one).
+        let app = csrf_test_server_with_token(token).build_router();
+        let resp = app
+            .oneshot(
+                Request::get("/api/onboarding/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

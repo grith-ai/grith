@@ -112,6 +112,12 @@ pub(crate) fn build_filter_registry_with_config_result(
         registry.register(Box::new(DestructiveActionFilter::new()));
     }
     let egress_config = egress_config?;
+    // Share the egress-policy trust sets with the egress-rate filter so routine/
+    // allowlisted destinations are excluded from its volumetric burst/rate
+    // counters (A#2). Cloned before `egress_config` is moved into the policy
+    // filter below.
+    let egress_rate_trusted_domains = egress_config.trusted_domains.clone();
+    let egress_rate_profile_trusted = egress_config.profile_trusted_domains.clone();
     if egress_config.enabled {
         registry.register(Box::new(EgressPolicyFilter::from_config(egress_config)));
     }
@@ -169,7 +175,11 @@ pub(crate) fn build_filter_registry_with_config_result(
     }
     let egress_rate_config = EgressRateConfig::default();
     if egress_rate_config.enabled && filter_cfg.egress.enabled {
-        registry.register(Box::new(EgressRateFilter::from_config(egress_rate_config)));
+        registry.register(Box::new(EgressRateFilter::from_config_with_trust(
+            egress_rate_config,
+            egress_rate_trusted_domains,
+            egress_rate_profile_trusted,
+        )));
     }
     // SemanticFilter is intentionally not registered — it requires an embedding
     // model integration that is not yet implemented. See work/todos/semantic-filter-roadmap.md.

@@ -201,6 +201,7 @@ fn make_item(score: f64) -> DigestItem {
         session_id: None,
         tool_call_type: "ShellExec".into(),
         arguments_summary: "echo 'test'".into(),
+        decision_reason: None,
         composite_score: score,
         severity: ScoreSeverity::from_score(score),
         filter_breakdown: vec![FilterBreakdown {

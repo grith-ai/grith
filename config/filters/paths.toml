@@ -1,5 +1,5 @@
 # Default path matching rules for the security proxy
-# Loaded by the path_match filter (Phase 2)
+# Loaded by the path-match filter (Phase 2)
 
 [[rules]]
 id = "ssh-private-key"

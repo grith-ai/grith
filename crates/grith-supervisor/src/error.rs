@@ -75,6 +75,27 @@ pub enum Error {
     /// The maximum number of concurrent supervised sessions has been reached.
     #[error("session limit reached: max {0} concurrent sessions")]
     SessionLimitReached(usize),
+
+    /// The audit chain failed startup verification, so the daemon is refusing
+    /// to admit new supervised sessions.
+    ///
+    /// work/74 Phase 5: a session whose decisions cannot be durably and
+    /// verifiably recorded is not a supervised session. Records are preserved
+    /// unmodified; recovery is an explicit operator action.
+    #[error("audit chain quarantined, refusing new sessions: {0}")]
+    AuditQuarantined(String),
+
+    /// This process opened the audit database read-only (another process
+    /// owns the exclusive writer lock), so it cannot record supervised
+    /// sessions and refuses to admit new ones.
+    ///
+    /// Same principle as [`Error::AuditQuarantined`], different cause and
+    /// remedy: nothing is wrong with the chain — this daemon just is not its
+    /// owner, and every audit write it attempted would fail. Admitting a
+    /// session in that state breaks it mid-flight (required DNS audit
+    /// records fail, and DNS is then denied fail-closed).
+    #[error("audit database is read-only for this process, refusing new sessions: {0}")]
+    AuditReadOnly(String),
 }
 
 /// Convenience alias used throughout the crate.

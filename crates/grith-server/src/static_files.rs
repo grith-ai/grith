@@ -69,7 +69,17 @@ fn add_disk_serving(router: Router<AppState>, path: &std::path::Path) -> Router<
 
     for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
         let entry_path = entry.path();
-        if entry_path.is_file() && entry_path.file_name().unwrap_or_default() != "index.html" {
+        // Nest a ServeDir for every top-level subdirectory (fonts/, and any
+        // future ones) so nested static files resolve in disk mode just like
+        // they do in the embedded bundle. `assets/` is already nested above.
+        if entry_path.is_dir() {
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                if name != "assets" {
+                    router = router.nest_service(&format!("/{name}"), ServeDir::new(&entry_path));
+                }
+            }
+        } else if entry_path.is_file() && entry_path.file_name().unwrap_or_default() != "index.html"
+        {
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let route = format!("/{name}");
                 let file_bytes = match std::fs::read(&entry_path) {

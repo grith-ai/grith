@@ -59,6 +59,62 @@ pub async fn run_license_refresh(creds: &Credentials) -> RefreshOutcome {
 }
 
 impl Daemon {
+    /// Spawn a task that re-applies the license gate from the on-disk license
+    /// whenever the daemon receives `SIGHUP`. `grith pro login` / `activate` /
+    /// `refresh` send `SIGHUP` right after writing a new license, so the
+    /// session-limit tier (and every other gated feature) takes effect
+    /// immediately instead of waiting for the 24-hour scheduled refresh or a
+    /// daemon restart. This makes no network call — it re-reads the local
+    /// license file the CLI just wrote and applies the resulting gate to the
+    /// live supervisor registry, exactly like the scheduled-refresh path does.
+    #[cfg(unix)]
+    pub fn spawn_license_regate_on_sighup(&self) -> tokio::task::JoinHandle<()> {
+        let feature_gate = Arc::clone(&self.feature_gate);
+        let supervisor_registry = Arc::clone(&self.supervisor_registry);
+        let notification_dispatcher = Arc::clone(&self.notification_dispatcher);
+        let refresh_state = Arc::clone(&self.refresh_state);
+        let config_max_sessions = self.config.supervisor.max_concurrent_sessions;
+        let mut shutdown_rx = self.subscribe_shutdown();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to register SIGHUP handler; immediate license re-gate on login is unavailable (falls back to the 24h refresh / restart)"
+                    );
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = sighup.recv() => {
+                        tracing::info!(
+                            event = "license_regate_signal",
+                            "SIGHUP received; re-applying license gate from disk"
+                        );
+                        apply_cached_license_gate(
+                            &feature_gate,
+                            &supervisor_registry,
+                            &notification_dispatcher,
+                            &refresh_state,
+                            config_max_sessions,
+                        );
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        })
+    }
+
+    /// No-op on non-Unix platforms (no `SIGHUP`); the CLI's re-gate signal is
+    /// Unix-only, so these platforms rely on the scheduled refresh / restart.
+    #[cfg(not(unix))]
+    pub fn spawn_license_regate_on_sighup(&self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+
     /// Spawn a background task that re-validates the license every 24 hours
     /// for non-air-gapped licences. Atomic licence writes, hard/transient
     /// failure split, and exposed refresh-state for the dashboard / CLI.
@@ -73,6 +129,25 @@ impl Daemon {
             let mut transient_attempts: u32 = 0;
             let mut transient_started_at: Option<DateTime<Utc>> = None;
             loop {
+                // Re-apply the licence gate from the on-disk licence on every
+                // wake, before any early-continue below. `evaluate_license`
+                // compares `valid_until` to the wall clock with no network, so
+                // this downgrades a lapsed licence to Community within one tick
+                // (<=1h) even when the daemon is not logged in, is air-gapped,
+                // or is between the 24h scheduled refresh attempts — none of
+                // which reach the refresh-outcome arms that were previously the
+                // only re-gate site. Without this a running daemon kept serving
+                // the pre-expiry tier (session cap + gated features) for up to
+                // ~24h after grace, and indefinitely for a credential-less /
+                // air-gapped daemon, until a restart or an operator SIGHUP.
+                apply_cached_license_gate(
+                    &feature_gate,
+                    &supervisor_registry,
+                    &notification_dispatcher,
+                    &refresh_state,
+                    config_max_sessions,
+                );
+
                 let creds = match load_credentials() {
                     Ok(Some(c)) => c,
                     _ => {
@@ -313,6 +388,7 @@ impl Daemon {
                     // existed (the supervisor used to stash the project name
                     // there).
                     project_name: r.project_name.clone().or_else(|| r.task_context.clone()),
+                    supervised_tool: r.supervised_tool.clone(),
                     llm_provider: r.llm_provider.clone(),
                     llm_model: r.llm_model.clone(),
                     prompt_tokens: r.prompt_tokens,
@@ -604,27 +680,57 @@ fn apply_runtime_license_gate(
     config_max_sessions: usize,
     new_gate: FeatureGate,
 ) {
-    if let Ok(mut gate) = feature_gate.write() {
-        *gate = new_gate.clone();
-    } else {
-        tracing::warn!("failed to update runtime feature gate (lock poisoned)");
-    }
-
     let effective_max = config_max_sessions.min(new_gate.max_sessions());
-    if let Ok(mut registry) = supervisor_registry.lock() {
-        registry.set_max_sessions(effective_max);
-    } else {
-        tracing::warn!("failed to update supervisor max sessions (lock poisoned)");
-    }
+
+    let prev_tier = match feature_gate.write() {
+        Ok(mut gate) => {
+            let prev = gate.tier;
+            *gate = new_gate.clone();
+            Some(prev)
+        }
+        Err(_) => {
+            tracing::warn!("failed to update runtime feature gate (lock poisoned)");
+            None
+        }
+    };
+
+    let prev_max = match supervisor_registry.lock() {
+        Ok(mut registry) => {
+            let prev = registry.max_sessions();
+            registry.set_max_sessions(effective_max);
+            Some(prev)
+        }
+        Err(_) => {
+            tracing::warn!("failed to update supervisor max sessions (lock poisoned)");
+            None
+        }
+    };
 
     notification_dispatcher.set_plan_tier(new_gate.tier);
-    tracing::info!(
-        tier = %new_gate.tier,
-        seats = new_gate.seats,
-        max_sessions = effective_max,
-        api_base = %api_base_url(),
-        "applied refreshed runtime license gate"
-    );
+
+    // The periodic revalidation loop re-applies the (usually unchanged) gate on
+    // every wake, so log at INFO only when the tier or the effective session
+    // cap actually changed; otherwise the daemon log would carry an hourly
+    // no-op line. A poisoned lock (prev == None) is treated as "changed" so the
+    // event is never silently dropped.
+    let changed =
+        prev_tier.is_none_or(|t| t != new_gate.tier) || prev_max.is_none_or(|m| m != effective_max);
+    if changed {
+        tracing::info!(
+            tier = %new_gate.tier,
+            seats = new_gate.seats,
+            max_sessions = effective_max,
+            api_base = %api_base_url(),
+            "applied runtime license gate"
+        );
+    } else {
+        tracing::debug!(
+            tier = %new_gate.tier,
+            seats = new_gate.seats,
+            max_sessions = effective_max,
+            "re-applied runtime license gate (unchanged)"
+        );
+    }
 }
 
 fn apply_cached_license_gate(

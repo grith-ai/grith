@@ -28,11 +28,11 @@ export function LockedProCard({
   children,
 }: Props) {
   return (
-    <div className="relative overflow-hidden rounded-xl border border-grith-border bg-white p-5">
+    <div className="relative overflow-hidden rounded-card border border-border bg-surface p-5">
       <div className="flex items-baseline justify-between mb-3">
-        <h2 className="text-sm font-medium text-grith-text">{title}</h2>
+        <h2 className="font-heading text-[15px] font-semibold text-text">{title}</h2>
         {!unlocked && (
-          <span className="inline-flex items-center gap-1 rounded-full border border-green/30 bg-green-light px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-green-dark">
+          <span className="inline-flex items-center gap-1 rounded-pill border border-green-border bg-green-light px-2.5 py-0.5 font-label text-[10px] font-medium uppercase tracking-[0.08em] text-accent-text">
             <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" aria-hidden>
               <path
                 d="M6 10V8a6 6 0 1112 0v2m-13 0h14v9a1 1 0 01-1 1H6a1 1 0 01-1-1v-9z"
@@ -55,11 +55,11 @@ export function LockedProCard({
       </div>
 
       {!unlocked && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-gradient-to-b from-white/40 to-white/85 px-6 text-center">
-          <p className="max-w-xs text-xs text-grith-muted">{description}</p>
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-gradient-to-b from-surface/40 to-surface/90 px-6 text-center">
+          <p className="max-w-xs text-xs text-text-secondary">{description}</p>
           <a
             href={billingUrl}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-green px-4 py-2 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-green-dark"
+            className="inline-flex items-center gap-1.5 rounded-btn bg-green px-4 py-2 text-xs font-heading font-semibold text-accent-ink transition-colors hover:bg-green-dark"
           >
             Unlock with {tier}
             <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" aria-hidden>

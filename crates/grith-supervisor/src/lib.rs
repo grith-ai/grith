@@ -51,7 +51,9 @@
 //! - [`syscall_map`] — Mapping from OS syscalls to proxy `ToolCallType`.
 
 pub mod audit_sink;
+pub mod cdp;
 pub mod config;
+pub mod connected_dns_proxy;
 pub mod dns_cache;
 pub mod dns_proxy;
 pub mod error;
@@ -67,6 +69,7 @@ pub mod profiles;
 pub mod provenance;
 pub mod pty;
 pub mod reviewer;
+pub mod scoped_permissions;
 pub mod session_sync;
 pub mod supervisor;
 pub mod syscall_map;
@@ -78,4 +81,4 @@ pub use interceptor::{SyscallEvent, SyscallInterceptor, SyscallKind, SyscallResp
 pub use inventory_sink::InventorySink;
 pub use profiles::SupervisorProfile;
 pub use reviewer::{DigestStore, LocalDigestStore, PollingQueueReviewer, QueueReviewer};
-pub use session_sync::{RegistrySessionSync, SessionSync};
+pub use session_sync::{RegistrySessionSync, SessionSync, SyncFailure, SyncOutcome};

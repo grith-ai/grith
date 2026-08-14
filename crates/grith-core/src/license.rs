@@ -17,12 +17,21 @@ use std::path::{Path, PathBuf};
 /// Ed25519 public key for license signature verification.
 /// Derived from the private key seed stored in the website's LICENSE_PRIVATE_KEY env var.
 const LICENSE_PUBLIC_KEY: [u8; 32] = [
-    0x0a, 0x16, 0xa2, 0x70, 0x08, 0xac, 0xa6, 0x20, 0x0e, 0x96, 0x62, 0x67, 0x3d, 0x2a, 0xf0, 0x79,
-    0x3b, 0x5b, 0x63, 0xfd, 0x3a, 0xd3, 0x72, 0xca, 0xe1, 0x95, 0xe8, 0x1b, 0x25, 0x13, 0xec, 0xdf,
+    0x57, 0xcc, 0xcf, 0x88, 0x23, 0x59, 0x57, 0xe7, 0x0b, 0xdd, 0x8d, 0x8f, 0xd9, 0xb8, 0x13, 0xdb,
+    0xbd, 0xaa, 0xc6, 0xb6, 0x59, 0x4f, 0x29, 0x37, 0xe9, 0x23, 0xa0, 0xa2, 0x3b, 0x4a, 0x35, 0x45,
 ];
 
-/// Default base URL for the grith website/API.
-const DEFAULT_API_BASE_URL: &str = "https://grith.ai";
+/// Default base URL for the grith cloud API. Points at the dedicated API host
+/// (api.grith.ai, the Hono service) rather than the marketing site: the daemon
+/// only ever calls machine endpoints (`/api/license`, `/api/sync`,
+/// `/api/device*`), which are served there. Overridable via `GRITH_API_BASE_URL`.
+const DEFAULT_API_BASE_URL: &str = "https://api.grith.ai";
+
+/// Default base URL for the grith web app (marketing site + dashboard). Human
+/// pages (dashboard, billing, pricing) live here, NOT on the API host.
+/// Overridable via `GRITH_WEB_BASE_URL` (e.g. `https://dev.grith.ai` pre-launch
+/// while grith.ai is in holding mode).
+const DEFAULT_WEB_BASE_URL: &str = "https://grith.ai";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const NATIVE_CREDENTIAL_SERVICE: &str = "ai.grith.cli";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -131,6 +140,11 @@ pub struct SyncRecord {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+    /// Name of the supervised external tool (e.g. "claude-code", "codex",
+    /// "aider"). None for built-in agent (`grith run`) records; the wire
+    /// field is omitted entirely in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervised_tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,6 +185,9 @@ pub enum DeviceAuthPollStatus {
     Pending,
     Expired,
     Approved,
+    /// The user authorized successfully but their team has no active
+    /// license (expired trial, lapsed subscription, or community plan).
+    NoActiveLicense,
 }
 
 /// API response from the policy fetch endpoint. All fields required for deserialization.
@@ -262,6 +279,17 @@ pub fn api_base_url() -> String {
 /// Build a full API URL from the configured base URL.
 fn api_url(path: &str) -> String {
     format!("{}/{}", api_base_url(), path.trim_start_matches('/'))
+}
+
+/// Resolve the web app base URL from `GRITH_WEB_BASE_URL` or default. Distinct
+/// from [`api_base_url`]: human-facing pages (dashboard, billing, pricing) are
+/// served by the web app (grith.ai), not the API host (api.grith.ai).
+pub fn web_base_url() -> String {
+    std::env::var("GRITH_WEB_BASE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_WEB_BASE_URL.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,6 +1208,17 @@ pub async fn poll_device_authorization(
         }
         428 => Ok((DeviceAuthPollStatus::Pending, None)),
         410 => Ok((DeviceAuthPollStatus::Expired, None)),
+        404 => {
+            // The server distinguishes "no team" / "no active license" from
+            // transport-level 404s via the error code in the body. Both mean
+            // the sign-in itself worked but there is no entitlement to issue.
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("no_active_license") || body.contains("no_team_found") {
+                Ok((DeviceAuthPollStatus::NoActiveLicense, None))
+            } else {
+                Err(LicenseError::Http(format!("404 Not Found: {body}")))
+            }
+        }
         _ => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -1521,6 +1560,47 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.user_id, "u1");
         assert_eq!(loaded.api_key, "grith_test");
+    }
+
+    fn make_sync_record() -> SyncRecord {
+        SyncRecord {
+            tool_call_type: "file_read".into(),
+            composite_score: 1.5,
+            proxy_action: "allow".into(),
+            filter_scores: None,
+            timestamp: "2026-08-05T00:00:00+00:00".into(),
+            session_id: Some("s1".into()),
+            project_name: None,
+            supervised_tool: None,
+            llm_provider: None,
+            llm_model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            estimated_cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn test_sync_record_serializes_supervised_tool_wire_name() {
+        let record = SyncRecord {
+            supervised_tool: Some("claude-code".into()),
+            ..make_sync_record()
+        };
+        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
+        // Exact wire field name and value.
+        assert_eq!(
+            json.get("supervised_tool").and_then(|v| v.as_str()),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
+    fn test_sync_record_omits_supervised_tool_when_none() {
+        let record = make_sync_record();
+        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
+        // Built-in agent records have no supervised tool - the field must be
+        // omitted from the payload entirely, not serialized as null.
+        assert!(json.get("supervised_tool").is_none());
     }
 
     fn make_license(plan: &str, seats: u32) -> License {

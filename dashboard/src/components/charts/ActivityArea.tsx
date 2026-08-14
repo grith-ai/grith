@@ -9,12 +9,15 @@ import { useMemo, useRef, useState } from "react";
 import * as d3Scale from "d3-scale";
 import { area, stack, curveMonotoneX } from "d3-shape";
 import type { AuditRecord, ProxyActionSummary } from "@/types/api";
+import { chartColors } from "@/lib/chartPalette";
 
 const COLORS: Record<ProxyActionSummary, string> = {
-  allow: "#00a85a",
-  queue: "#bf8700",
-  deny: "#d1242f",
+  allow: chartColors.accent,
+  queue: chartColors.warning,
+  deny: chartColors.danger,
 };
+
+const TICK_FONT = "'IBM Plex Mono', monospace";
 
 const MARGIN = { top: 12, right: 16, bottom: 26, left: 36 };
 const BUCKETS = 32;
@@ -112,13 +115,13 @@ export function ActivityArea({ records, width = 800, height = 200 }: Props) {
         <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
           {yScale.ticks(4).map((t) => (
             <g key={t}>
-              <line x1={0} x2={innerW} y1={yScale(t)} y2={yScale(t)} stroke="#e2e6eb" strokeWidth={0.5} />
-              <text x={-8} y={yScale(t) + 3} textAnchor="end" fontSize={10} fontFamily="'JetBrains Mono', monospace" fill="#8b949e">{t}</text>
+              <line x1={0} x2={innerW} y1={yScale(t)} y2={yScale(t)} stroke={chartColors.border} strokeWidth={0.5} />
+              <text x={-8} y={yScale(t) + 3} textAnchor="end" fontSize={10} fontFamily={TICK_FONT} fill={chartColors.faint}>{t}</text>
             </g>
           ))}
 
           {paths.map((p) => (
-            <path key={p.key} d={p.d} fill={COLORS[p.key]} opacity={0.55} stroke={COLORS[p.key]} strokeWidth={1} />
+            <path key={p.key} d={p.d} fill={COLORS[p.key]} opacity={0.55} stroke={COLORS[p.key]} strokeWidth={1.5} />
           ))}
 
           {hoverIdx != null && (
@@ -127,15 +130,15 @@ export function ActivityArea({ records, width = 800, height = 200 }: Props) {
               x2={xScale(buckets[hoverIdx]!.t)}
               y1={0}
               y2={innerH}
-              stroke="#0d1117"
+              stroke={chartColors.text}
               strokeWidth={1}
               opacity={0.25}
             />
           )}
 
-          <line x1={0} x2={innerW} y1={innerH} y2={innerH} stroke="#e2e6eb" />
+          <line x1={0} x2={innerW} y1={innerH} y2={innerH} stroke={chartColors.border} />
           {xTicks.map((t) => (
-            <text key={t} x={xScale(t)} y={innerH + 16} textAnchor="middle" fontSize={10} fontFamily="'JetBrains Mono', monospace" fill="#8b949e">
+            <text key={t} x={xScale(t)} y={innerH + 16} textAnchor="middle" fontSize={10} fontFamily={TICK_FONT} fill={chartColors.faint}>
               {new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             </text>
           ))}
@@ -143,15 +146,15 @@ export function ActivityArea({ records, width = 800, height = 200 }: Props) {
       </svg>
 
       {hb && hb.allow + hb.queue + hb.deny > 0 && (
-        <div className="pointer-events-none absolute right-2 top-2 rounded-lg border border-grith-border bg-white px-3 py-2 text-[11px] shadow-lg">
-          <div className="mb-1 font-mono text-grith-muted">
+        <div className="pointer-events-none absolute right-2 top-2 rounded-lg border border-border bg-surface px-3 py-2 text-[11px]">
+          <div className="mb-1 font-code text-text-secondary">
             {new Date(hb.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
           </div>
           {(["allow", "queue", "deny"] as ProxyActionSummary[]).map((k) => (
             <div key={k} className="flex items-center gap-2">
               <span className="h-2 w-2 rounded-sm" style={{ backgroundColor: COLORS[k] }} />
-              <span className="capitalize text-grith-muted">{k}</span>
-              <span className="ml-auto font-mono text-grith-text">{hb[k]}</span>
+              <span className="capitalize text-text-secondary">{k}</span>
+              <span className="ml-auto font-code text-text">{hb[k]}</span>
             </div>
           ))}
         </div>

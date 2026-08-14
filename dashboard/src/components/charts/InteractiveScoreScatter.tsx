@@ -16,12 +16,15 @@
 import { useMemo, useRef, useState } from "react";
 import * as d3Scale from "d3-scale";
 import type { AuditRecord, ProxyActionSummary } from "@/types/api";
+import { chartColors } from "@/lib/chartPalette";
 
 const COLORS: Record<ProxyActionSummary, string> = {
-  allow: "#00a85a",
-  queue: "#bf8700",
-  deny: "#d1242f",
+  allow: chartColors.accent,
+  queue: chartColors.warning,
+  deny: chartColors.danger,
 };
+
+const TICK_FONT = "'IBM Plex Mono', monospace";
 
 const MARGIN = { top: 12, right: 16, bottom: 28, left: 40 };
 /** Max pixel distance (in viewBox units) for a point to register as hovered. */
@@ -213,18 +216,18 @@ export function InteractiveScoreScatter({
         <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
           {/* Grid */}
           {yTicks.map((t) => (
-            <line key={t} x1={0} x2={innerW} y1={yScale(t)} y2={yScale(t)} stroke="#e2e6eb" strokeWidth={0.5} />
+            <line key={t} x1={0} x2={innerW} y1={yScale(t)} y2={yScale(t)} stroke={chartColors.border} strokeWidth={0.5} />
           ))}
 
           {/* Threshold guides */}
-          <line x1={0} x2={innerW} y1={yScale(allowThreshold)} y2={yScale(allowThreshold)} stroke="#00a85a" strokeWidth={1} strokeDasharray="4 3" opacity={0.5} />
-          <line x1={0} x2={innerW} y1={yScale(denyThreshold)} y2={yScale(denyThreshold)} stroke="#d1242f" strokeWidth={1} strokeDasharray="4 3" opacity={0.5} />
+          <line x1={0} x2={innerW} y1={yScale(allowThreshold)} y2={yScale(allowThreshold)} stroke={chartColors.accent} strokeWidth={1} strokeDasharray="4 3" opacity={0.5} />
+          <line x1={0} x2={innerW} y1={yScale(denyThreshold)} y2={yScale(denyThreshold)} stroke={chartColors.danger} strokeWidth={1} strokeDasharray="4 3" opacity={0.5} />
 
           {/* Zone labels */}
-          <text x={innerW - 2} y={yScale(allowThreshold / 2)} textAnchor="end" fontSize={9} fill="#00a85a" opacity={0.6}>ALLOW</text>
-          <text x={innerW - 2} y={yScale((allowThreshold + denyThreshold) / 2)} textAnchor="end" fontSize={9} fill="#bf8700" opacity={0.6}>QUEUE</text>
+          <text x={innerW - 2} y={yScale(allowThreshold / 2)} textAnchor="end" fontSize={9} fontFamily={TICK_FONT} fill={chartColors.accent} opacity={0.6}>ALLOW</text>
+          <text x={innerW - 2} y={yScale((allowThreshold + denyThreshold) / 2)} textAnchor="end" fontSize={9} fontFamily={TICK_FONT} fill={chartColors.warning} opacity={0.6}>QUEUE</text>
           {yScale.domain()[1]! > denyThreshold && (
-            <text x={innerW - 2} y={yScale((denyThreshold + yScale.domain()[1]!) / 2)} textAnchor="end" fontSize={9} fill="#d1242f" opacity={0.6}>DENY</text>
+            <text x={innerW - 2} y={yScale((denyThreshold + yScale.domain()[1]!) / 2)} textAnchor="end" fontSize={9} fontFamily={TICK_FONT} fill={chartColors.danger} opacity={0.6}>DENY</text>
           )}
 
           {/* Drag-zoom selection band */}
@@ -234,7 +237,7 @@ export function InteractiveScoreScatter({
               y={0}
               width={Math.abs(drag.cur - drag.start)}
               height={innerH}
-              fill="#00a85a"
+              fill={chartColors.accent}
               opacity={0.1}
             />
           )}
@@ -250,7 +253,7 @@ export function InteractiveScoreScatter({
                 r={active ? 5 : 3}
                 fill={COLORS[p.action]}
                 opacity={active ? 1 : 0.7}
-                stroke={active ? "#0d1117" : "none"}
+                stroke={active ? chartColors.bg : "none"}
                 strokeWidth={active ? 1 : 0}
                 style={{ pointerEvents: "none" }}
               />
@@ -275,16 +278,16 @@ export function InteractiveScoreScatter({
           />
 
           {/* Axes */}
-          <line x1={0} x2={innerW} y1={innerH} y2={innerH} stroke="#e2e6eb" style={{ pointerEvents: "none" }} />
+          <line x1={0} x2={innerW} y1={innerH} y2={innerH} stroke={chartColors.border} style={{ pointerEvents: "none" }} />
           {xTicks.map((t) => (
-            <text key={t.getTime()} x={xScale(t)} y={innerH + 16} textAnchor="middle" fontSize={10} fontFamily="'JetBrains Mono', monospace" fill="#8b949e" style={{ pointerEvents: "none" }}>
+            <text key={t.getTime()} x={xScale(t)} y={innerH + 16} textAnchor="middle" fontSize={10} fontFamily={TICK_FONT} fill={chartColors.faint} style={{ pointerEvents: "none" }}>
               {t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             </text>
           ))}
           {yTicks.map((t) => (
-            <text key={t} x={-8} y={yScale(t) + 3} textAnchor="end" fontSize={10} fontFamily="'JetBrains Mono', monospace" fill="#8b949e" style={{ pointerEvents: "none" }}>{t}</text>
+            <text key={t} x={-8} y={yScale(t) + 3} textAnchor="end" fontSize={10} fontFamily={TICK_FONT} fill={chartColors.faint} style={{ pointerEvents: "none" }}>{t}</text>
           ))}
-          <text x={-8} y={-4} textAnchor="end" fontSize={9} fill="#8b949e" fontFamily="'JetBrains Mono', monospace" style={{ pointerEvents: "none" }}>score</text>
+          <text x={-8} y={-4} textAnchor="end" fontSize={9} fill={chartColors.faint} fontFamily={TICK_FONT} style={{ pointerEvents: "none" }}>score</text>
         </g>
       </svg>
 
@@ -298,12 +301,12 @@ export function InteractiveScoreScatter({
               onClick={() => setVisible((v) => ({ ...v, [a]: !v[a] }))}
               className={`inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 transition-opacity ${
                 visible[a] ? "opacity-100" : "opacity-35"
-              } hover:bg-grith-surface`}
+              } hover:bg-surface-2`}
               title={`Toggle ${a}`}
             >
               <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: COLORS[a] }} />
-              <span className="capitalize text-grith-muted">{a}</span>
-              <span className="font-mono text-grith-dim">{counts[a]}</span>
+              <span className="capitalize text-text-secondary">{a}</span>
+              <span className="font-code text-text-dim">{counts[a]}</span>
             </button>
           ))}
         </div>
@@ -311,39 +314,39 @@ export function InteractiveScoreScatter({
           <button
             type="button"
             onClick={() => setZoom(null)}
-            className="inline-flex items-center gap-1 rounded-md border border-grith-border px-2 py-0.5 text-[11px] text-grith-muted hover:text-grith-text hover:border-grith-border-hover"
+            className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:text-text hover:border-border-dark"
           >
             Reset zoom
           </button>
         ) : (
-          <span className="text-[11px] text-grith-dim">drag to zoom · click a point to inspect</span>
+          <span className="text-[11px] text-text-dim">drag to zoom · click a point to inspect</span>
         )}
       </div>
 
       {/* Hover tooltip */}
       {hover && (
         <div
-          className="pointer-events-none absolute z-10 rounded-lg border border-grith-border bg-white px-3 py-2 text-xs shadow-lg"
+          className="pointer-events-none absolute z-10 rounded-lg border border-border bg-surface px-3 py-2 text-xs"
           style={{
             left: Math.min(hover.px + 12, (containerRef.current?.clientWidth ?? 0) - 180),
             top: Math.max(hover.py - 12, 0),
           }}
         >
-          <div className="flex items-center gap-1.5 font-mono text-grith-text">
+          <div className="flex items-center gap-1.5 font-code text-text">
             <span className="h-2 w-2 rounded-sm" style={{ backgroundColor: COLORS[hover.p.action] }} />
             <span className="truncate max-w-[200px]">{hover.p.type}</span>
           </div>
-          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] text-grith-muted">
+          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] text-text-secondary">
             <span>score</span>
-            <span className="text-right font-mono text-grith-text">{hover.p.score.toFixed(1)}</span>
+            <span className="text-right font-code text-text">{hover.p.score.toFixed(1)}</span>
             <span>decision</span>
-            <span className="text-right font-mono capitalize" style={{ color: COLORS[hover.p.action] }}>{hover.p.action}</span>
+            <span className="text-right font-code capitalize" style={{ color: COLORS[hover.p.action] }}>{hover.p.action}</span>
             <span>latency</span>
-            <span className="text-right font-mono text-grith-text">{hover.p.latency.toFixed(1)}ms</span>
+            <span className="text-right font-code text-text">{hover.p.latency.toFixed(1)}ms</span>
             {hover.p.topFilter && (
               <>
                 <span>filter</span>
-                <span className="text-right font-mono text-grith-text truncate">{hover.p.topFilter}</span>
+                <span className="text-right font-code text-text truncate">{hover.p.topFilter}</span>
               </>
             )}
           </div>

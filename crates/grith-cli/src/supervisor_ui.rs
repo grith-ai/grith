@@ -256,6 +256,7 @@ mod tests {
             total_queued: queued,
             total_denied: denied,
             total_filtered_noise: noise,
+            ..Default::default()
         }
     }
 

@@ -49,14 +49,14 @@ pub use grith_proxy::types::{
 /// `routine_provenance_signal = false`). `ScoringConfig::default()` matches the
 /// shipped fixed `3.0`/`8.0` thresholds (there is no cold-start widening).
 ///
-/// Included filters: operation_risk, path_match, sensitive_path, argument,
-/// secret_scan, command, destructive_action, egress_policy, **reputation** (static safe/malicious
+/// Included filters: operation-risk, path-match, sensitive_path, argument,
+/// secret-scan, command, destructive_action, egress-policy, **reputation** (static safe/malicious
 /// lists + raw-IP/suspicious-TLD scoring — it can ADD score on a single
 /// stateless op, so it is registered for fidelity), taint, rate_limit.
 ///
 /// Deliberately EXCLUDED (documented fidelity gaps): allowlist + capability
-/// (reduce/neutralise — omission OVER-counts, safe); dlp_gate + canary +
-/// session_containment (exfil-specific); behavioural + egress_rate (per-session
+/// (reduce/neutralise — omission OVER-counts, safe); dlp-gate + canary +
+/// session-containment (exfil-specific); behavioural + egress-rate (per-session
 /// STATEFUL — cold on the fresh-session corpus); the meta-rule engine (its only
 /// score-ADDING rule, `env-exfiltration-risk +5.0`, needs accumulated env-file
 /// taint, which the fresh-session corpus never builds).
@@ -162,7 +162,7 @@ impl TestFixtures {
     /// Sets up:
     /// - In-memory AuditStorage
     /// - In-memory DigestQueue
-    /// - SecurityProxy with all 6 default filters (path_match, secret_scan,
+    /// - SecurityProxy with all 6 default filters (path-match, secret-scan,
     ///   command, allowlist, argument, capability)
     /// - Default ScoringConfig and empty MetaRuleEngine
     pub fn new() -> Self {
@@ -208,7 +208,7 @@ impl TestFixtures {
     }
 
     /// Create a test environment with all filters including Phase 16 exfiltration
-    /// containment filters (egress_policy, dlp_gate, session_containment, egress_rate, canary).
+    /// containment filters (egress-policy, dlp-gate, session-containment, egress-rate, canary).
     pub fn with_all_filters() -> Self {
         let audit_storage = Arc::new(Mutex::new(
             AuditStorage::open_in_memory().expect("failed to create in-memory audit storage"),
@@ -277,7 +277,7 @@ impl TestFixtures {
     /// Build a FilterRegistry populated with all 6 default filter instances.
     ///
     /// Filters registered:
-    /// - **path_match** (Phase 1 Static): Detects access to sensitive paths
+    /// - **path-match** (Phase 1 Static): Detects access to sensitive paths
     ///   (SSH keys, .env files, PEM certificates)
     /// - **allowlist** (Phase 1 Static): User-defined allow/deny lists
     ///   (empty defaults, permissive)
@@ -285,7 +285,7 @@ impl TestFixtures {
     ///   injection and traversal patterns
     /// - **capability** (Phase 1 Static): Plugin capability token validation
     ///   (empty grants, permissive)
-    /// - **secret_scan** (Phase 2 Pattern): Regex-based secret detection
+    /// - **secret-scan** (Phase 2 Pattern): Regex-based secret detection
     ///   (AWS keys, GitHub tokens, private key blocks, generic API keys)
     /// - **command** (Phase 2 Pattern): Dangerous shell command pattern
     ///   detection (pipe-to-curl, sudo, chmod+s, base64 decode)

@@ -8,7 +8,7 @@ use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType};
 
 /// Heuristic path-risk filter.
 ///
-/// Unlike `path_match` (explicit TOML rules), this filter uses broad built-in
+/// Unlike `path-match` (explicit TOML rules), this filter uses broad built-in
 /// heuristics to catch common sensitive targets without requiring an exhaustive
 /// list of patterns.
 pub struct SensitivePathHeuristicFilter;
@@ -210,6 +210,20 @@ fn is_path_executable_dir(path_lc: &str) -> bool {
         || path_lc.contains("/.local/bin/")
 }
 
+/// Score for a WRITE/DELETE to the NSS shared cert store (A#4). Sub-threshold
+/// (below 3.0 QUEUE) so a routine browser rewrite doesn't prompt, but non-zero
+/// and `matched = true` so a CA-store change is recorded and nudges the
+/// composite when other risk is present.
+const NSS_CERT_STORE_CHANGE_SCORE: f64 = 1.5;
+
+/// True for the NSS *shared* certificate DB (`~/.pki/nssdb/…`) — an app cert
+/// store (chrome/curl/NSS), distinct from a user credential directory. Firefox's
+/// per-profile `cert9.db`/`key4.db` live under `~/.mozilla/firefox/…`, not here,
+/// so they are unaffected.
+fn is_nss_shared_db_path(path_lc: &str) -> bool {
+    path_lc.contains("/.pki/nssdb/")
+}
+
 /// True for another process's `environ`/`mem` under `/proc`
 /// (`/proc/<numeric-pid>/{environ,mem}`). The caller's own `/proc/self/*` and
 /// `/proc/thread-self/*` are benign. `path` is expected pre-lowercased.
@@ -229,7 +243,7 @@ fn proc_cross_process_secret(path: &str) -> bool {
 #[async_trait::async_trait]
 impl SecurityFilter for SensitivePathHeuristicFilter {
     fn name(&self) -> &str {
-        "sensitive_path_heuristic"
+        "sensitive-path-heuristic"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -237,18 +251,64 @@ impl SecurityFilter for SensitivePathHeuristicFilter {
     }
 
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
-        let path = match ctx.path() {
-            Some(p) => p,
-            None => return Ok(FilterResult::no_match(self.name())),
-        };
-        let op = match operation_for_call_type(&ctx.call_type) {
-            Some(op) => op,
-            None => return Ok(FilterResult::no_match(self.name())),
-        };
+        // Every path the call touches is judged, and the worst verdict wins.
+        // Link creation carries two: the target it exposes (a read of that
+        // data becomes possible) and the name being created (a write lands
+        // there). Judging only the target would price
+        // `ln -s ./mine ~/.ssh/authorized_keys` below the equivalent write,
+        // making a link the cheap way to plant one.
+        // This filter deliberately covers a narrower set of call types than
+        // the rule-driven one; anything outside it is left alone.
+        let handled = operation_for_call_type(&ctx.call_type).is_some()
+            || matches!(ctx.call_type, ToolCallType::FileLink { .. });
+        if !handled {
+            return Ok(FilterResult::no_match(self.name()));
+        }
+        let mut worst: Option<FilterResult> = None;
+        for (path, op) in path_operations(&ctx.call_type) {
+            let result = self.evaluate_path(path, op);
+            let better = match &worst {
+                Some(current) => result.score > current.score,
+                None => true,
+            };
+            if result.matched && better {
+                worst = Some(result);
+            }
+        }
+        Ok(worst.unwrap_or_else(|| FilterResult::no_match(self.name())))
+    }
+}
 
+impl SensitivePathHeuristicFilter {
+    fn evaluate_path(&self, path: &str, op: &'static str) -> FilterResult {
         let path_lc = normalize_path_for_match(path);
         let file_name_lc = normalized_file_name(&path_lc);
         let destructive = matches!(op, "write" | "delete");
+
+        // A#4: `~/.pki/nssdb` is the NSS *shared* certificate DB — an app cert
+        // store that chrome/curl/other NSS consumers read and atomically rewrite
+        // (cert9.db / key4.db / pkcs11.txt(.txu)) on every launch. It is NOT a
+        // user credential directory like `~/.ssh`. A READ is routine startup
+        // noise and is not flagged. A WRITE/DELETE is routed to a dedicated,
+        // sub-threshold CA-store-change signal: recorded and auditable (a write
+        // could inject a trusted CA) but not a standalone QUEUE, because the
+        // routine atomic rewrite is indistinguishable from injection by path
+        // alone. This deliberately does NOT touch `~/.ssh`/`~/.aws`/`~/.gnupg`
+        // (still full credential-directory) nor a Firefox-*profile* cert9.db/
+        // key4.db (the password-manager key, still flagged via the browser path).
+        if is_nss_shared_db_path(&path_lc) {
+            if destructive {
+                return FilterResult::matched(
+                    "sensitive-path-heuristic",
+                    "nss-cert-store-change",
+                    NSS_CERT_STORE_CHANGE_SCORE,
+                    Severity::Notice,
+                    format!("{op} to the NSS shared certificate store (~/.pki/nssdb)"),
+                );
+            }
+            return FilterResult::no_match("sensitive-path-heuristic");
+        }
+
         let ssh_metadata_read = op == "read"
             && matches!(
                 file_name_lc.as_str(),
@@ -361,6 +421,25 @@ impl SecurityFilter for SensitivePathHeuristicFilter {
                 });
                 break;
             }
+        }
+
+        // grith's own state directory — config, learned rules, reputation, and
+        // the daemon/dashboard IPC tokens + credentials all live under
+        // ~/.config/grith. A SUPERVISED tool has no legitimate reason to read
+        // or modify it; doing so would let it steal the IPC token (→ call any
+        // daemon IPC endpoint, e.g. poison the reputation table) or read the
+        // cloud credentials / licence. The daemon reads these from the untraced
+        // parent process, so only a tracee is flagged here. Mirrors
+        // grith_supervisor::syscall_map::is_sensitive_path, which already
+        // exempts this path from read-only noise suppression so it reaches this
+        // filter — this closes the scoring gap that let the read evaluate low.
+        if path_lc.contains("/.config/grith/") || path_lc.contains("/config/grith/") {
+            hits.push(HeuristicHit {
+                rule_id: "grith-self-access",
+                score: if destructive { 5.0 } else { 4.5 },
+                severity: Severity::Error,
+                message: format!("{op} access to grith's own state directory"),
+            });
         }
 
         // Control / autostart paths: any file here is a persistence or control
@@ -537,16 +616,16 @@ impl SecurityFilter for SensitivePathHeuristicFilter {
         }
 
         let Some(best) = hits.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-            return Ok(FilterResult::no_match(self.name()));
+            return FilterResult::no_match(self.name());
         };
 
-        Ok(FilterResult::matched(
+        FilterResult::matched(
             self.name(),
             best.rule_id,
             best.score,
             best.severity,
             best.message,
-        ))
+        )
     }
 }
 
@@ -590,6 +669,45 @@ fn normalized_file_name(path_lc: &str) -> String {
         .next_back()
         .unwrap_or_default()
         .to_string()
+}
+
+/// Every (path, operation) pair a call subjects to path policy.
+///
+/// Most calls have exactly one. Link creation has two, and they are different
+/// operations: the **target** becomes readable through a new name, and a new
+/// entry is **written** at the link path. Both must be judged — scoring only
+/// the target would let `ln -s ./mine ~/.ssh/authorized_keys` slip in under
+/// the price of writing that file (go-live review B2).
+pub(crate) fn path_operations(call_type: &ToolCallType) -> Vec<(&str, &'static str)> {
+    match call_type {
+        ToolCallType::FileLink {
+            target, link_path, ..
+        } => vec![(target.as_str(), "read"), (link_path.as_str(), "write")],
+        other => match path_of(other) {
+            Some(path) => vec![(
+                path,
+                crate::filters::path_match::operation_for_call_type(other),
+            )],
+            None => Vec::new(),
+        },
+    }
+}
+
+/// The single primary path of a non-link call.
+fn path_of(call_type: &ToolCallType) -> Option<&str> {
+    match call_type {
+        ToolCallType::FileRead { path }
+        | ToolCallType::FileWrite { path, .. }
+        | ToolCallType::FileAppend { path }
+        | ToolCallType::FileDelete { path }
+        | ToolCallType::DirList { path }
+        | ToolCallType::FileChmod { path, .. }
+        | ToolCallType::DirCreate { path } => Some(path),
+        ToolCallType::FileRename { old_path, .. } => Some(old_path),
+        ToolCallType::OwnershipChange { target, .. }
+        | ToolCallType::FilesystemMutation { target, .. } => Some(target),
+        _ => None,
+    }
 }
 
 fn operation_for_call_type(call_type: &ToolCallType) -> Option<&'static str> {
@@ -693,6 +811,24 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert!(result.score >= 4.0);
+    }
+
+    #[tokio::test]
+    async fn test_grith_own_state_dir_is_high_risk() {
+        // A supervised tool reading grith's own IPC token would let it call any
+        // daemon IPC endpoint (e.g. poison the reputation table). Must QUEUE.
+        let filter = SensitivePathHeuristicFilter::new();
+        let ctx = make_ctx(ToolCallType::FileRead {
+            path: "/home/dev/.config/grith/daemon.token".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert!(
+            result.score >= 3.0,
+            "grith token read score {} must reach QUEUE (rule {})",
+            result.score,
+            result.rule_id
+        );
     }
 
     #[tokio::test]
@@ -900,6 +1036,76 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert_eq!(result.rule_id, "browser-session-data");
+    }
+
+    // ---- A#4: NSS shared cert store (~/.pki/nssdb) ----
+
+    /// A READ of the browser's own NSS shared cert store is routine startup
+    /// noise — not flagged (was previously credential-directory / browser data).
+    #[tokio::test]
+    async fn test_nssdb_read_is_noise() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for name in ["cert9.db", "key4.db", "pkcs11.txt", "pkcs11.txu"] {
+            let ctx = make_ctx(ToolCallType::FileRead {
+                path: format!("/home/dan/.pki/nssdb/{name}"),
+            });
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert!(
+                !result.matched,
+                "nssdb read of {name} should be noise, got {}",
+                result.rule_id
+            );
+        }
+    }
+
+    /// A WRITE/DELETE to the NSS store routes to a dedicated, sub-threshold
+    /// CA-store-change signal: recorded but not a standalone QUEUE.
+    #[tokio::test]
+    async fn test_nssdb_write_is_sub_threshold_ca_change() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let ctx = make_ctx(ToolCallType::FileWrite {
+            path: "/home/dan/.pki/nssdb/cert9.db".into(),
+            content_hash: "abc".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "nss-cert-store-change");
+        assert!(
+            result.score < 3.0,
+            "must not QUEUE alone, got {}",
+            result.score
+        );
+
+        let del = make_ctx(ToolCallType::FileDelete {
+            path: "/home/dan/.pki/nssdb/pkcs11.txt".into(),
+        });
+        let r2 = filter.evaluate(&del).await.unwrap();
+        assert_eq!(r2.rule_id, "nss-cert-store-change");
+    }
+
+    /// A Firefox *profile* cert9.db (the password-manager key) is NOT under
+    /// ~/.pki/nssdb and stays flagged as browser session/credential data.
+    #[tokio::test]
+    async fn test_firefox_profile_cert9_still_flagged() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let ctx = make_ctx(ToolCallType::FileRead {
+            path: "/home/dan/.mozilla/firefox/abc123.default/cert9.db".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "browser-session-data");
+    }
+
+    /// The carve-out is nssdb-specific: ~/.ssh is still a full credential dir.
+    #[tokio::test]
+    async fn test_ssh_dir_unaffected_by_nssdb_carveout() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let ctx = make_ctx(ToolCallType::FileRead {
+            path: "/home/dan/.ssh/id_rsa".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert!(result.score >= 3.0);
     }
 
     #[tokio::test]

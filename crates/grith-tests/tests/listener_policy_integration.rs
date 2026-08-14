@@ -20,7 +20,7 @@
 //!   F6 → listener_wildcard_clamp_disabled
 //!   F7 → listener_no_routine_no_clamp (same shape as F6 conceptually
 //!        because the clamp decision is allow_clamp-gated, not
-//!        routine-gated; egress_policy doesn't see routine state).
+//!        routine-gated; egress-policy doesn't see routine state).
 //!
 //! **F5 (real ptrace bind + getsockname e2e) is intentionally deferred.**
 //! The byte-level sockaddr construction is verified by 7 unit tests
@@ -120,7 +120,7 @@ async fn f4_wildcard_undeclared_queues() {
         let listener_rule = decision
             .filter_results
             .iter()
-            .find(|r| r.matched && r.filter_name == "egress_policy");
+            .find(|r| r.matched && r.filter_name == "egress-policy");
         let rule = listener_rule.unwrap_or_else(|| panic!("wildcard {addr} should fire a rule"));
         assert_eq!(rule.rule_id, "wildcard-bind-undeclared", "addr={addr}");
         assert!(rule.score >= 5.0);
@@ -147,7 +147,7 @@ async fn f6_wildcard_declared_no_clamp_queues() {
     let rule = decision
         .filter_results
         .iter()
-        .find(|r| r.matched && r.filter_name == "egress_policy")
+        .find(|r| r.matched && r.filter_name == "egress-policy")
         .expect("rule must fire");
     assert_eq!(rule.rule_id, "wildcard-bind-declared-no-clamp");
     assert!(matches!(decision.action, ProxyAction::Queue { .. }));
@@ -174,14 +174,14 @@ async fn declared_and_undeclared_rules_are_mutually_exclusive() {
     let declared_rule = declared_decision
         .filter_results
         .iter()
-        .find(|r| r.matched && r.filter_name == "egress_policy")
+        .find(|r| r.matched && r.filter_name == "egress-policy")
         .expect("declared rule")
         .rule_id
         .clone();
     let undeclared_rule = undeclared_decision
         .filter_results
         .iter()
-        .find(|r| r.matched && r.filter_name == "egress_policy")
+        .find(|r| r.matched && r.filter_name == "egress-policy")
         .expect("undeclared rule")
         .rule_id
         .clone();
@@ -219,7 +219,7 @@ async fn f7_wildcard_declared_with_clamp_no_listener_policy_score() {
         !listener_rule_matched,
         "allow_clamp=true should suppress every listener-policy rule"
     );
-    // The egress_policy filter may still emit unknown-destination or
+    // The egress-policy filter may still emit unknown-destination or
     // unusual-port for this bind, but those are unrelated to the
     // listener-policy arm. The acceptance criterion is the absence
     // of the listener-policy queue, not the absence of every filter.
@@ -236,7 +236,7 @@ async fn specific_iface_bind_queues() {
     let ctx = netlisten_ctx("203.0.113.1", 9090);
     let decision = proxy.evaluate(&ctx).await;
     let listener_rule = decision.filter_results.iter().find(|r| {
-        r.matched && r.filter_name == "egress_policy" && r.rule_id == "specific-iface-bind"
+        r.matched && r.filter_name == "egress-policy" && r.rule_id == "specific-iface-bind"
     });
     assert!(
         listener_rule.is_some(),

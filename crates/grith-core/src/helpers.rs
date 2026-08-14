@@ -78,22 +78,6 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
-pub fn quality_indicator(attempts: usize, successes: usize, enable_color: bool) -> String {
-    if attempts == 0 {
-        "n/a".to_string()
-    } else if attempts == successes {
-        if enable_color {
-            "✓".with(Color::Green).to_string()
-        } else {
-            "✓".to_string()
-        }
-    } else if enable_color {
-        "✗".with(Color::Red).to_string()
-    } else {
-        "✗".to_string()
-    }
-}
-
 pub fn display_tool_label(tool: &str) -> String {
     match tool {
         "http_request" => "net_request".to_string(),
@@ -170,6 +154,23 @@ pub fn print_summary_row(
         return;
     }
     println!("{line}");
+}
+
+/// Print a single-column summary line (no right column, no fixed-width padding).
+pub fn print_summary_line(text: &str, color: Option<Color>, bold: bool, enable_color: bool) {
+    if enable_color {
+        let styled = match color {
+            Some(c) => text.with(c),
+            None => text.reset(),
+        };
+        if bold {
+            println!("{}", styled.bold());
+        } else {
+            println!("{styled}");
+        }
+        return;
+    }
+    println!("{text}");
 }
 
 pub fn normalize_tool_call_type_label(tool_call_type: &str) -> String {

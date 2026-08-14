@@ -130,6 +130,7 @@ mod tests {
             session_id: None,
             tool_call_type: "ShellExec".into(),
             arguments_summary: "test".into(),
+            decision_reason: None,
             composite_score: 4.0,
             severity: ScoreSeverity::Medium,
             filter_breakdown: vec![],

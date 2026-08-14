@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn audit_json_round_trips() {
-        let s = r#"[{"filter_name":"path_match","matched":true,"score":3.0,"rule_id":"dangerous-path","severity":"critical","message":"destructive path pattern"},{"filter_name":"command_structure","matched":true,"score":4.5,"rule_id":"rm-rf","severity":"critical","message":"recursive force delete"}]"#;
+        let s = r#"[{"filter_name":"path-match","matched":true,"score":3.0,"rule_id":"dangerous-path","severity":"critical","message":"destructive path pattern"},{"filter_name":"command_structure","matched":true,"score":4.5,"rule_id":"rm-rf","severity":"critical","message":"recursive force delete"}]"#;
         let bytes = compress_string(s);
         assert!(is_compressed(&bytes));
         assert!(

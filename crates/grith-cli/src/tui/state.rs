@@ -278,11 +278,14 @@ pub struct PermissionRequest {
     pub score: f32,
     pub filters: Vec<FilterHit>,
     pub reasons: Vec<String>,
+    pub decision_reason: String,
     pub context: String,
     pub severity: String,
     pub call_type: String,
     pub item_number: usize,
     pub total_items: usize,
+    /// Whether the exec reviewer may offer session directory scoping.
+    pub scope_enabled: bool,
 }
 
 #[cfg(test)]
@@ -373,10 +376,10 @@ mod tests {
     #[test]
     fn test_filter_hit_construction() {
         let hit = FilterHit {
-            name: "path_match".to_string(),
+            name: "path-match".to_string(),
             delta: 5.0,
         };
-        assert_eq!(hit.name, "path_match");
+        assert_eq!(hit.name, "path-match");
         assert!((hit.delta - 5.0).abs() < f32::EPSILON);
     }
 }

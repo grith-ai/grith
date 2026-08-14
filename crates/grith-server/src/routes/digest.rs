@@ -134,6 +134,25 @@ pub(crate) async fn deny_digest(
     }
 }
 
+/// Clear all actionable digest items (pending + escalated) in one atomic
+/// operation — a "dismiss all" for stale/older items. Does NOT approve
+/// (execute) or deny them; it removes them from the queue (see
+/// `bulk_clear_pending`). No per-item resolution notifications are dispatched
+/// (bulk clear must not flood the operator's notification channels).
+pub(crate) async fn clear_all_digest(State(state): State<AppState>) -> impl IntoResponse {
+    match state.digest_queue.bulk_clear_pending() {
+        Ok(cleared) => {
+            Json(serde_json::json!({"status": "cleared", "cleared": cleared})).into_response()
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e.to_string(),
+            "DIGEST_CLEAR_FAILED",
+        )
+        .into_response(),
+    }
+}
+
 pub(crate) async fn learn_digest(
     State(state): State<AppState>,
     Path(id): Path<String>,

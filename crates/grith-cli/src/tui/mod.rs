@@ -92,15 +92,18 @@ pub fn run_tui(
 }
 
 /// Show the ratatui permission dialog over the current screen (no alternate screen).
-/// Blocks until the user presses a/d/l/t, returns the chosen action string.
+/// Blocks until the user selects a review action.
 /// Used by `TerminalQueueReviewer` for styled review prompts.
 ///
 /// Does NOT use alternate screen — nested alt screens break with TUI tools
 /// that already use alt screen (e.g. Claude Code). Instead, clears and draws
 /// directly. After exit, the caller is responsible for triggering SIGWINCH
 /// so the tool redraws.
-pub fn run_review_dialog(req: &state::PermissionRequest) -> Option<&'static str> {
-    use crossterm::event::{self, Event, KeyCode};
+pub fn run_review_dialog(
+    req: &state::PermissionRequest,
+) -> Option<grith_digest::PermissionReviewAction> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use grith_digest::PermissionReviewAction;
 
     #[cfg(unix)]
     let saved_stderr = redirect_stderr_to_file();
@@ -127,6 +130,8 @@ pub fn run_review_dialog(req: &state::PermissionRequest) -> Option<&'static str>
     let is_deny = req.score > 8.0;
     let result;
     let mut show_inspect = false;
+    let mut show_help = false;
+    let mut scope_dialog: Option<widgets::permission::ScopeDialogState> = None;
 
     loop {
         let _ = terminal.draw(|frame| {
@@ -135,42 +140,100 @@ pub fn run_review_dialog(req: &state::PermissionRequest) -> Option<&'static str>
                     .style(ratatui::style::Style::new().bg(crate::tui::theme::BG)),
                 frame.area(),
             );
-            crate::tui::widgets::permission::render_permission_dialog(
-                frame,
-                req,
-                is_deny,
-                show_inspect,
-            );
+            if show_help {
+                crate::tui::widgets::permission::render_permission_help_dialog(frame, req, is_deny);
+            } else if let Some(scope) = &scope_dialog {
+                crate::tui::widgets::permission::render_scope_permission_dialog(frame, req, scope);
+            } else {
+                crate::tui::widgets::permission::render_permission_dialog(
+                    frame,
+                    req,
+                    is_deny,
+                    show_inspect,
+                );
+            }
         });
 
         if let Ok(true) = event::poll(Duration::from_millis(50)) {
             if let Ok(Event::Key(key)) = event::read() {
+                // Help overlay: modal — only closing keys act, so a
+                // decision can't be made blind while reading.
+                if show_help {
+                    if matches!(
+                        key.code,
+                        KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('q') | KeyCode::Esc
+                    ) {
+                        show_help = false;
+                    }
+                    continue;
+                }
+                if let Some(scope) = scope_dialog.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => scope_dialog = None,
+                        KeyCode::Enter => {
+                            if let Some(action) = scope.apply(req) {
+                                result = Some(action);
+                                break;
+                            }
+                        }
+                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            scope.focus_previous();
+                        }
+                        KeyCode::Tab | KeyCode::Down => scope.focus_next(),
+                        KeyCode::BackTab | KeyCode::Up => scope.focus_previous(),
+                        KeyCode::Backspace if scope.directory_focused() => {
+                            scope.pop_directory_char();
+                        }
+                        KeyCode::Char('u')
+                            if scope.directory_focused()
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            scope.clear_directory();
+                        }
+                        KeyCode::Char(' ') if !scope.directory_focused() => {
+                            scope.toggle_focused();
+                        }
+                        KeyCode::Char(ch)
+                            if scope.directory_focused() && key.modifiers.is_empty() =>
+                        {
+                            scope.push_directory_char(ch);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('a') | KeyCode::Char('A') if !is_deny => {
-                        result = Some("approve");
+                        result = Some(PermissionReviewAction::Approve);
                         break;
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') if !is_deny => {
-                        result = Some("deny");
+                        result = Some(PermissionReviewAction::Deny);
                         break;
                     }
                     KeyCode::Char('l') | KeyCode::Char('L') if !is_deny => {
-                        result = Some("approve_and_learn");
+                        result = Some(PermissionReviewAction::ApproveAndLearn);
                         break;
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') if !is_deny => {
-                        result = Some("deny_and_terminate");
+                        result = Some(PermissionReviewAction::DenyAndTerminate);
                         break;
                     }
                     KeyCode::Char('c') | KeyCode::Char('C') if is_deny => {
-                        result = Some("deny");
+                        result = Some(PermissionReviewAction::Deny);
                         break;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') if !is_deny => {
+                        scope_dialog = widgets::permission::ScopeDialogState::for_request(req);
                     }
                     KeyCode::Char('i') | KeyCode::Char('I') => {
                         show_inspect = !show_inspect;
                     }
+                    KeyCode::Char('h') | KeyCode::Char('H') => {
+                        show_help = true;
+                    }
                     KeyCode::Esc => {
-                        result = Some("deny");
+                        result = Some(PermissionReviewAction::Deny);
                         break;
                     }
                     _ => {}
@@ -649,11 +712,13 @@ fn check_pending_digest(state: &mut AppState) {
             .iter()
             .map(|f| f.message.clone())
             .collect(),
+        decision_reason: item.decision_reason.clone().unwrap_or_default(),
         context: item.task_context.clone().unwrap_or_default(),
         severity: severity.to_string(),
         call_type: call_type_category,
         item_number: 1,
         total_items: total,
+        scope_enabled: false,
     }));
 }
 

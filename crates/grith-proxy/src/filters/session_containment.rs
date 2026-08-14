@@ -191,7 +191,7 @@ impl SessionContainmentFilter {
         // Basename stem = the part before the first '.', so `secrets.yaml` /
         // `credentials.json` match (stem "secrets" / "credentials") but
         // `secret_scan.rs` / `credentials_helper.rs` do not (stems
-        // "secret_scan" / "credentials_helper").
+        // "secret-scan" / "credentials_helper").
         let stem = basename.split('.').next().unwrap_or(basename);
         self.sensitive_sources.iter().any(|needle| {
             if needle.contains('/') {
@@ -245,7 +245,7 @@ impl SessionContainmentFilter {
         if let ToolCallType::FileRead { path } = &ctx.call_type {
             if self.is_sensitive_source(path) {
                 self.tracker.register(ctx.session_id, now);
-                return Ok(FilterResult::no_match("session_containment"));
+                return Ok(FilterResult::no_match("session-containment"));
             }
         }
 
@@ -254,7 +254,7 @@ impl SessionContainmentFilter {
         }
 
         let Some(remaining) = self.tracker.active_remaining_seconds(ctx.session_id, now) else {
-            return Ok(FilterResult::no_match("session_containment"));
+            return Ok(FilterResult::no_match("session-containment"));
         };
 
         let mk_message = |kind: &str| {
@@ -265,7 +265,7 @@ impl SessionContainmentFilter {
             ToolCallType::HttpRequest { .. } | ToolCallType::NetConnect { .. } => {
                 let severity = severity_for(self.network_score);
                 FilterResult::matched(
-                    "session_containment",
+                    "session-containment",
                     "contained-network-egress",
                     self.network_score,
                     severity,
@@ -275,7 +275,7 @@ impl SessionContainmentFilter {
             ToolCallType::ProcessSpawn { .. } if self.spawn_is_outbound_capable(ctx) => {
                 let severity = severity_for(self.process_score);
                 FilterResult::matched(
-                    "session_containment",
+                    "session-containment",
                     "contained-process-egress",
                     self.process_score,
                     severity,
@@ -285,21 +285,21 @@ impl SessionContainmentFilter {
             // Routine local spawn (compiler, linker, test binary, …) under
             // containment: it cannot exfil, so don't penalise it. This is the
             // fix for the prompt flood when a contained session runs a build.
-            ToolCallType::ProcessSpawn { .. } => FilterResult::no_match("session_containment"),
+            ToolCallType::ProcessSpawn { .. } => FilterResult::no_match("session-containment"),
             ToolCallType::ShellExec { .. } => match ctx.full_command() {
                 Some(full) if self.looks_outbound_command(&full) => {
                     let severity = severity_for(self.shell_score);
                     FilterResult::matched(
-                        "session_containment",
+                        "session-containment",
                         "contained-shell-egress",
                         self.shell_score,
                         severity,
                         mk_message("shell outbound operation"),
                     )
                 }
-                _ => FilterResult::no_match("session_containment"),
+                _ => FilterResult::no_match("session-containment"),
             },
-            _ => FilterResult::no_match("session_containment"),
+            _ => FilterResult::no_match("session-containment"),
         };
 
         Ok(result)
@@ -309,7 +309,7 @@ impl SessionContainmentFilter {
 #[async_trait::async_trait]
 impl SecurityFilter for SessionContainmentFilter {
     fn name(&self) -> &str {
-        "session_containment"
+        "session-containment"
     }
 
     fn phase(&self) -> FilterPhase {

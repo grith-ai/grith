@@ -146,7 +146,7 @@ Replace the `PLACEHOLDER_SHA256_*` values in `Formula/grith.rb` and `dist/scoop/
 
 ## Verifying a release (supply-chain assurance)
 
-Every release tarball published to `grith-ai/grith` ships with **four
+Every release tarball published to `grith-ai/grith` ships with **five
 companion artefacts** so users can verify provenance independently of
 us:
 
@@ -156,16 +156,16 @@ us:
 | `<archive>.cdx.json` | CycloneDX 1.5 SBOM listing every transitive Rust dependency resolved in `Cargo.lock` at build time. |
 | `<archive>.cosign.bundle` | Sigstore signature of the archive — keyless, signed by the workflow's GitHub OIDC identity, anchored in the Rekor transparency log. |
 | `<archive>.cdx.json.cosign.bundle` | The same signature scheme applied to the SBOM, so the dependency manifest is also tamper-evident. |
+| `<archive>.intoto.bundle` | A **SLSA v1 build-provenance attestation** — an in-toto statement binding the archive to the workflow, source commit, and builder that produced it, signed with cosign (keyless, Rekor-anchored) by the same identity as the signatures above. |
 
-In addition, every tarball has a **SLSA v1 build-provenance attestation**
-emitted via GitHub's first-party attestations API. It can be retrieved
-with `gh attestation` and does not need to be downloaded as a separate
-asset.
+The provenance is signed with cosign and shipped as a release asset (rather
+than persisted to GitHub's attestations API), so it verifies with the same
+`cosign` toolchain as the signatures — no extra tooling and no dependency on
+a GitHub plan feature.
 
 ### Full verification (recommended)
 
-Requires [`cosign`](https://docs.sigstore.dev/cosign/installation/) and
-the [`gh` CLI](https://cli.github.com/).
+Requires only [`cosign`](https://docs.sigstore.dev/cosign/installation/).
 
 ```bash
 VERSION=0.1.4
@@ -174,7 +174,8 @@ BASE=https://github.com/grith-ai/grith/releases/download/v${VERSION}
 
 # 1. Download archive + companion artefacts
 for asset in "${ARCHIVE}" "${ARCHIVE}.sha256" "${ARCHIVE}.cdx.json" \
-             "${ARCHIVE}.cosign.bundle" "${ARCHIVE}.cdx.json.cosign.bundle"; do
+             "${ARCHIVE}.cosign.bundle" "${ARCHIVE}.cdx.json.cosign.bundle" \
+             "${ARCHIVE}.intoto.bundle"; do
   curl -fsSL -o "${asset}" "${BASE}/${asset}"
 done
 
@@ -195,8 +196,13 @@ cosign verify-blob \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   "${ARCHIVE}.cdx.json"
 
-# 5. Verify SLSA build-provenance (no separate download needed).
-gh attestation verify "${ARCHIVE}" --repo grith-ai/grith
+# 5. Verify SLSA build-provenance (binds the archive to the release workflow).
+cosign verify-blob-attestation \
+  --bundle "${ARCHIVE}.intoto.bundle" \
+  --type slsaprovenance1 \
+  --certificate-identity "https://github.com/grith-ai/grith/.github/workflows/release.yml@refs/tags/v${VERSION}" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "${ARCHIVE}"
 ```
 
 A passing run proves:
@@ -257,7 +263,7 @@ Output goes to `dist/release-artifacts/`.
 |----------|---------|----------------|
 | **CI** (`.github/workflows/ci.yml`) | Push to `main`, PRs | `cargo fmt`, `clippy -D warnings`, `cargo test`, MSRV 1.80, dashboard type-check/lint/build/test, API type drift |
 | **Security audit** (`.github/workflows/security-audit.yml`) | Weekly (Mon) + PRs | `cargo audit` (CVEs), `cargo deny check` (license compliance) |
-| **Release** (`.github/workflows/release.yml`) | `v*` tags | Cross-platform builds, archives, SHA-256 checksums, CycloneDX SBOM, cosign keyless signatures (archive + SBOM), SLSA build-provenance attestation, GitHub Release |
+| **Release** (`.github/workflows/release.yml`) | `v*` tags | Cross-platform builds, archives, SHA-256 checksums, CycloneDX SBOM, cosign keyless signatures (archive + SBOM), cosign-signed SLSA build-provenance, GitHub Release |
 
 ## Hotfix releases
 

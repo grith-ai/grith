@@ -86,7 +86,7 @@ export function SessionsPage() {
   if (loading && sessions.length === 0) {
     return (
       <div className="p-6">
-        <p className="text-grith-muted">Loading sessions…</p>
+        <p className="text-text-secondary">Loading sessions…</p>
       </div>
     );
   }
@@ -94,29 +94,29 @@ export function SessionsPage() {
   return (
     <div className="p-6">
       <div className="flex items-baseline justify-between mb-4">
-        <h1 className="text-xl font-semibold text-grith-text">
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text">
           Sessions
-          <span className="ml-2 text-sm font-normal text-grith-muted">
+          <span className="ml-2 text-sm font-normal text-text-secondary">
             {sessions.length} active
           </span>
         </h1>
         <button
           onClick={() => void fetchSessions()}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors"
+          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors"
         >
           Refresh
         </button>
       </div>
 
       {error && (
-        <div className="mb-4 rounded-xl border border-status-deny-red bg-status-deny-light px-4 py-3 text-sm text-status-deny-red">
+        <div className="mb-4 rounded-card border border-danger-border bg-danger-light px-4 py-3 text-sm text-danger-text">
           {error}
         </div>
       )}
 
-      <div className="bg-white border border-grith-border rounded-xl overflow-hidden">
+      <div className="bg-surface border border-border rounded-card overflow-hidden">
         <table className="w-full text-sm">
-          <thead className="bg-grith-surface text-grith-muted text-xs uppercase tracking-wide">
+          <thead className="border-b border-border font-label text-text-dim text-[11px] uppercase tracking-[0.08em]">
             <tr>
               <th className="text-left px-4 py-2 font-medium">Session</th>
               <th className="text-left px-4 py-2 font-medium">Project</th>
@@ -136,54 +136,54 @@ export function SessionsPage() {
               return (
                 <tr
                   key={s.id}
-                  className="border-t border-grith-border hover:bg-grith-surface/60"
+                  className="border-t border-border hover:bg-surface-2"
                 >
                   <td className="px-4 py-2">
                     <Link
                       to={`/audit?session_id=${s.id}`}
-                      className="font-mono text-grith-text hover:text-accent"
+                      className="font-code text-text hover:text-accent-text"
                       title={s.id}
                     >
                       {s.id.slice(0, 8)}
                     </Link>
-                    <span className="ml-2 text-grith-muted">{s.tool_name}</span>
+                    <span className="ml-2 text-text-secondary">{s.tool_name}</span>
                     {contained && (
-                      <span className="ml-2 text-xs font-medium text-status-deny-red">
+                      <span className="ml-2 font-label text-[11px] font-medium tracking-[0.08em] text-danger-text">
                         CONTAINED
                       </span>
                     )}
                     {orphaned && (
                       <span
-                        className="ml-2 text-xs font-medium text-status-queue-amber"
-                        title="Long-lived and idle — possibly a forgotten session."
+                        className="ml-2 text-xs font-medium text-warning-text"
+                        title="Long-lived and idle - possibly a forgotten session."
                       >
                         possibly orphaned
                       </span>
                     )}
                   </td>
                   <td
-                    className="px-4 py-2 text-grith-text truncate max-w-xs"
+                    className="px-4 py-2 text-text truncate max-w-xs"
                     title={s.cwd ?? undefined}
                   >
                     {locationLabel(s)}
                   </td>
-                  <td className="px-4 py-2 font-mono text-grith-muted">
+                  <td className="px-4 py-2 font-code text-text-secondary">
                     {s.tty ?? "—"}
                   </td>
-                  <td className="px-4 py-2 text-right font-mono text-grith-muted">
+                  <td className="px-4 py-2 text-right font-code text-text-secondary">
                     {s.root_pid}
                   </td>
-                  <td className="px-4 py-2 text-right text-grith-text">
+                  <td className="px-4 py-2 text-right text-text">
                     {formatDuration(s.uptime_seconds)}
                   </td>
                   <td
                     className={`px-4 py-2 text-right ${
-                      orphaned ? "text-status-queue-amber" : "text-grith-muted"
+                      orphaned ? "text-warning-text" : "text-text-secondary"
                     }`}
                   >
                     {idle >= 5 ? formatDuration(idle) : "active"}
                   </td>
-                  <td className="px-4 py-2 text-right text-grith-muted">
+                  <td className="px-4 py-2 text-right text-text-secondary">
                     {s.stats.total_intercepted.toLocaleString()} ·{" "}
                     {s.stats.total_queued} queued
                   </td>
@@ -193,13 +193,13 @@ export function SessionsPage() {
                         <button
                           onClick={() => void handleKill(s.id)}
                           disabled={killing === s.id}
-                          className="px-2 py-1 text-xs font-medium rounded-lg bg-status-deny-red text-white hover:opacity-90 transition-opacity disabled:opacity-50"
+                          className="px-2 py-1 text-xs font-medium rounded-btn border border-danger-border bg-danger-light text-danger-text hover:bg-danger/15 transition-colors disabled:opacity-50"
                         >
                           {killing === s.id ? "Killing…" : "Confirm kill"}
                         </button>
                         <button
                           onClick={() => setConfirmId(null)}
-                          className="px-2 py-1 text-xs rounded-lg border border-grith-border text-grith-muted hover:text-grith-text"
+                          className="px-2 py-1 text-xs rounded-lg border border-border text-text-secondary hover:text-text"
                         >
                           Cancel
                         </button>
@@ -207,7 +207,7 @@ export function SessionsPage() {
                     ) : (
                       <button
                         onClick={() => setConfirmId(s.id)}
-                        className="px-2 py-1 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-status-deny-red hover:border-status-deny-red transition-colors"
+                        className="px-2 py-1 text-xs font-medium rounded-btn border border-border text-text-secondary hover:text-danger-text hover:border-danger-border hover:bg-danger-light transition-colors"
                       >
                         Kill
                       </button>
@@ -220,10 +220,10 @@ export function SessionsPage() {
               <tr>
                 <td
                   colSpan={8}
-                  className="px-4 py-8 text-center text-grith-muted"
+                  className="px-4 py-8 text-center text-text-secondary"
                 >
                   No active sessions. Start one with{" "}
-                  <code className="font-mono text-grith-text bg-grith-surface px-1 rounded">
+                  <code className="font-code text-text bg-surface-2 px-1 rounded">
                     grith exec &lt;tool&gt;
                   </code>
                   .
@@ -235,7 +235,7 @@ export function SessionsPage() {
       </div>
 
       {confirmId && (
-        <p className="mt-3 text-xs text-grith-muted">
+        <p className="mt-3 text-xs text-text-secondary">
           Killing a session terminates the supervised process and its children.
         </p>
       )}

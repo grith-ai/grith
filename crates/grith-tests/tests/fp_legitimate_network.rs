@@ -66,7 +66,7 @@ fn ctx_https(url: &str) -> ToolCallContext {
 /// Realistic per-ecosystem hostnames (mostly subdomains, exercising the
 /// subdomain-aware `domain_matches`) that the shipped config must now trust.
 ///
-/// URLs use short paths on purpose: `egress_policy` also runs content signals
+/// URLs use short paths on purpose: `egress-policy` also runs content signals
 /// (entropy / base64 / length) that are evaluated independently of domain
 /// trust — and because `/` is in the base64 alphabet, a long path can form a
 /// ≥40-char "base64 run" and fire `base64-chunking` regardless of how trusted
@@ -79,6 +79,7 @@ async fn accept_dev_infra_ecosystems_are_trusted() {
     let trusted_hosts: &[&str] = &[
         // LLM providers
         "https://api.openai.com/v1",
+        "https://sdmtprcentralus.oaiusercontent.com:65535/",
         "https://openrouter.ai/api",
         // language registries / toolchains
         "https://api.nuget.org/v3",

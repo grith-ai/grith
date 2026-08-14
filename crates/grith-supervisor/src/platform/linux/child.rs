@@ -391,6 +391,7 @@ pub(super) async fn do_spawn_supervised(
 
             sup.set_trace_options(child)?;
             sup.supervised.insert(child_pid);
+            sup.tid_tgids.insert(child_pid, child_pid);
             sup.seccomp_tracees.insert(child_pid);
             // Spawned with a TSYNC'd seccomp filter: every descendant inherits
             // it, so the whole session must resume via PTRACE_CONT. See
@@ -554,6 +555,7 @@ pub(super) async fn do_spawn_supervised_pty(
 
             sup.set_trace_options(child)?;
             sup.supervised.insert(child_pid);
+            sup.tid_tgids.insert(child_pid, child_pid);
             sup.seccomp_tracees.insert(child_pid);
             // Spawned with a TSYNC'd seccomp filter: every descendant inherits
             // it, so the whole session must resume via PTRACE_CONT. See

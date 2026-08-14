@@ -43,6 +43,7 @@ trusted_domains = [
   "storage.googleapis.com",
   # --- FP §5.3: LLM providers ---
   "openai.com",
+  "oaiusercontent.com",   # OpenAI hosted-content transport used by Codex startup/MCP paths
   "openrouter.ai",
   # --- FP §5.3: language package registries / toolchains ---
   "nuget.org",            # .NET (api.nuget.org)

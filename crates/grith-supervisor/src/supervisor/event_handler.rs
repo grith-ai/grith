@@ -9,10 +9,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use futures::FutureExt;
 use uuid::Uuid;
 
 use grith_audit::types::AuditRecord;
@@ -23,7 +25,10 @@ use grith_digest::types::{
 use grith_proxy::engine::SecurityProxy;
 use grith_proxy::filters::session_containment::ContainmentTracker;
 use grith_proxy::session_state::SessionStateRegistry;
-use grith_proxy::types::{ProxyAction, SessionScopeKey, ToolCallContext, ToolCallType};
+use grith_proxy::types::{
+    format_dns_candidate_array, parse_dns_candidate_array, ProxyAction, SessionScopeKey,
+    ToolCallContext, ToolCallType,
+};
 use grith_proxy::{audit_bridge, exfil};
 use tokio::sync::broadcast;
 
@@ -156,6 +161,144 @@ fn is_loopback_connect_address(addr: &str) -> bool {
     false
 }
 
+/// Resolve network attribution without holding the shared DNS cache lock while
+/// libc performs a potentially blocking PTR lookup.
+async fn resolve_network_attribution(
+    dns_cache: &Arc<Mutex<DnsCache>>,
+    address: &str,
+) -> crate::dns_cache::Resolution {
+    let lookup = match dns_cache.lock() {
+        Ok(mut cache) => cache.lookup_attribution(address),
+        Err(_) => {
+            return address
+                .parse()
+                .map(crate::dns_cache::Resolution::Unknown)
+                .unwrap_or_else(|_| crate::dns_cache::Resolution::NotAnIp(address.to_string()));
+        }
+    };
+
+    match lookup {
+        crate::dns_cache::AttributionLookup::Ready(resolution) => resolution,
+        crate::dns_cache::AttributionLookup::NeedsReverse(addr) => {
+            let lookup_address = addr.to_string();
+            let hostname = tokio::task::spawn_blocking(move || {
+                crate::dns_cache::reverse_dns_lookup(&lookup_address)
+            })
+            .await
+            .unwrap_or(None);
+            dns_cache
+                .lock()
+                .map(|mut cache| cache.commit_reverse_lookup(addr, hostname))
+                .unwrap_or(crate::dns_cache::Resolution::Unknown(addr))
+        }
+    }
+}
+
+/// Bounded wall-clock budget for a miss-triggered forward re-resolve,
+/// mirroring the startup seed barrier. On expiry the lookup continues in the
+/// background so the next miss still benefits from the refreshed cache.
+const DNS_FORWARD_CONFIRM_BUDGET: Duration = Duration::from_millis(400);
+
+/// Last-chance recovery for a `NetConnect` attribution miss: re-resolve the
+/// session's trusted destinations right now and re-check the cache.
+///
+/// The periodic priority refresh only accumulates the answers the supervisor's
+/// own queries happened to receive; rotating-CDN pools (github.com/Azure) can
+/// hand the supervised tool an address the refresh has never seen, and such
+/// IPs often have no PTR record either. A fresh resolution at prompt time
+/// frequently covers exactly the address the tool just connected to —
+/// converting a raw-IP QUEUE prompt into the silent allow the operator's
+/// profile already intends.
+///
+/// Returns the (possibly upgraded) resolution plus whether the upgrade came
+/// from this confirm pass. Rate-limited via [`DnsForwardConfirm::try_begin`];
+/// a skipped or failed confirm returns the original miss unchanged.
+async fn confirm_forward_attribution(
+    dns_cache: &Arc<Mutex<DnsCache>>,
+    confirm: Option<&crate::dns_cache::DnsForwardConfirm>,
+    address: &str,
+    miss: crate::dns_cache::Resolution,
+) -> (crate::dns_cache::Resolution, bool) {
+    use crate::dns_cache::Resolution;
+
+    let Some(confirm) = confirm else {
+        return (miss, false);
+    };
+    if !confirm.try_begin() {
+        return (miss, false);
+    }
+    let domains = confirm.domains().to_vec();
+    let mut handle = tokio::task::spawn_blocking(move || {
+        crate::dns_cache::resolve_domains(domains.iter().map(String::as_str))
+    });
+    match tokio::time::timeout(DNS_FORWARD_CONFIRM_BUDGET, &mut handle).await {
+        Ok(Ok(resolved)) => {
+            let refreshed = match dns_cache.lock() {
+                Ok(mut cache) => {
+                    cache.record_resolved_domains(resolved);
+                    match cache.lookup_attribution(address) {
+                        crate::dns_cache::AttributionLookup::Ready(resolution) => Some(resolution),
+                        // The reverse path already ran (and negative-cached)
+                        // on the way to this miss; do not re-run it here.
+                        crate::dns_cache::AttributionLookup::NeedsReverse(_) => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            match refreshed {
+                Some(resolution @ (Resolution::Exact(_) | Resolution::Ambiguous(_))) => {
+                    tracing::info!(
+                        event = "dns_forward_confirm",
+                        outcome = "hit",
+                        raw_ip = %address,
+                        "attribution miss recovered by re-resolving trusted destinations"
+                    );
+                    (resolution, true)
+                }
+                _ => {
+                    tracing::debug!(
+                        event = "dns_forward_confirm",
+                        outcome = "miss",
+                        raw_ip = %address,
+                        "re-resolved trusted destinations do not cover this address"
+                    );
+                    (miss, false)
+                }
+            }
+        }
+        Ok(Err(join_error)) => {
+            tracing::warn!(
+                event = "dns_forward_confirm",
+                outcome = "error",
+                raw_ip = %address,
+                error = %join_error,
+                "forward re-resolve task failed"
+            );
+            (miss, false)
+        }
+        Err(_elapsed) => {
+            // Budget spent. Let the lookup finish detached and merge its
+            // results so the next miss finds a warm cache.
+            let cache = Arc::clone(dns_cache);
+            tokio::spawn(async move {
+                if let Ok(resolved) = handle.await {
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.record_resolved_domains(resolved);
+                    }
+                }
+            });
+            tracing::debug!(
+                event = "dns_forward_confirm",
+                outcome = "timeout",
+                raw_ip = %address,
+                budget_ms = DNS_FORWARD_CONFIRM_BUDGET.as_millis() as u64,
+                "forward re-resolve exceeded its budget; continuing in background"
+            );
+            (miss, false)
+        }
+    }
+}
+
 /// PR 3 Phase B: cheap pre-execve check for "this binary doesn't exist
 /// at the supervisor's filesystem view." Returns `true` only when we
 /// can prove the path is missing.
@@ -278,15 +421,22 @@ pub(super) struct SupervisorLoopContext<'a> {
     pub(super) session_sync: Option<Arc<dyn SessionSync>>,
     /// Paths approved via "learn" during this session. Auto-allowed on
     /// subsequent accesses without going through the proxy.
-    pub(super) session_allowed: Mutex<HashSet<String>>,
+    pub(super) session_allowed: Arc<Mutex<HashSet<String>>>,
     /// Reverse DNS cache: resolves raw IPs from `connect()` syscalls
     /// to hostnames so the egress filter can match trusted domains.
     pub(super) dns_cache: Arc<Mutex<DnsCache>>,
-    /// Local port of the DNS inspection proxy, if running.
-    pub(super) dns_proxy_port: Option<u16>,
-    /// Receiver for DNS query events from the DNS proxy.
-    pub(super) dns_query_rx:
-        Option<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::dns_proxy::DnsQueryEvent>>>,
+    /// Whether in-line DNS inspection is active (query blocking + response
+    /// observation). Gates the DoT deny and the in-line query evaluation.
+    pub(super) dns_inspection_enabled: bool,
+    /// Transport-neutral DNS policy service shared by the in-line and
+    /// connected-proxy inspection owners.
+    pub(super) dns_decision_service:
+        Option<Arc<dyn crate::connected_dns_proxy::DnsDecisionService>>,
+    /// Miss-triggered forward re-resolution of the session's trusted
+    /// destinations, consulted before a `NetConnect` attribution miss turns
+    /// into a raw-IP prompt. `None` in unit tests and for sessions without
+    /// seed domains.
+    pub(super) dns_forward_confirm: Option<crate::dns_cache::DnsForwardConfirm>,
     /// Optional file writer for logging every syscall request and decision.
     pub(super) syscall_log: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
     /// Optional JSONL sink for pre-filter forensic tracing.
@@ -339,32 +489,56 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// mass-destruction signal (rate-limit-burst redesign step 2). Always
     /// present; recording is gated on [`mass_destruction::signal_enabled`].
     pub(super) mass_destruction: Mutex<mass_destruction::MassDestructionTracker>,
+    /// YAMA `ptrace_scope` probed once at session start (`None` = Yama
+    /// absent or the file unreadable, i.e. classic ptrace semantics). Used
+    /// by the cross-process gate: at scope >= 2 the kernel refuses
+    /// ptrace/process_vm for a caller without CAP_SYS_PTRACE, so a
+    /// provably-doomed out-of-tree cross-process syscall is
+    /// allowed-and-recorded rather than queued — a prompt cannot change an
+    /// outcome the kernel has already decided. Probe failures fail toward
+    /// enforcement.
+    pub(super) yama_ptrace_scope: Option<u8>,
 }
+
+/// Minimum spacing between daemon restart attempts. Per-outage rather than
+/// once-per-session: a session that loses the recovery race during one daemon
+/// restart must still be able to recover from the next outage, but a flapping
+/// daemon must not be restarted in a tight loop.
+const DAEMON_RESTART_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 pub(super) struct DaemonRestartState {
     config: DaemonRestartConfig,
-    attempted: Mutex<bool>,
+    last_attempt: Mutex<Option<Instant>>,
 }
 
 impl DaemonRestartState {
     pub(super) fn new(config: DaemonRestartConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
-            attempted: Mutex::new(false),
+            last_attempt: Mutex::new(None),
         })
     }
 
     fn take_attempt(&self) -> bool {
-        match self.attempted.lock() {
-            Ok(mut attempted) => {
-                if *attempted {
+        match self.last_attempt.lock() {
+            Ok(mut last) => {
+                let now = Instant::now();
+                if last.is_some_and(|at| now.duration_since(at) < DAEMON_RESTART_RETRY_COOLDOWN) {
                     false
                 } else {
-                    *attempted = true;
+                    *last = Some(now);
                     true
                 }
             }
             Err(_) => false,
+        }
+    }
+
+    /// Re-arm the restart budget after a healthy remote evaluation so the
+    /// next outage gets an immediate recovery attempt.
+    fn note_success(&self) {
+        if let Ok(mut last) = self.last_attempt.lock() {
+            *last = None;
         }
     }
 }
@@ -536,6 +710,207 @@ async fn log_supervisor_audit_event(
     }
 }
 
+/// Read a process's parent PID from `/proc/<tgid>/status`. `None` if the
+/// process has already exited or the field can't be parsed.
+fn read_ppid(tgid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{tgid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
+}
+
+/// Backfill a spawn/provenance audit record for a process whose creation was
+/// never tagged as a `ProcessSpawn`.
+///
+/// Two situations produce an untagged actor doing security-relevant work:
+/// - **In-process engines that never `execve`.** An agent's code-execution
+///   runtime can walk the filesystem with direct `openat`/`getdents` from its
+///   own threads — there is no child process to record.
+/// - **`posix_spawn`'d direct children whose exec event slipped past tagging.**
+///   Exec tagging relies on a single `PTRACE_EVENT_EXEC` path; a
+///   fork-then-immediately-exec child can race it.
+///
+/// Either way, enforcement still happened (every syscall was scored at the
+/// boundary) — only the durable *provenance* link was missing. This records
+/// that link, audit-only (`Allow`, score 0), reusing the supervisor-origin
+/// audit path so it groups under `ProcessSpawn` in the dashboard. Best-effort:
+/// a process that has already exited yields a `<pid:N>` placeholder rather than
+/// failing. Runs at most once per process (deduped by the caller).
+async fn synthesize_spawn_provenance(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    session: &SupervisorSession,
+    tgid: u32,
+) {
+    let command = std::fs::read_link(format!("/proc/{tgid}/exe"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| format!("<pid:{tgid}>"));
+    let args: Vec<String> = std::fs::read(format!("/proc/{tgid}/cmdline"))
+        .map(|data| {
+            data.split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let ppid = read_ppid(tgid);
+
+    // Match the `ToolCallType::ProcessSpawn` Display so these group with real
+    // spawn rows in the dashboard's Call Types breakdown.
+    let tool_call_type = format!("ProcessSpawn({} {})", command, args.join(" "));
+    let arguments = serde_json::json!({
+        "command": command,
+        "args": args,
+        "pid": tgid,
+        "ppid": ppid,
+        "synthesized": true,
+    });
+
+    log_supervisor_audit_event(
+        loop_ctx,
+        session,
+        tgid,
+        &tool_call_type,
+        "synthesized_spawn_provenance",
+        grith_audit::types::ProxyActionSummary::Allow,
+        arguments,
+        "provenance backfill: first security-relevant syscall from a process with no prior spawn record",
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// YAMA ptrace-scope probe (cross-process gate refinement)
+// ---------------------------------------------------------------------------
+
+/// CAP_SYS_PTRACE bit index in the `/proc/<pid>/status` `CapEff` bitmask.
+const CAP_SYS_PTRACE_BIT: u32 = 19;
+
+/// Read the kernel's YAMA ptrace policy. Probed once per session and cached
+/// on [`SupervisorLoopContext`] — the setting is a live sysctl, so it must
+/// not be assumed stable across sessions. `None` = Yama absent or the file
+/// unreadable (classic ptrace semantics apply); callers treat that like
+/// scope 0/1, i.e. enforce.
+pub(super) fn probe_yama_ptrace_scope() -> Option<u8> {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()?
+        .trim()
+        .parse::<u8>()
+        .ok()
+}
+
+/// Parse the `CapEff` hex bitmask out of `/proc/<pid>/status` content.
+fn parse_cap_eff(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("CapEff:")?;
+        u64::from_str_radix(rest.trim(), 16).ok()
+    })
+}
+
+/// Whether task `id` (a pid or a tid — procfs resolves `/proc/<tid>/status`
+/// to the individual thread, whose effective caps may differ from the
+/// leader's) currently holds CAP_SYS_PTRACE in its effective set. `None`
+/// when the status file is unreadable — callers must treat unknown as "may
+/// hold it" (enforce).
+pub(super) fn pid_has_cap_sys_ptrace(id: u32) -> Option<bool> {
+    let status = std::fs::read_to_string(format!("/proc/{id}/status")).ok()?;
+    Some(parse_cap_eff(&status)? & (1u64 << CAP_SYS_PTRACE_BIT) != 0)
+}
+
+/// The user-namespace identity of `pid` (the `user:[<inode>]` symlink
+/// target). Readable only for same-uid (or capability-held) targets — an
+/// unreadable link yields `None`, which callers treat as unverifiable.
+fn pid_user_ns(pid: u32) -> Option<std::ffi::OsString> {
+    std::fs::read_link(format!("/proc/{pid}/ns/user"))
+        .ok()
+        .map(std::path::PathBuf::into_os_string)
+}
+
+/// True when the kernel is *guaranteed* to EPERM a cross-process
+/// ptrace/process_vm from `caller_tid` to `target_pid`, so queueing it
+/// would prompt the user about an operation whose outcome is already
+/// decided. Requires ALL of:
+///
+/// 1. YAMA scope >= 2 (admin-only / disabled) — below that, same-uid
+///    access is kernel-legal and the proxy must evaluate it.
+/// 2. The *calling thread* provably lacks CAP_SYS_PTRACE (effective set).
+///    We key on the tid, not the thread-group leader: capabilities are
+///    per-task, YAMA checks `current` (the issuing thread), and a worker
+///    thread can hold a different effective set than the leader. Reading
+///    the effective set is race-free because the calling thread is frozen
+///    at the syscall-entry stop — it resumes directly into the intercepted
+///    syscall and cannot `capset` permitted→effective in between, so a
+///    permitted-but-not-effective cap genuinely stays blocked.
+/// 3. Caller and target share a user namespace. A capability-less process
+///    can still hold CAP_SYS_PTRACE *over a descendant user namespace it
+///    owns* (e.g. a rootless container it created), so a cross-namespace
+///    read cannot be assumed blocked. (A different-uid target's
+///    `/proc/<pid>/ns/user` is unreadable → `None` → not suppressed, which
+///    is the wanted outcome: an other-uid memory read is worth surfacing.)
+///    User namespace is thread-group-wide, so probing it via the tid is
+///    equivalent to the leader.
+///
+/// Every probe failure returns false — fail toward enforcement.
+pub(super) fn kernel_blocks_cross_process(
+    yama_scope: Option<u8>,
+    caller_tid: u32,
+    target_pid: u32,
+) -> bool {
+    let Some(scope) = yama_scope else {
+        return false;
+    };
+    if scope < 2 {
+        return false;
+    }
+    if pid_has_cap_sys_ptrace(caller_tid) != Some(false) {
+        return false;
+    }
+    match (pid_user_ns(caller_tid), pid_user_ns(target_pid)) {
+        (Some(caller_ns), Some(target_ns)) => caller_ns == target_ns,
+        _ => false,
+    }
+}
+
+/// The PID-namespace identity of task `id` (the `pid:[<inode>]` symlink
+/// target). `None` when unreadable — callers treat unknown as unverifiable.
+fn pid_pid_ns(id: u32) -> Option<std::ffi::OsString> {
+    std::fs::read_link(format!("/proc/{id}/ns/pid"))
+        .ok()
+        .map(std::path::PathBuf::into_os_string)
+}
+
+/// True when a cross-process syscall's target provably does not exist, so
+/// the kernel is guaranteed to answer ESRCH and the syscall can grant no
+/// authority — prompting would only train the operator to mash approve
+/// (test harnesses probe dead PIDs on purpose; grith's own dead-tracee
+/// tests are the canonical flood).
+///
+/// Preconditions, all failing toward enforcement:
+///
+/// 1. The *caller* shares the supervisor's PID namespace. A tracee inside a
+///    child pidns numbers processes differently, so our `/proc` view says
+///    nothing about what ITS `target_pid` names — an absent
+///    `/proc/<target>` here could be a live process there.
+/// 2. `/proc/<target_pid>` does not exist (procfs resolves bare TIDs too,
+///    so a live worker thread of any process counts as existing).
+///    `target_pid == 0` also qualifies: no task is addressable as 0 from a
+///    caller's view, the kernel ESRCHs it unconditionally.
+///
+/// TOCTOU: the pid could be allocated to a *new* process between this probe
+/// and syscall resumption. The window is the microseconds the caller spends
+/// frozen at its syscall-entry stop, the caller cannot influence which
+/// process receives a recycled pid, and the suppression is audit-recorded —
+/// same accepted trade as PR 3's failed-exec pre-stat.
+fn cross_process_target_provably_absent(caller_tid: u32, target_pid: u32) -> bool {
+    match (pid_pid_ns(caller_tid), pid_pid_ns(std::process::id())) {
+        (Some(caller_ns), Some(own_ns)) if caller_ns == own_ns => {}
+        _ => return false,
+    }
+    if target_pid == 0 {
+        return true;
+    }
+    !std::path::Path::new(&format!("/proc/{target_pid}")).exists()
+}
+
 // ---------------------------------------------------------------------------
 // Core event handler
 // ---------------------------------------------------------------------------
@@ -557,6 +932,23 @@ pub(super) async fn handle_syscall_event(
             &session.process_tree,
             &event,
         );
+    }
+
+    // Provenance backfill. The first time we see security-relevant activity
+    // from a process (keyed by TGID), guarantee it has a spawn record. When a
+    // real `ProcessExec` is the first thing we see, the normal path below
+    // audits it — we only mark the TGID so we don't double-log. When the first
+    // thing we see is anything else (its exec was never tagged, or it never
+    // exec'd — an in-process code engine), synthesize the provenance record.
+    // `HashSet::insert` returns true only on first insertion, so this fires at
+    // most once per process. `pid == 0` is a pre-assignment fork placeholder.
+    // Short-circuit `&&` still runs `insert` (marking the TGID seen) for a
+    // real exec, so we don't re-synthesize once its normal record lands.
+    if event.pid != 0
+        && session.spawn_recorded.insert(event.pid)
+        && !matches!(event.kind, SyscallKind::ProcessExec { .. })
+    {
+        synthesize_spawn_provenance(loop_ctx, session, event.pid).await;
     }
 
     // Update the process tree with fork events.
@@ -588,11 +980,13 @@ pub(super) async fn handle_syscall_event(
     // multi-threaded programs (e.g. Node.js / Claude Code).
     let tid = event.tid;
 
-    // ---- DNS proxy redirection: rewrite port 53 to DNS proxy ----
-    // This MUST run before to_tool_call_type mapping because NetSendTo
-    // (used by UDP DNS) maps to None and would be auto-allowed as noise,
-    // bypassing the DNS proxy entirely.
-    {
+    // ---- In-line DNS owner ----
+    // These events come only from unconnected or explicit-destination DNS
+    // sends. Connected-proxy sockets bypass this query/response state in the
+    // interceptor and are evaluated in their route worker. Here we (a) block
+    // DNS-over-TLS so encrypted DNS cannot dodge inspection, and (b) evaluate
+    // the stashed in-line query and block a disallowed send.
+    if loop_ctx.dns_inspection_enabled {
         let port = match &event.kind {
             SyscallKind::NetConnect { port, .. } | SyscallKind::NetSendTo { port, .. } => {
                 Some(*port)
@@ -600,47 +994,78 @@ pub(super) async fn handle_syscall_event(
             _ => None,
         };
 
-        // Block DNS-over-TLS (port 853) to force DNS through our proxy
+        // Force plaintext DNS: block DNS-over-TLS (853) so it stays inspectable.
         if port == Some(853) {
-            if let Some(dns_port) = loop_ctx.dns_proxy_port {
-                tracing::debug!(tid, dns_proxy_port = dns_port, "blocking DoT (port 853)");
-                if let Err(e) = interceptor.deny(tid).await {
-                    tracing::warn!(error = %e, tid, "deny (DoT block) failed");
-                }
-                return Ok(());
+            tracing::debug!(tid, "blocking DoT (port 853) — DNS inspection on");
+            if let Err(e) = interceptor.deny(tid).await {
+                tracing::warn!(error = %e, tid, "deny (DoT block) failed");
             }
+            return Ok(());
         }
 
-        // Redirect port-53 traffic to the DNS proxy. Fail closed if we cannot
-        // safely rewrite the destination sockaddr.
-        if port == Some(53) {
-            if let Some(dns_port) = loop_ctx.dns_proxy_port {
-                let Some(sockaddr) = event.sockaddr_addr else {
-                    tracing::warn!(tid, "missing sockaddr pointer for port-53 syscall; denying");
-                    if let Err(e) = interceptor.deny(tid).await {
-                        tracing::warn!(error = %e, tid, "deny (missing DNS sockaddr) failed");
-                    }
-                    return Ok(());
-                };
+        // Block TCP-DNS: this :53 connect is on a stream (TCP) socket, whose
+        // query/response ride write/read and can't be content-inspected.
+        // Denying forces resolution onto the inspected UDP path so query
+        // blocking isn't bypassable (gated by block_tcp_dns).
+        if port == Some(53) && interceptor.take_tcp_dns_deny(tid) {
+            tracing::debug!(tid, "blocking TCP-DNS connect — forcing inspected UDP path");
+            if let Err(e) = interceptor.deny(tid).await {
+                tracing::warn!(error = %e, tid, "deny (TCP-DNS block) failed");
+            }
+            return Ok(());
+        }
 
-                if let Err(e) = interceptor
-                    .rewrite_sockaddr_port(tid, sockaddr, dns_port)
-                    .await
-                {
-                    tracing::warn!(error = %e, tid, "DNS proxy sockaddr rewrite failed; denying");
-                    if let Err(deny_err) = interceptor.deny(tid).await {
-                        tracing::warn!(error = %deny_err, tid, "deny (DNS rewrite failure) failed");
+        // In-line DNS query inspection. The interceptor stashed the parsed
+        // (domain, qtype) for a send on a tracked DNS socket; evaluate it and
+        // block the send (EPERM) for a denied domain — the query never leaves.
+        if matches!(event.kind, SyscallKind::NetSendTo { .. }) {
+            if let Some(inspection) = interceptor.take_dns_query(tid) {
+                if let Some(reason) = inspection.parse_error {
+                    interceptor.finish_dns_query(tid, false);
+                    tracing::warn!(
+                        pid = event.pid,
+                        tid,
+                        reason,
+                        "denying uninspectable outbound DNS traffic"
+                    );
+                    write_forensics_stage(
+                        loop_ctx,
+                        trace_event_id,
+                        session,
+                        event.pid,
+                        None,
+                        "denied",
+                        Some("auto-deny"),
+                        None,
+                        Some(&reason),
+                    );
+                    if let Err(e) = interceptor.deny(tid).await {
+                        tracing::warn!(error = %e, tid, "deny (DNS parse failure) failed");
                     }
                     return Ok(());
                 }
 
-                tracing::debug!(
-                    tid,
-                    dns_proxy_port = dns_port,
-                    "redirected port-53 to DNS proxy"
-                );
-                if let Err(e) = interceptor.allow(tid).await {
-                    tracing::warn!(error = %e, tid, "allow (DNS redirect) failed");
+                let mut allow = true;
+                for (domain, query_type) in &inspection.queries {
+                    if !evaluate_dns_query_inline(
+                        session, loop_ctx, event.pid, tid, domain, query_type,
+                    )
+                    .await
+                    {
+                        allow = false;
+                        break;
+                    }
+                }
+                if allow && !inspection.queries.is_empty() {
+                    interceptor.finish_dns_query(tid, true);
+                    if let Err(e) = interceptor.allow(tid).await {
+                        tracing::warn!(error = %e, tid, "allow (DNS query) failed");
+                    }
+                } else {
+                    interceptor.finish_dns_query(tid, false);
+                    if let Err(e) = interceptor.deny(tid).await {
+                        tracing::warn!(error = %e, tid, "deny (DNS query block) failed");
+                    }
                 }
                 return Ok(());
             }
@@ -757,9 +1182,15 @@ pub(super) async fn handle_syscall_event(
             SyscallKind::KernelModuleOp { .. } | SyscallKind::KexecLoad { .. } => {
                 !coverage.category1_hard_deny
             }
-            SyscallKind::OwnershipChange { .. }
-            | SyscallKind::FilesystemMutation { .. }
-            | SyscallKind::CrossProcessAccess { .. } => !coverage.category2_proxy,
+            SyscallKind::OwnershipChange { .. } | SyscallKind::FilesystemMutation { .. } => {
+                !coverage.category2_proxy
+            }
+            // Cross-process access (ptrace / process_vm) is split onto its own
+            // flag: enforced by default because supervised coding tools never
+            // read/debug another process's memory, so it is ~0 false positives
+            // and closes the scope-0 secret-theft path. process_vm-of-self is
+            // already carved out upstream in classify.
+            SyscallKind::CrossProcessAccess { .. } => !coverage.category2_crossprocess,
             SyscallKind::NamespaceOp { .. } => !coverage.category3_namespace,
             SyscallKind::ArchPrivilegedOp { .. } => !coverage.category4_arch_priv,
             _ => false,
@@ -798,6 +1229,301 @@ pub(super) async fn handle_syscall_event(
             }
             return Ok(());
         }
+    }
+
+    // PR 6 cross-process refinement (category2_crossprocess). ptrace /
+    // process_vm against a target INSIDE grith's supervised tree is not a
+    // cross-boundary secret-theft primitive: the target already lives in the
+    // session sandbox the user launched, and a descendant-to-descendant
+    // ptrace-attach is EPERM'd anyway because grith holds the tracer slot.
+    // Sanitizers (LeakSanitizer's StopTheWorld `process_vm_readv` at every
+    // ASan/LSan test-binary exit), crash handlers and fork/trace test
+    // harnesses all read a descendant/sibling, so QUEUEing them would flood
+    // the user with prompts for zero security gain. Allow-and-record those.
+    //
+    // Only a read of a target OUTSIDE the tree falls through to the proxy and
+    // QUEUEs — another same-uid app holding decrypted secrets (the scope-0
+    // exfil path the kernel does NOT block; `process_vm_readv` needs no tracer
+    // slot), or the supervisor's own memory (grith is the tracer/parent, never
+    // in its own `supervised` set → correctly non-descendant). `supervised_pids()`
+    // is the full PID+TID set, so a sibling worker-thread tid is recognised as
+    // in-tree.
+    //
+    // Fail-safe: a brand-new sibling whose clone event grith has not yet
+    // processed is treated as out-of-tree → a transient QUEUE, never a missed
+    // read. `target_pid` is a register scalar, not a pointer, so there is no
+    // check-vs-use TOCTOU. PTRACE_TRACEME is already carved in classify.
+    if let SyscallKind::CrossProcessAccess { op, target_pid } = &event.kind {
+        let in_tree = *target_pid != 0 && interceptor.supervised_pids().contains(target_pid);
+        if in_tree {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                None,
+                "noise_filtered",
+                Some("auto-allow"),
+                None,
+                Some("cross-process in-tree"),
+            );
+            session.stats.total_filtered_noise += 1;
+            log_supervisor_audit_event(
+                loop_ctx,
+                session,
+                event.pid,
+                &syscall_kind_label(&event.kind),
+                "cross_process_intree_allowed",
+                grith_audit::types::ProxyActionSummary::Allow,
+                serde_json::json!({
+                    "pid": event.pid,
+                    "tid": tid,
+                    "op": format!("{op:?}"),
+                    "target_pid": target_pid,
+                }),
+                "cross-process access to an in-tree target; allowed without proxy evaluation",
+            )
+            .await;
+            if let Err(e) = interceptor.allow(tid).await {
+                tracing::warn!(error = %e, tid, "allow (cross-process in-tree) failed");
+            }
+            return Ok(());
+        }
+
+        // Dead-target refinement: a cross-process syscall aimed at a PID
+        // that does not exist can only get ESRCH from the kernel — no
+        // authority is at stake, so a prompt cannot change the outcome.
+        // Applies at any YAMA scope (unlike the kernel-blocked check
+        // below). Guarded on the caller sharing our PID namespace; see
+        // `cross_process_target_provably_absent` for the TOCTOU trade.
+        if cross_process_target_provably_absent(tid, *target_pid) {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                None,
+                "noise_filtered",
+                Some("auto-allow"),
+                None,
+                Some("cross-process dead target"),
+            );
+            session.stats.total_filtered_noise += 1;
+            log_supervisor_audit_event(
+                loop_ctx,
+                session,
+                event.pid,
+                &syscall_kind_label(&event.kind),
+                "cross_process_dead_target_allowed",
+                grith_audit::types::ProxyActionSummary::Allow,
+                serde_json::json!({
+                    "pid": event.pid,
+                    "tid": tid,
+                    "op": format!("{op:?}"),
+                    "target_pid": target_pid,
+                }),
+                "cross-process access to a nonexistent process; the kernel will answer ESRCH — allowed without prompting",
+            )
+            .await;
+            if let Err(e) = interceptor.allow(tid).await {
+                tracing::warn!(error = %e, tid, "allow (cross-process dead-target) failed");
+            }
+            return Ok(());
+        }
+
+        // Scope-probe refinement: an out-of-tree cross-process syscall the
+        // kernel is guaranteed to EPERM (YAMA scope >= 2, the calling thread
+        // provably uncapped, same user namespace) is allowed-and-recorded
+        // instead of queued — the prompt cannot change an outcome the kernel
+        // already decided, and in non-interactive exec it would hang forever.
+        // Any probe failure falls through to the proxy (fail toward
+        // enforcement). We pass `tid` (the syscall-issuing thread), not
+        // `event.pid`: capabilities are per-task and YAMA checks the calling
+        // thread, so the leader's caps are the wrong ones to consult.
+        //
+        // The scope is probed once at session start and cached; a mid-session
+        // sysctl lowering (2 -> 0) could stale this toward suppression, but
+        // writing `ptrace_scope` needs root outside the supervised tool's
+        // reach (the tool's own write would be EPERM'd and proxy-scored), so
+        // it is out of the tool's threat model — the same session-start
+        // granularity grith uses for the listener-clamp capability probe.
+        if kernel_blocks_cross_process(loop_ctx.yama_ptrace_scope, tid, *target_pid) {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                None,
+                "noise_filtered",
+                Some("auto-allow"),
+                None,
+                Some("cross-process kernel-blocked"),
+            );
+            session.stats.total_filtered_noise += 1;
+            log_supervisor_audit_event(
+                loop_ctx,
+                session,
+                event.pid,
+                &syscall_kind_label(&event.kind),
+                "cross_process_kernel_blocked_allowed",
+                grith_audit::types::ProxyActionSummary::Allow,
+                serde_json::json!({
+                    "pid": event.pid,
+                    "tid": tid,
+                    "op": format!("{op:?}"),
+                    "target_pid": target_pid,
+                    "yama_ptrace_scope": loop_ctx.yama_ptrace_scope,
+                }),
+                "cross-process access the kernel will refuse (YAMA scope >= 2, caller without CAP_SYS_PTRACE); allowed without proxy evaluation",
+            )
+            .await;
+            if let Err(e) = interceptor.allow(tid).await {
+                tracing::warn!(error = %e, tid, "allow (cross-process kernel-blocked) failed");
+            }
+            return Ok(());
+        }
+    }
+
+    // Self-filter defence (go-live review round 2). A tracee that installs
+    // its own seccomp filter can out-rank grith's SECCOMP_RET_TRACE:
+    // SECCOMP_RET_USER_NOTIF (0x7fc00000) wins over TRACE (0x7ff00000) on
+    // action precedence, and by answering its own notifications with
+    // USER_NOTIF_FLAG_CONTINUE the tracee runs syscalls grith never sees.
+    //
+    // The NEW_LISTENER install is the escape and is denied (fail-closed:
+    // seccomp() returns EPERM, no listener fd exists). A plain filter cannot
+    // grant authority — it can only make the tracee's own syscalls fail
+    // invisibly — so it is observed only when the operator asks, and
+    // otherwise allowed. Both branches are register-only decisions, immune to
+    // the argument-rewrite TOCTOU that pointer-carried syscalls have.
+    if let SyscallKind::SeccompInstall { via, new_listener } = &event.kind {
+        let deny = *new_listener && loop_ctx.config.coverage.deny_self_seccomp_notify;
+        if deny {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                None,
+                "denied",
+                Some("auto-deny"),
+                None,
+                Some("self seccomp NEW_LISTENER denied"),
+            );
+            tracing::warn!(
+                event = "self_seccomp_notify_denied",
+                pid = event.pid,
+                tid,
+                via = ?via,
+                "denied a tracee's own seccomp NEW_LISTENER filter — it would out-rank grith's interception",
+            );
+            log_supervisor_audit_event(
+                loop_ctx,
+                session,
+                event.pid,
+                &syscall_kind_label(&event.kind),
+                "self_seccomp_notify_denied",
+                grith_audit::types::ProxyActionSummary::Deny,
+                serde_json::json!({
+                    "pid": event.pid,
+                    "tid": tid,
+                    "via": format!("{via:?}"),
+                    "new_listener": new_listener,
+                }),
+                "tracee seccomp NEW_LISTENER filter denied before it could hide syscalls",
+            )
+            .await;
+            if let Err(e) = interceptor.deny(tid).await {
+                tracing::warn!(error = %e, tid, "deny (self seccomp notify) failed");
+            }
+            return Ok(());
+        }
+
+        // Not the escape form. Record it if the operator is observing filter
+        // installs; either way, allow — a plain filter cannot escape the
+        // sandbox, and denying every self-filter would break bwrap, Electron
+        // and Node/Bun sandboxes.
+        if loop_ctx.config.coverage.observe_self_seccomp_filter {
+            log_supervisor_audit_event(
+                loop_ctx,
+                session,
+                event.pid,
+                &syscall_kind_label(&event.kind),
+                "self_seccomp_filter_observed",
+                grith_audit::types::ProxyActionSummary::Allow,
+                serde_json::json!({
+                    "pid": event.pid,
+                    "tid": tid,
+                    "via": format!("{via:?}"),
+                    "new_listener": new_listener,
+                }),
+                "tracee installed its own seccomp filter (audit-only; can blind but not escape)",
+            )
+            .await;
+        }
+        if let Err(e) = interceptor.allow(tid).await {
+            tracing::warn!(error = %e, tid, "allow (self seccomp filter) failed");
+        }
+        return Ok(());
+    }
+
+    // Go-live review B1: hard-deny foreign-ABI syscalls before any
+    // classification or proxy evaluation. The seccomp filter fails
+    // closed on a non-x86_64 audit arch or x32 numbering; the raw
+    // number belongs to a foreign syscall table, so nothing downstream
+    // may interpret it. Unconditional — no coverage flag gates this.
+    if let SyscallKind::ForeignAbiSyscall { abi, raw_nr } = &event.kind {
+        // Throttle the durable record: a tracee can loop a foreign-ABI
+        // syscall ~30k/s, and each grants no authority (all denied), so an
+        // un-throttled record floods the bounded audit channel and evicts
+        // genuine evidence — audit blinding on demand. The counter records
+        // the true total; records are written for the first few and then
+        // exponentially sparser.
+        let should_audit = session.stats.record_foreign_abi_denial();
+        if should_audit {
+            let total = session.stats.foreign_abi_denied;
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                None,
+                "denied",
+                Some("auto-deny"),
+                None,
+                Some("foreign-ABI syscall denied"),
+            );
+            tracing::warn!(
+                event = "foreign_abi_syscall_denied",
+                pid = event.pid,
+                tid,
+                abi = ?abi,
+                raw_nr,
+                session_total = total,
+                "foreign-ABI syscall denied — the supervisor cannot interpret non-x86_64 syscall numbers and never allows what it cannot interpret",
+            );
+            log_supervisor_audit_event(
+                loop_ctx,
+                session,
+                event.pid,
+                &syscall_kind_label(&event.kind),
+                "foreign_abi_syscall_denied",
+                grith_audit::types::ProxyActionSummary::Deny,
+                serde_json::json!({
+                    "pid": event.pid,
+                    "tid": tid,
+                    "abi": format!("{abi:?}"),
+                    "raw_syscall_nr": raw_nr,
+                    "session_total": total,
+                }),
+                "foreign-ABI syscall denied before classification; seccomp arch check failed closed",
+            )
+            .await;
+        }
+        if let Err(e) = interceptor.deny(tid).await {
+            tracing::warn!(error = %e, tid, "deny (foreign ABI) failed");
+        }
+        return Ok(());
     }
 
     // PR 6 Phase A: hard-deny kernel-module load/unload before proxy
@@ -934,7 +1660,7 @@ pub(super) async fn handle_syscall_event(
             return Ok(());
         }
         // else: fall through to standard proxy evaluation. The proxy's
-        // operation_risk filter scores NamespaceOp at +5.0 → QUEUE.
+        // operation-risk filter scores NamespaceOp at +5.0 → QUEUE.
     }
 
     // PR 6 Phase D: hard-deny architecture-specific privileged ops.
@@ -1224,15 +1950,65 @@ pub(super) async fn handle_syscall_event(
     // opaque raw IPs from the connect() syscall.
     let call_type = match call_type {
         grith_proxy::types::ToolCallType::NetConnect { address, port } => {
-            let resolved = loop_ctx
-                .dns_cache
-                .lock()
-                .map(|mut cache| cache.resolve(&address))
-                .unwrap_or_else(|_| address.clone());
-            grith_proxy::types::ToolCallType::NetConnect {
+            let resolution = resolve_network_attribution(&loop_ctx.dns_cache, &address).await;
+            let (resolution, via_forward_confirm) =
+                if matches!(resolution, crate::dns_cache::Resolution::Unknown(_)) {
+                    confirm_forward_attribution(
+                        &loop_ctx.dns_cache,
+                        loop_ctx.dns_forward_confirm.as_ref(),
+                        &address,
+                        resolution,
+                    )
+                    .await
+                } else {
+                    (resolution, false)
+                };
+            let confirm_suffix = if via_forward_confirm {
+                " (recovered by re-resolving trusted destinations)"
+            } else {
+                ""
+            };
+            let (resolved, attribution_reason) = match resolution {
+                crate::dns_cache::Resolution::Exact(name) => {
+                    let reason = format!("exact DNS attribution{confirm_suffix}: {name}");
+                    (name, reason)
+                }
+                crate::dns_cache::Resolution::Ambiguous(candidates) => {
+                    let candidate_array = format_dns_candidate_array(&candidates);
+                    tracing::warn!(
+                        raw_ip = %address,
+                        ?candidates,
+                        "displaying ambiguous shared-IP DNS attribution as hostname candidates"
+                    );
+                    (
+                        candidate_array.clone(),
+                        format!(
+                            "ambiguous DNS attribution{confirm_suffix} for {address}: \
+                             {candidate_array}"
+                        ),
+                    )
+                }
+                crate::dns_cache::Resolution::Unknown(_)
+                | crate::dns_cache::Resolution::NotAnIp(_) => {
+                    (address.clone(), "DNS attribution miss".into())
+                }
+            };
+            let resolved_call = grith_proxy::types::ToolCallType::NetConnect {
                 address: resolved,
                 port,
-            }
+            };
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                Some(&resolved_call),
+                "dns_attribution",
+                None,
+                None,
+                Some(&attribution_reason),
+            );
+            resolved_call
         }
         other => other,
     };
@@ -1254,8 +2030,15 @@ pub(super) async fn handle_syscall_event(
     let containment_active = SessionStateRegistry::global().is_containment_active(scope);
 
     // Optional noise path check (e.g., reads of /proc/, /sys/, etc.).
-    if let Some(path) = ToolCallContext::new("", call_type.clone(), session.id).path() {
-        if syscall_map::is_noise_path(path) {
+    //
+    // A call is noise only when EVERY path it touches is noise. Link creation
+    // carries two, and keying on the primary one alone let a link whose
+    // *target* was noise carry an arbitrary link path past the proxy without
+    // any filter running (go-live review B2).
+    let noise_probe = ToolCallContext::new("", call_type.clone(), session.id);
+    let probe_paths = noise_probe.paths();
+    if let Some(path) = probe_paths.first().copied() {
+        if probe_paths.iter().all(|p| syscall_map::is_noise_path(p)) {
             // H2 Option 1 (IPC-delegated authority): `/dev/pts/*` is a noise
             // path, but a WRITE to a pts that is not the tool's own controlling
             // terminal is a possible command injection into a sibling pane
@@ -1460,12 +2243,21 @@ pub(super) async fn handle_syscall_event(
     // allowlist is not consulted — even profile-trusted destinations like
     // `api.openai.com` must run through the full proxy pipeline so the
     // post-contamination egress gate can decide whether to queue or deny.
+    //
+    // Explicit read-only scopes for sensitive directories are handled
+    // separately: they still run through the proxy so taint/audit state is
+    // recorded, then a queue decision is converted to an allow below.
+    let sensitive_scoped_read_allowed = loop_ctx
+        .session_allowed
+        .lock()
+        .is_ok_and(|allowed| is_sensitive_scoped_read_match(&call_type, &allowed));
     if !containment_active {
         if let Some(key) = session_allowlist_key(&call_type) {
             if loop_ctx
                 .session_allowed
                 .lock()
                 .is_ok_and(|s| is_session_allowlist_match(&key, &s, &call_type))
+                && !sensitive_scoped_read_allowed
             {
                 write_forensics_stage(
                     loop_ctx,
@@ -1519,7 +2311,7 @@ pub(super) async fn handle_syscall_event(
     // the mass-destruction signal below.)
 
     // PR 4 Phase D: compute SpawnProvenance for ProcessSpawn so
-    // operation_risk's routine signal can consult it. Skipped on
+    // operation-risk's routine signal can consult it. Skipped on
     // non-spawn calls (cheap branch). Empty `routine_exec_roots` is
     // valid — the resulting `matched_routine_root: None` causes the
     // signal to fail closed downstream.
@@ -1541,7 +2333,7 @@ pub(super) async fn handle_syscall_event(
     }
 
     // PR 5 Phase C: match NetListen against the session profile's
-    // local_listener_policy so egress_policy knows whether to queue,
+    // local_listener_policy so egress-policy knows whether to queue,
     // pass through (loopback), or clamp (wildcard + allow_clamp).
     //
     // PR 5 Phase D: also propagate the tracee-side sockaddr pointer
@@ -1578,6 +2370,17 @@ pub(super) async fn handle_syscall_event(
     // Note: we evaluate the proxy first anyway to get filter_results for the
     // safety ceiling check. The auto-allow only fires if no ceiling applies.
     let mut decision = evaluate_proxy(loop_ctx, &ctx).await;
+
+    // A scoped read of a sensitive directory must not bypass evaluation:
+    // doing so would skip taint registration and its egress containment
+    // signal. Once evaluated, honour the operator's explicit session scope
+    // for queue-level reads. Auto-deny decisions remain fail-closed.
+    if sensitive_scoped_read_allowed && matches!(decision.action, ProxyAction::Queue { .. }) {
+        decision.action = ProxyAction::Allow;
+        decision.decision_reason =
+            "read allowed by explicit sensitive-directory session scope after proxy evaluation"
+                .to_string();
+    }
 
     // ---- Target-aware mass-destruction signal (rate-limit-burst redesign,
     // step 2) ----
@@ -1919,7 +2722,7 @@ async fn enforce_decision(
             // PR 5 Phase D: opportunistic wildcard-to-loopback clamp.
             // When NetListen got an Allow despite being a wildcard
             // bind, that means a `local_listener_policy` entry with
-            // `allow_clamp = true` matched (egress_policy silently
+            // `allow_clamp = true` matched (egress-policy silently
             // passed it through). The supervisor now rewrites the
             // tracee's sockaddr to loopback before resuming the
             // syscall — kernel processes the bind on `127.0.0.1` /
@@ -2144,6 +2947,53 @@ async fn enforce_decision(
                 session.stats.total_queued += 1;
                 return Ok(());
             }
+
+            // In "deny" mode (a non-interactive session with no reviewer to
+            // answer a dialog — CI, piped, backgrounded), deny the queued
+            // syscall immediately rather than freezing the process tree for
+            // `freeze_timeout_seconds` on a prompt no one can see. Fail-closed:
+            // same outcome as the freeze-then-timeout auto-deny, but immediate
+            // and legible.
+            if loop_ctx.config.interactive_queue_action
+                == crate::config::InteractiveQueueAction::Deny
+            {
+                write_forensics_stage(
+                    loop_ctx,
+                    trace_event_id,
+                    session,
+                    event_pid,
+                    Some(&ctx.call_type),
+                    "proxy_scored",
+                    Some("auto-deny-headless"),
+                    Some(decision.composite_score),
+                    Some(&decision.decision_reason),
+                );
+                write_syscall_log(
+                    loop_ctx,
+                    event_pid,
+                    &ctx.call_type,
+                    decision.composite_score,
+                    "auto-deny-headless",
+                    &decision.decision_reason,
+                );
+                tracing::warn!(
+                    session_id = %session.id,
+                    tid,
+                    score = decision.composite_score,
+                    call_type = %ctx.call_type,
+                    "QUEUE auto-denied (non-interactive session, no reviewer) — allowlist it in the profile, run with a terminal, or pass --allow-queued"
+                );
+                let mut digest_item = build_digest_item(ctx, decision, loop_ctx.dlp_redactor);
+                digest_item.informational_only = true;
+                if let Err(e) = loop_ctx.digest_store.enqueue(&digest_item).await {
+                    tracing::error!(error = %e, "failed to enqueue informational digest item");
+                }
+                if let Err(e) = interceptor.deny(tid).await {
+                    tracing::warn!(error = %e, tid, "deny (non-interactive queue) failed");
+                }
+                session.stats.total_denied += 1;
+                return Ok(());
+            }
             // Blocking review — logged inside queue_and_wait with the review outcome.
             queue_and_wait(
                 interceptor,
@@ -2224,6 +3074,124 @@ async fn queue_and_wait(
     // process tree so that the supervised tool (e.g. Ink/Node.js) keeps
     // rendering while the single syscall thread awaits a permission decision.
 
+    // Deny-replay: a request identical to one the operator denied (or let
+    // time out) inside the replay window is denied again without a fresh
+    // prompt — a retrying tool would otherwise re-open the same dialog once
+    // per attempt. Keyed by the full call identity (the same rendering the
+    // prompt shows), so any change in target or arguments prompts anew. The
+    // window runs from the reviewed decision and is NOT refreshed by
+    // replays: after it lapses the operator is asked again. The durable
+    // audit record for this evaluation is still written by the caller.
+    let replay_key = ctx.call_type.to_string();
+    let replay_window = Duration::from_secs(config.deny_replay_seconds);
+    if !replay_window.is_zero()
+        && session
+            .recent_denials
+            .get(&replay_key)
+            .is_some_and(|denied_at| denied_at.elapsed() < replay_window)
+    {
+        write_forensics_stage(
+            loop_ctx,
+            trace_event_id,
+            session,
+            event_pid,
+            Some(&ctx.call_type),
+            "deny_replayed",
+            Some("auto-deny"),
+            Some(decision.composite_score),
+            Some("identical request denied moments ago"),
+        );
+        write_syscall_log(
+            loop_ctx,
+            session.root_pid,
+            &ctx.call_type,
+            decision.composite_score,
+            "deny-replay",
+            "identical request denied moments ago",
+        );
+        tracing::info!(
+            event = "deny_replayed",
+            session_id = %session.id,
+            tid,
+            call = %replay_key,
+            window_seconds = config.deny_replay_seconds,
+            "identical request denied within the replay window — denying without a prompt"
+        );
+        record_reputation_observation(
+            loop_ctx,
+            session,
+            &ctx.call_type,
+            grith_proxy::reputation::ReputationOutcome::Denied(implicit_deny_weight(
+                &loop_ctx.reputation_config,
+            )),
+        );
+        thaw_and_resume(interceptor, session, tid, false).await;
+        session.stats.total_denied += 1;
+        return Ok(());
+    }
+
+    // Approve-replay: a request identical to one the operator approved
+    // inside the replay window is allowed without a fresh prompt. Most
+    // approvals also add a session allowlist grant, but grant keys can fail
+    // to match (exec provenance rejections, unresolvable paths) and some
+    // call types carry no grant — a retrying tool would re-open the same
+    // dialog once per attempt. Keyed by the full call identity like
+    // deny-replay. Checked after deny-replay so when the same key has been
+    // both approved and later denied, the more recent human decision wins
+    // (a live deny window always postdates any live approve window: replays
+    // never re-prompt, so a later approval can only exist once the deny
+    // window has lapsed).
+    //
+    // Never consulted while containment is active: post-contamination,
+    // session taint can change between retries, so every call must re-score
+    // through the full pipeline and re-queue for review — mirroring the
+    // session-allowlist bypass under containment.
+    let approve_replay_window = Duration::from_secs(config.approve_replay_seconds);
+    if !approve_replay_window.is_zero()
+        && session
+            .recent_approvals
+            .get(&replay_key)
+            .is_some_and(|approved_at| approved_at.elapsed() < approve_replay_window)
+        && !SessionStateRegistry::global()
+            .is_containment_active(SessionScopeKey::from_session_id(session.id))
+    {
+        write_forensics_stage(
+            loop_ctx,
+            trace_event_id,
+            session,
+            event_pid,
+            Some(&ctx.call_type),
+            "approve_replayed",
+            Some("auto-allow"),
+            Some(decision.composite_score),
+            Some("identical request approved moments ago"),
+        );
+        write_syscall_log(
+            loop_ctx,
+            session.root_pid,
+            &ctx.call_type,
+            decision.composite_score,
+            "approve-replay",
+            "identical request approved moments ago",
+        );
+        tracing::info!(
+            event = "approve_replayed",
+            session_id = %session.id,
+            tid,
+            call = %replay_key,
+            window_seconds = config.approve_replay_seconds,
+            "identical request approved within the replay window — allowing without a prompt"
+        );
+        // Deliberately NO reputation observation, unlike deny-replay: a
+        // replayed deny accruing distrust is fail-safe, but a replayed
+        // approval accruing trust would let a tool whitewash its reputation
+        // by looping one approved call. Only the original human approval
+        // counts.
+        thaw_and_resume(interceptor, session, tid, true).await;
+        session.stats.total_allowed += 1;
+        return Ok(());
+    }
+
     // Enqueue a digest item for human review.
     let digest_item = build_digest_item(ctx, decision, dlp_redactor);
     let digest_id = digest_item.id;
@@ -2234,25 +3202,95 @@ async fn queue_and_wait(
     session.stats.total_queued += 1;
 
     // Wait for approval/denial (or timeout) before resuming the syscall.
-    let outcome = loop_ctx
-        .reviewer
-        .review(
-            &digest_item,
-            Duration::from_secs(config.freeze_timeout_seconds),
-        )
-        .await;
+    // A malformed/unsafe scoped proposal is returned to Pending instead of
+    // denying the exact request, so the operator can edit the proposal or
+    // fall back to a single-request approval.
+    let (outcome, review_action, validated_scope) = loop {
+        let outcome = loop_ctx
+            .reviewer
+            .review(
+                &digest_item,
+                Duration::from_secs(config.freeze_timeout_seconds),
+            )
+            .await;
 
-    // Retrieve the stored review action to dispatch side-effects.
-    let review_action = match loop_ctx.digest_store.get(digest_id).await {
-        Ok(item) => item.and_then(|item| item.review_action.clone()),
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                item_id = %digest_id,
-                "failed to fetch digest review action"
-            );
-            None
+        let review_action = match loop_ctx.digest_store.get(digest_id).await {
+            Ok(item) => item.and_then(|item| item.review_action.clone()),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    item_id = %digest_id,
+                    "failed to fetch digest review action"
+                );
+                None
+            }
+        };
+
+        let parsed = review_action
+            .as_deref()
+            .and_then(grith_digest::PermissionReviewAction::from_storage_value);
+        if matches!(outcome, ReviewOutcome::Approved) {
+            if let Some(grith_digest::PermissionReviewAction::ScopedAllow(request)) = &parsed {
+                match crate::scoped_permissions::validate_scoped_allow(
+                    request,
+                    &ctx.call_type.to_string(),
+                ) {
+                    Ok(scope) => break (outcome, review_action, Some(scope)),
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %digest_id,
+                            error = %error,
+                            "invalid scoped approval; returning review to pending"
+                        );
+                        if let Err(update_error) = loop_ctx
+                            .digest_store
+                            .update_status(
+                                digest_id,
+                                grith_digest::types::DigestStatus::Pending,
+                                None,
+                                Some(&format!("Scoped approval rejected: {error}")),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                error = %update_error,
+                                item_id = %digest_id,
+                                "failed to return invalid scoped approval to pending"
+                            );
+                            break (ReviewOutcome::Denied, review_action, None);
+                        }
+                        continue;
+                    }
+                }
+            }
+            // JSON is reserved for structured actions. Do not accidentally
+            // treat malformed or unknown JSON as a legacy exact approval.
+            if review_action
+                .as_deref()
+                .is_some_and(|action| action.trim_start().starts_with('{'))
+                && parsed.is_none()
+            {
+                if let Err(error) = loop_ctx
+                    .digest_store
+                    .update_status(
+                        digest_id,
+                        grith_digest::types::DigestStatus::Pending,
+                        None,
+                        Some("Invalid structured review action"),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        error = %error,
+                        item_id = %digest_id,
+                        "failed to return malformed review action to pending"
+                    );
+                    break (ReviewOutcome::Denied, review_action, None);
+                }
+                continue;
+            }
         }
+        break (outcome, review_action, None);
     };
 
     match outcome {
@@ -2283,50 +3321,94 @@ async fn queue_and_wait(
                 decision,
                 session.scope_name(),
             );
-            // Add the approved path/address to the session allowlist so
-            // subsequent accesses bypass the proxy. Both "approve" and
-            // "approve_and_learn" benefit from this — the difference is that
-            // "learn" also records a reputation observation for long-term trust.
-            if let Some(key) = approved_session_allowlist_entry(&ctx.call_type) {
+            // Scoped approvals deliberately do not add an exact `rw:` entry:
+            // that namespace would broaden write/create intent to
+            // delete/chmod on the current target.
+            if let Some(scope) = &validated_scope {
                 if let Ok(mut allowed) = loop_ctx.session_allowed.lock() {
-                    let is_learn = review_action.as_deref() == Some("approve_and_learn");
-                    if is_learn {
-                        tracing::info!(key, "session allowlist: learned (persisted)");
-                    } else {
-                        tracing::info!(key, "session allowlist: approved");
+                    for rule in &scope.rules {
+                        allowed.insert(rule.clone());
                     }
-                    allowed.insert(key.clone());
+                }
+                let summary = scope.rules.join(", ");
+                tracing::info!(
+                    directory = scope.directory,
+                    rules = summary,
+                    "session scoped permission applied"
+                );
+                write_forensics_stage(
+                    loop_ctx,
+                    trace_event_id,
+                    session,
+                    event_pid,
+                    Some(&ctx.call_type),
+                    "scoped_allow_applied",
+                    Some("manual-allow"),
+                    Some(decision.composite_score),
+                    Some(&summary),
+                );
+                if let Some(tx) = loop_ctx.event_tx {
+                    let event = serde_json::json!({
+                        "session_id": session.id.to_string(),
+                        "tool_name": session.tool_name,
+                        "call_type": format!("Scoped: {summary}"),
+                        "plugin_id": format!("supervisor:{}", session.tool_name),
+                        "score": 0.0,
+                        "action": "scoped-allow",
+                        "reason": format!("Session directory scope added for {}", scope.directory),
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+                    let _ = tx.send(event.to_string());
+                }
+            } else {
+                // An ambiguous-attribution NetConnect expands to one `net:`
+                // entry per candidate hostname; every other call type yields
+                // its single entry.
+                let entries = approved_session_allowlist_entries(&ctx.call_type);
+                if !entries.is_empty() {
+                    if let Ok(mut allowed) = loop_ctx.session_allowed.lock() {
+                        let is_learn = review_action.as_deref() == Some("approve_and_learn");
+                        for key in &entries {
+                            if is_learn {
+                                tracing::info!(key, "session allowlist: learned (persisted)");
+                            } else {
+                                tracing::info!(key, "session allowlist: approved");
+                            }
+                            allowed.insert(key.clone());
+                        }
 
-                    // /tmp self-created subtree auto-allow: when the
-                    // approved op is a top-level `/tmp/<name>` dir create
-                    // (or file write/rename), also register a bare-path
-                    // prefix so subsequent accesses anywhere in that
-                    // subtree (or to that file) bypass the proxy without
-                    // further prompts. See `tmp_self_created_prefix` for
-                    // the carveouts and scope rules.
-                    if let Some(tmp_prefix) = tmp_self_created_prefix(&ctx.call_type) {
-                        tracing::info!(
-                            entry = tmp_prefix,
-                            "session allowlist: /tmp self-created subtree registered"
-                        );
-                        allowed.insert(tmp_prefix);
-                    }
+                        // /tmp self-created subtree auto-allow: when the
+                        // approved op is a top-level `/tmp/<name>` dir create
+                        // (or file write/rename), also register a bare-path
+                        // prefix so subsequent accesses anywhere in that
+                        // subtree (or to that file) bypass the proxy without
+                        // further prompts. See `tmp_self_created_prefix` for
+                        // the carveouts and scope rules.
+                        if let Some(tmp_prefix) = tmp_self_created_prefix(&ctx.call_type) {
+                            tracing::info!(
+                                entry = tmp_prefix,
+                                "session allowlist: /tmp self-created subtree registered"
+                            );
+                            allowed.insert(tmp_prefix);
+                        }
 
-                    // Broadcast learned-rule feedback to the TUI log.
-                    if is_learn {
-                        if let Some(tx) = loop_ctx.event_tx {
-                            let profile = session_scope_name(session);
-                            let event = serde_json::json!({
-                                "session_id": session.id.to_string(),
-                                "tool_name": session.tool_name,
-                                "call_type": format!("Learned: {key}"),
-                                "plugin_id": format!("supervisor:{}", session.tool_name),
-                                "score": 0.0,
-                                "action": "learned",
-                                "reason": format!("Rule persisted for profile {profile}"),
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                            });
-                            let _ = tx.send(event.to_string());
+                        // Broadcast learned-rule feedback to the TUI log.
+                        if is_learn {
+                            if let Some(tx) = loop_ctx.event_tx {
+                                let profile = session_scope_name(session);
+                                let summary = entries.join(", ");
+                                let event = serde_json::json!({
+                                    "session_id": session.id.to_string(),
+                                    "tool_name": session.tool_name,
+                                    "call_type": format!("Learned: {summary}"),
+                                    "plugin_id": format!("supervisor:{}", session.tool_name),
+                                    "score": 0.0,
+                                    "action": "learned",
+                                    "reason": format!("Rule persisted for profile {profile}"),
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                });
+                                let _ = tx.send(event.to_string());
+                            }
                         }
                     }
                 }
@@ -2345,6 +3427,18 @@ async fn queue_and_wait(
                     grith_proxy::reputation::ReputationOutcome::Approved(weight),
                     Some(&ctx.arguments),
                 );
+            }
+            // Remember the reviewed approval so identical retries inside the
+            // replay window are allowed without a fresh prompt (see the
+            // approve-replay check above). Lapsed entries are purged here,
+            // so the map stays bounded by recent human decisions.
+            if config.approve_replay_seconds > 0 {
+                let now = Instant::now();
+                let window = Duration::from_secs(config.approve_replay_seconds);
+                session
+                    .recent_approvals
+                    .retain(|_, at| now.duration_since(*at) < window);
+                session.recent_approvals.insert(replay_key, now);
             }
             thaw_and_resume(interceptor, session, tid, true).await;
         }
@@ -2391,6 +3485,18 @@ async fn queue_and_wait(
                     Some(&ctx.arguments),
                 );
             }
+            // Remember the reviewed denial so identical retries inside the
+            // replay window are denied without a fresh prompt. Lapsed
+            // entries are purged here, so the map stays bounded by recent
+            // human decisions.
+            if config.deny_replay_seconds > 0 {
+                let now = Instant::now();
+                let window = Duration::from_secs(config.deny_replay_seconds);
+                session
+                    .recent_denials
+                    .retain(|_, at| now.duration_since(*at) < window);
+                session.recent_denials.insert(replay_key, now);
+            }
             thaw_and_resume(interceptor, session, tid, false).await;
             session.stats.total_denied += 1;
         }
@@ -2412,58 +3518,59 @@ fn dispatch_supervisor_review_side_effects(
     };
     match action {
         "approve_and_learn" => {
-            // Persist the learned rule to disk.
+            // Persist the learned rule(s) to disk. An ambiguous-attribution
+            // NetConnect expands to one `net:` rule per candidate hostname.
             if let Some(profile) = profile_scope {
-                if let Some(entry) = approved_session_allowlist_entry(&ctx.call_type) {
-                    if crate::learned_rules::validate_persisted_rule(&entry).is_ok() {
-                        // Build a human-readable reason from the context arguments.
-                        let reason = ctx
+                // Build a human-readable reason from the context arguments.
+                let reason = ctx
+                    .arguments
+                    .get("process")
+                    .and_then(|v| v.as_str())
+                    .map(|proc| {
+                        let target = ctx
                             .arguments
-                            .get("process")
-                            .and_then(|v| v.as_str())
-                            .map(|proc| {
-                                let target = ctx
-                                    .arguments
-                                    .get("process_args")
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|args| {
-                                        args.iter().filter_map(|a| a.as_str()).find(|a| {
-                                            !a.starts_with('-')
-                                                && (a.contains('@') || a.contains('.'))
-                                        })
-                                    });
-                                match target {
-                                    Some(t) => format!("{proc} → {t}"),
-                                    None => proc.to_string(),
-                                }
-                            })
-                            .unwrap_or_default();
+                            .get("process_args")
+                            .and_then(|v| v.as_array())
+                            .and_then(|args| {
+                                args.iter().filter_map(|a| a.as_str()).find(|a| {
+                                    !a.starts_with('-') && (a.contains('@') || a.contains('.'))
+                                })
+                            });
+                        match target {
+                            Some(t) => format!("{proc} → {t}"),
+                            None => proc.to_string(),
+                        }
+                    })
+                    .unwrap_or_default();
 
-                        let rule = crate::learned_rules::LearnedRule {
-                            pattern: entry.clone(),
-                            profile: profile.to_string(),
-                            scope: "user".to_string(),
-                            reason,
-                            created_at: chrono::Utc::now().to_rfc3339(),
-                            created_by: String::new(),
-                        };
-                        let path = crate::learned_rules::default_learned_rules_path();
-                        match crate::learned_rules::append_learned_rule(&path, rule) {
-                            Ok(()) => {
-                                tracing::info!(
-                                    pattern = entry,
-                                    profile,
-                                    path = %path.display(),
-                                    "learned rule persisted"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    pattern = entry,
-                                    "failed to persist learned rule"
-                                );
-                            }
+                for entry in approved_session_allowlist_entries(&ctx.call_type) {
+                    if crate::learned_rules::validate_persisted_rule(&entry).is_err() {
+                        continue;
+                    }
+                    let rule = crate::learned_rules::LearnedRule {
+                        pattern: entry.clone(),
+                        profile: profile.to_string(),
+                        scope: "user".to_string(),
+                        reason: reason.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        created_by: String::new(),
+                    };
+                    let path = crate::learned_rules::default_learned_rules_path();
+                    match crate::learned_rules::append_learned_rule(&path, rule) {
+                        Ok(()) => {
+                            tracing::info!(
+                                pattern = entry,
+                                profile,
+                                path = %path.display(),
+                                "learned rule persisted"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                pattern = entry,
+                                "failed to persist learned rule"
+                            );
                         }
                     }
                 }
@@ -2597,159 +3704,203 @@ fn log_exfil_annotations(
 // DNS query evaluation
 // ---------------------------------------------------------------------------
 
-/// Handle a DNS query event from the DNS inspection proxy.
+/// Evaluate an in-line DNS query parsed from a supervised `sendto` on a DNS
+/// socket. Returns `true` to allow the send (the query reaches the real
+/// resolver untouched and the reply is observed at the `recvfrom` exit) or
+/// `false` to block it (the interceptor denies the syscall with EPERM).
 ///
-/// Builds a `ToolCallType::DnsQuery`, evaluates it through the security proxy,
-/// and sends the decision back to the DNS proxy.
-pub(super) async fn handle_dns_query_event(
+/// This uses the same transport-neutral decision service as connected proxy
+/// routes. The two owners differ only in enforcement: an in-line refusal
+/// denies the syscall, while a proxied refusal returns a DNS error response.
+pub(super) async fn evaluate_dns_query_inline(
     session: &mut SupervisorSession,
     loop_ctx: &SupervisorLoopContext<'_>,
-    query_event: crate::dns_proxy::DnsQueryEvent,
-) {
+    tgid: u32,
+    tid: u32,
+    domain: &str,
+    query_type: &str,
+) -> bool {
     let trace_event_id = Uuid::new_v4();
     let call_type = grith_proxy::types::ToolCallType::DnsQuery {
-        domain: query_event.domain.clone(),
-        query_type: query_event.query_type.clone(),
+        domain: domain.to_string(),
+        query_type: query_type.to_string(),
     };
 
     if let Some(trace) = &loop_ctx.forensics_trace {
         trace.capture_dns_query(
             trace_event_id,
             session.id,
-            session.root_pid,
+            tgid,
             &session.process_tree,
-            session.root_pid,
+            tgid,
             &call_type,
         );
     }
 
-    // Session allowlist check: DNS queries for domains in the profile's
-    // routine_destinations should be auto-allowed without hitting the proxy.
-    if let Some(key) = session_allowlist_key(&call_type) {
-        if loop_ctx
-            .session_allowed
-            .lock()
-            .is_ok_and(|s| is_session_allowlist_match(&key, &s, &call_type))
-        {
-            write_forensics_stage(
-                loop_ctx,
-                trace_event_id,
-                session,
-                session.root_pid,
-                Some(&call_type),
-                "session_allowed",
-                Some("auto-allow"),
-                None,
-                Some("session allowlist"),
-            );
-            session.stats.total_filtered_noise += 1;
-            tracing::debug!(
-                domain = query_event.domain,
-                query_type = query_event.query_type,
-                "DNS query auto-allowed (session allowlist)"
-            );
-            let _ = query_event
-                .response_tx
-                .send(crate::dns_proxy::DnsDecision::Forward);
-            return;
-        }
-    }
-
-    let plugin_id = format!("supervisor:{}", session.tool_name);
-    let mut ctx = ToolCallContext::new(plugin_id, call_type, session.id);
-    ctx.profile_name = session.profile_name.clone();
-    ctx.task_context = session.project_name.clone();
-    ctx.arguments = supervisor_event_arguments(session, session.root_pid, &ctx.call_type);
-
-    let decision = evaluate_proxy(loop_ctx, &ctx).await;
-
-    let dns_decision = match &decision.action {
-        ProxyAction::Deny { reason } => {
-            write_forensics_stage(
-                loop_ctx,
-                trace_event_id,
-                session,
-                session.root_pid,
-                Some(&ctx.call_type),
-                "proxy_scored",
-                Some("auto-deny"),
-                Some(decision.composite_score),
-                Some(reason),
-            );
-            tracing::warn!(
-                domain = query_event.domain,
-                query_type = query_event.query_type,
-                score = decision.composite_score,
-                reason = %reason,
-                "DNS query DENIED"
-            );
-            session.stats.total_denied += 1;
-            crate::dns_proxy::DnsDecision::Refuse
-        }
-        ProxyAction::Queue { .. } => {
-            write_forensics_stage(
-                loop_ctx,
-                trace_event_id,
-                session,
-                session.root_pid,
-                Some(&ctx.call_type),
-                "proxy_scored",
-                Some("queue"),
-                Some(decision.composite_score),
-                Some(&decision.decision_reason),
-            );
-            tracing::info!(
-                domain = query_event.domain,
-                query_type = query_event.query_type,
-                score = decision.composite_score,
-                "DNS query QUEUED for review (forwarding query)"
-            );
-            let digest_item = build_digest_item(&ctx, &decision, loop_ctx.dlp_redactor);
-            if let Err(e) = loop_ctx.digest_store.enqueue(&digest_item).await {
-                tracing::error!(error = %e, "failed to enqueue DNS digest item");
-            } else {
-                session.stats.total_queued += 1;
-            }
-            crate::dns_proxy::DnsDecision::Forward
-        }
-        ProxyAction::Allow => {
-            write_forensics_stage(
-                loop_ctx,
-                trace_event_id,
-                session,
-                session.root_pid,
-                Some(&ctx.call_type),
-                "proxy_scored",
-                Some("auto-allow"),
-                Some(decision.composite_score),
-                Some(&decision.decision_reason),
-            );
-            tracing::debug!(
-                domain = query_event.domain,
-                query_type = query_event.query_type,
-                score = decision.composite_score,
-                "DNS query allowed"
-            );
-            crate::dns_proxy::DnsDecision::Forward
-        }
+    let Some(service) = loop_ctx.dns_decision_service.as_ref() else {
+        tracing::error!(
+            query_type,
+            "DNS decision service unavailable; denying query"
+        );
+        session.stats.total_denied += 1;
+        return false;
+    };
+    let request = crate::connected_dns_proxy::DnsDecisionRequest {
+        // Route zero is reserved for the in-line inspection owner. The
+        // production adapter omits route-only metadata for this sentinel.
+        route_id: crate::connected_dns_proxy::ConnectedDnsRouteId(0),
+        provenance: crate::connected_dns_proxy::DnsRouteProvenance {
+            tgid,
+            creator_tid: tid,
+            socket_id: 0,
+        },
+        original_resolver: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+        transaction_id: 0,
+        domain: domain.to_string(),
+        query_type: query_type.to_string(),
+        queue_action: loop_ctx.config.dns_inspection.proxy_queue_action,
+    };
+    let evaluation = AssertUnwindSafe(service.evaluate(request)).catch_unwind();
+    let decision = match tokio::time::timeout(
+        Duration::from_millis(loop_ctx.config.dns_inspection.proxy_policy_timeout_ms),
+        evaluation,
+    )
+    .await
+    {
+        Ok(Ok(decision)) => decision,
+        Ok(Err(_)) => crate::connected_dns_proxy::DnsDecision::InfrastructureFailure {
+            reason: "DNS policy evaluation panicked".into(),
+        },
+        Err(_) => crate::connected_dns_proxy::DnsDecision::InfrastructureFailure {
+            reason: "DNS policy evaluation timed out".into(),
+        },
     };
 
-    // Audit log the DNS query (no reputation context for DNS)
-    let audit_record = build_audit_record(
-        &ctx,
-        &decision,
-        session,
-        0, // No specific PID for DNS queries
-        loop_ctx.dlp_redactor,
-        None,
-        None,
-    );
-    if let Err(e) = loop_ctx.audit_sink.log(audit_record).await {
-        tracing::error!(error = %e, "failed to log DNS audit record");
+    match decision {
+        crate::connected_dns_proxy::DnsDecision::Allow => {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                tgid,
+                Some(&call_type),
+                "proxy_scored",
+                Some("auto-allow"),
+                None,
+                Some("shared DNS decision service allowed query"),
+            );
+            tracing::debug!(query_type, "in-line DNS query allowed");
+            true
+        }
+        crate::connected_dns_proxy::DnsDecision::Deny { reason } => {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                tgid,
+                Some(&call_type),
+                "proxy_scored",
+                Some("auto-deny"),
+                None,
+                Some(&reason),
+            );
+            tracing::warn!(query_type, %reason, "in-line DNS query denied");
+            session.stats.total_denied += 1;
+            false
+        }
+        crate::connected_dns_proxy::DnsDecision::Queue { reason } => {
+            let forward = loop_ctx.config.dns_inspection.proxy_queue_action
+                == crate::config::DnsProxyQueueAction::Forward;
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                tgid,
+                Some(&call_type),
+                "proxy_scored",
+                Some("queue"),
+                None,
+                Some(&reason),
+            );
+            tracing::info!(
+                query_type,
+                %reason,
+                forward,
+                "in-line DNS query queued"
+            );
+            session.stats.total_queued += 1;
+            if !forward {
+                session.stats.total_denied += 1;
+            }
+            forward
+        }
+        crate::connected_dns_proxy::DnsDecision::InfrastructureFailure { reason } => {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                tgid,
+                Some(&call_type),
+                "infrastructure_failure",
+                Some("auto-deny"),
+                None,
+                Some(&reason),
+            );
+            tracing::error!(
+                query_type,
+                %reason,
+                "DNS policy infrastructure failure; denying in-line query"
+            );
+            // Surface the outage in the TUI/dashboard ticker (rate-limited).
+            // An infrastructure failure denies every DNS query the tool
+            // makes, which otherwise looks like the tool silently hanging
+            // while the counters barely move.
+            if let Some(tx) = loop_ctx.event_tx {
+                if dns_infrastructure_event_permitted() {
+                    let event = serde_json::json!({
+                        "type": "proxy_evaluation",
+                        "session_id": session.id.to_string(),
+                        "tool_name": session.tool_name,
+                        "project_name": session.project_name,
+                        "call_type": call_type.to_string(),
+                        "call_id": format!("{}:dns-infrastructure", session.id),
+                        "plugin_id": "supervisor",
+                        "composite_score": 0.0,
+                        "score": 0.0,
+                        "action": "deny",
+                        "evaluation_time_ms": 0.0,
+                        "filter_results": [],
+                        "reason": format!(
+                            "DNS lookups are being blocked: {reason}. They stay \
+                             blocked until the grith service recovers."
+                        ),
+                        "timestamp": Utc::now().to_rfc3339(),
+                    })
+                    .to_string();
+                    let _ = tx.send(event);
+                }
+            }
+            session.stats.total_denied += 1;
+            false
+        }
     }
+}
 
-    // Send decision back to the DNS proxy
-    let _ = query_event.response_tx.send(dns_decision);
+/// At most one DNS-infrastructure-failure event per interval reaches the
+/// TUI/dashboard ticker — an outage denies every query and would otherwise
+/// flood the ticker with identical lines.
+fn dns_infrastructure_event_permitted() -> bool {
+    static LAST_EMITTED: Mutex<Option<Instant>> = Mutex::new(None);
+    const INTERVAL: Duration = Duration::from_secs(30);
+    let Ok(mut last) = LAST_EMITTED.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -2793,8 +3944,37 @@ async fn evaluate_proxy(
             .map(|guard| guard.clone())
             .unwrap_or_default();
         match remote_proxy_evaluate(url, &current_token, ctx).await {
-            Ok(decision) => return decision,
+            Ok(decision) => {
+                if let Some(restart_state) = &loop_ctx.daemon_restart {
+                    restart_state.note_success();
+                }
+                return decision;
+            }
             Err(e) => {
+                // Stale-token fast path: a 401/403 from a live daemon usually
+                // means the daemon restarted and rotated its IPC token — the
+                // current token is already on disk. Reload it and retry before
+                // considering a restart.
+                if is_auth_rejection(&e) {
+                    if let Some(restart_state) = &loop_ctx.daemon_restart {
+                        if let Some(fresh) =
+                            reload_rotated_token(&restart_state.config, token, &current_token)
+                        {
+                            match remote_proxy_evaluate(url, &fresh, ctx).await {
+                                Ok(decision) => {
+                                    restart_state.note_success();
+                                    return decision;
+                                }
+                                Err(retry_error) => {
+                                    tracing::warn!(
+                                        error = %retry_error,
+                                        "remote proxy evaluation still failed after token reload"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(restart_state) = &loop_ctx.daemon_restart {
                     if restart_state.take_attempt() {
                         tracing::warn!(
@@ -2845,6 +4025,40 @@ fn daemon_unreachable_decision(error: String) -> grith_proxy::types::ProxyDecisi
         evaluation_time: std::time::Duration::from_secs(0),
         decision_reason: format!("Daemon unreachable; operation denied for safety: {error}"),
     }
+}
+
+/// Whether a remote evaluation error is the daemon rejecting our credentials
+/// (as opposed to being unreachable). Matched on the status line embedded by
+/// [`remote_proxy_evaluate`].
+fn is_auth_rejection(error: &str) -> bool {
+    error.contains("daemon returned 401") || error.contains("daemon returned 403")
+}
+
+/// Reload the IPC token from disk after an auth rejection, updating the
+/// session's shared token so every holder (including the DNS decision
+/// service) heals together. Returns the fresh token only when it differs
+/// from the one just rejected — retrying with an identical token cannot
+/// succeed.
+fn reload_rotated_token(
+    config: &DaemonRestartConfig,
+    shared: &Arc<Mutex<String>>,
+    just_used: &str,
+) -> Option<String> {
+    let fresh = std::fs::read_to_string(&config.token_path)
+        .ok()?
+        .trim()
+        .to_string();
+    if fresh.is_empty() || fresh == just_used {
+        return None;
+    }
+    if let Ok(mut guard) = shared.lock() {
+        *guard = fresh.clone();
+    }
+    tracing::info!(
+        event = "ipc_token_refreshed",
+        "daemon IPC token reloaded from disk after auth rejection"
+    );
+    Some(fresh)
 }
 
 async fn attempt_daemon_restart(
@@ -2933,13 +4147,19 @@ async fn remote_proxy_evaluate(
         .map(|arr| {
             arr.iter()
                 .filter_map(|fr| {
+                    let severity = match fr["severity"].as_str().unwrap_or("Notice") {
+                        "Critical" | "critical" => grith_proxy::types::Severity::Critical,
+                        "Error" | "error" => grith_proxy::types::Severity::Error,
+                        "Warning" | "warning" => grith_proxy::types::Severity::Warning,
+                        _ => grith_proxy::types::Severity::Notice,
+                    };
                     Some(grith_proxy::types::FilterResult {
                         filter_name: fr["filter_name"].as_str()?.to_string(),
                         matched: fr["matched"].as_bool()?,
                         score: fr["score"].as_f64()?,
-                        rule_id: String::new(),
-                        severity: grith_proxy::types::Severity::Notice,
-                        message: String::new(),
+                        rule_id: fr["rule_id"].as_str().unwrap_or("").to_string(),
+                        severity,
+                        message: fr["message"].as_str().unwrap_or("").to_string(),
                         metadata: std::collections::HashMap::new(),
                     })
                 })
@@ -3072,7 +4292,7 @@ fn looks_like_openssh_agent_socket(p: &str) -> bool {
 
 /// Binaries that legitimately use the SSH/GPG agent. The agent socket itself is
 /// local IPC for signing/auth; the actual exfil channel is the subsequent
-/// *network* connection, which `egress_policy` scores independently. So when a
+/// *network* connection, which `egress-policy` scores independently. So when a
 /// recognised agent client connects to an agent socket, it is routine local IPC
 /// (FP research §5.1 — fixes the credentialed-git-over-SSH / GPG-signed-commit
 /// false positive). A NON-client process touching the agent socket is NOT
@@ -3176,7 +4396,7 @@ fn is_local_connect_address(address: &str) -> bool {
 /// the Allow branch in two shapes for `NetListen`:
 ///   1. Loopback bind — nothing to do; return Ok(()).
 ///   2. Wildcard bind with `listener_policy_match.allow_clamp = true` —
-///      egress_policy silently passed it through; we now rewrite the
+///      egress-policy silently passed it through; we now rewrite the
 ///      tracee's sockaddr to loopback before the kernel processes
 ///      `bind(2)`.
 ///
@@ -3375,8 +4595,48 @@ fn session_allowlist_key(call_type: &grith_proxy::types::ToolCallType) -> Option
         }
         ToolCallType::ProcessSpawn { command, .. } => Some(format!("exec:{command}")),
         ToolCallType::DnsQuery { domain, .. } => Some(format!("dns:{domain}")),
+        // Cross-process operations get an exact, per-target session key so an
+        // operator approval sticks for the rest of the session instead of
+        // re-prompting on every identical syscall. The key is bound to the
+        // target's start time, NOT just its pid: Linux recycles pids, and a
+        // bare-pid grant would silently transfer to whatever same-uid
+        // process later lands on that number — re-opening the exact
+        // scope-0 `process_vm_readv` memory-theft path this coverage exists
+        // to gate. Start time (procfs stat field 22, monotonic in boot
+        // ticks) changes on every fork, so a recycled pid gets a different
+        // key and must be re-approved. Unreadable identity (target already
+        // gone) → `None` → no grant, always re-prompt (fail safe).
+        //
+        // Residual: a pid could still be recycled in the microseconds the
+        // caller is frozen between this read and the kernel executing the
+        // syscall, but that requires a grant to already exist for the exact
+        // prior tenant and collapses the window from session-long to a
+        // syscall stop — the same class of accepted pre-check TOCTOU as the
+        // failed-exec/failed-connect suppressions.
+        ToolCallType::CrossProcessAccess { op, target_pid } => process_start_time(*target_pid)
+            .map(|start| format!("process:{op}:{target_pid}:{start}")),
+        // Namespace grants key on (syscall, flag word); flags are not a
+        // reusable handle the way a pid is, so no identity binding is needed.
+        ToolCallType::NamespaceOp { syscall, flags } => {
+            Some(format!("namespace:{syscall}:{flags:#x}"))
+        }
         _ => None,
     }
+}
+
+/// A process's start time from `/proc/<pid>/stat` field 22 (monotonic boot
+/// ticks), used to bind a cross-process session grant to a specific process
+/// so a recycled pid does not inherit it. `None` when the process is gone or
+/// the field is unparseable.
+///
+/// The `comm` field (field 2) is parenthesised and may itself contain spaces
+/// and parentheses, so everything up to and including the LAST `)` is
+/// skipped; after it, `state` is field 3 and `starttime` is field 22 — the
+/// 20th whitespace token (index 19).
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Record a reputation observation from the event handler context.
@@ -3545,6 +4805,31 @@ fn approved_session_allowlist_entry(
     }
 }
 
+/// The session-allowlist entries to store for an approved call.
+///
+/// Wraps [`approved_session_allowlist_entry`], expanding a `net:` key that
+/// carries an ambiguous DNS attribution array (`net:["a.example","b.example"]`)
+/// into one `net:<candidate>` entry per hostname. Storing the array string
+/// verbatim would be a dead grant: `is_session_allowlist_match` checks each
+/// candidate of an incoming key against `net:` entries via domain matching,
+/// which the literal array text can never satisfy, so every retry would
+/// re-prompt. The operator saw the full candidate list in the prompt, so
+/// granting each name is exactly the approval they gave.
+fn approved_session_allowlist_entries(call_type: &grith_proxy::types::ToolCallType) -> Vec<String> {
+    let Some(key) = approved_session_allowlist_entry(call_type) else {
+        return Vec::new();
+    };
+    if let Some(domain) = key.strip_prefix("net:") {
+        if let Some(candidates) = parse_dns_candidate_array(domain) {
+            return candidates
+                .into_iter()
+                .map(|candidate| format!("net:{candidate}"))
+                .collect();
+        }
+    }
+    vec![key]
+}
+
 /// If `call_type` is a top-level `/tmp/<name>` create/write (DirCreate or
 /// FileWrite/FileAppend/FileRename-target with a single path component
 /// under `/tmp/`), return the bare-path prefix to register in
@@ -3606,6 +4891,7 @@ fn tmp_self_created_prefix(call_type: &grith_proxy::types::ToolCallType) -> Opti
 /// - filesystem paths use exact or prefix matching
 /// - `exec-prefix:` entries ONLY match `exec:` keys (namespace isolation)
 /// - `ro:` entries use exact match only and only match `FileRead` operations
+/// - scoped prefix entries use boundary-safe, operation-specific matching
 fn is_session_allowlist_match(
     key: &str,
     allowed: &HashSet<String>,
@@ -3618,6 +4904,23 @@ fn is_session_allowlist_match(
         .strip_prefix("net:")
         .or_else(|| key.strip_prefix("dns:"));
     if let Some(domain) = net_domain {
+        // Ambiguous DNS attribution is rendered as a JSON hostname array
+        // (for example `["ab.chatgpt.com","chatgpt.com"]`). Check every
+        // candidate independently against the network allowlist. Requiring
+        // all candidates to match preserves the shared-IP safety boundary:
+        // one trusted name must not grant trust to an untrusted name that
+        // currently resolves to the same address.
+        if let Some(candidates) = parse_dns_candidate_array(domain) {
+            return !candidates.is_empty()
+                && candidates.iter().all(|candidate| {
+                    allowed.iter().any(|entry| {
+                        entry
+                            .strip_prefix("net:")
+                            .is_some_and(|suffix| domain_matches(candidate, suffix))
+                    })
+                });
+        }
+
         return allowed.iter().any(|entry| {
             if let Some(suffix) = entry.strip_prefix("net:") {
                 domain_matches(domain, suffix)
@@ -3683,6 +4986,34 @@ fn is_session_allowlist_match(
         return decision.trusted;
     }
 
+    // Operation-specific directory scopes. Resolve the target through the
+    // same existing-ancestor strategy used when the rule is created so
+    // canonical stored directories also match not-yet-created child paths.
+    if let Some(target) = crate::scoped_permissions::scoped_call_target(call_type) {
+        let resolved = crate::scoped_permissions::resolve_target(target)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&target));
+        let resolved = resolved.to_string_lossy().replace('\\', "/");
+        let prefix_namespace = match call_type {
+            grith_proxy::types::ToolCallType::FileRead { .. }
+            | grith_proxy::types::ToolCallType::DirList { .. } => Some("ro-prefix:"),
+            grith_proxy::types::ToolCallType::FileWrite { .. }
+            | grith_proxy::types::ToolCallType::FileAppend { .. }
+            | grith_proxy::types::ToolCallType::DirCreate { .. } => Some("write-prefix:"),
+            grith_proxy::types::ToolCallType::FileDelete { .. }
+            | grith_proxy::types::ToolCallType::FileRename { .. } => Some("delete-prefix:"),
+            _ => None,
+        };
+        if let Some(namespace) = prefix_namespace {
+            if allowed.iter().any(|entry| {
+                entry
+                    .strip_prefix(namespace)
+                    .is_some_and(|directory| directory_scope_matches(directory, &resolved))
+            }) {
+                return true;
+            }
+        }
+    }
+
     // Read-only path matching: `ro:` entries use exact match only and are
     // scoped to FileRead operations. They do not match writes, appends,
     // deletes, renames, chmod, ownership changes, filesystem
@@ -3734,18 +5065,78 @@ fn is_session_allowlist_match(
         }
     }
 
-    if allowed.contains(key) {
+    // Cross-process / namespace grants: exact-match only, and gated on the
+    // matching call type so a filesystem path that happens to spell a
+    // `process:`/`namespace:` key can never borrow the grant (relative
+    // paths from tracee registers are attacker-controlled strings).
+    if key.starts_with("process:") {
+        return matches!(call_type, ToolCallType::CrossProcessAccess { .. })
+            && allowed.contains(key);
+    }
+    if key.starts_with("namespace:") {
+        return matches!(call_type, ToolCallType::NamespaceOp { .. }) && allowed.contains(key);
+    }
+
+    if !key.starts_with("ro-prefix:")
+        && !key.starts_with("write-prefix:")
+        && !key.starts_with("delete-prefix:")
+        && allowed.contains(key)
+    {
         return true;
     }
 
     // Prefix matching for bare-path entries. Exclude namespaced entries
-    // to prevent namespace leakage.
+    // to prevent namespace leakage — `process:ptrace:1` must never serve
+    // as a string prefix for `process:ptrace:123`.
     allowed.iter().any(|prefix| {
         !prefix.starts_with("exec-prefix:")
+            && !prefix.starts_with("ro-prefix:")
+            && !prefix.starts_with("write-prefix:")
+            && !prefix.starts_with("delete-prefix:")
             && !prefix.starts_with("ro:")
             && !prefix.starts_with("ro-glob:")
             && !prefix.starts_with("rw:")
+            && !prefix.starts_with("process:")
+            && !prefix.starts_with("namespace:")
             && key.starts_with(prefix.as_str())
+    })
+}
+
+/// Boundary-safe match for a normalized directory rule.
+fn directory_scope_matches(directory: &str, target: &str) -> bool {
+    let directory = directory.trim_end_matches('/');
+    target == directory
+        || target
+            .strip_prefix(directory)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Match an explicit read scope for a sensitive path without using the normal
+/// pre-proxy allowlist fast path.
+fn is_sensitive_scoped_read_match(
+    call_type: &grith_proxy::types::ToolCallType,
+    allowed: &HashSet<String>,
+) -> bool {
+    use grith_proxy::types::ToolCallType;
+
+    let path = match call_type {
+        ToolCallType::FileRead { path } | ToolCallType::DirList { path } => path,
+        _ => return false,
+    };
+    let directory_form = format!("{}/", path.trim_end_matches('/'));
+    if !crate::syscall_map::is_sensitive_path(path)
+        && !crate::syscall_map::is_sensitive_path(&directory_form)
+    {
+        return false;
+    }
+
+    let resolved = crate::scoped_permissions::resolve_target(path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let resolved = resolved.to_string_lossy().replace('\\', "/");
+    allowed.iter().any(|entry| {
+        entry
+            .strip_prefix("ro-prefix:")
+            .is_some_and(|directory| directory_scope_matches(directory, &resolved))
     })
 }
 
@@ -3847,6 +5238,21 @@ fn supervisor_event_arguments(
         ToolCallType::FileRename { old_path, new_path } => {
             obj.insert("old_path".into(), serde_json::json!(old_path));
             obj.insert("new_path".into(), serde_json::json!(new_path));
+        }
+        ToolCallType::FileLink {
+            target,
+            link_path,
+            symbolic,
+        } => {
+            // A link has two paths and the filters now score BOTH; the
+            // deciding one is frequently the link path (where it was
+            // planted), not the target. `path` is the link path so an
+            // operator asking "what was created at ~/.ssh/authorized_keys"
+            // finds it; `link_target` records what the link exposes. Both
+            // are queryable.
+            obj.insert("path".into(), serde_json::json!(link_path));
+            obj.insert("link_target".into(), serde_json::json!(target));
+            obj.insert("link_symbolic".into(), serde_json::json!(symbolic));
         }
         ToolCallType::HttpRequest { method, url } => {
             obj.insert("method".into(), serde_json::json!(method));
@@ -4071,7 +5477,7 @@ pub(super) fn build_audit_record(
     // higher +1.0 baseline.
     if let Some(prov) = ctx.spawn_provenance.as_ref() {
         let routine_signal_applied = decision.filter_results.iter().any(|fr| {
-            fr.filter_name == "operation_risk"
+            fr.filter_name == "operation-risk"
                 && fr.rule_id == grith_proxy::filters::operation_risk::ROUTINE_SPAWN_RULE_ID
         });
         let shadow_phase3 = if routine_signal_applied {
@@ -4084,7 +5490,7 @@ pub(super) fn build_audit_record(
             let entries: Vec<serde_json::Value> = decision
                 .filter_results
                 .iter()
-                .filter(|fr| fr.matched && fr.score > 0.0 && fr.filter_name != "operation_risk")
+                .filter(|fr| fr.matched && fr.score > 0.0 && fr.filter_name != "operation-risk")
                 .map(|fr| {
                     serde_json::json!({
                         "filter": fr.filter_name,
@@ -4161,6 +5567,20 @@ pub(super) fn build_audit_record(
         }
     }
 
+    // H-16: populate decision_reason + enforcement_outcome on EVERY supervisor
+    // record. Previously only the DNS path (dns_decision.rs) set these, so the
+    // evidence columns — which exist and are hash-covered — were NULL on every
+    // non-DNS record. Map the proxy decision to what grith enforced at the
+    // syscall boundary; the reason is DLP-redacted like the DNS path.
+    let decision_reason = (!decision.decision_reason.is_empty())
+        .then(|| dlp_redactor.redact(&decision.decision_reason));
+    let enforcement_outcome = match &decision.action {
+        grith_proxy::types::ProxyAction::Allow => "allowed",
+        grith_proxy::types::ProxyAction::Queue { .. } => "queued",
+        grith_proxy::types::ProxyAction::Deny { .. } => "denied",
+    };
+    record = record.with_decision_enforcement(decision_reason, enforcement_outcome);
+
     record
 }
 
@@ -4180,6 +5600,8 @@ pub(super) fn build_digest_item(
         session_id: Some(ctx.session_id),
         tool_call_type: ctx.call_type.to_string(),
         arguments_summary: summary,
+        decision_reason: (!decision.decision_reason.is_empty())
+            .then(|| decision.decision_reason.clone()),
         composite_score: decision.composite_score,
         severity: ScoreSeverity::from_score(decision.composite_score),
         filter_breakdown: to_filter_breakdowns(&decision.filter_results),
@@ -4214,6 +5636,10 @@ pub(super) fn build_ws_event(
         "type": "proxy_evaluation",
         "session_id": session.id.to_string(),
         "tool_name": session.tool_name,
+        // Carry the project name on the live event so the dashboard's audit
+        // ticker can label a brand-new session's rows immediately, instead of
+        // waiting for the ~5s REST audit poll to populate the session→project map.
+        "project_name": session.project_name,
         "call_type": ctx.call_type.to_string(),
         "call_id": format!("{}:{}", session.id, ctx.plugin_id),
         "plugin_id": ctx.plugin_id,
@@ -4384,7 +5810,6 @@ mod tests {
             timestamp: Utc::now(),
             kind: SyscallKind::IoUringSetup,
             raw_syscall_nr,
-            sockaddr_addr: None,
         }
     }
 
@@ -4426,7 +5851,7 @@ mod tests {
 
         let results = vec![
             FilterResult::matched(
-                "path_match",
+                "path-match",
                 "ssh-key",
                 5.0,
                 Severity::Critical,
@@ -4437,7 +5862,7 @@ mod tests {
 
         let summaries = audit_bridge::to_filter_summaries(&results);
         assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].filter_name, "path_match");
+        assert_eq!(summaries[0].filter_name, "path-match");
         assert!(summaries[0].matched);
         assert_eq!(summaries[0].score, 5.0);
         assert_eq!(summaries[0].severity, "critical");
@@ -4450,7 +5875,7 @@ mod tests {
 
         let results = vec![
             FilterResult::matched("cmd", "dangerous-cmd", 4.0, Severity::Warning, "risky"),
-            FilterResult::no_match("path_match"),
+            FilterResult::no_match("path-match"),
             FilterResult::matched("secret", "aws-key", 7.0, Severity::Critical, "secret found"),
         ];
 
@@ -4478,6 +5903,42 @@ mod tests {
         assert_eq!(item.composite_score, 5.5);
         assert_eq!(item.plugin_id, "supervisor:claude-code");
         assert!(!item.informational_only);
+    }
+
+    /// H-16: every supervisor record (not just DNS) now carries the dedicated
+    /// decision_reason / enforcement_outcome columns instead of leaving them
+    /// NULL. Outcome is derived from the proxy decision's action; the reason is
+    /// the (redacted) policy explanation.
+    #[test]
+    fn build_audit_record_populates_decision_reason_and_outcome() {
+        let session = SupervisorSession::new("claude-code", 42);
+        let ctx = ToolCallContext::new(
+            "supervisor:claude-code",
+            ToolCallType::ShellExec {
+                command: "rm".into(),
+                args: vec!["-rf".into(), "/".into()],
+            },
+            session.id,
+        );
+        let redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+
+        let deny = grith_proxy::types::ProxyDecision::deny(
+            9.0,
+            vec![],
+            "dangerous command".into(),
+            Duration::from_millis(1),
+        );
+        let rec = build_audit_record(&ctx, &deny, &session, 42, &redactor, None, None);
+        assert_eq!(rec.enforcement_outcome.as_deref(), Some("denied"));
+        assert_eq!(rec.decision_reason.as_deref(), Some("dangerous command"));
+
+        let allow = grith_proxy::types::ProxyDecision::allow(0.5, vec![], Duration::from_millis(1));
+        let rec = build_audit_record(&ctx, &allow, &session, 42, &redactor, None, None);
+        assert_eq!(rec.enforcement_outcome.as_deref(), Some("allowed"));
+
+        let queue = grith_proxy::types::ProxyDecision::queue(5.5, vec![], Duration::from_millis(1));
+        let rec = build_audit_record(&ctx, &queue, &session, 42, &redactor, None, None);
+        assert_eq!(rec.enforcement_outcome.as_deref(), Some("queued"));
     }
 
     #[test]
@@ -4539,6 +6000,93 @@ mod tests {
             &allowed,
             &d
         ));
+    }
+
+    #[test]
+    fn net_allowlist_matches_when_every_dns_candidate_is_trusted() {
+        let call = ToolCallType::NetConnect {
+            address: r#"["ab.chatgpt.com","chatgpt.com"]"#.into(),
+            port: 443,
+        };
+        let allowed = HashSet::from(["net:chatgpt.com".to_string()]);
+
+        assert!(is_session_allowlist_match(
+            r#"net:["ab.chatgpt.com","chatgpt.com"]"#,
+            &allowed,
+            &call
+        ));
+    }
+
+    #[test]
+    fn net_allowlist_rejects_mixed_trust_dns_candidates() {
+        let call = ToolCallType::NetConnect {
+            address: r#"["chatgpt.com","untrusted.example"]"#.into(),
+            port: 443,
+        };
+        let allowed = HashSet::from(["net:chatgpt.com".to_string()]);
+
+        assert!(!is_session_allowlist_match(
+            r#"net:["chatgpt.com","untrusted.example"]"#,
+            &allowed,
+            &call
+        ));
+    }
+
+    #[test]
+    fn net_allowlist_rejects_empty_or_malformed_dns_candidate_arrays() {
+        let d = dummy_file_read();
+        let allowed = HashSet::from(["net:chatgpt.com".to_string()]);
+
+        assert!(!is_session_allowlist_match("net:[]", &allowed, &d));
+        assert!(!is_session_allowlist_match(
+            r#"net:["chatgpt.com""#,
+            &allowed,
+            &d
+        ));
+    }
+
+    #[test]
+    fn approved_ambiguous_net_connect_expands_to_per_candidate_entries() {
+        let call = ToolCallType::NetConnect {
+            address: r#"["a.example.com","b.example.com"]"#.into(),
+            port: 443,
+        };
+        assert_eq!(
+            approved_session_allowlist_entries(&call),
+            vec![
+                "net:a.example.com".to_string(),
+                "net:b.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn approved_single_host_net_connect_keeps_single_entry() {
+        let call = ToolCallType::NetConnect {
+            address: "api.example.com".into(),
+            port: 443,
+        };
+        assert_eq!(
+            approved_session_allowlist_entries(&call),
+            vec!["net:api.example.com".to_string()]
+        );
+    }
+
+    /// Regression: storing the array literal verbatim was a dead grant — the
+    /// per-candidate matcher can never satisfy it, so every retried connect
+    /// re-prompted even after an approval. Expanded entries must unlock the
+    /// same ambiguous key the approval was granted for.
+    #[test]
+    fn approved_ambiguous_entries_unlock_subsequent_ambiguous_connects() {
+        let call = ToolCallType::NetConnect {
+            address: r#"["a.example.com","b.example.com"]"#.into(),
+            port: 443,
+        };
+        let allowed: HashSet<String> = approved_session_allowlist_entries(&call)
+            .into_iter()
+            .collect();
+        let key = session_allowlist_key(&call).expect("net key");
+        assert!(is_session_allowlist_match(&key, &allowed, &call));
     }
 
     #[test]
@@ -4760,6 +6308,106 @@ mod tests {
     }
 
     #[test]
+    fn daemon_restart_state_is_per_outage_not_per_session() {
+        let state = DaemonRestartState::new(DaemonRestartConfig {
+            executable: std::path::PathBuf::from("/usr/bin/true"),
+            config_path: None,
+            token_path: std::path::PathBuf::from("/nonexistent/token"),
+        });
+
+        // First failure in an outage wins the attempt; an immediate second
+        // failure is inside the cooldown and must not stack restarts.
+        assert!(state.take_attempt());
+        assert!(!state.take_attempt());
+
+        // A healthy evaluation re-arms the budget, so the NEXT outage gets an
+        // immediate attempt instead of being locked out for the session.
+        state.note_success();
+        assert!(state.take_attempt());
+    }
+
+    #[test]
+    fn auth_rejection_is_distinguished_from_unreachable() {
+        assert!(is_auth_rejection(
+            "daemon returned 403 Forbidden: Invalid IPC token"
+        ));
+        assert!(is_auth_rejection("daemon returned 401 Unauthorized: "));
+        assert!(!is_auth_rejection(
+            "HTTP request failed: connection refused"
+        ));
+        assert!(!is_auth_rejection(
+            "daemon returned 500 Internal Server Error"
+        ));
+    }
+
+    #[test]
+    fn reload_rotated_token_adopts_only_a_changed_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("daemon.token");
+        let config = DaemonRestartConfig {
+            executable: std::path::PathBuf::from("/usr/bin/true"),
+            config_path: None,
+            token_path: token_path.clone(),
+        };
+        let shared = Arc::new(Mutex::new("stale".to_string()));
+
+        // Missing file: nothing to reload.
+        assert_eq!(reload_rotated_token(&config, &shared, "stale"), None);
+
+        // Disk still holds the token the daemon just rejected: a retry with
+        // it cannot succeed, so nothing is adopted.
+        std::fs::write(&token_path, "stale\n").unwrap();
+        assert_eq!(reload_rotated_token(&config, &shared, "stale"), None);
+        assert_eq!(*shared.lock().unwrap(), "stale");
+
+        // Rotated token on disk: adopted into the shared slot (healing the
+        // DNS decision service and any other holder) and returned for retry.
+        std::fs::write(&token_path, "fresh\n").unwrap();
+        assert_eq!(
+            reload_rotated_token(&config, &shared, "stale"),
+            Some("fresh".to_string())
+        );
+        assert_eq!(*shared.lock().unwrap(), "fresh");
+    }
+
+    #[test]
+    fn dns_infrastructure_events_are_rate_limited() {
+        assert!(dns_infrastructure_event_permitted());
+        assert!(!dns_infrastructure_event_permitted());
+    }
+
+    #[tokio::test]
+    async fn forward_confirm_recovers_attribution_miss_and_rate_limits() {
+        use crate::dns_cache::{DnsCache, DnsForwardConfirm, Resolution};
+
+        // localhost resolves via /etc/hosts — the same offline-safe precedent
+        // as dns_cache::tests::forward_cache_seed_and_lookup.
+        let cache = Arc::new(Mutex::new(DnsCache::new()));
+        let confirm = DnsForwardConfirm::new(vec!["localhost".to_string()]).unwrap();
+
+        // No confirm state configured → the miss passes through untouched.
+        let miss = Resolution::Unknown("127.0.0.1".parse().unwrap());
+        let (resolution, via) =
+            confirm_forward_attribution(&cache, None, "127.0.0.1", miss.clone()).await;
+        assert!(!via);
+        assert_eq!(resolution, miss);
+
+        // A live confirm re-resolves and recovers the attribution.
+        let (resolution, via) =
+            confirm_forward_attribution(&cache, Some(&confirm), "127.0.0.1", miss).await;
+        assert!(via);
+        assert_eq!(resolution, Resolution::Exact("localhost".into()));
+
+        // A second miss inside the cooldown window is not allowed to spend
+        // another resolve; it keeps its miss.
+        let second = Resolution::Unknown("192.0.2.9".parse().unwrap());
+        let (resolution, via) =
+            confirm_forward_attribution(&cache, Some(&confirm), "192.0.2.9", second.clone()).await;
+        assert!(!via);
+        assert_eq!(resolution, second);
+    }
+
+    #[test]
     fn connect_carveout_rejects_non_agent_addresses_and_non_clients() {
         // A permissive root to isolate the address/identity checks from the
         // routine-root check.
@@ -4868,6 +6516,18 @@ mod tests {
         assert!(!is_loopback_connect_address(""));
     }
 
+    #[test]
+    fn ambiguous_dns_candidates_render_as_name_array() {
+        let address = format_dns_candidate_array(&["ab.chatgpt.com".into(), "chatgpt.com".into()]);
+        assert_eq!(address, r#"["ab.chatgpt.com","chatgpt.com"]"#);
+
+        let call = ToolCallType::NetConnect { address, port: 443 };
+        assert_eq!(
+            call.to_string(),
+            r#"NetConnect(["ab.chatgpt.com","chatgpt.com"]:443)"#
+        );
+    }
+
     /// PR 3 Phase C: a port that almost certainly has no listener
     /// returns false. We pick a high random port (65500) that's
     /// unlikely to be in use on any test machine.
@@ -4923,10 +6583,11 @@ mod tests {
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
             session_sync: None,
-            session_allowed: Mutex::new(HashSet::new()),
+            session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
-            dns_proxy_port: None,
-            dns_query_rx: None,
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
             syscall_log: None,
             forensics_trace: None,
             reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
@@ -4941,6 +6602,7 @@ mod tests {
             namespace_users: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
         };
 
         let event = sample_io_uring_event(pid, crate::platform::linux::syscall_nr::IO_URING_SETUP);
@@ -4953,6 +6615,163 @@ mod tests {
         assert!(state.allow_pids.is_empty());
         assert_eq!(session.stats.total_queued, 0);
         assert_eq!(session.stats.total_denied, 0);
+    }
+
+    /// Provenance backfill: the first non-exec syscall from a process with no
+    /// prior spawn record gets exactly one synthesized `ProcessSpawn` audit
+    /// record; repeats from the same TGID do not; and a process whose first
+    /// event IS a real exec is not double-tagged as synthesized.
+    #[tokio::test]
+    async fn untagged_process_gets_one_synthesized_spawn_provenance() {
+        let read_pid = 4242; // in-process / missed-exec actor: first event is a read
+        let exec_pid = 4243; // normal actor: first event is a real exec
+
+        let (mock, _state) = MockInterceptor::new(vec![]);
+        let mut interceptor: Box<dyn SyscallInterceptor> = Box::new(mock);
+        let mut session = SupervisorSession::new("mock-tool", read_pid);
+        let proxy = allow_only_proxy();
+        let audit_storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let audit_sink: Arc<dyn crate::audit_sink::AuditSink> = Arc::new(
+            crate::audit_sink::StorageAuditSink::new(audit_storage.clone()),
+        );
+        let digest_queue = Arc::new(grith_digest::queue::DigestQueue::open_in_memory().unwrap());
+        let digest_store: Arc<dyn crate::reviewer::DigestStore> =
+            Arc::new(crate::reviewer::LocalDigestStore::new(digest_queue));
+        let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+        let correlation_tracker = Arc::new(grith_audit::CorrelationTracker::with_defaults());
+        let containment_tracker = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::new(
+                Duration::from_secs(60),
+            ),
+        );
+        let config = SupervisorConfig::default();
+        let loop_ctx = SupervisorLoopContext {
+            proxy: &proxy,
+            audit_sink,
+            digest_store,
+            dlp_redactor: &dlp_redactor,
+            correlation_tracker: &correlation_tracker,
+            containment_tracker: &containment_tracker,
+            config: &config,
+            event_tx: None,
+            freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
+            read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
+            reviewer: Arc::new(PanicReviewer),
+            session_sync: None,
+            session_allowed: Arc::new(Mutex::new(HashSet::new())),
+            dns_cache: Arc::new(Mutex::new(DnsCache::new())),
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
+            syscall_log: None,
+            forensics_trace: None,
+            reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
+            reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            daemon_proxy_url: None,
+            daemon_proxy_token: None,
+            daemon_restart: None,
+            persist_local_reputation: true,
+            routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
+            local_listener_policy: Vec::new(),
+            namespace_users: Vec::new(),
+            working_root: None,
+            mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
+        };
+
+        let read_event = |pid: u32| SyscallEvent {
+            pid,
+            tid: pid,
+            timestamp: Utc::now(),
+            kind: SyscallKind::FileRead {
+                fd: 7,
+                path: Some("/etc/hostname".into()),
+            },
+            raw_syscall_nr: 0,
+        };
+        let exec_event = |pid: u32| SyscallEvent {
+            pid,
+            tid: pid,
+            timestamp: Utc::now(),
+            kind: SyscallKind::ProcessExec {
+                path: "/bin/true".into(),
+                args: vec!["/bin/true".into()],
+            },
+            raw_syscall_nr: crate::platform::linux::syscall_nr::EXECVE,
+        };
+
+        // The sink writes on a background thread, so read back the synthesized
+        // rows for a session with a short poll for the flush.
+        let synthesized_rows = |session_id: Uuid| {
+            let storage = audit_storage.clone();
+            async move {
+                for _ in 0..200 {
+                    let rows: Vec<_> = storage
+                        .lock()
+                        .unwrap()
+                        .get_by_session(&session_id)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|r| {
+                            r.tool_call_type.starts_with("ProcessSpawn(")
+                                && r.arguments_summary.contains("synthesized_spawn_provenance")
+                        })
+                        .collect();
+                    if !rows.is_empty() {
+                        return rows;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Vec::new()
+            }
+        };
+
+        // First read from an untagged actor → one synthesized provenance row.
+        handle_syscall_event(
+            &mut interceptor,
+            &mut session,
+            &loop_ctx,
+            read_event(read_pid),
+        )
+        .await
+        .unwrap();
+        assert!(session.spawn_recorded.contains(&read_pid));
+        let rows = synthesized_rows(session.id).await;
+        assert_eq!(rows.len(), 1, "exactly one synthesized provenance row");
+        assert_eq!(rows[0].supervised_pid, Some(read_pid));
+
+        // Second read from the same TGID → no new provenance row (deduped).
+        handle_syscall_event(
+            &mut interceptor,
+            &mut session,
+            &loop_ctx,
+            read_event(read_pid),
+        )
+        .await
+        .unwrap();
+        // A process whose FIRST event is a real exec must NOT be synthesized —
+        // the normal exec path already tags it.
+        handle_syscall_event(
+            &mut interceptor,
+            &mut session,
+            &loop_ctx,
+            exec_event(exec_pid),
+        )
+        .await
+        .unwrap();
+        assert!(session.spawn_recorded.contains(&exec_pid));
+        // Let any erroneous extra writes flush, then confirm still exactly one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rows = synthesized_rows(session.id).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "provenance emitted at most once per process, and never for the real-exec actor"
+        );
+        assert_eq!(rows[0].supervised_pid, Some(read_pid));
     }
 
     // ---- PR 6 Phase A: category-1 hard-deny tests ----
@@ -4968,7 +6787,6 @@ mod tests {
             timestamp: Utc::now(),
             kind,
             raw_syscall_nr,
-            sockaddr_addr: None,
         }
     }
 
@@ -5007,10 +6825,11 @@ mod tests {
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
             session_sync: None,
-            session_allowed: Mutex::new(HashSet::new()),
+            session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
-            dns_proxy_port: None,
-            dns_query_rx: None,
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
             syscall_log: None,
             forensics_trace: None,
             reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
@@ -5025,6 +6844,7 @@ mod tests {
             namespace_users: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
         };
 
         handle_syscall_event(&mut interceptor, &mut session, &loop_ctx, event)
@@ -5088,6 +6908,37 @@ mod tests {
             5005,
             crate::platform::linux::syscall_nr::KEXEC_FILE_LOAD,
             SyscallKind::KexecLoad { from_fd: true },
+        ))
+        .await;
+    }
+
+    // ---- B1: foreign-ABI hard-deny tests ----
+
+    #[tokio::test]
+    async fn foreign_compat_arch_syscall_is_denied() {
+        // i386 open(5) via int 0x80 — the raw number must never be
+        // interpreted through the x86_64 table (5 = fstat there).
+        assert_event_denied(sample_phase_a_event(
+            5006,
+            5,
+            SyscallKind::ForeignAbiSyscall {
+                abi: crate::interceptor::ForeignAbiKind::CompatArch,
+                raw_nr: 5,
+            },
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn foreign_x32_syscall_is_denied() {
+        let raw_nr = crate::platform::linux::syscall_nr::OPENAT | 0x4000_0000;
+        assert_event_denied(sample_phase_a_event(
+            5007,
+            raw_nr,
+            SyscallKind::ForeignAbiSyscall {
+                abi: crate::interceptor::ForeignAbiKind::X32,
+                raw_nr,
+            },
         ))
         .await;
     }
@@ -5224,10 +7075,11 @@ mod tests {
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
             session_sync: None,
-            session_allowed: Mutex::new(HashSet::new()),
+            session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
-            dns_proxy_port: None,
-            dns_query_rx: None,
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
             syscall_log: None,
             forensics_trace: None,
             reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
@@ -5242,6 +7094,7 @@ mod tests {
             namespace_users: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
         };
 
         handle_syscall_event(&mut interceptor, &mut session, &loop_ctx, event)
@@ -5329,6 +7182,69 @@ mod tests {
             crate::config::CoverageConfig::default(),
         )
         .await;
+    }
+
+    // -- YAMA scope-probe helper tests --------------------------------------
+
+    #[test]
+    fn parse_cap_eff_reads_hex_mask() {
+        let status = "Name:\tcat\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000080000\nCapBnd:\t000001ffffffffff\n";
+        // 0x80000 = 1 << 19 = CAP_SYS_PTRACE alone.
+        assert_eq!(parse_cap_eff(status), Some(0x8_0000));
+        assert_eq!(
+            parse_cap_eff("CapEff:\t000001ffffffffff"),
+            Some(0x1ff_ffff_ffff)
+        );
+        assert_eq!(parse_cap_eff("Name:\tcat\n"), None);
+    }
+
+    #[test]
+    fn kernel_blocks_requires_scope_two_or_higher() {
+        // None = Yama absent (classic semantics) → never provably blocked.
+        assert!(!kernel_blocks_cross_process(None, 1, 2));
+        // Scope 0/1: same-uid access is kernel-legal → the proxy must see it.
+        assert!(!kernel_blocks_cross_process(Some(0), 1, 2));
+        assert!(!kernel_blocks_cross_process(Some(1), 1, 2));
+    }
+
+    #[test]
+    fn dead_target_detected_from_live_same_ns_caller() {
+        let me = std::process::id();
+        // Unallocatable pid: provably absent → suppressible.
+        assert!(cross_process_target_provably_absent(me, 0x3fff_fff1));
+        // pid 0 is unaddressable — the kernel ESRCHs it unconditionally.
+        assert!(cross_process_target_provably_absent(me, 0));
+        // init always exists → never suppressible.
+        assert!(!cross_process_target_provably_absent(me, 1));
+        // Self as target trivially exists.
+        assert!(!cross_process_target_provably_absent(me, me));
+    }
+
+    #[test]
+    fn dead_target_fails_safe_on_unverifiable_caller() {
+        // A caller with no /proc entry → PID namespace unknown → our /proc
+        // view proves nothing about its target numbering → enforce.
+        assert!(!cross_process_target_provably_absent(
+            u32::MAX - 3,
+            0x3fff_fff2
+        ));
+    }
+
+    #[test]
+    fn kernel_blocks_fails_safe_on_unreadable_caller() {
+        // A pid with no /proc entry → capability unverifiable → enforce.
+        assert!(!kernel_blocks_cross_process(Some(2), u32::MAX - 1, 1));
+    }
+
+    #[test]
+    fn kernel_blocks_self_consistent_at_scope_two() {
+        // Target ourselves: same user namespace by construction, so the
+        // outcome depends only on whether this test process holds
+        // CAP_SYS_PTRACE (it normally doesn't; under root/CI-with-caps the
+        // expectation flips with it).
+        let me = std::process::id();
+        let expected = pid_has_cap_sys_ptrace(me) == Some(false);
+        assert_eq!(kernel_blocks_cross_process(Some(2), me, me), expected);
     }
 
     // -- session allowlist matching tests ----------------------------------
@@ -5447,6 +7363,147 @@ mod tests {
             "exec-prefix:/home/user/tools/foo",
             &allowed,
             &dummy_file_read()
+        ));
+    }
+
+    #[test]
+    fn scoped_read_prefix_matches_reads_and_directory_lists_only() {
+        let mut allowed = HashSet::new();
+        allowed.insert("ro-prefix:/repo/src/".into());
+
+        for call in [
+            ToolCallType::FileRead {
+                path: "/repo/src/lib.rs".into(),
+            },
+            ToolCallType::DirList {
+                path: "/repo/src/components".into(),
+            },
+        ] {
+            assert!(is_session_allowlist_match("/ignored", &allowed, &call));
+        }
+        assert!(!is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileWrite {
+                path: "/repo/src/lib.rs".into(),
+                content_hash: String::new(),
+            }
+        ));
+        assert!(!is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileRead {
+                path: "/repo/src-old/lib.rs".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn scoped_write_prefix_matches_write_create_but_not_delete() {
+        let mut allowed = HashSet::new();
+        allowed.insert("write-prefix:/repo/build/".into());
+
+        for call in [
+            ToolCallType::FileWrite {
+                path: "/repo/build/out.o".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileAppend {
+                path: "/repo/build/log".into(),
+            },
+            ToolCallType::DirCreate {
+                path: "/repo/build/new".into(),
+            },
+        ] {
+            assert!(is_session_allowlist_match("/ignored", &allowed, &call));
+        }
+        assert!(!is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileDelete {
+                path: "/repo/build/out.o".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn scoped_delete_prefix_matches_delete_and_rename_old_path_only() {
+        let mut allowed = HashSet::new();
+        allowed.insert("delete-prefix:/repo/build/".into());
+
+        assert!(is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileDelete {
+                path: "/repo/build/out.o".into(),
+            }
+        ));
+        assert!(is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileRename {
+                old_path: "/repo/build/out.o".into(),
+                new_path: "/repo/archive/out.o".into(),
+            }
+        ));
+        assert!(!is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileRename {
+                old_path: "/repo/src/out.o".into(),
+                new_path: "/repo/build/out.o".into(),
+            }
+        ));
+        assert!(!is_session_allowlist_match(
+            "/ignored",
+            &allowed,
+            &ToolCallType::FileWrite {
+                path: "/repo/build/out.o".into(),
+                content_hash: String::new(),
+            }
+        ));
+    }
+
+    #[test]
+    fn scoped_prefix_namespaces_never_fall_through_to_bare_matching() {
+        let allowed = HashSet::from(["write-prefix:/repo/build/".to_string()]);
+        assert!(!is_session_allowlist_match(
+            "write-prefix:/repo/build/out.o",
+            &allowed,
+            &ToolCallType::FileRead {
+                path: "/elsewhere/out.o".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn sensitive_scoped_reads_are_identified_for_post_proxy_allow() {
+        let allowed = HashSet::from(["ro-prefix:/home/dev/.config/grith/".to_string()]);
+
+        assert!(is_sensitive_scoped_read_match(
+            &ToolCallType::FileRead {
+                path: "/home/dev/.config/grith/daemon.token".into(),
+            },
+            &allowed
+        ));
+        assert!(is_sensitive_scoped_read_match(
+            &ToolCallType::DirList {
+                path: "/home/dev/.config/grith".into(),
+            },
+            &allowed
+        ));
+        assert!(!is_sensitive_scoped_read_match(
+            &ToolCallType::FileRead {
+                path: "/home/dev/project/src/lib.rs".into(),
+            },
+            &allowed
+        ));
+        assert!(!is_sensitive_scoped_read_match(
+            &ToolCallType::FileWrite {
+                path: "/home/dev/.config/grith/config.toml".into(),
+                content_hash: String::new(),
+            },
+            &allowed
         ));
     }
 
@@ -5822,6 +7879,164 @@ mod tests {
             &allowed,
             &call
         ));
+    }
+
+    // -- process:/namespace: session grants (cross-process approval flood) --
+
+    fn cross_process_call(op: &str, target_pid: u32) -> ToolCallType {
+        ToolCallType::CrossProcessAccess {
+            op: op.into(),
+            target_pid,
+        }
+    }
+
+    #[test]
+    fn approved_cross_process_key_binds_pid_and_start_time() {
+        // A live target (self) yields a 4-component key ending in the
+        // process's start time, so a recycled pid cannot inherit the grant.
+        let me = std::process::id();
+        let call = cross_process_call("ptrace", me);
+        let entry = approved_session_allowlist_entry(&call).expect("live target has an entry");
+        let parts: Vec<&str> = entry.split(':').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "expected process:op:pid:starttime, got {entry}"
+        );
+        assert_eq!(parts[0], "process");
+        assert_eq!(parts[1], "ptrace");
+        assert_eq!(parts[2], me.to_string());
+        assert!(
+            parts[3].parse::<u64>().is_ok(),
+            "start time must be numeric"
+        );
+
+        // A dead target has no readable identity → no grant (always
+        // re-prompts). 0x3fff_fff5 is above pid_max, never allocatable.
+        assert_eq!(
+            approved_session_allowlist_entry(&cross_process_call("ptrace", 0x3fff_fff5)),
+            None,
+        );
+
+        let ns_call = ToolCallType::NamespaceOp {
+            syscall: "unshare".into(),
+            flags: 0x2000_0000,
+        };
+        assert_eq!(
+            approved_session_allowlist_entry(&ns_call).as_deref(),
+            Some("namespace:unshare:0x20000000"),
+        );
+    }
+
+    #[test]
+    fn process_grant_survives_and_matches_only_the_same_live_process() {
+        // The key derived for a live self-target round-trips: storing it and
+        // re-deriving it matches. A recycled pid would derive a different
+        // start-time component and miss.
+        let me = std::process::id();
+        let call = cross_process_call("ptrace", me);
+        let key = session_allowlist_key(&call).expect("live target keyed");
+        let mut allowed = HashSet::new();
+        allowed.insert(key.clone());
+        assert!(is_session_allowlist_match(&key, &allowed, &call));
+
+        // A stored grant for the SAME pid but a DIFFERENT start time (the
+        // recycled-pid case) must not match the live process's derived key.
+        let stale = format!("process:ptrace:{me}:1");
+        let mut stale_allowed = HashSet::new();
+        stale_allowed.insert(stale);
+        assert!(
+            !is_session_allowlist_match(&key, &stale_allowed, &call),
+            "a grant with a different start time is a different process"
+        );
+    }
+
+    #[test]
+    fn process_entry_matches_exact_key_and_type_only() {
+        // is_session_allowlist_match works on the precomputed key, so these
+        // use hand-crafted 4-part keys and don't depend on /proc.
+        let mut allowed = HashSet::new();
+        allowed.insert("process:ptrace:123:9999".to_string());
+        assert!(is_session_allowlist_match(
+            "process:ptrace:123:9999",
+            &allowed,
+            &cross_process_call("ptrace", 123),
+        ));
+        // Different op, same pid+start: no match.
+        assert!(!is_session_allowlist_match(
+            "process:process_vm_readv:123:9999",
+            &allowed,
+            &cross_process_call("process_vm_readv", 123),
+        ));
+    }
+
+    #[test]
+    fn process_entry_never_serves_as_string_prefix() {
+        // A grant for pid 1 must not leak to pid 12, 123, ... via the
+        // bare-path prefix fallback.
+        let mut allowed = HashSet::new();
+        allowed.insert("process:ptrace:1:100".to_string());
+        assert!(!is_session_allowlist_match(
+            "process:ptrace:12:100",
+            &allowed,
+            &cross_process_call("ptrace", 12),
+        ));
+    }
+
+    #[test]
+    fn process_entry_requires_cross_process_call_type() {
+        // A relative path from a tracee register can spell anything —
+        // including a process: key. It must not borrow the grant.
+        let mut allowed = HashSet::new();
+        allowed.insert("process:ptrace:123:9999".to_string());
+        let read = ToolCallType::FileRead {
+            path: "process:ptrace:123:9999".into(),
+        };
+        assert!(!is_session_allowlist_match(
+            "process:ptrace:123:9999",
+            &allowed,
+            &read
+        ));
+    }
+
+    #[test]
+    fn namespace_entry_exact_and_type_gated() {
+        let mut allowed = HashSet::new();
+        allowed.insert("namespace:unshare:0x20000000".to_string());
+        let ns = ToolCallType::NamespaceOp {
+            syscall: "unshare".into(),
+            flags: 0x2000_0000,
+        };
+        assert!(is_session_allowlist_match(
+            "namespace:unshare:0x20000000",
+            &allowed,
+            &ns
+        ));
+        // Different flag word: a fresh prompt.
+        let ns_wider = ToolCallType::NamespaceOp {
+            syscall: "unshare".into(),
+            flags: 0x2002_0000,
+        };
+        assert!(!is_session_allowlist_match(
+            "namespace:unshare:0x20020000",
+            &allowed,
+            &ns_wider
+        ));
+        // Type gate: a file path spelling the key must not match.
+        let read = ToolCallType::FileRead {
+            path: "namespace:unshare:0x20000000".into(),
+        };
+        assert!(!is_session_allowlist_match(
+            "namespace:unshare:0x20000000",
+            &allowed,
+            &read
+        ));
+    }
+
+    #[test]
+    fn process_start_time_reads_self_and_rejects_dead() {
+        assert!(process_start_time(std::process::id()).is_some());
+        assert_eq!(process_start_time(0x3fff_fff6), None);
     }
 
     #[cfg(unix)]

@@ -6,6 +6,7 @@ import {
   denyDigest,
   learnDigest,
   escalateDigest,
+  clearAllDigest,
 } from "@/lib/api";
 
 /** Auto-refresh interval in milliseconds. */
@@ -57,6 +58,9 @@ export interface UseDigestReturn {
   approveMany: (ids: string[]) => Promise<void>;
   /** Deny many items at once (bounded concurrency). */
   denyMany: (ids: string[]) => Promise<void>;
+  /** Clear (dismiss) all actionable items at once — no approve/deny side
+   *  effect. Atomic server-side; refreshes the list when done. */
+  clearAll: () => Promise<void>;
   /** Whether a bulk action is currently in flight. */
   bulkBusy: boolean;
   /** Manually trigger a refresh. */
@@ -220,6 +224,16 @@ export function useDigest(): UseDigestReturn {
     [deny],
   );
 
+  const clearAll = useCallback(async () => {
+    setBulkBusy(true);
+    try {
+      await clearAllDigest();
+      await fetchItems();
+    } finally {
+      if (mountedRef.current) setBulkBusy(false);
+    }
+  }, [fetchItems]);
+
   useEffect(() => {
     mountedRef.current = true;
     void fetchItems();
@@ -246,6 +260,7 @@ export function useDigest(): UseDigestReturn {
     escalate,
     approveMany,
     denyMany,
+    clearAll,
     bulkBusy,
     refresh: fetchItems,
   };

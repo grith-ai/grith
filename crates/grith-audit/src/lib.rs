@@ -17,13 +17,15 @@ pub mod retention;
 pub mod stats;
 pub mod storage;
 pub mod types;
+pub mod writer_lock;
 
 pub use correlation::CorrelationTracker;
 pub use error::Error;
 pub use logger::AuditLogger;
 pub use query::AuditQuery;
 pub use stats::AuditStats;
-pub use storage::AuditStorage;
+pub use storage::{AuditStorage, ForkRecord};
 pub use types::{
     AuditRecord, ChainVerification, FilterResultSummary, ProxyActionSummary, RecordType,
+    SegmentHistory,
 };

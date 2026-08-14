@@ -3,7 +3,7 @@
 
 //! Daemon IPC client for thin grith sessions.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -19,8 +19,23 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct DaemonClient {
     base_url: String,
-    token: String,
+    /// Bearer token for daemon IPC. Shared and refreshable: a daemon restart
+    /// rotates the token on disk, and the first 401/403 triggers a re-read so
+    /// every clone of this client heals together instead of failing until the
+    /// session ends (the stale-token DNS outage of 2026-08-13, where a live
+    /// daemon rejected every audit enqueue and fail-closed DNS denied all
+    /// resolution for the supervised tool).
+    token: Arc<Mutex<String>>,
     http: reqwest::Client,
+    /// Instance id of the daemon this client admitted the session against,
+    /// captured once at [`DaemonClient::connect`] time (B12 #77). Stamped
+    /// into every session snapshot so the daemon's adopt-on-heartbeat path can
+    /// detect a session whose authority is crossing a daemon-instance boundary
+    /// (the original daemon restarted). Deliberately *not* refreshed on
+    /// reconnect — refreshing would capture the replacement daemon's id and
+    /// mask the very transition it exists to reveal. `None` when the daemon
+    /// published no identity we could read.
+    instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +98,26 @@ pub enum RegisterOutcome {
     LimitReached(SessionLimitRejection),
 }
 
+/// Outcome of asking the daemon to reserve a capacity slot before spawning
+/// (work/74 Phase 1).
+#[derive(Debug)]
+pub enum ReserveOutcome {
+    /// A seat is held for us; the caller must activate or cancel it.
+    Reserved(Uuid),
+    /// The cap is full — refuse *before* spawning anything.
+    LimitReached(SessionLimitRejection),
+    /// The daemon predates reservations (no such route). The caller falls
+    /// back to the legacy register-after-spawn path for one release, because
+    /// hard-failing a new CLI against an older daemon would repeat the
+    /// stale-daemon lockout incident.
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReservationResponse {
+    reservation_id: String,
+}
+
 #[derive(Deserialize)]
 struct ReputationTableResponse {
     table_json: String,
@@ -91,6 +126,20 @@ struct ReputationTableResponse {
 #[derive(Deserialize)]
 struct ProxyStatusFullResponse {
     filter_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteTierSummary {
+    pub tier: String,
+}
+
+impl RemoteTierSummary {
+    pub fn is_paid(&self) -> bool {
+        matches!(
+            self.tier.trim().to_ascii_lowercase().as_str(),
+            "pro" | "pro_trial" | "enterprise"
+        )
+    }
 }
 
 impl DaemonClient {
@@ -106,27 +155,60 @@ impl DaemonClient {
             .build()
             .ok()?;
 
-        let client = Self {
+        let mut client = Self {
             base_url,
-            token,
+            token: Arc::new(Mutex::new(token)),
             http,
+            instance_id: None,
         };
 
         let rt = tokio::runtime::Handle::try_current();
-        let healthy = match rt {
-            Ok(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(client.authenticated_health_check()))
-            }
+        let (healthy, instance_id) = match rt {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let healthy = client.authenticated_health_check().await;
+                    let id = client.fetch_daemon_instance_id().await;
+                    (healthy, id)
+                })
+            }),
             Err(_) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .ok()?;
-                rt.block_on(client.authenticated_health_check())
+                rt.block_on(async {
+                    let healthy = client.authenticated_health_check().await;
+                    let id = client.fetch_daemon_instance_id().await;
+                    (healthy, id)
+                })
             }
         };
 
+        // B12 #77: capture the admitting daemon's identity once. A daemon that
+        // published no identity leaves this None — the adopt path treats that
+        // as "cannot compare" rather than blocking the session.
+        client.instance_id = instance_id;
         healthy.then_some(client)
+    }
+
+    /// Best-effort read of the daemon's `instance_id` from `/health`. Any
+    /// failure (older daemon, no identity published, transport error) yields
+    /// `None`; the caller never treats that as a match.
+    async fn fetch_daemon_instance_id(&self) -> Option<String> {
+        let resp = self
+            .http
+            .get(format!("{}/health", self.base_url))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        body.get("instance_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     }
 
     pub fn base_url(&self) -> &str {
@@ -212,6 +294,11 @@ impl DaemonClient {
         Ok(body.filter_count)
     }
 
+    pub async fn tier_summary(&self) -> Result<RemoteTierSummary, DaemonClientError> {
+        self.request_typed(self.http.get(format!("{}/api/tier", self.base_url)))
+            .await
+    }
+
     pub async fn ingest_audit(&self, record: &AuditRecord) -> Result<(), DaemonClientError> {
         self.request_empty(
             self.http
@@ -254,12 +341,11 @@ impl DaemonClient {
 
     pub async fn get_digest(&self, item_id: Uuid) -> Result<Option<DigestItem>, DaemonClientError> {
         let response = self
-            .http
-            .get(format!("{}/api/ipc/digest/items/{item_id}", self.base_url))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| DaemonClientError::Network(e.to_string()))?;
+            .send_authorized(
+                self.http
+                    .get(format!("{}/api/ipc/digest/items/{item_id}", self.base_url)),
+            )
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -324,7 +410,7 @@ impl DaemonClient {
         self.request_empty(
             self.http
                 .post(format!("{}/api/ipc/sessions", self.base_url))
-                .json(&session_snapshot_json(session)),
+                .json(&self.session_snapshot_json(session)),
         )
         .await
     }
@@ -337,13 +423,12 @@ impl DaemonClient {
         session: &SupervisorSession,
     ) -> Result<RegisterOutcome, DaemonClientError> {
         let response = self
-            .http
-            .post(format!("{}/api/ipc/sessions", self.base_url))
-            .bearer_auth(&self.token)
-            .json(&session_snapshot_json(session))
-            .send()
-            .await
-            .map_err(|e| DaemonClientError::Network(e.to_string()))?;
+            .send_authorized(
+                self.http
+                    .post(format!("{}/api/ipc/sessions", self.base_url))
+                    .json(&self.session_snapshot_json(session)),
+            )
+            .await?;
         let status = response.status();
         if status.is_success() {
             return Ok(RegisterOutcome::Registered);
@@ -355,6 +440,98 @@ impl DaemonClient {
             }
         }
         Err(DaemonClientError::Http(format!("{status}: {body}")))
+    }
+
+    /// Reserve a capacity slot before spawning the supervised target
+    /// (work/74 Phase 1, go-live review B12 item 1).
+    ///
+    /// Returns [`ReserveOutcome::Unsupported`] against a daemon that predates
+    /// the route so the caller can fall back to registering after the spawn.
+    pub async fn reserve_session(
+        &self,
+        tool_name: &str,
+        profile_name: Option<&str>,
+    ) -> Result<ReserveOutcome, DaemonClientError> {
+        let response = self
+            .send_authorized(
+                self.http
+                    .post(format!("{}/api/ipc/session-reservations", self.base_url))
+                    .json(&serde_json::json!({
+                        "tool_name": tool_name,
+                        "profile_name": profile_name,
+                    })),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            let body: ReservationResponse = response
+                .json()
+                .await
+                .map_err(|e| DaemonClientError::Parse(e.to_string()))?;
+            let id = Uuid::parse_str(&body.reservation_id)
+                .map_err(|e| DaemonClientError::Parse(e.to_string()))?;
+            return Ok(ReserveOutcome::Reserved(id));
+        }
+        // An older daemon has no such route. Axum answers an unknown path
+        // with 404 and an unknown method with 405; treat both as "this
+        // daemon can't reserve" rather than as a hard failure.
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            return Ok(ReserveOutcome::Unsupported);
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let Ok(rej) = serde_json::from_str::<SessionLimitRejection>(&body) {
+                return Ok(ReserveOutcome::LimitReached(rej));
+            }
+        }
+        Err(DaemonClientError::Http(format!("{status}: {body}")))
+    }
+
+    /// Activate a held reservation once the spawn has succeeded.
+    ///
+    /// Idempotent server-side, so a retry after a lost response does not
+    /// consume a second seat.
+    pub async fn activate_session(
+        &self,
+        reservation_id: Uuid,
+        session: &SupervisorSession,
+    ) -> Result<RegisterOutcome, DaemonClientError> {
+        let response = self
+            .send_authorized(
+                self.http
+                    .post(format!(
+                        "{}/api/ipc/session-reservations/{reservation_id}/activate",
+                        self.base_url
+                    ))
+                    .json(&self.session_snapshot_json(session)),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(RegisterOutcome::Registered);
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let Ok(rej) = serde_json::from_str::<SessionLimitRejection>(&body) {
+                return Ok(RegisterOutcome::LimitReached(rej));
+            }
+        }
+        Err(DaemonClientError::Http(format!("{status}: {body}")))
+    }
+
+    /// Release a reservation whose spawn failed. Best-effort: the daemon's
+    /// TTL reaper reclaims the seat regardless, so callers log and move on.
+    pub async fn cancel_session_reservation(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<(), DaemonClientError> {
+        self.request_empty(self.http.delete(format!(
+            "{}/api/ipc/session-reservations/{reservation_id}",
+            self.base_url
+        )))
+        .await
     }
 
     /// Ask the daemon to reap dead sessions on demand. Returns (reaped, remaining).
@@ -372,9 +549,64 @@ impl DaemonClient {
         self.request_empty(
             self.http
                 .put(format!("{}/api/ipc/sessions/{}", self.base_url, session.id))
-                .json(&session_snapshot_json(session)),
+                .json(&self.session_snapshot_json(session)),
         )
         .await
+    }
+
+    /// Heartbeat that distinguishes an authoritative refusal from a transport
+    /// failure (work/74 Phase 3).
+    ///
+    /// A 409 means the daemon answered and is not accounting for this
+    /// session; anything else that fails is treated as retryable, because a
+    /// daemon that is merely restarting must not be mistaken for one that has
+    /// disowned us.
+    pub async fn sync_session_checked(
+        &self,
+        session: &SupervisorSession,
+    ) -> Result<(), grith_supervisor::SyncFailure> {
+        let response = self
+            .send_authorized(
+                self.http
+                    .put(format!("{}/api/ipc/sessions/{}", self.base_url, session.id))
+                    .json(&self.session_snapshot_json(session)),
+            )
+            .await
+            .map_err(|e| grith_supervisor::SyncFailure::Transport(e.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::CONFLICT {
+            let message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("daemon refused to track this session: {body}"));
+            return Err(grith_supervisor::SyncFailure::AuthorityLost(message));
+        }
+        // B12 #79 LOW: classify by status class rather than treating every
+        // non-409 as retryable Transport. A 4xx means the daemon *answered*
+        // and rejected the request — an authoritative refusal that retrying
+        // will not fix — so it is AuthorityLost, mirroring the 409 case.
+        // 408/429 are the transient 4xx exceptions (timeout / rate limit), and
+        // 5xx means the daemon is unhealthy or restarting; both stay Transport
+        // so a blip is not mistaken for disownment.
+        let transient = status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        if status.is_client_error() && !transient {
+            return Err(grith_supervisor::SyncFailure::AuthorityLost(format!(
+                "daemon refused this session with {status}: {body}"
+            )));
+        }
+        Err(grith_supervisor::SyncFailure::Transport(format!(
+            "{status}: {body}"
+        )))
     }
 
     pub async fn unregister_session(&self, session_id: Uuid) -> Result<(), DaemonClientError> {
@@ -411,6 +643,69 @@ impl DaemonClient {
         .await
     }
 
+    fn current_token(&self) -> String {
+        self.token
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Re-read the IPC token from disk after an auth rejection.
+    fn refreshed_token(&self, just_used: &str) -> Option<String> {
+        Self::adopt_refreshed_token(&self.token, just_used, super::token::read_token()?)
+    }
+
+    /// Adopt a freshly read token only when it differs from the one the
+    /// daemon just rejected — retrying with an identical token cannot
+    /// succeed, so the caller lets the original rejection stand.
+    fn adopt_refreshed_token(
+        shared: &Arc<Mutex<String>>,
+        just_used: &str,
+        fresh: String,
+    ) -> Option<String> {
+        if fresh == just_used {
+            return None;
+        }
+        if let Ok(mut guard) = shared.lock() {
+            *guard = fresh.clone();
+        }
+        tracing::info!(
+            event = "ipc_token_refreshed",
+            "daemon IPC token reloaded from disk after auth rejection"
+        );
+        Some(fresh)
+    }
+
+    /// Send `request` with bearer auth, retrying once with a token re-read
+    /// from disk when the daemon answers 401/403. A daemon restart rotates
+    /// the IPC token; without the retry, every long-lived session keeps
+    /// failing against a perfectly healthy daemon even though the current
+    /// token sits on disk the whole time.
+    async fn send_authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, DaemonClientError> {
+        let retry = request.try_clone();
+        let used = self.current_token();
+        let response = request
+            .bearer_auth(&used)
+            .send()
+            .await
+            .map_err(|e| DaemonClientError::Network(e.to_string()))?;
+        let status = response.status();
+        if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::FORBIDDEN {
+            return Ok(response);
+        }
+        let (Some(retry), Some(fresh)) = (retry, self.refreshed_token(&used)) else {
+            return Ok(response);
+        };
+        retry
+            .bearer_auth(&fresh)
+            .send()
+            .await
+            .map_err(|e| DaemonClientError::Network(e.to_string()))
+    }
+
     async fn request_json(
         &self,
         request: reqwest::RequestBuilder,
@@ -422,11 +717,7 @@ impl DaemonClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, DaemonClientError> {
-        let response = request
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| DaemonClientError::Network(e.to_string()))?;
+        let response = self.send_authorized(request).await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -442,11 +733,7 @@ impl DaemonClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<(), DaemonClientError> {
-        let response = request
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| DaemonClientError::Network(e.to_string()))?;
+        let response = self.send_authorized(request).await?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -468,21 +755,27 @@ impl DaemonClient {
     }
 }
 
-fn session_snapshot_json(session: &SupervisorSession) -> serde_json::Value {
-    serde_json::json!({
-        "id": session.id.to_string(),
-        "tool_name": session.tool_name.clone(),
-        "profile_name": session.profile_name.clone(),
-        "policy_scope": session.policy_scope.clone(),
-        "launcher_overlay_name": session.launcher_overlay_name.clone(),
-        "provider_overlay_name": session.provider_overlay_name.clone(),
-        "root_pid": session.root_pid,
-        "project_name": session.project_name.clone(),
-        "cwd": session.cwd.clone(),
-        "tty": session.tty.clone(),
-        "process_tree_pids": session.process_tree.all_pids(),
-        "stats": session.stats.clone(),
-    })
+impl DaemonClient {
+    /// Build the session snapshot wire body, stamping the admitting daemon's
+    /// instance id (B12 #77) so the daemon can detect an authority transfer
+    /// across a restart on the adopt-on-heartbeat path.
+    fn session_snapshot_json(&self, session: &SupervisorSession) -> serde_json::Value {
+        serde_json::json!({
+            "id": session.id.to_string(),
+            "tool_name": session.tool_name.clone(),
+            "profile_name": session.profile_name.clone(),
+            "policy_scope": session.policy_scope.clone(),
+            "launcher_overlay_name": session.launcher_overlay_name.clone(),
+            "provider_overlay_name": session.provider_overlay_name.clone(),
+            "root_pid": session.root_pid,
+            "project_name": session.project_name.clone(),
+            "cwd": session.cwd.clone(),
+            "tty": session.tty.clone(),
+            "process_tree_pids": session.process_tree.all_pids(),
+            "stats": session.stats.clone(),
+            "admitting_instance_id": self.instance_id.clone(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -679,25 +972,126 @@ impl RemoteSessionSync {
 
 #[async_trait]
 impl grith_supervisor::SessionSync for RemoteSessionSync {
-    async fn sync(&self, session: &SupervisorSession) -> std::result::Result<(), String> {
+    async fn sync(
+        &self,
+        session: &SupervisorSession,
+    ) -> std::result::Result<grith_supervisor::SyncOutcome, grith_supervisor::SyncFailure> {
         if let Ok(mut last_sync) = self.last_sync.lock() {
             if let Some(last) = *last_sync {
                 if last.elapsed() < self.min_interval {
-                    return Ok(());
+                    // B12 #79: a throttled beat contacts nobody, so it proves
+                    // nothing about daemon authority. Report it as Throttled —
+                    // NOT Ok — so the supervisor does not mistake a skipped
+                    // heartbeat for the daemon confirming it still tracks us.
+                    return Ok(grith_supervisor::SyncOutcome::Throttled);
                 }
             }
             *last_sync = Some(Instant::now());
         }
         self.client
-            .sync_session(session)
+            .sync_session_checked(session)
             .await
-            .map_err(|e| e.to_string())
+            .map(|()| grith_supervisor::SyncOutcome::Confirmed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B12 #77: every session snapshot the CLI sends carries the admitting
+    /// daemon's instance id, so the daemon's adopt path can detect an
+    /// authority transfer across a restart. A client with no captured
+    /// identity emits null, which the daemon reads as "cannot compare".
+    #[test]
+    fn snapshot_json_stamps_the_admitting_instance_id() {
+        let client = DaemonClient {
+            base_url: "http://127.0.0.1:0".into(),
+            token: Arc::new(Mutex::new("t".into())),
+            http: reqwest::Client::new(),
+            instance_id: Some("inst-123".into()),
+        };
+        let session = SupervisorSession::new("claude-code", 4242);
+        let body = client.session_snapshot_json(&session);
+        assert_eq!(body["admitting_instance_id"], serde_json::json!("inst-123"));
+
+        let anon = DaemonClient {
+            instance_id: None,
+            ..client
+        };
+        let body = anon.session_snapshot_json(&session);
+        assert!(
+            body["admitting_instance_id"].is_null(),
+            "a client without a captured identity must emit null"
+        );
+    }
+
+    /// B12 #79: a heartbeat skipped by the throttle must report `Throttled`,
+    /// never `Confirmed`. Reporting a skipped beat as confirmed is what let
+    /// the supervisor read it as "the daemon is tracking us again" and flap.
+    #[tokio::test]
+    async fn throttled_heartbeat_reports_throttled_not_confirmed() {
+        use grith_supervisor::{SessionSync, SyncOutcome};
+
+        let client = DaemonClient {
+            // Nothing is listening on port 1 — the first (unthrottled) beat
+            // fails transport immediately, which is all we need: it arms the
+            // throttle window.
+            base_url: "http://127.0.0.1:1".into(),
+            token: Arc::new(Mutex::new("t".into())),
+            http: reqwest::Client::new(),
+            instance_id: None,
+        };
+        let sync = RemoteSessionSync::new(client, Duration::from_secs(3600));
+        let session = SupervisorSession::new("claude-code", 4242);
+
+        // First beat attempts a send (and fails transport — no daemon), arming
+        // the min-interval window.
+        let _ = sync.sync(&session).await;
+        // Second beat, well within the interval, is skipped — and must be
+        // reported Throttled, never Confirmed.
+        assert_eq!(
+            sync.sync(&session).await.unwrap(),
+            SyncOutcome::Throttled,
+            "a throttled heartbeat must not masquerade as a confirmed one"
+        );
+    }
+
+    /// Stale-token recovery: a token re-read from disk is adopted (and shared
+    /// with every clone) only when it differs from the one the daemon just
+    /// rejected — an identical token cannot make the retry succeed.
+    #[test]
+    fn adopt_refreshed_token_only_on_change() {
+        let shared = Arc::new(Mutex::new("stale".to_string()));
+
+        // Same token on disk as the rejected one: nothing to adopt.
+        assert_eq!(
+            DaemonClient::adopt_refreshed_token(&shared, "stale", "stale".into()),
+            None
+        );
+        assert_eq!(*shared.lock().unwrap(), "stale");
+
+        // Rotated token on disk: adopted and visible to every clone.
+        assert_eq!(
+            DaemonClient::adopt_refreshed_token(&shared, "stale", "fresh".into()),
+            Some("fresh".to_string())
+        );
+        assert_eq!(*shared.lock().unwrap(), "fresh");
+    }
+
+    #[test]
+    fn remote_tier_summary_distinguishes_paid_accounts() {
+        for tier in ["pro", "Pro", "pro_trial", "enterprise"] {
+            assert!(RemoteTierSummary {
+                tier: tier.to_string()
+            }
+            .is_paid());
+        }
+        assert!(!RemoteTierSummary {
+            tier: "community".to_string()
+        }
+        .is_paid());
+    }
 
     #[test]
     fn parse_evaluate_response_roundtrips_allow() {

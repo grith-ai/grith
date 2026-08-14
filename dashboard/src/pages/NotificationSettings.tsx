@@ -8,14 +8,14 @@ import type { ChannelInfo, NotificationEvent } from "@/types/api";
 
 function TierBadge({ tier }: { tier: ChannelInfo["required_tier"] }) {
   const styles: Record<string, string> = {
-    community: "bg-status-allow-green/10 text-status-allow-green",
-    pro: "bg-green/10 text-green",
-    enterprise: "bg-purple-500/15 text-purple-400",
+    community: "bg-green-light border-green-border text-accent-text",
+    pro: "bg-green-light border-green-border text-accent-text",
+    enterprise: "bg-purple-light border-purple-border text-purple",
   };
 
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-medium capitalize ${styles[tier]}`}
+      className={`inline-flex items-center px-2.5 py-0.5 rounded-pill border text-xs font-medium capitalize ${styles[tier]}`}
     >
       {tier}
     </span>
@@ -29,8 +29,8 @@ function TierBadge({ tier }: { tier: ChannelInfo["required_tier"] }) {
 function HealthDot({ health }: { health: ChannelInfo["health"] }) {
   if (!health) {
     return (
-      <span className="flex items-center gap-1.5 text-xs text-grith-muted">
-        <span className="w-2 h-2 rounded-full bg-grith-muted/40" />
+      <span className="flex items-center gap-1.5 text-xs text-text-secondary">
+        <span className="w-2 h-2 rounded-full bg-text-secondary/40" />
         No data
       </span>
     );
@@ -38,11 +38,11 @@ function HealthDot({ health }: { health: ChannelInfo["health"] }) {
 
   if (health.connected) {
     return (
-      <span className="flex items-center gap-1.5 text-xs text-status-allow-green">
-        <span className="w-2 h-2 rounded-full bg-status-allow-green" />
+      <span className="flex items-center gap-1.5 text-xs text-accent-text">
+        <span className="w-2 h-2 rounded-full bg-green" />
         Connected
         {health.latency_ms !== undefined && (
-          <span className="text-grith-muted font-mono">
+          <span className="text-text-secondary font-code">
             {health.latency_ms}ms
           </span>
         )}
@@ -51,11 +51,11 @@ function HealthDot({ health }: { health: ChannelInfo["health"] }) {
   }
 
   return (
-    <span className="flex items-center gap-1.5 text-xs text-status-deny-red">
-      <span className="w-2 h-2 rounded-full bg-status-deny-red" />
+    <span className="flex items-center gap-1.5 text-xs text-danger-text">
+      <span className="w-2 h-2 rounded-full bg-danger" />
       Disconnected
       {health.error && (
-        <span className="text-grith-muted truncate max-w-[160px]" title={health.error}>
+        <span className="text-text-secondary truncate max-w-[160px]" title={health.error}>
           {health.error}
         </span>
       )}
@@ -93,24 +93,24 @@ function ChannelCard({
   };
 
   return (
-    <div className="bg-white border border-grith-border rounded-xl p-4">
+    <div className="bg-surface border border-border rounded-card p-4">
       <div className="flex items-start justify-between mb-3">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-grith-text">
+          <span className="font-heading text-[15px] font-semibold text-text">
             {channel.display_name}
           </span>
           <TierBadge tier={channel.required_tier} />
           {channel.supports_interactive && (
-            <span className="inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-medium bg-blue-500/10 text-blue-400">
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-pill border border-info-border text-xs font-medium bg-info-light text-info">
               Interactive
             </span>
           )}
         </div>
         <span
-          className={`inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-medium ${
+          className={`inline-flex items-center px-2.5 py-0.5 rounded-pill border text-xs font-medium ${
             channel.enabled
-              ? "bg-status-allow-green/10 text-status-allow-green"
-              : "bg-white text-grith-muted"
+              ? "bg-green-light border-green-border text-accent-text"
+              : "bg-surface-2 border-border text-text-secondary"
           }`}
         >
           {channel.enabled ? "Enabled" : "Disabled"}
@@ -125,8 +125,8 @@ function ChannelCard({
             <span
               className={`text-xs font-medium ${
                 testResult === "sent"
-                  ? "text-status-allow-green"
-                  : "text-status-deny-red"
+                  ? "text-accent-text"
+                  : "text-danger-text"
               }`}
             >
               {testResult === "sent" ? "Sent" : "Failed"}
@@ -135,7 +135,7 @@ function ChannelCard({
           <button
             onClick={() => void handleTest()}
             disabled={testing || !channel.enabled}
-            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {testing ? "Sending..." : "Test"}
           </button>
@@ -155,58 +155,58 @@ function EventRow({ event }: { event: NotificationEvent }) {
   switch (event.type) {
     case "sent":
       return (
-        <div className="flex items-center gap-3 py-2 border-b border-grith-border last:border-b-0">
-          <span className="w-2 h-2 rounded-full bg-status-allow-green flex-shrink-0" />
-          <span className="text-xs text-grith-muted font-mono w-40 flex-shrink-0">
+        <div className="flex items-center gap-3 py-2 border-b border-border last:border-b-0">
+          <span className="w-2 h-2 rounded-full bg-green flex-shrink-0" />
+          <span className="text-xs text-text-secondary font-code w-40 flex-shrink-0">
             {time}
           </span>
-          <span className="text-xs text-grith-text">
+          <span className="text-xs text-text">
             Sent to{" "}
-            <span className="font-mono text-green">
+            <span className="font-code text-accent-text">
               {event.channel_id}
             </span>
           </span>
-          <span className="text-xs text-grith-muted font-mono ml-auto">
+          <span className="text-xs text-text-secondary font-code ml-auto">
             {event.item_id.slice(0, 8)}
           </span>
         </div>
       );
     case "failed":
       return (
-        <div className="flex items-center gap-3 py-2 border-b border-grith-border last:border-b-0">
-          <span className="w-2 h-2 rounded-full bg-status-deny-red flex-shrink-0" />
-          <span className="text-xs text-grith-muted font-mono w-40 flex-shrink-0">
+        <div className="flex items-center gap-3 py-2 border-b border-border last:border-b-0">
+          <span className="w-2 h-2 rounded-full bg-danger flex-shrink-0" />
+          <span className="text-xs text-text-secondary font-code w-40 flex-shrink-0">
             {time}
           </span>
-          <span className="text-xs text-grith-text">
+          <span className="text-xs text-text">
             Failed on{" "}
-            <span className="font-mono text-green">
+            <span className="font-code text-accent-text">
               {event.channel_id}
             </span>
-            <span className="text-status-deny-red ml-2">{event.error}</span>
+            <span className="text-danger ml-2">{event.error}</span>
           </span>
-          <span className="text-xs text-grith-muted font-mono ml-auto">
+          <span className="text-xs text-text-secondary font-code ml-auto">
             {event.item_id.slice(0, 8)}
           </span>
         </div>
       );
     case "interactive_response":
       return (
-        <div className="flex items-center gap-3 py-2 border-b border-grith-border last:border-b-0">
-          <span className="w-2 h-2 rounded-full bg-blue-400 flex-shrink-0" />
-          <span className="text-xs text-grith-muted font-mono w-40 flex-shrink-0">
+        <div className="flex items-center gap-3 py-2 border-b border-border last:border-b-0">
+          <span className="w-2 h-2 rounded-full bg-info flex-shrink-0" />
+          <span className="text-xs text-text-secondary font-code w-40 flex-shrink-0">
             {time}
           </span>
-          <span className="text-xs text-grith-text">
-            <span className="text-blue-400">{event.reviewer}</span>{" "}
+          <span className="text-xs text-text">
+            <span className="text-info">{event.reviewer}</span>{" "}
             responded{" "}
-            <span className="font-mono text-green">{event.action}</span>{" "}
+            <span className="font-code text-accent-text">{event.action}</span>{" "}
             on{" "}
-            <span className="font-mono text-green">
+            <span className="font-code text-accent-text">
               {event.channel_id}
             </span>
           </span>
-          <span className="text-xs text-grith-muted font-mono ml-auto">
+          <span className="text-xs text-text-secondary font-code ml-auto">
             {event.item_id.slice(0, 8)}
           </span>
         </div>
@@ -237,23 +237,23 @@ export function NotificationSettingsPage() {
   if (featureGated) {
     return (
       <div className="p-6 max-w-4xl">
-        <h1 className="text-xl font-semibold text-grith-text mb-6">
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-6">
           Notifications
         </h1>
-        <div className="bg-white border border-grith-border rounded-xl p-8 text-center">
+        <div className="bg-surface border border-border rounded-card p-8 text-center">
           <div className="mb-4">
-            <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-semibold bg-green/10 text-green uppercase tracking-wider">
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-pill border border-green-border bg-green-light font-label text-[11px] font-medium text-accent-text uppercase tracking-[0.08em]">
               {requiredTier} Feature
             </span>
           </div>
-          <p className="text-grith-text mb-2">
+          <p className="text-text mb-2">
             Multi-channel notifications require a{" "}
-            <span className="font-semibold text-grith-text">
+            <span className="font-semibold text-text">
               {requiredTier}
             </span>{" "}
             subscription.
           </p>
-          <p className="text-sm text-grith-muted mb-6">
+          <p className="text-sm text-text-secondary mb-6">
             Get Slack, email, Telegram, Discord, PagerDuty, and webhook
             notifications for digest events and security alerts.
           </p>
@@ -262,7 +262,7 @@ export function NotificationSettingsPage() {
               href="https://grith.ai/pricing"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-green text-white text-sm font-medium hover:bg-green-dark transition-colors"
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-btn bg-green text-accent-ink text-sm font-heading font-semibold hover:bg-green-dark transition-colors"
             >
               Upgrade to {requiredTier}
               <svg
@@ -280,9 +280,9 @@ export function NotificationSettingsPage() {
               </svg>
             </a>
           </div>
-          <p className="text-xs text-grith-muted mt-4">
+          <p className="text-xs text-text-secondary mt-4">
             Or run{" "}
-            <code className="font-mono text-green">
+            <code className="font-code text-accent-text">
               grith pro upgrade
             </code>{" "}
             from the CLI.
@@ -297,17 +297,17 @@ export function NotificationSettingsPage() {
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold text-grith-text">
+          <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text">
             Notifications
           </h1>
-          <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-medium rounded-full bg-green/20 text-green">
+          <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-medium rounded-pill border border-green-border bg-green-light text-accent-text">
             {enabledCount} enabled
           </span>
         </div>
         <button
           onClick={() => void refresh()}
           disabled={loading}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50"
+          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors disabled:opacity-50"
         >
           {loading ? "Loading..." : "Refresh"}
         </button>
@@ -315,15 +315,15 @@ export function NotificationSettingsPage() {
 
       {/* Error */}
       {error && (
-        <div className="bg-status-deny-red/10 border border-status-deny-red/30 rounded-xl p-3 mb-6 text-sm text-status-deny-red">
+        <div className="bg-danger-light border border-danger-border rounded-card p-3 mb-6 text-sm text-danger-text">
           {error}
         </div>
       )}
 
       {/* Channel grid */}
       {!loading && channels.length === 0 && (
-        <div className="bg-white border border-grith-border rounded-xl p-8 text-center mb-8">
-          <p className="text-grith-muted text-sm">
+        <div className="bg-surface-2 border border-border rounded-card p-8 text-center mb-8">
+          <p className="text-text-secondary text-sm">
             No notification channels configured.
           </p>
         </div>
@@ -343,17 +343,17 @@ export function NotificationSettingsPage() {
 
       {/* Recent events */}
       <div>
-        <h2 className="text-sm font-semibold text-grith-text mb-3 uppercase tracking-wider">
+        <h2 className="font-label text-[11px] font-medium text-text-dim mb-3 uppercase tracking-[0.1em]">
           Recent Events
         </h2>
         {displayedEvents.length === 0 ? (
-          <div className="bg-white border border-grith-border rounded-xl p-6 text-center">
-            <p className="text-grith-muted text-sm">
+          <div className="bg-surface-2 border border-border rounded-card p-6 text-center">
+            <p className="text-text-secondary text-sm">
               No recent notification events.
             </p>
           </div>
         ) : (
-          <div className="bg-white border border-grith-border rounded-xl px-4 py-2">
+          <div className="bg-surface border border-border rounded-card px-4 py-2">
             {displayedEvents.map((event, i) => (
               <EventRow key={`${event.item_id}-${event.timestamp}-${i}`} event={event} />
             ))}

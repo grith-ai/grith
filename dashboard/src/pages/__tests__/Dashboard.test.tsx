@@ -45,7 +45,7 @@ const mockProxy = {
   deny_count: 50,
   filters: [
     {
-      name: "path_match",
+      name: "path-match",
       phase: "static",
       enabled: true,
       is_ready: true,
@@ -53,7 +53,7 @@ const mockProxy = {
       avg_latency_ms: 0.05,
     },
     {
-      name: "secret_scan",
+      name: "secret-scan",
       phase: "pattern",
       enabled: true,
       is_ready: true,
@@ -194,6 +194,7 @@ function mockFetchSuccess() {
 describe("DashboardPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    window.history.replaceState({}, "", "/");
   });
 
   it("renders the hero with live status and uptime", async () => {
@@ -253,6 +254,16 @@ describe("DashboardPage", () => {
     expect(arg).not.toHaveProperty("project_name");
     // Confirms the success label swap.
     await waitFor(() => expect(screen.getByText("Saved PNG")).toBeTruthy());
+  });
+
+  it("opens the existing share menu from the CLI deep link", async () => {
+    window.history.replaceState({}, "", "/?share=1");
+    mockFetchSuccess();
+    render(<DashboardPage />);
+
+    expect(await screen.findByText("Post to X")).toBeTruthy();
+    expect(screen.getByText("Post to Threads")).toBeTruthy();
+    expect(screen.getByText("Submit to Hacker News")).toBeTruthy();
   });
 
   it("renders the filter pipeline with active count", async () => {

@@ -191,6 +191,7 @@ impl BehaviouralFilter {
             ToolCallType::ShellExec { .. } => "shell_exec",
             ToolCallType::HttpRequest { .. } => "http_request",
             ToolCallType::FileRename { .. } => "file_rename",
+            ToolCallType::FileLink { .. } => "file_link",
             ToolCallType::FileChmod { .. } => "file_chmod",
             ToolCallType::DirCreate { .. } => "dir_create",
             ToolCallType::NetConnect { .. } => "net_connect",

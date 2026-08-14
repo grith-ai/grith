@@ -5,6 +5,8 @@
  * rather than live data.
  */
 
+import { chartColors } from "@/lib/chartPalette";
+
 /** Anomaly detection: a baseline band with a flagged spike. */
 export function AnomalyPreview() {
   const pts = [8, 9, 7, 10, 8, 9, 22, 9, 8, 10, 7, 9];
@@ -16,11 +18,11 @@ export function AnomalyPreview() {
   const line = pts.map((v, i) => `${i === 0 ? "M" : "L"}${i * step},${y(v)}`).join(" ");
   return (
     <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-28">
-      <rect x={0} y={y(12)} width={w} height={y(6) - y(12)} fill="#00a85a" opacity={0.08} />
-      <path d={line} fill="none" stroke="#57606a" strokeWidth={1.5} />
-      <circle cx={6 * step} cy={y(22)} r={5} fill="#d1242f" />
-      <circle cx={6 * step} cy={y(22)} r={10} fill="none" stroke="#d1242f" strokeWidth={1.5} opacity={0.5} />
-      <text x={6 * step + 14} y={y(22) + 4} fontSize={10} fill="#d1242f" fontFamily="'JetBrains Mono', monospace">
+      <rect x={0} y={y(12)} width={w} height={y(6) - y(12)} fill={chartColors.accent} opacity={0.08} />
+      <path d={line} fill="none" stroke={chartColors.muted} strokeWidth={1.5} />
+      <circle cx={6 * step} cy={y(22)} r={5} fill={chartColors.danger} />
+      <circle cx={6 * step} cy={y(22)} r={10} fill="none" stroke={chartColors.danger} strokeWidth={1.5} opacity={0.5} />
+      <text x={6 * step + 14} y={y(22) + 4} fontSize={10} fill={chartColors.danger} fontFamily="'IBM Plex Mono', monospace">
         anomaly
       </text>
     </svg>
@@ -44,7 +46,7 @@ export function RetentionTrendPreview() {
           width={bw - 2}
           height={(v / max) * h}
           rx={1.5}
-          fill="#00a85a"
+          fill={chartColors.accent}
           opacity={0.3 + (i / bars.length) * 0.5}
         />
       ))}
@@ -64,14 +66,14 @@ export function MultiSessionPreview() {
     <div className="space-y-2.5 py-1">
       {rows.map((r) => (
         <div key={r.name}>
-          <div className="mb-1 flex justify-between font-mono text-[11px] text-grith-muted">
+          <div className="mb-1 flex justify-between font-code text-[11px] text-text-secondary">
             <span>{r.name}</span>
             <span>{r.a}% allow</span>
           </div>
-          <div className="flex h-2 overflow-hidden rounded-full bg-grith-surface">
-            <div style={{ width: `${r.a}%`, backgroundColor: "#00a85a" }} />
-            <div style={{ width: `${r.q}%`, backgroundColor: "#bf8700" }} />
-            <div style={{ width: `${r.d}%`, backgroundColor: "#d1242f" }} />
+          <div className="flex h-2 overflow-hidden rounded-full bg-border">
+            <div style={{ width: `${r.a}%`, backgroundColor: chartColors.accent }} />
+            <div style={{ width: `${r.q}%`, backgroundColor: chartColors.warning }} />
+            <div style={{ width: `${r.d}%`, backgroundColor: chartColors.danger }} />
           </div>
         </div>
       ))}

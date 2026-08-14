@@ -496,7 +496,7 @@ mod tests {
                 Severity::Critical,
                 format!("Canary secret 'trap' (id: {canary_id}) detected in outbound operation"),
             ),
-            FilterResult::no_match("egress_policy"),
+            FilterResult::no_match("egress-policy"),
         ];
         let ids = detected_canary_ids(&results);
         assert_eq!(ids.len(), 1);

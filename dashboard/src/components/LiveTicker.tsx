@@ -20,11 +20,12 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import type { AuditRecord, ProxyActionSummary, WsEvent } from "@/types/api";
+import { chartColors, withAlpha } from "@/lib/chartPalette";
 
 const COLORS: Record<ProxyActionSummary, string> = {
-  allow: "#00a85a",
-  queue: "#bf8700",
-  deny: "#d1242f",
+  allow: chartColors.accent,
+  queue: chartColors.warning,
+  deny: chartColors.danger,
 };
 
 const MAX_ROWS = 12;
@@ -40,6 +41,9 @@ interface Row {
   sessionId: string | null;
   /** Full audit record, when this row was sourced from / matched the audit poll. */
   record: AuditRecord | null;
+  /** Project name carried directly on the event/record — fills the gap for a
+   *  brand-new session not yet in the audit poll's session→project map. */
+  projectName: string | null;
 }
 
 interface Props {
@@ -90,6 +94,7 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
           score: r.composite_score,
           sessionId: r.session_id,
           record: r,
+          projectName: r.project_name ?? null,
         });
       }
     }
@@ -111,6 +116,7 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
         score: e.composite_score,
         sessionId: e.session_id ?? existing?.sessionId ?? null,
         record: existing?.record ?? null,
+        projectName: e.project_name ?? existing?.projectName ?? null,
       });
     }
 
@@ -142,6 +148,7 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
     if (r.sessionId && projects?.has(r.sessionId)) {
       return projects.get(r.sessionId) ?? null;
     }
+    if (r.projectName) return r.projectName;
     const rec = r.record;
     if (rec?.project_name) return rec.project_name;
     if (rec && rec.supervised_tool && rec.task_context) {
@@ -151,17 +158,17 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
   }
 
   return (
-    <div className="bg-white border border-grith-border rounded-xl p-5">
+    <div className="bg-surface border border-border rounded-card p-5">
       <div className="flex items-baseline justify-between mb-3">
-        <h2 className="text-sm font-medium text-grith-text">Live Decisions</h2>
-        <span className="inline-flex items-center gap-1.5 text-xs text-grith-muted">
+        <h2 className="font-heading text-[15px] font-semibold text-text">Live Decisions</h2>
+        <span className="inline-flex items-center gap-1.5 text-xs text-text-secondary">
           <span
             className={`h-2 w-2 rounded-full ${
               streaming
-                ? "bg-status-allow-green animate-pulse"
+                ? "bg-green animate-pulse"
                 : online
-                  ? "bg-status-queue-amber"
-                  : "bg-grith-dim"
+                  ? "bg-warning"
+                  : "bg-text-dim"
             }`}
           />
           {streaming ? (connected ? "streaming" : "polling") : online ? "idle" : "offline"}
@@ -169,11 +176,11 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
       </div>
 
       {rows.length === 0 ? (
-        <p className="text-xs text-grith-muted py-6 text-center">
-          Waiting for activity — run a supervised tool and decisions appear here.
+        <p className="text-xs text-text-secondary py-6 text-center">
+          Waiting for activity - run a supervised tool and decisions appear here.
         </p>
       ) : (
-        <div className="space-y-0.5 font-mono text-xs">
+        <div className="space-y-0.5 font-code text-xs">
           {rows.map((r, i) => {
             const isNew = newKeys.has(r.key);
             const clickable = r.record !== null && onSelect !== undefined;
@@ -195,12 +202,12 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
                     : undefined
                 }
                 title={clickable ? "Click to see full details" : undefined}
-                className={`flex items-center gap-3 py-1 border-b border-grith-border/40 last:border-0 rounded-sm ${
+                className={`flex items-center gap-3 py-1 border-b border-border/40 last:border-0 rounded-sm ${
                   isNew ? "grith-fade-up" : ""
-                } ${clickable ? "cursor-pointer hover:bg-grith-surface" : ""}`}
+                } ${clickable ? "cursor-pointer hover:bg-surface-2" : ""}`}
                 style={isNew ? { animationDelay: `${Math.min(i, 6) * 40}ms` } : undefined}
               >
-                <span className="text-grith-dim tabular-nums">
+                <span className="text-text-dim tabular-nums">
                   {new Date(r.ts).toLocaleTimeString([], {
                     hour: "2-digit",
                     minute: "2-digit",
@@ -211,18 +218,18 @@ export function LiveTicker({ records, online, projects, onSelect }: Props) {
                   className="inline-flex w-12 justify-center rounded px-1 py-0.5 text-[10px] font-semibold uppercase"
                   style={{
                     color: COLORS[r.action],
-                    backgroundColor: `${COLORS[r.action]}1a`,
+                    backgroundColor: withAlpha(COLORS[r.action], 0.1),
                   }}
                 >
                   {r.action}
                 </span>
-                <span className="text-grith-text truncate flex-1">{r.callType}</span>
+                <span className="text-text truncate flex-1">{r.callType}</span>
                 {proj && (
-                  <span className="hidden sm:inline text-grith-dim truncate max-w-[140px]">
+                  <span className="hidden sm:inline text-text-dim truncate max-w-[140px]">
                     {proj}
                   </span>
                 )}
-                <span className="text-grith-muted tabular-nums">
+                <span className="text-text-secondary tabular-nums">
                   {r.score.toFixed(1)}
                 </span>
               </div>

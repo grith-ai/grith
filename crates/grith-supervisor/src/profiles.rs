@@ -594,11 +594,29 @@ impl SupervisorProfile {
 
         let mut allowed = HashSet::<String>::new();
 
-        let home = std::env::var("HOME").unwrap_or_default();
-        let project_dir = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_default();
+        // Canonicalise the two stable roots — and ONLY these — so a profile
+        // prefix written against a symlinked `${HOME}` (common) or a
+        // container-mounted `${PROJECT_DIR}` still matches the resolved paths
+        // B3 produces. The full routine path is deliberately NOT canonicalised:
+        // its leaf (e.g. `~/.cache/claude`) is tool-writable, and resolving a
+        // tool-planted symlink there would widen the allowlist to the
+        // symlink's target — a symlink to `/` would allowlist the whole
+        // filesystem for the session. Resolving only the roots keeps the FP
+        // fix without that escape; a symlinked leaf simply sends its accesses
+        // to the proxy (fail-safe) rather than silently trusting them.
+        let canon_root = |raw: String| -> String {
+            std::fs::canonicalize(&raw)
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or(raw)
+        };
+        let home = canon_root(std::env::var("HOME").unwrap_or_default());
+        let project_dir = canon_root(
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default(),
+        );
 
         for pattern in &self.routine_paths {
             let expanded = pattern
@@ -609,6 +627,11 @@ impl SupervisorProfile {
                 .trim_end_matches('*')
                 .to_string();
             if !expanded.is_empty() {
+                // The prefix is already rooted at the canonicalised
+                // `${HOME}`/`${PROJECT_DIR}`, so it matches B3-resolved paths
+                // without following any tool-writable leaf symlink. See the
+                // `canon_root` note above for why the full path is NOT
+                // canonicalised here.
                 allowed.insert(expanded);
             }
         }
@@ -1789,6 +1812,66 @@ routine_destinations = ["child.com"]
 
         assert!(allowed.contains(&format!("ro:{canonical}")));
         assert!(!allowed.contains(&format!("ro:{}", link.to_string_lossy())));
+    }
+
+    /// CRITICAL regression (go-live review round 2): a `routine_paths` entry
+    /// whose leaf is a tool-writable symlink must NOT widen the session
+    /// allowlist to the symlink's target. Canonicalising the full routine
+    /// path let a symlink planted at e.g. `~/.cache/claude` — pointed at `/`
+    /// — allowlist the entire filesystem for the session. Only the stable
+    /// `${HOME}`/`${PROJECT_DIR}` roots are resolved now; a symlinked leaf's
+    /// accesses go to the proxy (fail-safe), never onto the allowlist.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_routine_path_leaf_does_not_widen_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A routine path that is itself a symlink pointing at a sensitive
+        // location — the shape of the attack.
+        let sensitive = tmp.path().join("sensitive-target");
+        let routine_link = tmp.path().join("cache-claude");
+        std::fs::create_dir(&sensitive).unwrap();
+        symlink(&sensitive, &routine_link).unwrap();
+
+        let profile = SupervisorProfile {
+            name: "test".into(),
+            display_name: "Test".into(),
+            rationale: None,
+            extends: None,
+            routine_paths: vec![
+                format!("{}/**", routine_link.to_string_lossy()),
+                // A path that does not exist yet must survive untouched.
+                "/nonexistent-xyz/cache".into(),
+            ],
+            routine_commands: Vec::new(),
+            routine_destinations: Vec::new(),
+            routine_listen_addresses: Vec::new(),
+            routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
+            readonly_paths: Vec::new(),
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+        };
+
+        let allowed = profile.build_session_allowlist();
+        let target = std::fs::canonicalize(&sensitive)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            !allowed.contains(&target),
+            "the symlink target must NOT be allowlisted — that is the widening bug"
+        );
+        assert!(
+            allowed.contains(&routine_link.to_string_lossy().into_owned()),
+            "the literal routine prefix is still kept (its accesses go to the proxy)"
+        );
+        assert!(
+            allowed.contains("/nonexistent-xyz/cache"),
+            "a not-yet-created directory must still be allowlisted"
+        );
     }
 
     // ── Duplicate name detection ──────────────────────────────────

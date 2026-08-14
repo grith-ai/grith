@@ -72,7 +72,7 @@ fn vendor_provenance() -> SpawnProvenance {
     }
 }
 
-/// Spin up a fresh `SecurityProxy` with the operation_risk filter
+/// Spin up a fresh `SecurityProxy` with the operation-risk filter
 /// constructed with `routine_signal_enabled = true`. Other phase-3
 /// filters are intentionally absent — these tests verify the routine
 /// signal in isolation; phase-3 additivity is covered separately by
@@ -248,7 +248,7 @@ async fn i6_hash_swap_mid_session_does_not_get_signal() {
 async fn i7_file_write_inside_routine_root_is_not_routine() {
     // The routine signal is scoped to ProcessSpawn only. A FileWrite
     // under a routine_exec_root must NOT inherit any reduction — the
-    // baseline operation_risk for FileWrite is +0.5 (writes), and the
+    // baseline operation-risk for FileWrite is +0.5 (writes), and the
     // routine signal doesn't apply to it.
     let proxy = proxy_with_signal_on();
     let session_id = Uuid::new_v4();
@@ -263,7 +263,7 @@ async fn i7_file_write_inside_routine_root_is_not_routine() {
     ctx.session_scope = Some(SessionScopeKey::from_session_id(session_id));
 
     let decision = proxy.evaluate(&ctx).await;
-    // FileWrite baseline is +0.5 from operation_risk — NOT because of
+    // FileWrite baseline is +0.5 from operation-risk — NOT because of
     // the routine signal, but because writes intrinsically score 0.5.
     // The point of this test is that the score reflects the FileWrite
     // baseline and isn't accidentally widened or narrowed by routine

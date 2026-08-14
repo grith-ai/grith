@@ -29,7 +29,7 @@ fn make_record(
         score,
         action,
         vec![FilterResultSummary {
-            filter_name: "path_match".into(),
+            filter_name: "path-match".into(),
             matched: score > 0.0,
             score,
             rule_id: "test-rule".into(),
@@ -559,7 +559,7 @@ fn filter_results_survive_round_trip() {
 
     let retrieved = storage.get_by_id(&id).unwrap();
     assert_eq!(retrieved.filter_results.len(), 1);
-    assert_eq!(retrieved.filter_results[0].filter_name, "path_match");
+    assert_eq!(retrieved.filter_results[0].filter_name, "path-match");
     assert_eq!(retrieved.filter_results[0].score, 3.0);
     assert_eq!(retrieved.filter_results[0].rule_id, "test-rule");
     assert!(retrieved.filter_results[0].matched);

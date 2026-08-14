@@ -4,11 +4,16 @@
 //! `grith dashboard` subcommand — start, stop, and query the web dashboard server.
 
 use crate::daemon;
+use crate::daemon::readiness::{probe_port, wait_for_port_release, PortProbe};
 use grith_supervisor::supervisor::SupervisorRegistry;
 use std::sync::{Arc, Mutex};
 
 /// How often the idle watchdog checks the session registry.
 const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `stop`/`restart` wait for a daemon to shut down and release its
+/// port before reporting it as wedged.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Check whether a PID is still alive. Returns `true` on EPERM (process
 /// exists but we lack signal permission, e.g. ptraced children).
@@ -42,6 +47,22 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
     let server_config = crate::to_server_config(&daemon.config.server);
     let port = server_config.port;
 
+    // Refuse to start into an occupied port. The PID file and IPC token are
+    // written before the server binds, so proceeding would clobber the live
+    // daemon's identity and token and then die on EADDRINUSE — leaving the
+    // real daemon unidentifiable and the CLI unable to authenticate to it.
+    match probe_port(port) {
+        PortProbe::Vacant => {}
+        PortProbe::GrithDaemon { version, .. } => anyhow::bail!(
+            "a Grith daemon ({version}) is already listening on 127.0.0.1:{port}; \
+             replace it with: grith dashboard restart"
+        ),
+        PortProbe::Foreign => anyhow::bail!(
+            "port {port} is already in use by a process that is not a Grith daemon; \
+             free it or change `server.port`"
+        ),
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
     let ipc_token = crate::daemon::token::generate_token();
     // Separate per-server token authorising the dashboard SPA (browser) to
@@ -74,8 +95,48 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
         sync_api_key: sync_api_key.clone(),
         sync_api_base_url: sync_api_base_url.clone(),
     };
+    // go-live review H-20: mint this instance's identity up front so it can be
+    // advertised on /api/health, but publish the file only once the listener
+    // is bound (see `with_on_listening` below) — an identity written before
+    // the socket exists is a claim the daemon cannot yet honour.
+    let identity = crate::daemon::identity::DaemonIdentity::new(
+        port,
+        env!("CARGO_PKG_VERSION"),
+        Some(
+            crate::helpers::expand_user_path(&daemon.config.general.audit_dir)
+                .join("audit.db")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    let instance_id = identity.instance_id.to_string();
+
     let server =
         grith_server::GrithServer::new(server_config, deps, env!("CARGO_PKG_VERSION"), shutdown_rx)
+            .with_instance_identity(
+                instance_id.clone(),
+                crate::daemon::identity::IPC_PROTOCOL_VERSION,
+            )
+            .with_on_listening(move || {
+                if let Err(e) = crate::daemon::identity::publish(&identity) {
+                    // B12 #77 LOW: /api/health still advertises this instance
+                    // (set via with_instance_identity), so session-adoption
+                    // detection is unaffected. What is lost is the on-disk
+                    // identity file the restart/kill path reads to prove a
+                    // daemon is *this* one — without it that path falls back to
+                    // "cannot identify" and refuses to terminate. Name the
+                    // degraded capability explicitly rather than logging a bare
+                    // failure, so an operator can see why a later restart may
+                    // report the daemon as unverifiable.
+                    tracing::warn!(
+                        event = "daemon_identity_publish_failed",
+                        error = %e,
+                        "could not publish the daemon identity file; restart/kill \
+                         verification will fall back to unidentified and refuse to \
+                         terminate this daemon by identity until the next successful publish"
+                    );
+                }
+            })
             .with_shutdown_sender(shutdown_tx.clone())
             .with_plan_tier(&daemon.config.general.plan_tier)
             .with_account_id(&daemon.account_id)
@@ -137,6 +198,10 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
         });
 
         let license_handle = daemon.spawn_license_revalidation();
+        // Re-apply the license gate immediately on SIGHUP (sent by
+        // `grith pro login`/`refresh` after writing a new license). The task
+        // detaches and self-terminates on the shutdown broadcast.
+        let _regate_handle = daemon.spawn_license_regate_on_sighup();
         let sync_handle = if daemon.config.general.audit_sync {
             daemon.spawn_audit_sync()
         } else {
@@ -208,6 +273,7 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
 
     let _ = daemon::remove_dashboard_pid();
     daemon::remove_dashboard_opened();
+    crate::daemon::identity::remove();
     let _ = crate::daemon::token::remove_token();
     // Intentionally NOT removing the dashboard token: it is reused across
     // restarts so an already-open browser tab stays authorised. Delete
@@ -248,28 +314,17 @@ pub fn cmd_dashboard_pair(auto_open: bool) -> anyhow::Result<()> {
 }
 
 /// Stop the running dashboard server.
-pub fn cmd_dashboard_stop() -> anyhow::Result<()> {
+///
+/// `configured_port` is consulted only when no PID file identifies a daemon:
+/// an orphaned daemon (live listener, no PID file) is still ours to stop via a
+/// token-authenticated shutdown request, and anything else on the port is
+/// reported truthfully instead of as "not running".
+pub fn cmd_dashboard_stop(configured_port: u16) -> anyhow::Result<()> {
     let Some((pid, port)) = daemon::is_dashboard_running() else {
-        println!("Dashboard is not running.");
-        return Ok(());
+        return stop_unidentified(configured_port);
     };
 
-    let url = format!("http://127.0.0.1:{port}/api/server/shutdown");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    let shutdown_ok = runtime.block_on(async {
-        let mut request = reqwest::Client::new()
-            .post(&url)
-            .timeout(std::time::Duration::from_secs(5));
-        if let Some(token) = crate::daemon::token::read_token() {
-            request = request.bearer_auth(token);
-        }
-        matches!(request.send().await, Ok(resp) if resp.status().is_success())
-    });
-
-    if shutdown_ok {
+    if request_http_shutdown(port) {
         println!("Dashboard server (PID {pid}, port {port}) is shutting down.");
     } else {
         #[cfg(unix)]
@@ -295,17 +350,146 @@ pub fn cmd_dashboard_stop() -> anyhow::Result<()> {
         }
         #[cfg(not(unix))]
         {
-            eprintln!("Could not reach dashboard server at {url}. It may have already exited.");
+            eprintln!(
+                "Could not reach the dashboard server on port {port}. \
+                 It may have already exited."
+            );
         }
     }
 
-    let _ = daemon::remove_dashboard_pid();
-    daemon::remove_dashboard_opened();
+    // Only drop the PID file once the process is actually gone — it is the
+    // only handle later commands have on a daemon that wedges mid-shutdown.
+    if wait_for_exit(pid, STOP_WAIT) {
+        let _ = daemon::remove_dashboard_pid();
+        daemon::remove_dashboard_opened();
+        crate::daemon::identity::remove();
+    } else {
+        println!(
+            "The daemon (PID {pid}) has not exited yet; it may still be draining sessions.\n\
+             Check again with: grith dashboard status\n\
+             Force it with: kill -9 {pid}"
+        );
+    }
+    Ok(())
+}
+
+/// Stop path when no PID file identifies a daemon. Probes the port so "not
+/// running" is only claimed when nothing is actually listening.
+fn stop_unidentified(port: u16) -> anyhow::Result<()> {
+    match probe_port(port) {
+        PortProbe::Vacant => {
+            println!("Dashboard is not running.");
+        }
+        PortProbe::Foreign => {
+            println!(
+                "Dashboard is not running.\n\
+                 (Port {port} is in use by a process that is not a Grith daemon.)"
+            );
+        }
+        PortProbe::GrithDaemon { version, .. } => {
+            println!(
+                "Found a Grith daemon ({version}) on 127.0.0.1:{port}, but no PID file \
+                 identifies its process — likely an orphan from an earlier install."
+            );
+            if request_http_shutdown(port) {
+                if wait_for_port_release(port, STOP_WAIT) {
+                    println!("It accepted the shutdown request and released the port.");
+                } else {
+                    println!(
+                        "It accepted the shutdown request but has not released the port yet.\n\
+                         Find it with: ss -ltnp 'sport = :{port}'  — then kill that PID."
+                    );
+                }
+            } else {
+                println!(
+                    "It did not accept an authenticated shutdown request.\n\
+                     Find it with: ss -ltnp 'sport = :{port}'  — then kill that PID."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// POST the daemon's authenticated shutdown endpoint. Returns `true` when the
+/// daemon acknowledged the request (acknowledgement, not completion — callers
+/// must still wait for exit or port release).
+fn request_http_shutdown(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/api/server/shutdown");
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    runtime.block_on(async {
+        let mut request = reqwest::Client::new()
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(token) = crate::daemon::token::read_token() {
+            request = request.bearer_auth(token);
+        }
+        matches!(request.send().await, Ok(resp) if resp.status().is_success())
+    })
+}
+
+/// Poll until `pid` exits, or `timeout` passes.
+fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !session_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    !session_alive(pid)
+}
+
+/// Restart the daemon: stop whatever is running — identified via PID file or
+/// an orphan reachable only over HTTP — wait for the port, then start this
+/// build. This is the remedy the version-mismatch error message names.
+pub fn cmd_dashboard_restart(
+    port: u16,
+    auto_open: bool,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if daemon::is_dashboard_running().is_some() {
+        if crate::daemon::readiness::restart_identified_daemon(port).is_err() {
+            anyhow::bail!(
+                "the running daemon did not release port {port}; \
+                 check `grith dashboard status` and retry"
+            );
+        }
+        println!("Stopped the running daemon.");
+    } else {
+        match probe_port(port) {
+            PortProbe::Vacant => {}
+            PortProbe::GrithDaemon { version, .. } => {
+                println!("Stopping an orphaned Grith daemon ({version}) on port {port}...");
+                if !(request_http_shutdown(port) && wait_for_port_release(port, STOP_WAIT)) {
+                    anyhow::bail!(
+                        "could not stop the orphaned daemon on port {port}. \
+                         Find it with: ss -ltnp 'sport = :{port}'  — then kill that PID and retry."
+                    );
+                }
+                println!("Stopped it.");
+            }
+            PortProbe::Foreign => anyhow::bail!(
+                "port {port} is in use by a process that is not a Grith daemon; \
+                 free it or change `server.port`"
+            ),
+        }
+    }
+
+    ensure_dashboard_running_with_port(port, auto_open, true, config_path);
     Ok(())
 }
 
 /// Print the dashboard server's status.
-pub fn cmd_dashboard_status() -> anyhow::Result<()> {
+///
+/// `configured_port` is probed when no PID file exists, so an orphaned daemon
+/// (or a foreign process on the port) is reported instead of "not running".
+pub fn cmd_dashboard_status(configured_port: u16) -> anyhow::Result<()> {
     match daemon::is_dashboard_running() {
         Some((pid, port)) => {
             let base = format!("http://127.0.0.1:{port}");
@@ -315,10 +499,29 @@ pub fn cmd_dashboard_status() -> anyhow::Result<()> {
             println!("  Pair:  grith dashboard pair   (authorise a browser)");
             println!("  Stop:  grith dashboard stop");
         }
-        None => {
-            println!("Dashboard is not running.");
-            println!("  Start: grith dashboard start");
-        }
+        None => match probe_port(configured_port) {
+            PortProbe::GrithDaemon { version, .. } => {
+                println!(
+                    "A Grith daemon ({version}) is listening on 127.0.0.1:{configured_port}, \
+                     but no PID file identifies its process."
+                );
+                if version != env!("CARGO_PKG_VERSION") {
+                    println!("  This CLI is {}.", env!("CARGO_PKG_VERSION"));
+                }
+                println!("  Replace it with: grith dashboard restart");
+            }
+            PortProbe::Foreign => {
+                println!("Dashboard is not running.");
+                println!(
+                    "  Port {configured_port} is in use by a process that is not a Grith \
+                     daemon; free it or change `server.port`."
+                );
+            }
+            PortProbe::Vacant => {
+                println!("Dashboard is not running.");
+                println!("  Start: grith dashboard start");
+            }
+        },
     }
     Ok(())
 }
@@ -441,6 +644,15 @@ pub fn ensure_dashboard_running_with_port(
         // still trigger the one-time open.
         let code = fetch_pair_code(running_port);
         announce_with_pairing("Dashboard: ", &url, pid, code.as_deref(), auto_open);
+        if let PortProbe::GrithDaemon { version, .. } = probe_port(running_port) {
+            if version != env!("CARGO_PKG_VERSION") {
+                println!(
+                    "  Note: the running daemon is {version}, this CLI is {}. \
+                     Upgrade it with: grith dashboard restart",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+        }
         return Some(url);
     }
 
@@ -460,7 +672,12 @@ pub fn ensure_dashboard_running_with_port(
     args.push("dashboard".to_string());
     args.push("start".to_string());
 
-    const STARTUP_POLL_INTERVAL_MS: u64 = 500;
+    const STARTUP_POLL_INTERVAL_MS: u64 = 200;
+    // Longer than the child's writer-lock wait (Daemon::start waits up to 10s
+    // for a shutting-down predecessor to release the audit database), so a
+    // child that fails at that deadline is seen failing rather than reported
+    // as "starting". Successful starts exit this poll in well under a second.
+    const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
     let mut command = std::process::Command::new(&exe);
     command
@@ -480,28 +697,69 @@ pub fn ensure_dashboard_running_with_port(
     }
     match command.spawn() {
         Ok(_child) => {
-            std::thread::sleep(std::time::Duration::from_millis(STARTUP_POLL_INTERVAL_MS));
-            if let Some((pid, running_port)) = daemon::is_dashboard_running() {
-                let url = format!("http://127.0.0.1:{running_port}");
-                let code = fetch_pair_code(running_port);
-                announce_with_pairing("Dashboard started: ", &url, pid, code.as_deref(), auto_open);
-                println!("  Stop with: grith dashboard stop");
-                Some(url)
-            } else {
-                // PID file not yet visible; fall back to our target port and a
-                // 0 sentinel pid (no marker recorded, so a later call still
-                // opens once the daemon is up).
-                let url = format!("http://127.0.0.1:{port}");
-                let code = fetch_pair_code(port);
-                announce_with_pairing(
-                    "Dashboard starting at: ",
-                    &url,
-                    0,
-                    code.as_deref(),
-                    auto_open,
-                );
-                Some(url)
+            // Success means a daemon of *this build* answering on the port —
+            // not the child's PID file existing (it is written before the
+            // server binds, so it can name a child about to die on
+            // EADDRINUSE) and not the port merely answering (a stale daemon
+            // from before an upgrade answers too).
+            let deadline = std::time::Instant::now() + STARTUP_WAIT;
+            loop {
+                match probe_port(port) {
+                    PortProbe::GrithDaemon { version, .. }
+                        if version == env!("CARGO_PKG_VERSION") =>
+                    {
+                        let (pid, running_port) =
+                            daemon::is_dashboard_running().unwrap_or((0, port));
+                        let url = format!("http://127.0.0.1:{running_port}");
+                        let code = fetch_pair_code(running_port);
+                        announce_with_pairing(
+                            "Dashboard started: ",
+                            &url,
+                            pid,
+                            code.as_deref(),
+                            auto_open,
+                        );
+                        println!("  Stop with: grith dashboard stop");
+                        return Some(url);
+                    }
+                    PortProbe::GrithDaemon { version, .. } => {
+                        eprintln!(
+                            "Dashboard did not start: a Grith daemon ({version}) already owns \
+                             port {port}, and this CLI is {}.\n  Replace it with: grith \
+                             dashboard restart",
+                            env!("CARGO_PKG_VERSION")
+                        );
+                        return None;
+                    }
+                    PortProbe::Foreign => {
+                        eprintln!(
+                            "Dashboard did not start: port {port} is in use by a process that \
+                             is not a Grith daemon."
+                        );
+                        return None;
+                    }
+                    PortProbe::Vacant => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(STARTUP_POLL_INTERVAL_MS));
             }
+            // Nothing answering yet — the child may legitimately still be
+            // initialising (first-run database setup and audit verification
+            // can be slow). Report "starting", not "started", with a 0
+            // sentinel pid (no auto-open marker recorded, so a later call
+            // still opens once it is up) — but name where the child's own
+            // error lands if it never comes up, because the detached child's
+            // stderr is discarded.
+            let url = format!("http://127.0.0.1:{port}");
+            announce_with_pairing("Dashboard starting at: ", &url, 0, None, auto_open);
+            println!("  Check it with: grith daemon status");
+            println!(
+                "  If it does not come up, check the supervisor log: \
+                 ~/.local/share/grith/supervisor.log"
+            );
+            Some(url)
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to start dashboard as background process");
@@ -515,6 +773,21 @@ pub fn ensure_dashboard_running(
     daemon: &daemon::Daemon,
     config_path: Option<&std::path::Path>,
 ) -> Option<String> {
+    // This process owns the audit database for as long as it lives, so a
+    // spawned daemon child could never take the writer lock and would refuse
+    // to start (a daemon that cannot record sessions does not serve).
+    // Returning None makes the caller host the server in-process instead —
+    // the audit owner is the one process that can record right now. (When a
+    // real daemon is already running, that daemon owns the lock and this
+    // process is a Reader, so this branch cannot fire.)
+    if daemon.audit_role.can_write() && daemon::is_dashboard_running().is_none() {
+        tracing::info!(
+            event = "dashboard_in_process_preferred",
+            "this process owns the audit database; hosting the dashboard \
+             in-process instead of spawning a daemon that could not own it"
+        );
+        return None;
+    }
     ensure_dashboard_running_with_port(
         daemon.config.server.port,
         daemon.config.server.auto_open_dashboard,

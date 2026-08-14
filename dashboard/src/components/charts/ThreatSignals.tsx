@@ -41,8 +41,8 @@ export function ThreatSignals({ records }: { records: AuditRecord[] }) {
 
   if (signals.length === 0) {
     return (
-      <p className="text-xs text-grith-muted py-4 text-center">
-        No filters have contributed score yet — your agents have been clean.
+      <p className="text-xs text-text-secondary py-4 text-center">
+        No filters have contributed score yet - your agents have been clean.
       </p>
     );
   }
@@ -59,24 +59,24 @@ export function ThreatSignals({ records }: { records: AuditRecord[] }) {
             key={s.name}
             href="/audit"
             className="group block"
-            title={`${s.name} — ${s.score.toFixed(1)} total score across ${s.hits} calls`}
+            title={`${s.name} - ${s.score.toFixed(1)} total score across ${s.hits} calls`}
           >
             <div className="flex items-center justify-between mb-1">
-              <span className="font-mono text-xs text-grith-text truncate group-hover:text-green-dark transition-colors">
+              <span className="font-code text-xs text-text truncate group-hover:text-accent-text transition-colors">
                 {s.name}
               </span>
               <span className="flex items-center gap-2 text-[11px] flex-shrink-0">
                 {s.heldBack > 0 && (
-                  <span className="text-status-deny-red font-mono">{s.heldBack} held</span>
+                  <span className="text-danger-text font-code">{s.heldBack} queued/denied</span>
                 )}
-                <span className="text-grith-dim font-mono">{s.hits} hits</span>
-                <span className="font-mono font-semibold text-grith-text">{s.score.toFixed(1)}</span>
+                <span className="text-text-dim font-code">{s.hits} hits</span>
+                <span className="font-code font-semibold text-text">{s.score.toFixed(1)}</span>
               </span>
             </div>
-            <div className="h-2 rounded-full bg-grith-surface overflow-hidden">
+            <div className="h-2 rounded-full bg-border overflow-hidden">
               <div
                 className={`h-full rounded-full transition-all ${
-                  danger ? "bg-status-deny-red" : "bg-status-queue-amber"
+                  danger ? "bg-danger" : "bg-warning"
                 }`}
                 style={{ width: `${Math.max(pct, 3)}%` }}
               />
@@ -84,7 +84,7 @@ export function ThreatSignals({ records }: { records: AuditRecord[] }) {
           </a>
         );
       })}
-      <p className="text-[11px] text-grith-dim pt-1">
+      <p className="text-[11px] text-text-dim pt-1">
         Ranked by total score contributed. Click a signal to inspect the calls it fired on.
       </p>
     </div>

@@ -21,6 +21,7 @@ import { SessionComparison } from "@/components/charts/SessionComparison";
 import { MiniDonut } from "@/components/charts/MiniDonut";
 import { CallTypeBar } from "@/components/charts/CallTypeBar";
 import { DashboardHero } from "@/components/DashboardHero";
+import { GetStartedCard } from "@/components/GetStartedCard";
 import { AuditDetailModal } from "@/components/AuditDetailModal";
 import { LiveTicker } from "@/components/LiveTicker";
 import { UpgradeBanner } from "@/components/UpgradeBanner";
@@ -44,7 +45,7 @@ function ScoreDistributionBar({
   const total = allow + queue + deny;
   if (total === 0) {
     return (
-      <div className="h-3 rounded-full bg-grith-surface overflow-hidden" />
+      <div className="h-3 rounded-full bg-border overflow-hidden" />
     );
   }
   const pctAllow = (allow / total) * 100;
@@ -52,22 +53,22 @@ function ScoreDistributionBar({
   const pctDeny = (deny / total) * 100;
 
   return (
-    <div className="h-3 rounded-full bg-grith-surface overflow-hidden flex">
+    <div className="h-3 rounded-full bg-border overflow-hidden flex">
       {pctAllow > 0 && (
         <div
-          className="bg-status-allow-green transition-all"
+          className="bg-green transition-all"
           style={{ width: `${pctAllow}%` }}
         />
       )}
       {pctQueue > 0 && (
         <div
-          className="bg-status-queue-amber transition-all"
+          className="bg-warning transition-all"
           style={{ width: `${pctQueue}%` }}
         />
       )}
       {pctDeny > 0 && (
         <div
-          className="bg-status-deny-red transition-all"
+          className="bg-danger transition-all"
           style={{ width: `${pctDeny}%` }}
         />
       )}
@@ -103,11 +104,11 @@ function FilterPipeline({
     },
   ];
   return (
-    <div className="bg-white border border-grith-border rounded-xl p-5">
+    <div className="bg-surface border border-border rounded-card p-5">
       <div className="flex items-baseline justify-between mb-4">
-        <h2 className="text-sm font-medium text-grith-text">Filter Pipeline</h2>
-        <span className="text-xs text-grith-muted">
-          <span className="font-mono font-semibold text-status-allow-green">
+        <h2 className="font-heading text-[15px] font-semibold text-text">Filter Pipeline</h2>
+        <span className="text-xs text-text-secondary">
+          <span className="font-code font-semibold text-accent-text">
             {ready}
           </span>{" "}
           active
@@ -116,17 +117,17 @@ function FilterPipeline({
       <div className="flex items-stretch gap-2">
         {phases.map((p, i) => (
           <div key={p.key} className="flex items-stretch flex-1 gap-2">
-            <div className="flex-1 rounded-lg bg-grith-surface border border-grith-border px-3 py-3 text-center">
-              <div className="font-mono text-2xl font-semibold text-grith-text tabular-nums">
+            <div className="flex-1 rounded-btn bg-surface-2 border border-border px-3 py-3 text-center">
+              <div className="font-heading text-2xl font-semibold tracking-[-0.02em] text-text tabular-nums">
                 {p.count}
               </div>
-              <div className="text-xs text-grith-text mt-0.5">{p.label}</div>
-              <div className="text-[10px] text-grith-dim font-mono mt-0.5">
+              <div className="text-xs text-text mt-0.5">{p.label}</div>
+              <div className="text-[10px] text-text-dim font-code mt-0.5">
                 {p.sub}
               </div>
             </div>
             {i < phases.length - 1 && (
-              <div className="flex items-center text-grith-dim">
+              <div className="flex items-center text-text-dim">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
                   <path
                     d="M9 6l6 6-6 6"
@@ -141,12 +142,12 @@ function FilterPipeline({
           </div>
         ))}
       </div>
-      <p className="text-xs text-grith-muted mt-4 leading-relaxed">
+      <p className="text-xs text-text-secondary mt-4 leading-relaxed">
         Every tool call flows through {ready} parallel filters across three
         phases before grith decides{" "}
-        <span className="text-status-allow-green font-medium">allow</span>,{" "}
-        <span className="text-status-queue-amber font-medium">review</span>, or{" "}
-        <span className="text-status-deny-red font-medium">deny</span>.
+        <span className="text-accent-text font-medium">allow</span>,{" "}
+        <span className="text-warning-text font-medium">queue</span>, or{" "}
+        <span className="text-danger-text font-medium">deny</span>.
       </p>
     </div>
   );
@@ -158,13 +159,13 @@ function RetentionNote({ billingUrl }: { billingUrl: string }) {
   return (
     <a
       href={billingUrl}
-      className="mt-3 flex items-center justify-between gap-2 rounded-lg border border-dashed border-green/40 bg-green-light/50 px-3 py-2 text-[11px] transition-colors hover:bg-green-light"
+      className="mt-3 flex items-center justify-between gap-2 rounded-lg border border-green-border bg-green-light px-3 py-2 text-[11px] transition-colors hover:bg-green/15"
     >
-      <span className="text-grith-muted">
-        Showing the last <span className="font-medium text-grith-text">24 hours</span>. Pro retains{" "}
-        <span className="font-medium text-grith-text">90 days</span> for trend &amp; incident review.
+      <span className="text-text-secondary">
+        Showing the last <span className="font-medium text-text">24 hours</span>. Pro retains{" "}
+        <span className="font-medium text-text">90 days</span> for trend &amp; incident review.
       </span>
-      <span className="flex-shrink-0 font-semibold text-green-dark">Upgrade →</span>
+      <span className="flex-shrink-0 font-semibold text-accent-text">Upgrade →</span>
     </a>
   );
 }
@@ -323,6 +324,8 @@ export function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [selectedRecord, setSelectedRecord] = useState<AuditRecord | null>(null);
   const tierState = useTier();
+  const shareRequested =
+    new URLSearchParams(window.location.search).get("share") === "1";
 
   useEffect(() => {
     async function load() {
@@ -386,7 +389,7 @@ export function DashboardPage() {
   return (
     <div className="p-6 max-w-6xl">
       {error && (
-        <div className="bg-status-deny-red/10 border border-status-deny-red/30 rounded-xl p-3 mb-6 text-sm text-status-deny-red">
+        <div className="bg-danger-light border border-danger-border rounded-card p-3 mb-6 text-sm text-danger-text">
           {error}
         </div>
       )}
@@ -405,15 +408,19 @@ export function DashboardPage() {
         planLabel={PlanLabel(tierState.tierKey)}
         planPaid={tierState.isPaid}
         billingUrl={tierState.billingUrl}
+        shareOnOpen={shareRequested && (auditStats !== null || proxy !== null)}
       />
 
       {/* Persistent upgrade banner — hidden only for Enterprise. */}
       <UpgradeBanner tierState={tierState} />
 
+      {/* First-run "Get started" checklist — self-hides when done/dismissed. */}
+      <GetStartedCard />
+
       {/* Interactive score scatter — the hero visualization */}
       {auditRecords.length > 0 && (
-        <div className="bg-white border border-grith-border rounded-xl p-5 mb-8">
-          <h2 className="text-sm font-medium text-grith-text mb-2">
+        <div className="bg-surface border border-border rounded-card p-5 mb-8">
+          <h2 className="font-heading text-[15px] font-semibold text-text mb-2">
             Evaluation Scores
           </h2>
           <InteractiveScoreScatter
@@ -427,8 +434,8 @@ export function DashboardPage() {
       {/* Activity over time (stacked) + live decision ticker */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
         {auditRecords.length > 0 && (
-          <div className="bg-white border border-grith-border rounded-xl p-5">
-            <h2 className="text-sm font-medium text-grith-text mb-2">
+          <div className="bg-surface border border-border rounded-card p-5">
+            <h2 className="font-heading text-[15px] font-semibold text-text mb-2">
               Activity Over Time
             </h2>
             <ActivityArea records={auditRecords} />
@@ -444,12 +451,12 @@ export function DashboardPage() {
 
       {/* Threat signals (filter contribution) — the security story */}
       {auditRecords.length > 0 && (
-        <div className="bg-white border border-grith-border rounded-xl p-5 mb-8">
+        <div className="bg-surface border border-border rounded-card p-5 mb-8">
           <div className="flex items-baseline justify-between mb-3">
-            <h2 className="text-sm font-medium text-grith-text">
+            <h2 className="font-heading text-[15px] font-semibold text-text">
               Threat Signals
             </h2>
-            <span className="text-xs text-grith-muted">which filters fired</span>
+            <span className="text-xs text-text-secondary">which filters fired</span>
           </div>
           <ThreatSignals records={auditRecords} />
         </div>
@@ -458,16 +465,16 @@ export function DashboardPage() {
       {/* Call types + latency, side by side */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
         {auditRecords.length > 0 && (
-          <div className="bg-white border border-grith-border rounded-xl p-5">
-            <h2 className="text-sm font-medium text-grith-text mb-2">
+          <div className="bg-surface border border-border rounded-card p-5">
+            <h2 className="font-heading text-[15px] font-semibold text-text mb-2">
               Call Types
             </h2>
             <CallTypeBar records={auditRecords} />
           </div>
         )}
         {auditRecords.length > 0 && (
-          <div className="bg-white border border-grith-border rounded-xl p-5">
-            <h2 className="text-sm font-medium text-grith-text mb-2">
+          <div className="bg-surface border border-border rounded-card p-5">
+            <h2 className="font-heading text-[15px] font-semibold text-text mb-2">
               Evaluation Latency
             </h2>
             <LatencyHistogram records={auditRecords} />
@@ -486,10 +493,10 @@ export function DashboardPage() {
       {!tierState.isPaid && (
         <div className="mb-8">
           <div className="flex items-baseline justify-between mb-3">
-            <h2 className="text-sm font-medium text-grith-text">
+            <h2 className="font-heading text-[15px] font-semibold text-text">
               Premium Insights
             </h2>
-            <span className="text-xs text-grith-muted">available on Pro</span>
+            <span className="text-xs text-text-secondary">available on Pro</span>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <LockedProCard
@@ -520,12 +527,12 @@ export function DashboardPage() {
 
       {/* Unlocked Session Comparison — real data for paid tiers. */}
       {tierState.isPaid && displaySessions.length > 1 && (
-        <div className="bg-white border border-grith-border rounded-xl p-5 mb-8">
+        <div className="bg-surface border border-border rounded-card p-5 mb-8">
           <div className="flex items-baseline justify-between mb-3">
-            <h2 className="text-sm font-medium text-grith-text">
+            <h2 className="font-heading text-[15px] font-semibold text-text">
               Session Comparison
             </h2>
-            <span className="text-xs text-grith-muted">posture by session</span>
+            <span className="text-xs text-text-secondary">posture by session</span>
           </div>
           <SessionComparison
             sessions={displaySessions.map((s) => ({
@@ -542,26 +549,26 @@ export function DashboardPage() {
 
       {/* Exfiltration attempts */}
       {exfil && (exfil.total_blocked > 0 || exfil.total_queued > 0) && (
-        <div className="bg-white border border-grith-border rounded-xl p-5 mb-8">
-          <h2 className="text-sm font-medium text-grith-text mb-4">
+        <div className="bg-surface border border-border rounded-card p-5 mb-8">
+          <h2 className="font-heading text-[15px] font-semibold text-text mb-4">
             Exfiltration Attempts
           </h2>
           <div className="grid grid-cols-3 gap-4 mb-4">
             <div className="text-center">
-              <p className="text-xs text-grith-muted uppercase">Blocked</p>
-              <p className="text-xl font-semibold text-status-deny-red">
+              <p className="font-label text-[11px] text-text-dim uppercase tracking-[0.08em]">Denied</p>
+              <p className="font-heading text-xl font-semibold text-danger-text">
                 {exfil.total_blocked}
               </p>
             </div>
             <div className="text-center">
-              <p className="text-xs text-grith-muted uppercase">Queued</p>
-              <p className="text-xl font-semibold text-status-queue-amber">
+              <p className="font-label text-[11px] text-text-dim uppercase tracking-[0.08em]">Queued</p>
+              <p className="font-heading text-xl font-semibold text-warning-text">
                 {exfil.total_queued}
               </p>
             </div>
             <div className="text-center">
-              <p className="text-xs text-grith-muted uppercase">Redacted (DLP)</p>
-              <p className="text-xl font-semibold text-grith-text">
+              <p className="font-label text-[11px] text-text-dim uppercase tracking-[0.08em]">Redacted (DLP)</p>
+              <p className="font-heading text-xl font-semibold text-text">
                 {exfil.total_redacted}
               </p>
             </div>
@@ -571,26 +578,26 @@ export function DashboardPage() {
           {tierState.tierKey !== "enterprise" && exfil.total_blocked > 0 && (
             <a
               href={tierState.billingUrl}
-              className="group mb-4 flex items-center justify-between gap-3 rounded-lg border border-status-deny-red/30 bg-status-deny-red/5 px-4 py-3 transition-colors hover:border-status-deny-red/50"
+              className="group mb-4 flex items-center justify-between gap-3 rounded-lg border border-danger-border bg-danger-light px-4 py-3 transition-colors hover:border-danger/50"
             >
               <div className="flex items-center gap-3 min-w-0">
-                <span className="flex-shrink-0 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-status-deny-red/10 text-status-deny-red">
+                <span className="flex-shrink-0 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-danger-light text-danger-text">
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden>
                     <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
                   </svg>
                 </span>
-                <p className="text-xs text-grith-text min-w-0">
-                  grith blocked{" "}
+                <p className="text-xs text-text min-w-0">
+                  grith denied{" "}
                   <span className="font-semibold">
                     {exfil.total_blocked.toLocaleString()}
                   </span>{" "}
                   exfiltration attempt{exfil.total_blocked !== 1 ? "s" : ""}.{" "}
-                  <span className="text-grith-muted">
+                  <span className="text-text-secondary">
                     Get a real-time Slack &amp; email alert the moment it happens with Pro.
                   </span>
                 </p>
               </div>
-              <span className="flex-shrink-0 inline-flex items-center gap-1 rounded-lg bg-green px-3 py-1.5 text-[11px] font-semibold text-white transition-transform group-hover:translate-x-0.5">
+              <span className="flex-shrink-0 inline-flex items-center gap-1 rounded-btn bg-green px-3 py-1.5 text-[11px] font-heading font-semibold text-accent-ink transition-transform group-hover:translate-x-0.5">
                 Enable alerts →
               </span>
             </a>
@@ -598,15 +605,15 @@ export function DashboardPage() {
 
           {Object.keys(exfil.by_protocol).length > 0 && (
             <div className="mb-4">
-              <h3 className="text-xs text-grith-muted uppercase mb-2">By Protocol</h3>
+              <h3 className="font-label text-[11px] text-text-dim uppercase tracking-[0.08em] mb-2">By Protocol</h3>
               <div className="flex flex-wrap gap-2">
                 {Object.entries(exfil.by_protocol).map(([protocol, count]) => (
                   <span
                     key={protocol}
-                    className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-grith-surface text-xs"
+                    className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-surface-2 text-xs"
                   >
-                    <span className="text-grith-text">{protocol}</span>
-                    <span className="text-grith-muted font-mono">{count}</span>
+                    <span className="text-text">{protocol}</span>
+                    <span className="text-text-secondary font-code">{count}</span>
                   </span>
                 ))}
               </div>
@@ -615,8 +622,8 @@ export function DashboardPage() {
 
           {exfil.top_blocked_destinations.length > 0 && (
             <div>
-              <h3 className="text-xs text-grith-muted uppercase mb-2">
-                Top Blocked Destinations
+              <h3 className="font-label text-[11px] text-text-dim uppercase tracking-[0.08em] mb-2">
+                Top Denied Destinations
               </h3>
               <div className="space-y-1">
                 {exfil.top_blocked_destinations.map((d) => (
@@ -624,10 +631,10 @@ export function DashboardPage() {
                     key={d.domain}
                     className="flex items-center justify-between py-1 px-3 rounded-md"
                   >
-                    <span className="text-xs text-grith-text font-mono truncate max-w-[300px]">
+                    <span className="text-xs text-text font-code truncate max-w-[300px]">
                       {d.domain}
                     </span>
-                    <span className="text-xs text-status-deny-red font-mono">
+                    <span className="text-xs text-danger-text font-code">
                       {d.count}
                     </span>
                   </div>
@@ -642,11 +649,11 @@ export function DashboardPage() {
       {displaySessions.length > 0 && (
         <div className="mb-8 space-y-4">
           <div className="flex items-baseline justify-between">
-            <h2 className="text-sm font-medium text-grith-text">Sessions</h2>
-            <span className="text-xs text-grith-muted">
+            <h2 className="font-heading text-[15px] font-semibold text-text">Sessions</h2>
+            <span className="text-xs text-text-secondary">
               {liveSessions.length > 0 ? (
                 <>
-                  <span className="font-mono font-semibold text-status-allow-green">
+                  <span className="font-code font-semibold text-accent-text">
                     {liveSessions.length}
                   </span>{" "}
                   live
@@ -659,7 +666,7 @@ export function DashboardPage() {
           {displaySessions.map((s) => (
             <div
               key={s.session_id}
-              className="bg-white border border-grith-border rounded-xl p-5 transition-colors hover:border-grith-border-hover"
+              className="bg-surface border border-border rounded-card p-5 transition-colors hover:border-border-dark"
             >
               <div className="flex gap-5">
                 {/* Donut */}
@@ -674,22 +681,22 @@ export function DashboardPage() {
                     <div className="flex items-center gap-2.5 min-w-0">
                       {s.is_live && (
                         <span className="relative flex flex-shrink-0">
-                          <span className="grith-pulse-ring relative w-2 h-2 rounded-full text-status-allow-green">
-                            <span className="block w-2 h-2 rounded-full bg-status-allow-green" />
+                          <span className="grith-pulse-ring relative w-2 h-2 rounded-full text-green">
+                            <span className="block w-2 h-2 rounded-full bg-green" />
                           </span>
                         </span>
                       )}
-                      <span className="text-sm font-semibold text-grith-text truncate">
+                      <span className="text-sm font-semibold text-text truncate">
                         {s.project_name ?? s.name}
                       </span>
-                      <span className="flex-shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-md bg-grith-surface text-[11px] font-medium text-grith-muted">
+                      <span className="flex-shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-md bg-surface-2 text-[11px] font-medium text-text-secondary">
                         {s.name}
                       </span>
-                      <span className="hidden sm:inline text-[11px] text-grith-dim font-mono flex-shrink-0">
+                      <span className="hidden sm:inline text-[11px] text-text-dim font-code flex-shrink-0">
                         {s.session_id.slice(0, 8)}
                       </span>
                     </div>
-                    <span className="text-xs text-grith-muted flex-shrink-0">
+                    <span className="text-xs text-text-secondary flex-shrink-0">
                       {s.is_live && s.uptime_seconds !== undefined
                         ? `${formatUptime(s.uptime_seconds)} up`
                         : new Date(s.last_seen).toLocaleTimeString()}
@@ -698,7 +705,7 @@ export function DashboardPage() {
 
                   {/* cwd path, when known */}
                   {s.cwd && (
-                    <p className="text-[11px] text-grith-dim font-mono truncate mb-3 -mt-1">
+                    <p className="text-[11px] text-text-dim font-code truncate mb-3 -mt-1">
                       {s.cwd}
                     </p>
                   )}
@@ -706,26 +713,26 @@ export function DashboardPage() {
                   {/* Session stats */}
                   <div className="flex gap-6 text-xs mb-3">
                     <span>
-                      <span className="text-grith-muted">Total </span>
-                      <span className="font-semibold text-grith-text font-mono">
+                      <span className="text-text-secondary">Total </span>
+                      <span className="font-semibold text-text font-code">
                         {s.total.toLocaleString()}
                       </span>
                     </span>
                     <span>
-                      <span className="text-grith-muted">Allow </span>
-                      <span className="font-semibold text-status-allow-green font-mono">
+                      <span className="text-text-secondary">Allow </span>
+                      <span className="font-semibold text-accent-text font-code">
                         {s.allowed.toLocaleString()}
                       </span>
                     </span>
                     <span>
-                      <span className="text-grith-muted">Queue </span>
-                      <span className="font-semibold text-status-queue-amber font-mono">
+                      <span className="text-text-secondary">Queue </span>
+                      <span className="font-semibold text-warning-text font-code">
                         {s.queued.toLocaleString()}
                       </span>
                     </span>
                     <span>
-                      <span className="text-grith-muted">Deny </span>
-                      <span className="font-semibold text-status-deny-red font-mono">
+                      <span className="text-text-secondary">Deny </span>
+                      <span className="font-semibold text-danger-text font-code">
                         {s.denied.toLocaleString()}
                       </span>
                     </span>
@@ -748,8 +755,8 @@ export function DashboardPage() {
 
       {/* Subsystems */}
       {health && Object.keys(health.subsystems).length > 0 && (
-        <div className="bg-white border border-grith-border rounded-xl p-5">
-          <h2 className="text-sm font-medium text-grith-text mb-4">
+        <div className="bg-surface border border-border rounded-card p-5">
+          <h2 className="font-heading text-[15px] font-semibold text-text mb-4">
             Subsystems
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -762,18 +769,18 @@ export function DashboardPage() {
                   <span
                     className={`w-2 h-2 rounded-full ${
                       sub.status === "ok"
-                        ? "bg-status-allow-green"
+                        ? "bg-green"
                         : sub.status === "degraded"
-                          ? "bg-status-queue-amber"
-                          : "bg-status-deny-red"
+                          ? "bg-warning"
+                          : "bg-danger"
                     }`}
                   />
-                  <span className="text-sm text-grith-text capitalize">
+                  <span className="text-sm text-text capitalize">
                     {name}
                   </span>
                 </div>
                 {sub.latency_ms !== undefined && (
-                  <span className="text-xs text-grith-muted">
+                  <span className="text-xs text-text-secondary">
                     {sub.latency_ms.toFixed(1)}ms
                   </span>
                 )}

@@ -88,7 +88,7 @@ async fn test_safe_file_read_allows() {
 #[tokio::test]
 async fn test_sensitive_ssh_key_read_denies() {
     // Use a scoring config with a lower deny threshold so that the
-    // path_match score of 5.0 for ssh-private-key exceeds it.
+    // path-match score of 5.0 for ssh-private-key exceeds it.
     let scoring = ScoringConfig {
         auto_allow_threshold: 2.0,
         auto_deny_threshold: 4.5,
@@ -115,14 +115,14 @@ async fn test_sensitive_ssh_key_read_denies() {
         "Expected score >= 5.0, got {}",
         decision.composite_score
     );
-    // Verify path_match filter triggered with the ssh-private-key rule
+    // Verify path-match filter triggered with the ssh-private-key rule
     let path_match_result = decision
         .filter_results
         .iter()
-        .find(|r| r.filter_name == "path_match" && r.matched);
+        .find(|r| r.filter_name == "path-match" && r.matched);
     assert!(
         path_match_result.is_some(),
-        "Expected path_match filter to fire"
+        "Expected path-match filter to fire"
     );
     assert_eq!(path_match_result.unwrap().rule_id, "ssh-private-key");
 }
@@ -137,7 +137,7 @@ async fn test_ambiguous_operation_queues() {
     // Warm up past cold-start so normal thresholds (3.0/8.0) apply
     warm_up_proxy(&fixtures.proxy, 200).await;
 
-    // PEM file read scores 4.0 from path_match, which lands in the QUEUE
+    // PEM file read scores 4.0 from path-match, which lands in the QUEUE
     // range (> 3.0 allow threshold, <= 8.0 deny threshold).
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
@@ -270,10 +270,10 @@ async fn test_aws_secret_key_in_content_flags() {
     let secret_result = decision
         .filter_results
         .iter()
-        .find(|r| r.filter_name == "secret_scan" && r.matched);
+        .find(|r| r.filter_name == "secret-scan" && r.matched);
     assert!(
         secret_result.is_some(),
-        "Expected secret_scan filter to flag AWS key"
+        "Expected secret-scan filter to flag AWS key"
     );
     assert_eq!(secret_result.unwrap().rule_id, "aws-access-key");
     assert_eq!(
@@ -288,27 +288,29 @@ async fn test_aws_secret_key_in_content_flags() {
 
 #[tokio::test]
 async fn test_meta_rule_ssh_key_access() {
-    // Set up a meta-rule that fires when path_match detects ssh-private-key
-    // AND secret_scan detects a private key block. The meta-rule overrides
+    // Set up a meta-rule that fires when path-match detects ssh-private-key
+    // AND secret-scan detects a private key block. The meta-rule overrides
     // the score to 9.0.
     let meta_rules = vec![MetaRule {
         id: "ssh-key-access".into(),
         conditions: vec![
             MetaCondition {
-                filter: Some("path_match".into()),
+                filter: Some("path-match".into()),
                 rule_id: Some("ssh-private-key".into()),
                 matched: Some(true),
                 call_type: None,
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             },
             MetaCondition {
-                filter: Some("secret_scan".into()),
+                filter: Some("secret-scan".into()),
                 rule_id: None,
                 matched: Some(true),
                 call_type: None,
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             },
         ],
         score_override: Some(9.0),
@@ -317,7 +319,7 @@ async fn test_meta_rule_ssh_key_access() {
     }];
 
     // Use a scoring config with a high deny threshold so that the base score
-    // (path_match=5.0 + secret_scan=5.0 = 10.0) does NOT trigger early
+    // (path-match=5.0 + secret-scan=5.0 = 10.0) does NOT trigger early
     // termination before meta-rules run. The meta-rule should then override
     // the score to 9.0.
     let scoring = ScoringConfig {
@@ -326,8 +328,8 @@ async fn test_meta_rule_ssh_key_access() {
     };
     let proxy = proxy_with_meta_rules(meta_rules, scoring);
 
-    // Create a context that triggers both path_match (ssh-private-key) and
-    // secret_scan (private key block) by embedding a PEM header in arguments.
+    // Create a context that triggers both path-match (ssh-private-key) and
+    // secret-scan (private key block) by embedding a PEM header in arguments.
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
             path: "/home/user/.ssh/id_rsa".into(),
@@ -339,7 +341,7 @@ async fn test_meta_rule_ssh_key_access() {
 
     let decision = proxy.evaluate(&ctx).await;
 
-    // Base score: path_match (5.0) + secret_scan (5.0) = 10.0
+    // Base score: path-match (5.0) + secret-scan (5.0) = 10.0
     // Meta-rule override to 9.0 => adjustment = 9.0 - 10.0 = -1.0
     // Final score: 10.0 + (-1.0) = 9.0
     assert!(
@@ -410,7 +412,7 @@ async fn test_early_termination_on_phase1_deny() {
     };
     let proxy = proxy_with_scoring(scoring);
 
-    // SSH private key read scores 5.0 from path_match (Phase 1 Static).
+    // SSH private key read scores 5.0 from path-match (Phase 1 Static).
     // 5.0 > 4.0 (deny threshold) => early termination before Phase 2.
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
@@ -429,12 +431,12 @@ async fn test_early_termination_on_phase1_deny() {
         decision.action
     );
 
-    // Phase 2 filters (secret_scan, command) should NOT have run.
+    // Phase 2 filters (secret-scan, command) should NOT have run.
     // Only Phase 1 filters should appear in results.
     let phase2_matched = decision
         .filter_results
         .iter()
-        .any(|r| r.filter_name == "secret_scan" || r.filter_name == "command");
+        .any(|r| r.filter_name == "secret-scan" || r.filter_name == "command");
     assert!(
         !phase2_matched,
         "Phase 2 filters should not have run due to early termination; \
@@ -446,15 +448,15 @@ async fn test_early_termination_on_phase1_deny() {
             .collect::<Vec<_>>()
     );
 
-    // Phase 1 filters should be present (path_match, allowlist, argument, capability)
+    // Phase 1 filters should be present (path-match, allowlist, argument, capability)
     let phase1_names: Vec<&str> = decision
         .filter_results
         .iter()
         .map(|r| r.filter_name.as_str())
         .collect();
     assert!(
-        phase1_names.contains(&"path_match"),
-        "Expected path_match in Phase 1 results"
+        phase1_names.contains(&"path-match"),
+        "Expected path-match in Phase 1 results"
     );
 }
 
@@ -496,8 +498,8 @@ async fn test_all_filters_in_phase_produce_results() {
 
     // Verify we get results from both Phase 1 and Phase 2 filters
     assert!(
-        filter_names.contains(&"path_match"),
-        "Expected path_match (Phase 1) in results"
+        filter_names.contains(&"path-match"),
+        "Expected path-match (Phase 1) in results"
     );
     assert!(
         filter_names.contains(&"allowlist"),
@@ -512,8 +514,8 @@ async fn test_all_filters_in_phase_produce_results() {
         "Expected capability (Phase 1) in results"
     );
     assert!(
-        filter_names.contains(&"secret_scan"),
-        "Expected secret_scan (Phase 2) in results"
+        filter_names.contains(&"secret-scan"),
+        "Expected secret-scan (Phase 2) in results"
     );
     assert!(
         filter_names.contains(&"command"),
@@ -604,8 +606,8 @@ async fn test_scores_are_additive_across_phases() {
     // Warm up past cold start
     warm_up_proxy(&fixtures.proxy, 200).await;
 
-    // Create a FileWrite to an .env file (path_match score=3.0) with
-    // content containing an AWS key (secret_scan score=5.0).
+    // Create a FileWrite to an .env file (path-match score=3.0) with
+    // content containing an AWS key (secret-scan score=5.0).
     // Combined score should be 3.0 + 5.0 = 8.0.
     let ctx = make_tool_call_context(
         ToolCallType::FileWrite {
@@ -619,7 +621,7 @@ async fn test_scores_are_additive_across_phases() {
 
     let decision = fixtures.proxy.evaluate(&ctx).await;
 
-    // .env path_match (write op) = 3.0, aws-access-key secret_scan = 5.0
+    // .env path-match (write op) = 3.0, aws-access-key secret-scan = 5.0
     // Total = 8.0. Since route uses > (not >=), 8.0 is NOT > 8.0, so QUEUE.
     assert_eq!(
         decision.composite_score, 8.0,
@@ -641,7 +643,7 @@ async fn test_shell_exfiltration_with_secret_in_command() {
     warm_up_proxy(&fixtures.proxy, 200).await;
 
     // Shell command with both pipe-to-curl (command=4.0) and an AWS key in the
-    // arguments (secret_scan=5.0). Total should be 9.0.
+    // arguments (secret-scan=5.0). Total should be 9.0.
     let ctx = make_tool_call_context(
         ToolCallType::ShellExec {
             command: "echo".into(),
@@ -702,12 +704,13 @@ async fn test_meta_rule_score_adjustment() {
         id: "env-file-write-penalty".into(),
         conditions: vec![
             MetaCondition {
-                filter: Some("path_match".into()),
+                filter: Some("path-match".into()),
                 rule_id: Some("env-file".into()),
                 matched: Some(true),
                 call_type: None,
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             },
             MetaCondition {
                 filter: None,
@@ -716,6 +719,7 @@ async fn test_meta_rule_score_adjustment() {
                 call_type: Some("FileWrite".into()),
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             },
         ],
         score_override: None,
@@ -736,7 +740,7 @@ async fn test_meta_rule_score_adjustment() {
 
     let decision = proxy.evaluate(&ctx).await;
 
-    // path_match env-file = 3.0, meta-rule adjustment = +3.0, total = 6.0
+    // path-match env-file = 3.0, meta-rule adjustment = +3.0, total = 6.0
     assert_eq!(
         decision.composite_score, 6.0,
         "Expected 6.0 (3.0 base + 3.0 meta adjustment), got {}",

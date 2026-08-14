@@ -54,7 +54,7 @@ async fn test_path_traversal_denied() {
     };
     let decision = eval_syscall(&fixtures.proxy, &kind).await;
 
-    // The argument filter catches deep traversal (score 2.0) and the path_match
+    // The argument filter catches deep traversal (score 2.0) and the path-match
     // filter catches the SSH key (score 5.0), resulting in composite > threshold.
     assert_not_allowed(&decision, "path traversal to SSH key");
     assert!(
@@ -196,8 +196,8 @@ async fn test_network_egress_unusual_port() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "Expected egress_policy filter to flag unusual port, matched: {:?}",
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "Expected egress-policy filter to flag unusual port, matched: {:?}",
         decision
             .filter_results
             .iter()

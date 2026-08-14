@@ -10,6 +10,7 @@ pub mod commands;
 pub mod diff;
 pub mod digest_ui;
 pub mod error;
+pub mod onboarding;
 pub mod render;
 pub mod repl;
 pub mod supervisor_ui;

@@ -85,7 +85,7 @@ fn rate_limit_fired(decision: &grith_proxy::types::ProxyDecision) -> bool {
     decision
         .filter_results
         .iter()
-        .any(|r| r.filter_name == "rate_limit" && r.matched)
+        .any(|r| r.filter_name == "rate-limit" && r.matched)
 }
 
 // ---------------------------------------------------------------------------

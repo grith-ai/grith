@@ -264,6 +264,7 @@ pub fn action_name(call_type: &ToolCallType) -> &'static str {
         ToolCallType::DirList { .. } => "DirList",
         ToolCallType::DirCreate { .. } => "DirCreate",
         ToolCallType::FileRename { .. } => "FileRename",
+        ToolCallType::FileLink { .. } => "FileLink",
         ToolCallType::FileChmod { .. } => "FileChmod",
         ToolCallType::ShellExec { .. } => "ShellExec",
         ToolCallType::ProcessSpawn { .. } => "ProcessSpawn",
@@ -300,7 +301,7 @@ pub fn has_safety_ceiling(
     // Secret-scanning filter matched.
     let secret_scan_matched = filter_results
         .iter()
-        .any(|r| r.matched && r.filter_name == "secret_scan");
+        .any(|r| r.matched && r.filter_name == "secret-scan");
     if secret_scan_matched {
         return true;
     }
@@ -751,7 +752,7 @@ mod tests {
     #[test]
     fn ceiling_on_high_filter_score() {
         let config = ReputationConfig::default();
-        let filters = vec![matched_result("path_match", 5.0)];
+        let filters = vec![matched_result("path-match", 5.0)];
         let call = ToolCallType::FileRead {
             path: "/tmp/foo".into(),
         };
@@ -761,7 +762,7 @@ mod tests {
     #[test]
     fn no_ceiling_on_low_filter_score() {
         let config = ReputationConfig::default();
-        let filters = vec![matched_result("path_match", 4.9)];
+        let filters = vec![matched_result("path-match", 4.9)];
         let call = ToolCallType::FileRead {
             path: "/tmp/foo".into(),
         };
@@ -771,7 +772,7 @@ mod tests {
     #[test]
     fn ceiling_on_secret_scan() {
         let config = ReputationConfig::default();
-        let filters = vec![matched_result("secret_scan", 2.0)];
+        let filters = vec![matched_result("secret-scan", 2.0)];
         let call = ToolCallType::FileRead {
             path: "/tmp/.env".into(),
         };

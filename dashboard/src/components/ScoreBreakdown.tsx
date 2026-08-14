@@ -8,15 +8,15 @@ interface ScoreBreakdownProps {
 }
 
 function scoreColor(score: number): string {
-  if (score < 2) return "bg-status-allow-green";
-  if (score <= 5) return "bg-status-queue-amber";
-  return "bg-status-deny-red";
+  if (score < 2) return "bg-green";
+  if (score <= 5) return "bg-warning";
+  return "bg-danger";
 }
 
 function scoreTextColor(score: number): string {
-  if (score < 2) return "text-status-allow-green";
-  if (score <= 5) return "text-status-queue-amber";
-  return "text-status-deny-red";
+  if (score < 2) return "text-accent-text";
+  if (score <= 5) return "text-warning-text";
+  return "text-danger-text";
 }
 
 function decisionLabel(
@@ -25,12 +25,12 @@ function decisionLabel(
   denyThreshold: number,
 ): { text: string; color: string } {
   if (score < allowThreshold) {
-    return { text: "ALLOW", color: "text-status-allow-green" };
+    return { text: "ALLOW", color: "text-accent-text" };
   }
   if (score > denyThreshold) {
-    return { text: "DENY", color: "text-status-deny-red" };
+    return { text: "DENY", color: "text-danger-text" };
   }
-  return { text: "QUEUE (digest review)", color: "text-status-queue-amber" };
+  return { text: "QUEUE (digest review)", color: "text-warning-text" };
 }
 
 export function ScoreBreakdown({
@@ -43,25 +43,25 @@ export function ScoreBreakdown({
 
   if (matched.length === 0) {
     return (
-      <div className="bg-white border border-grith-border rounded-xl p-5">
-        <p className="text-xs text-grith-muted uppercase tracking-wider mb-3">
+      <div className="bg-surface border border-border rounded-card p-5">
+        <p className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.1em] mb-3">
           Score Breakdown
         </p>
         <div className="flex items-center gap-3">
-          <div className="flex-1 h-8 rounded-lg bg-white flex items-center justify-center">
-            <span className="text-xs text-grith-muted italic">
+          <div className="flex-1 h-8 rounded-lg bg-surface-2 flex items-center justify-center">
+            <span className="text-xs text-text-secondary italic">
               No filters triggered
             </span>
           </div>
         </div>
         <div className="mt-3 flex items-center justify-between">
-          <span className="text-xs text-grith-muted">
+          <span className="text-xs text-text-secondary">
             Composite score:{" "}
-            <span className="font-mono text-status-allow-green font-medium">
+            <span className="font-code text-accent-text font-medium">
               {compositeScore.toFixed(1)}
             </span>
           </span>
-          <span className="text-xs font-medium text-status-allow-green">
+          <span className="text-xs font-medium text-accent-text">
             ALLOW
           </span>
         </div>
@@ -77,14 +77,14 @@ export function ScoreBreakdown({
   const decision = decisionLabel(compositeScore, allowThreshold, denyThreshold);
 
   return (
-    <div className="bg-white border border-grith-border rounded-xl p-5">
-      <p className="text-xs text-grith-muted uppercase tracking-wider mb-3">
+    <div className="bg-surface border border-border rounded-card p-5">
+      <p className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.1em] mb-3">
         Score Breakdown
       </p>
 
       {/* Stacked bar */}
       <div className="relative">
-        <div className="h-8 rounded-lg bg-white overflow-hidden flex">
+        <div className="h-8 rounded-lg bg-surface-2 overflow-hidden flex">
           {matched.map((f, i) => {
             const widthPct = (f.score / barMax) * 100;
             return (
@@ -95,7 +95,7 @@ export function ScoreBreakdown({
                 title={`${f.filter_name}: +${f.score.toFixed(1)}`}
               >
                 {widthPct > 8 && (
-                  <span className="text-[10px] font-mono text-white/90 truncate px-1">
+                  <span className="text-[10px] font-code text-accent-ink truncate px-1">
                     {f.filter_name}
                   </span>
                 )}
@@ -107,20 +107,20 @@ export function ScoreBreakdown({
         {/* Threshold markers */}
         {allowThreshold > 0 && allowThreshold < barMax && (
           <div
-            className="absolute top-0 h-full border-l border-dashed border-status-allow-green/50"
+            className="absolute top-0 h-full border-l border-dashed border-green-border"
             style={{ left: `${(allowThreshold / barMax) * 100}%` }}
           >
-            <span className="absolute -top-4 -translate-x-1/2 text-[9px] font-mono text-status-allow-green/70">
+            <span className="absolute -top-4 -translate-x-1/2 text-[9px] font-code text-accent-text/70">
               {allowThreshold.toFixed(1)}
             </span>
           </div>
         )}
         {denyThreshold > 0 && denyThreshold < barMax && (
           <div
-            className="absolute top-0 h-full border-l border-dashed border-status-deny-red/50"
+            className="absolute top-0 h-full border-l border-dashed border-danger-border"
             style={{ left: `${(denyThreshold / barMax) * 100}%` }}
           >
-            <span className="absolute -top-4 -translate-x-1/2 text-[9px] font-mono text-status-deny-red/70">
+            <span className="absolute -top-4 -translate-x-1/2 text-[9px] font-code text-danger-text/70">
               {denyThreshold.toFixed(1)}
             </span>
           </div>
@@ -134,8 +134,8 @@ export function ScoreBreakdown({
             <span
               className={`w-2 h-2 rounded-sm ${scoreColor(f.score)}`}
             />
-            <span className="text-grith-text">{f.filter_name}</span>
-            <span className={`font-mono ${scoreTextColor(f.score)}`}>
+            <span className="text-text">{f.filter_name}</span>
+            <span className={`font-code ${scoreTextColor(f.score)}`}>
               +{f.score.toFixed(1)}
             </span>
           </span>
@@ -143,11 +143,11 @@ export function ScoreBreakdown({
       </div>
 
       {/* Composite score and decision */}
-      <div className="mt-3 pt-3 border-t border-grith-border flex items-center justify-between">
-        <span className="text-xs text-grith-muted">
+      <div className="mt-3 pt-3 border-t border-border flex items-center justify-between">
+        <span className="text-xs text-text-secondary">
           Composite score:{" "}
           <span
-            className={`font-mono font-medium ${scoreTextColor(compositeScore)}`}
+            className={`font-code font-medium ${scoreTextColor(compositeScore)}`}
           >
             {compositeScore.toFixed(1)}
           </span>

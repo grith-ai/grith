@@ -71,7 +71,7 @@ export function ListenerRewritesPage() {
   if (loading && !data) {
     return (
       <div className="p-6">
-        <p className="text-zinc-400">Loading listener rewrites…</p>
+        <p className="text-text-secondary">Loading listener rewrites…</p>
       </div>
     );
   }
@@ -79,8 +79,8 @@ export function ListenerRewritesPage() {
   if (error) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-semibold mb-4">Listener rewrites</h1>
-        <p className="text-status-deny-red">{error}</p>
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-4">Listener rewrites</h1>
+        <p className="text-danger-text">{error}</p>
       </div>
     );
   }
@@ -94,12 +94,12 @@ export function ListenerRewritesPage() {
   return (
     <div className="p-6">
       <div className="flex items-baseline justify-between mb-2">
-        <h1 className="text-xl font-semibold text-grith-text">
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text">
           Listener rewrites
         </h1>
         <button
           onClick={() => void fetchRewrites()}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors"
+          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors"
         >
           Refresh
         </button>
@@ -108,17 +108,17 @@ export function ListenerRewritesPage() {
       <SessionHeader sessionId={data.session_id} basePath="/listener-rewrites" />
 
       {isEmpty ? (
-        <div className="bg-white border border-grith-border rounded-xl px-6 py-10 text-center">
-          <p className="text-grith-text mb-2">
+        <div className="bg-surface-2 border border-border rounded-card px-6 py-10 text-center">
+          <p className="font-heading text-[15px] font-semibold text-text mb-2">
             No listener rewrites for this session.
           </p>
-          <p className="text-grith-muted text-sm max-w-lg mx-auto">
+          <p className="text-text-secondary text-sm max-w-lg mx-auto">
             The supervisor only logs here when it rewrites a wildcard{" "}
-            <code className="font-mono text-grith-text bg-grith-surface px-1 rounded">
+            <code className="font-code text-text bg-surface px-1 rounded">
               bind()
             </code>{" "}
             to loopback per the profile's{" "}
-            <code className="font-mono text-grith-text bg-grith-surface px-1 rounded">
+            <code className="font-code text-text bg-surface px-1 rounded">
               local_listener_policy
             </code>
             . Tools that only make outbound connections never trigger it.
@@ -126,11 +126,11 @@ export function ListenerRewritesPage() {
         </div>
       ) : (
         <>
-          <p className="text-grith-muted text-sm mb-4">
+          <p className="text-text-secondary text-sm mb-4">
             {data.rewrites.length} rewrite
-            {data.rewrites.length === 1 ? "" : "s"} this session — each one is a
+            {data.rewrites.length === 1 ? "" : "s"} this session - each one is a
             wildcard{" "}
-            <code className="font-mono text-grith-text bg-grith-surface px-1 rounded">
+            <code className="font-code text-text bg-surface-2 px-1 rounded">
               bind()
             </code>{" "}
             the supervisor clamped to loopback.
@@ -138,7 +138,7 @@ export function ListenerRewritesPage() {
 
           <div className="relative max-w-md mb-4">
             <svg
-              className="absolute left-3 top-2.5 w-4 h-4 text-grith-dim pointer-events-none"
+              className="absolute left-3 top-2.5 w-4 h-4 text-text-dim pointer-events-none"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -155,13 +155,13 @@ export function ListenerRewritesPage() {
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               placeholder="Filter by address, profile entry, or tool"
-              className="w-full pl-9 pr-3 py-2 rounded-input border border-grith-border bg-white text-sm font-mono text-grith-text placeholder:text-grith-dim focus:outline-none focus:border-accent"
+              className="w-full pl-9 pr-3 py-2 rounded-btn border border-border bg-surface text-sm font-code text-text placeholder:text-text-dim focus:outline-none focus:border-green focus:shadow-glow"
             />
           </div>
 
-          <div className="bg-white border border-grith-border rounded-xl overflow-hidden">
+          <div className="bg-surface border border-border rounded-card overflow-hidden">
             <table className="w-full text-sm">
-              <thead className="bg-grith-surface text-grith-muted text-xs uppercase tracking-wide">
+              <thead className="border-b border-border font-label text-text-dim text-[11px] uppercase tracking-[0.08em]">
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">When</th>
                   <th className="text-left px-4 py-2 font-medium">Tool / PID</th>
@@ -174,24 +174,24 @@ export function ListenerRewritesPage() {
                 {rewrites.map((r) => (
                   <tr
                     key={r.id}
-                    className="border-t border-grith-border hover:bg-grith-surface/60"
+                    className="border-t border-border hover:bg-surface-2"
                   >
-                    <td className="px-4 py-2 font-mono text-xs text-grith-muted whitespace-nowrap">
+                    <td className="px-4 py-2 font-code text-xs text-text-secondary whitespace-nowrap">
                       {new Date(r.timestamp).toLocaleString()}
                     </td>
-                    <td className="px-4 py-2 font-mono text-xs text-grith-text whitespace-nowrap">
+                    <td className="px-4 py-2 font-code text-xs text-text whitespace-nowrap">
                       {r.tool ?? "?"}
                       {r.pid !== undefined ? ` (pid ${r.pid})` : ""}
                     </td>
-                    <td className="px-4 py-2 font-mono text-status-queue-amber whitespace-nowrap">
+                    <td className="px-4 py-2 font-code text-warning-text whitespace-nowrap">
                       {r.original_addr}
                     </td>
-                    <td className="px-4 py-2 font-mono text-status-allow-green whitespace-nowrap">
+                    <td className="px-4 py-2 font-code text-accent-text whitespace-nowrap">
                       {r.rewritten_addr}
                     </td>
-                    <td className="px-4 py-2 text-grith-text">
+                    <td className="px-4 py-2 text-text">
                       {r.clamp_profile_entry || (
-                        <span className="text-grith-dim italic">
+                        <span className="text-text-dim italic">
                           (no description)
                         </span>
                       )}
@@ -202,7 +202,7 @@ export function ListenerRewritesPage() {
                   <tr>
                     <td
                       colSpan={5}
-                      className="px-4 py-8 text-center text-grith-muted"
+                      className="px-4 py-8 text-center text-text-secondary"
                     >
                       No rewrites match the filter.
                     </td>

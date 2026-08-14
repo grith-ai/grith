@@ -46,8 +46,12 @@ impl PathMatchFilter {
 
         Self { rules, normalized }
     }
+}
 
-    fn operation_for_call_type(call_type: &ToolCallType) -> &str {
+/// The operation a call performs, for rule matching. Full coverage of every
+/// `ToolCallType` — `sensitive_path` applies its own narrower gate on top.
+pub(crate) fn operation_for_call_type(call_type: &ToolCallType) -> &'static str {
+    {
         match call_type {
             ToolCallType::FileRead { .. } => "read",
             ToolCallType::FileWrite { .. } => "write",
@@ -57,6 +61,10 @@ impl PathMatchFilter {
             ToolCallType::ShellExec { .. } => "exec",
             ToolCallType::HttpRequest { .. } => "http",
             ToolCallType::FileRename { .. } => "write",
+            // Only reached when a caller asks for a single operation; the
+            // two-path form in `path_operations` is what actually scores a
+            // link, and it uses read-for-target / write-for-link-path.
+            ToolCallType::FileLink { .. } => "write",
             ToolCallType::FileChmod { .. } => "write",
             ToolCallType::DirCreate { .. } => "write",
             ToolCallType::NetConnect { .. } => "http",
@@ -99,7 +107,7 @@ fn parse_severity(s: &str) -> Severity {
 #[async_trait::async_trait]
 impl SecurityFilter for PathMatchFilter {
     fn name(&self) -> &str {
-        "path_match"
+        "path-match"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -107,13 +115,28 @@ impl SecurityFilter for PathMatchFilter {
     }
 
     async fn evaluate(&self, ctx: &ToolCallContext) -> crate::error::Result<FilterResult> {
-        let path = match ctx.path() {
-            Some(p) => p,
-            None => return Ok(FilterResult::no_match("path_match")),
-        };
+        // Judge every (path, operation) the call carries and keep the worst.
+        // Link creation has two with different operations — the target is
+        // made readable, the link path is written — so a link planted at a
+        // rule-protected location is priced like the write it substitutes
+        // for (go-live review B2).
+        let mut worst: Option<FilterResult> = None;
+        for (path, operation) in crate::filters::sensitive_path::path_operations(&ctx.call_type) {
+            let result = self.evaluate_path(path, operation);
+            let better = match &worst {
+                Some(current) => result.score > current.score,
+                None => true,
+            };
+            if result.matched && better {
+                worst = Some(result);
+            }
+        }
+        Ok(worst.unwrap_or_else(|| FilterResult::no_match("path-match")))
+    }
+}
 
-        let operation = Self::operation_for_call_type(&ctx.call_type);
-
+impl PathMatchFilter {
+    fn evaluate_path(&self, path: &str, operation: &str) -> FilterResult {
         // Check all rules for matches and select the highest-scoring one.
         // We use direct substring matching rather than Aho-Corasick's find_iter
         // here because overlapping patterns (e.g. ".ssh/" and ".ssh/id_") need
@@ -144,15 +167,9 @@ impl SecurityFilter for PathMatchFilter {
         match best_match {
             Some(rule) => {
                 let severity = parse_severity(&rule.severity);
-                Ok(FilterResult::matched(
-                    "path_match",
-                    &rule.id,
-                    rule.score,
-                    severity,
-                    &rule.message,
-                ))
+                FilterResult::matched("path-match", &rule.id, rule.score, severity, &rule.message)
             }
-            None => Ok(FilterResult::no_match("path_match")),
+            None => FilterResult::no_match("path-match"),
         }
     }
 }

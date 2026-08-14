@@ -7,14 +7,14 @@ import type { DigestItem, FilterBreakdown, WsDigestQueued } from "@/types/api";
 function ScoreBadge({ score }: { score: number }) {
   const color =
     score < 3
-      ? "text-status-allow-green bg-status-allow-green/10"
+      ? "text-accent-text bg-green-light border-green-border"
       : score < 8
-        ? "text-status-queue-amber bg-status-queue-amber/10"
-        : "text-status-deny-red bg-status-deny-red/10";
+        ? "text-warning-text bg-warning-light border-warning-border"
+        : "text-danger-text bg-danger-light border-danger-border";
 
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-mono font-medium ${color}`}
+      className={`inline-flex items-center px-2.5 py-0.5 rounded-pill border text-xs font-code font-medium ${color}`}
     >
       {score.toFixed(1)}
     </span>
@@ -29,31 +29,31 @@ function FilterBreakdownList({
   const triggered = filters.filter((f) => f.score > 0);
   if (triggered.length === 0) {
     return (
-      <p className="text-xs text-grith-muted italic">No filters triggered</p>
+      <p className="text-xs text-text-secondary italic">No filters triggered</p>
     );
   }
   return (
     <div className="space-y-1">
       {triggered.map((f, i) => (
         <div key={i} className="flex items-center gap-2 text-xs">
-          <span className="font-mono text-grith-muted w-8 text-right">
+          <span className="font-code text-text-secondary w-8 text-right">
             +{f.score.toFixed(1)}
           </span>
           <span
             className={`capitalize ${
               f.score >= 8
-                ? "text-status-deny-red"
+                ? "text-danger-text"
                 : f.score >= 5
-                  ? "text-status-deny-red/80"
+                  ? "text-danger-text/80"
                   : f.score >= 3
-                    ? "text-status-queue-amber"
-                    : "text-grith-muted"
+                    ? "text-warning-text"
+                    : "text-text-secondary"
             }`}
           >
             {f.score >= 8 ? "critical" : f.score >= 5 ? "high" : f.score >= 3 ? "medium" : "low"}
           </span>
-          <span className="text-grith-text">{f.message}</span>
-          <span className="text-grith-muted font-mono">
+          <span className="text-text">{f.message}</span>
+          <span className="text-text-secondary font-code">
             ({f.filter_name})
           </span>
         </div>
@@ -65,7 +65,7 @@ function FilterBreakdownList({
 function StatusBadge({ status }: { status: string }) {
   if (status !== "escalated") return null;
   return (
-    <span className="inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-medium bg-purple-500/15 text-purple-400">
+    <span className="inline-flex items-center px-2.5 py-0.5 rounded-pill border border-purple-border bg-purple-light font-label text-[11px] font-medium uppercase tracking-[0.08em] text-purple">
       Escalated
     </span>
   );
@@ -90,36 +90,36 @@ function DigestCard({
   const isEscalated = item.status === "escalated";
 
   return (
-    <div className="bg-white border border-grith-border rounded-xl p-4">
+    <div className="bg-surface border border-border rounded-card p-4">
       {/* Header */}
       <div className="flex items-start justify-between mb-3">
         <div className="flex items-center gap-2">
           <ScoreBadge score={item.composite_score} />
-          <span className="text-sm font-mono text-green">
+          <span className="text-sm font-code text-accent-text">
             {item.tool_call_type}
           </span>
           <StatusBadge status={item.status} />
         </div>
-        <time className="text-xs text-grith-muted">
+        <time className="text-xs text-text-secondary">
           {new Date(item.created_at).toLocaleString()}
         </time>
       </div>
 
       {/* Arguments */}
-      <p className="text-sm text-grith-text font-mono bg-white rounded-lg px-3 py-2 mb-3 break-all">
+      <p className="text-sm text-text font-code bg-surface-2 rounded-lg px-3 py-2 mb-3 break-all">
         {item.arguments_summary}
       </p>
 
       {/* Context */}
       {item.task_context && (
-        <p className="text-xs text-grith-muted mb-3">
-          <span className="text-grith-text">Context:</span> {item.task_context}
+        <p className="text-xs text-text-secondary mb-3">
+          <span className="text-text">Context:</span> {item.task_context}
         </p>
       )}
 
       {/* Filter breakdown */}
       <div className="mb-4">
-        <p className="text-xs text-grith-muted mb-1.5 uppercase tracking-wider">
+        <p className="font-label text-[11px] font-medium text-text-dim mb-1.5 uppercase tracking-[0.1em]">
           Filter breakdown
         </p>
         <FilterBreakdownList filters={item.filter_breakdown} />
@@ -129,19 +129,19 @@ function DigestCard({
       <div className="flex gap-2">
         <button
           onClick={() => onApprove(item.id)}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-status-allow-green/15 text-status-allow-green hover:bg-status-allow-green/25 transition-colors"
+          className="px-3 py-1.5 text-xs font-medium rounded-btn border border-green-border bg-green-light text-accent-text hover:bg-green/15 transition-colors"
         >
           Approve
         </button>
         <button
           onClick={() => onDeny(item.id)}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-status-deny-red/15 text-status-deny-red hover:bg-status-deny-red/25 transition-colors"
+          className="px-3 py-1.5 text-xs font-medium rounded-btn border border-danger-border bg-danger-light text-danger-text hover:bg-danger/15 transition-colors"
         >
           Deny
         </button>
         <button
           onClick={() => onLearn(item.id)}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-green/15 text-green hover:bg-green/25 transition-colors"
+          className="px-3 py-1.5 text-xs font-medium rounded-btn border border-green-border bg-green-light text-accent-text hover:bg-green/15 transition-colors"
         >
           Approve &amp; Learn
         </button>
@@ -150,7 +150,7 @@ function DigestCard({
             onClick={() => onEscalate(item.id)}
             disabled={!canEscalate}
             title={canEscalate ? "Escalate for senior review" : "Upgrade to Pro for escalation"}
-            className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-500/15 text-purple-400 hover:bg-purple-500/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            className="px-3 py-1.5 text-xs font-medium rounded-btn border border-purple-border bg-purple-light text-purple hover:bg-purple/15 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Escalate
           </button>
@@ -168,7 +168,7 @@ function ConfirmDialog({
   onConfirm,
   onCancel,
 }: {
-  kind: "approve" | "deny";
+  kind: "approve" | "deny" | "clear";
   count: number;
   busy: boolean;
   onConfirm: () => void;
@@ -183,11 +183,14 @@ function ConfirmDialog({
     return () => window.removeEventListener("keydown", handler);
   }, [onCancel, busy]);
 
-  const isApprove = kind === "approve";
-  const verb = isApprove ? "Approve" : "Deny";
-  const confirmClass = isApprove
-    ? "bg-status-allow-green text-white hover:bg-status-allow-green/90"
-    : "bg-status-deny-red text-white hover:bg-status-deny-red/90";
+  const verb =
+    kind === "approve" ? "Approve" : kind === "deny" ? "Deny" : "Clear";
+  const confirmClass =
+    kind === "approve"
+      ? "bg-green text-accent-ink font-heading font-semibold hover:bg-green-dark"
+      : kind === "deny"
+        ? "border border-danger-border text-danger-text hover:bg-danger-light"
+        : "border border-border text-text hover:border-border-dark hover:bg-surface-2";
 
   return (
     <div
@@ -195,23 +198,27 @@ function ConfirmDialog({
       onClick={busy ? undefined : onCancel}
     >
       <div
-        className="bg-white border border-grith-border rounded-xl shadow-2xl max-w-md w-full p-5"
+        className="bg-surface border border-border rounded-card max-w-md w-full p-5"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-base font-semibold text-grith-text mb-1.5">
-          {verb} {count} pending item{count !== 1 ? "s" : ""}?
+        <h2 className="font-heading text-[15px] font-semibold text-text mb-1.5">
+          {verb} {count} {kind === "clear" ? "" : "pending "}item
+          {count !== 1 ? "s" : ""}?
         </h2>
-        <p className="text-sm text-grith-muted mb-5">
-          {isApprove
-            ? "Every pending item in the queue will be approved and its tool call allowed. This cannot be undone."
-            : "Every pending item in the queue will be denied and its tool call blocked. This cannot be undone."}
-          {" "}Escalated items are not affected.
+        <p className="text-sm text-text-secondary mb-5">
+          {kind === "approve" &&
+            "Every pending item in the queue will be approved and its tool call allowed. This cannot be undone. "}
+          {kind === "deny" &&
+            "Every pending item in the queue will be denied and its tool call stopped. This cannot be undone. "}
+          {kind === "clear" &&
+            "Every actionable item (pending and escalated) will be dismissed from the queue - not approved or denied, just cleared. This cannot be undone."}
+          {kind !== "clear" && "Escalated items are not affected."}
         </p>
         <div className="flex justify-end gap-2">
           <button
             onClick={onCancel}
             disabled={busy}
-            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50"
+            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors disabled:opacity-50"
           >
             Cancel
           </button>
@@ -248,6 +255,7 @@ export function DigestPage() {
     escalate,
     approveMany,
     denyMany,
+    clearAll,
     bulkBusy,
     refresh,
   } = useDigest();
@@ -255,7 +263,7 @@ export function DigestPage() {
   // Captured at the moment the bulk action is requested, so the confirmation
   // count stays stable while items clear out of the list.
   const [confirmBulk, setConfirmBulk] = useState<null | {
-    kind: "approve" | "deny";
+    kind: "approve" | "deny" | "clear";
     ids: string[];
   }>(null);
   const { lastEvent, liveFeedUnavailable } = useWebSocket();
@@ -316,7 +324,8 @@ export function DigestPage() {
     if (!confirmBulk) return;
     const { kind, ids } = confirmBulk;
     if (kind === "approve") await approveMany(ids);
-    else await denyMany(ids);
+    else if (kind === "deny") await denyMany(ids);
+    else await clearAll();
     setConfirmBulk(null);
   };
 
@@ -324,23 +333,23 @@ export function DigestPage() {
     <div className="p-6 max-w-4xl">
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold text-grith-text">
+          <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text">
             Digest
           </h1>
           {pendingCount > 0 && (
-            <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-medium rounded-full bg-status-queue-amber/20 text-status-queue-amber">
+            <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-medium rounded-pill border border-warning-border bg-warning-light text-warning-text">
               {pendingCount}
             </span>
           )}
           {escalatedCount > 0 && (
-            <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-medium rounded-full bg-purple-500/20 text-purple-400">
+            <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-medium rounded-pill border border-purple-border bg-purple-light text-purple">
               {escalatedCount} escalated
             </span>
           )}
           {liveFeedUnavailable && (
             <span
               title="Re-open the dashboard using the URL grith printed on startup (it carries a one-time #token=…) to restore live updates."
-              className="inline-flex items-center gap-1 h-5 px-1.5 text-xs font-medium rounded-full bg-status-queue-amber/20 text-status-queue-amber"
+              className="inline-flex items-center gap-1 h-5 px-1.5 text-xs font-medium rounded-pill border border-warning-border bg-warning-light text-warning-text"
             >
               live feed offline
             </span>
@@ -357,7 +366,7 @@ export function DigestPage() {
                   })
                 }
                 disabled={bulkBusy}
-                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-status-allow-green/15 text-status-allow-green hover:bg-status-allow-green/25 transition-colors disabled:opacity-50"
+                className="px-3 py-1.5 text-xs font-medium rounded-btn border border-green-border bg-green-light text-accent-text hover:bg-green/15 transition-colors disabled:opacity-50"
               >
                 Approve all
               </button>
@@ -369,17 +378,34 @@ export function DigestPage() {
                   })
                 }
                 disabled={bulkBusy}
-                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-status-deny-red/15 text-status-deny-red hover:bg-status-deny-red/25 transition-colors disabled:opacity-50"
+                className="px-3 py-1.5 text-xs font-medium rounded-btn border border-danger-border bg-danger-light text-danger-text hover:bg-danger/15 transition-colors disabled:opacity-50"
               >
                 Deny all
               </button>
-              <span className="w-px h-5 bg-grith-border mx-1" />
             </>
+          )}
+          {items.length > 0 && (
+            <button
+              onClick={() =>
+                setConfirmBulk({
+                  kind: "clear",
+                  ids: items.map((i) => i.id),
+                })
+              }
+              disabled={bulkBusy}
+              title="Dismiss all items (pending + escalated) without approving or denying them"
+              className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors disabled:opacity-50"
+            >
+              Clear all
+            </button>
+          )}
+          {items.length > 0 && (
+            <span className="w-px h-5 bg-border mx-1" />
           )}
           <button
             onClick={() => void refresh()}
             disabled={loading}
-            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-grith-border text-grith-muted hover:text-grith-text hover:border-grith-border-hover transition-colors disabled:opacity-50"
+            className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text hover:border-border-dark transition-colors disabled:opacity-50"
           >
             {loading ? "Loading..." : "Refresh"}
           </button>
@@ -387,14 +413,14 @@ export function DigestPage() {
       </div>
 
       {error && (
-        <div className="bg-status-deny-red/10 border border-status-deny-red/30 rounded-xl p-3 mb-6 text-sm text-status-deny-red">
+        <div className="bg-danger-light border border-danger-border rounded-card p-3 mb-6 text-sm text-danger-text">
           {error}
         </div>
       )}
 
       {!loading && items.length === 0 && (
-        <div className="bg-white border border-grith-border rounded-xl p-8 text-center">
-          <p className="text-grith-muted text-sm">
+        <div className="bg-surface-2 border border-border rounded-card p-8 text-center">
+          <p className="text-text-secondary text-sm">
             No pending digest items. The proxy is handling everything
             automatically.
           </p>

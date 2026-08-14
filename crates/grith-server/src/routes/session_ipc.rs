@@ -14,6 +14,18 @@ use grith_supervisor::process_tree::ProcessTree;
 use grith_supervisor::supervisor::{SessionStats, SessionSummary, SupervisorSession};
 use serde::Deserialize;
 
+/// Body for `POST /api/ipc/session-reservations` (work/74 Phase 1).
+///
+/// Deliberately minimal: at reserve time the CLI knows only what it is about
+/// to launch, not the session id or root PID — those exist only after a
+/// successful spawn and arrive with the activation.
+#[derive(Deserialize)]
+pub(crate) struct SessionReservationRequest {
+    pub tool_name: String,
+    #[serde(default)]
+    pub profile_name: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct SessionSnapshotRequest {
     pub id: String,
@@ -32,6 +44,25 @@ pub(crate) struct SessionSnapshotRequest {
     pub process_tree_pids: Vec<u32>,
     #[serde(default)]
     pub stats: SessionStats,
+    /// Instance id of the daemon that originally *admitted* this session, as
+    /// captured by the CLI at connect time (B12 #77). Carried on every
+    /// heartbeat so the adopt-on-heartbeat path can tell a normal update from
+    /// an authority transfer to a daemon that never admitted the session
+    /// (i.e. the original daemon restarted or was replaced). `None` from an
+    /// older CLI, or one that could not read the daemon's identity — treated
+    /// as "cannot compare", never as a match.
+    #[serde(default)]
+    pub admitting_instance_id: Option<String>,
+}
+
+/// B12 #77: does adopting this heartbeat transfer the session's authority
+/// across a daemon-instance boundary? True only when both the admitting id
+/// (from the CLI) and this daemon's id are known *and differ*. A missing id
+/// on either side is "cannot compare" — never a mismatch — so an older CLI
+/// or a daemon without a published identity degrades to the prior behaviour
+/// rather than blocking a live session.
+fn adoption_crosses_instance(admitting: Option<&str>, current: Option<&str>) -> bool {
+    matches!((admitting, current), (Some(a), Some(c)) if a != c)
 }
 
 fn restore_process_tree(tool_name: &str, root_pid: u32, pids: &[u32]) -> ProcessTree {
@@ -144,16 +175,10 @@ fn session_limit_rejection_response(
     (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response()
 }
 
-pub(crate) async fn register_session(
-    _auth: IpcAuth,
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(body): Json<SessionSnapshotRequest>,
-) -> impl IntoResponse {
-    let id = match parse_uuid_or_400(&body.id) {
-        Ok(id) => id,
-        Err(resp) => return resp,
-    };
+/// Reconstruct a `SupervisorSession` from a wire snapshot. Shared by the
+/// register path and the heartbeat-adopt path in `update_session` so both
+/// build the session identically.
+fn session_from_snapshot(id: uuid::Uuid, body: &SessionSnapshotRequest) -> SupervisorSession {
     let mut session = SupervisorSession::new(body.tool_name.clone(), body.root_pid);
     session.id = id;
     session.profile_name = body.profile_name.clone();
@@ -166,6 +191,20 @@ pub(crate) async fn register_session(
     session.stats = body.stats.clone();
     session.process_tree =
         restore_process_tree(&body.tool_name, body.root_pid, &body.process_tree_pids);
+    session
+}
+
+pub(crate) async fn register_session(
+    _auth: IpcAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SessionSnapshotRequest>,
+) -> impl IntoResponse {
+    let id = match parse_uuid_or_400(&body.id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let session = session_from_snapshot(id, &body);
 
     let mut registry = match state.supervisor_registry.lock() {
         Ok(r) => r,
@@ -200,6 +239,45 @@ pub(crate) async fn register_session(
             tracing::info!(session_id = %id, tool = %body.tool_name, pid = body.root_pid, "IPC session registered");
             StatusCode::CREATED.into_response()
         }
+        // work/74 Phase 5: a quarantined audit chain is NOT a plan-limit
+        // rejection. Reporting it as one would show the user a bogus "upgrade
+        // for more sessions" prompt for a problem no upgrade fixes, and would
+        // pollute the 7-day rejection counter that drives the upsell nudge.
+        Err(grith_supervisor::Error::AuditQuarantined(reason)) => {
+            drop(registry);
+            tracing::error!(
+                event = "session_refused_audit_quarantined",
+                session_id = %id,
+                reason = %reason,
+                "refusing session registration: audit chain quarantined"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": "audit_chain_quarantined",
+                    "message": format!(
+                        "The audit chain failed verification, so grith will not start a \
+                         supervised session it cannot verifiably record: {reason}"
+                    ),
+                    "remediation": "grith audit diagnose",
+                    "records_preserved": true,
+                })),
+            )
+                .into_response()
+        }
+        // Like quarantine, a read-only audit handle is not a plan-limit
+        // rejection: no upgrade fixes it, and it must not pollute the
+        // rejection counter that drives the upsell nudge.
+        Err(grith_supervisor::Error::AuditReadOnly(reason)) => {
+            drop(registry);
+            tracing::error!(
+                event = "session_refused_audit_read_only",
+                session_id = %id,
+                reason = %reason,
+                "refusing session registration: audit database is read-only"
+            );
+            audit_read_only_response(&reason)
+        }
         Err(e) => {
             let active = registry.count();
             drop(registry);
@@ -230,6 +308,225 @@ pub(crate) async fn register_session(
     }
 }
 
+/// The 503 envelope for a daemon whose audit database is read-only: same
+/// principle as the quarantine envelope (a session grith cannot record must
+/// not start), different cause and remedy.
+fn audit_read_only_response(reason: &str) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "error": "audit_read_only",
+            "message": format!(
+                "This daemon cannot write audit records ({reason}), so grith \
+                 will not start a supervised session it cannot record."
+            ),
+            "remediation": "grith daemon restart",
+        })),
+    )
+        .into_response()
+}
+
+/// Shared rendering for an admission refusal, so the reservation routes
+/// return exactly the envelopes the register route already returns.
+fn admission_error_response(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    err: &grith_supervisor::Error,
+    limit: usize,
+    active: usize,
+) -> axum::response::Response {
+    match err {
+        grith_supervisor::Error::AuditQuarantined(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "audit_chain_quarantined",
+                "message": format!(
+                    "The audit chain failed verification, so grith will not start a \
+                     supervised session it cannot verifiably record: {reason}"
+                ),
+                "remediation": "grith audit diagnose",
+                "records_preserved": true,
+            })),
+        )
+            .into_response(),
+        grith_supervisor::Error::AuditReadOnly(reason) => audit_read_only_response(reason),
+        _ => {
+            let tier = state
+                .feature_gate
+                .read()
+                .map(|g| g.tier)
+                .unwrap_or(grith_digest::notification::PlanTier::Community);
+            crate::record_session_limit_rejection(&state.session_limit_rejections);
+            session_limit_rejection_response(
+                headers,
+                tier,
+                limit,
+                active,
+                state.billing_portal_url.as_deref(),
+            )
+        }
+    }
+}
+
+/// `POST /api/ipc/session-reservations` — claim a capacity slot *before* the
+/// target process is created (work/74 Phase 1, go-live review B12 item 1).
+///
+/// Admission used to happen after the spawn, so a capacity rejection could
+/// land once the supervised tool had already executed code. Reserving first
+/// means the refusal happens while there is still nothing running.
+pub(crate) async fn reserve_session(
+    _auth: IpcAuth,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SessionReservationRequest>,
+) -> impl IntoResponse {
+    let mut registry = match state.supervisor_registry.lock() {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "supervisor registry lock poisoned",
+            )
+                .into_response()
+        }
+    };
+
+    let limit = registry.max_sessions();
+    match registry.reserve(&body.tool_name, body.profile_name.as_deref()) {
+        Ok(reservation_id) => {
+            let active = registry.occupancy();
+            drop(registry);
+            tracing::info!(
+                event = "session_reserved",
+                reservation_id = %reservation_id,
+                tool = %body.tool_name,
+                active,
+                limit,
+                "capacity reserved before spawn"
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "reservation_id": reservation_id.to_string(),
+                    "expires_in_seconds":
+                        grith_supervisor::supervisor::RESERVATION_TTL.as_secs(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let active = registry.occupancy();
+            drop(registry);
+            tracing::warn!(
+                event = "session_reservation_refused",
+                tool = %body.tool_name,
+                error = %e,
+                active,
+                limit,
+                "refused capacity reservation before spawn"
+            );
+            admission_error_response(&state, &headers, &e, limit, active)
+        }
+    }
+}
+
+/// `POST /api/ipc/session-reservations/:id/activate` — turn a held
+/// reservation into a registered session once the spawn has succeeded.
+///
+/// Idempotent: a retried activation for an already-registered session is a
+/// success, not a second seat.
+pub(crate) async fn activate_session(
+    _auth: IpcAuth,
+    State(state): State<AppState>,
+    Path(reservation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SessionSnapshotRequest>,
+) -> impl IntoResponse {
+    let reservation_id = match parse_uuid_or_400(&reservation_id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let session_id = match parse_uuid_or_400(&body.id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let session = session_from_snapshot(session_id, &body);
+
+    let mut registry = match state.supervisor_registry.lock() {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "supervisor registry lock poisoned",
+            )
+                .into_response()
+        }
+    };
+
+    let limit = registry.max_sessions();
+    match registry.activate(reservation_id, session) {
+        Ok(()) => {
+            drop(registry);
+            tracing::info!(
+                event = "session_activated",
+                reservation_id = %reservation_id,
+                session_id = %session_id,
+                tool = %body.tool_name,
+                pid = body.root_pid,
+                "reservation activated into a live session"
+            );
+            StatusCode::CREATED.into_response()
+        }
+        Err(e) => {
+            let active = registry.occupancy();
+            drop(registry);
+            tracing::warn!(
+                event = "session_activation_refused",
+                reservation_id = %reservation_id,
+                session_id = %session_id,
+                error = %e,
+                "refused to activate reservation"
+            );
+            admission_error_response(&state, &headers, &e, limit, active)
+        }
+    }
+}
+
+/// `DELETE /api/ipc/session-reservations/:id` — release a reservation whose
+/// spawn failed. The TTL reaper is the backstop; this is the fast path.
+pub(crate) async fn cancel_session_reservation(
+    _auth: IpcAuth,
+    State(state): State<AppState>,
+    Path(reservation_id): Path<String>,
+) -> impl IntoResponse {
+    let reservation_id = match parse_uuid_or_400(&reservation_id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    match state.supervisor_registry.lock() {
+        Ok(mut registry) => {
+            let held = registry.cancel(reservation_id);
+            drop(registry);
+            if held {
+                tracing::info!(
+                    event = "session_reservation_cancelled",
+                    reservation_id = %reservation_id,
+                    "released capacity reservation"
+                );
+            }
+            // Cancelling an unknown or already-expired lease is not an error:
+            // the caller's intent (don't hold this seat) is satisfied either
+            // way, and a 404 would only invite pointless retry logic.
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "supervisor registry lock poisoned",
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn update_session(
     _auth: IpcAuth,
     State(state): State<AppState>,
@@ -244,13 +541,110 @@ pub(crate) async fn update_session(
         return (StatusCode::BAD_REQUEST, "path ID does not match body ID").into_response();
     }
     match state.supervisor_registry.lock() {
-        Ok(mut registry) => match registry.get_mut(&id) {
-            Some(session) => {
+        Ok(mut registry) => {
+            if let Some(session) = registry.get_mut(&id) {
                 apply_snapshot(session, &body, true);
-                StatusCode::OK.into_response()
+                return StatusCode::OK.into_response();
             }
-            None => (StatusCode::NOT_FOUND, "session not found").into_response(),
-        },
+            // Adopt-on-heartbeat: the daemon doesn't know this session — almost
+            // always because it restarted while the supervised process kept
+            // running (its register-at-start call was against the old daemon).
+            // The heartbeat PUT carries the full snapshot, so re-register the
+            // session here instead of 404ing it into invisibility forever. Only
+            // a live process heartbeats, so this can't resurrect a dead session;
+            // reap dead slots first so adoption still honours the licensed cap.
+            //
+            // B12 #77: this is precisely the "silently transfer its authority
+            // to a daemon that never admitted it" case the daemon-identity
+            // work exists to surface. If the CLI captured the admitting
+            // daemon's instance id and it differs from ours, the session is
+            // crossing a daemon-instance boundary — make it loud rather than
+            // silent. Fail-safe is to adopt anyway (refusing would drop a live
+            // session), but never without a record.
+            //
+            // Residual: even flagged, we cannot prove the records written to
+            // the *previous* daemon's audit chain and those we will now write
+            // form one continuous, verifiable chain — the two daemons may own
+            // different audit databases (`DaemonIdentity::audit_path`). That
+            // audit-path continuity check is deferred; the flag here is the
+            // detection, not the repair.
+            if adoption_crosses_instance(
+                body.admitting_instance_id.as_deref(),
+                state.instance_id.as_deref(),
+            ) {
+                tracing::warn!(
+                    event = "session_adopted_across_daemon_instance",
+                    session_id = %id,
+                    pid = body.root_pid,
+                    admitting_instance_id = body.admitting_instance_id.as_deref().unwrap_or("unknown"),
+                    current_instance_id = state.instance_id.as_deref().unwrap_or("unknown"),
+                    "adopting a session admitted by a different daemon instance; audit-chain \
+                     continuity across the restart is not verified (B12 #77 residual)"
+                );
+            }
+            if registry.count() >= registry.max_sessions() {
+                registry.reap_dead();
+            }
+            let session = session_from_snapshot(id, &body);
+            match registry.register(session) {
+                Ok(()) => {
+                    tracing::info!(
+                        event = "session_adopted_on_heartbeat",
+                        session_id = %id,
+                        pid = body.root_pid,
+                        "adopted an orphaned session via heartbeat (daemon likely restarted)"
+                    );
+                    StatusCode::OK.into_response()
+                }
+                Err(e) => {
+                    // work/74 Phase 3 (go-live review B12 item 2): answering
+                    // 200 here told the client everything was fine while the
+                    // daemon accounted for nothing — the session kept running
+                    // untracked, outside the licensed cap and outside the
+                    // registry that makes it visible or killable.
+                    //
+                    // 409 is the honest answer: the request is understood and
+                    // refused because of the daemon's current state. The
+                    // client decides what to do about it (see the
+                    // authority-lost handling in the supervisor loop); the
+                    // daemon does not kill anyone's work from here. The
+                    // status stays 409 for every cause — the heartbeat
+                    // client's authority-lost handling keys off 4xx, and a
+                    // permanent 503 would retry forever — but the structured
+                    // reason and remediation must name the actual cause.
+                    let (reason, remediation) = match &e {
+                        grith_supervisor::Error::AuditQuarantined(_) => {
+                            ("audit_quarantined", vec!["grith audit diagnose"])
+                        }
+                        grith_supervisor::Error::AuditReadOnly(_) => {
+                            ("audit_read_only", vec!["grith daemon restart"])
+                        }
+                        _ => ("capacity", vec!["close_session", "upgrade"]),
+                    };
+                    tracing::warn!(
+                        event = "session_adoption_refused",
+                        session_id = %id,
+                        reason,
+                        error = %e,
+                        "refusing to adopt an orphaned session"
+                    );
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({
+                            "error": "session_not_tracked",
+                            "reason": reason,
+                            "message": format!(
+                                "This daemon is not tracking session {id} and cannot adopt \
+                                 it: {e}. Its decisions are still being evaluated, but the \
+                                 daemon is not accounting for the session."
+                            ),
+                            "remediation": remediation,
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "supervisor registry lock poisoned",
@@ -401,8 +795,24 @@ mod tests {
                 total_queued: 0,
                 total_denied: 0,
                 total_filtered_noise: noise,
+                ..Default::default()
             },
+            admitting_instance_id: None,
         }
+    }
+
+    #[test]
+    fn adoption_crosses_instance_only_on_a_known_mismatch() {
+        // Both known and different — the authority-transfer case.
+        assert!(adoption_crosses_instance(Some("a"), Some("b")));
+        // Same instance — an ordinary in-place update, not a crossing.
+        assert!(!adoption_crosses_instance(Some("a"), Some("a")));
+        // Either side unknown — cannot compare, so never a crossing. This is
+        // what keeps an older CLI or an identity-less daemon from blocking a
+        // live session.
+        assert!(!adoption_crosses_instance(None, Some("b")));
+        assert!(!adoption_crosses_instance(Some("a"), None));
+        assert!(!adoption_crosses_instance(None, None));
     }
 
     /// An aged Instant that is safe even on a freshly-booted monotonic clock.

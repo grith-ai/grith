@@ -217,7 +217,7 @@ async fn guard_exfil_of_tainted_path_still_fires_under_data_flow_rule() {
 /// fire. Condition 4 is now suppressed under
 /// `taint_outbound_requires_data_flow`; genuine exfil still fires via
 /// conditions 1–3/5 (see the guard tests below), and an outbound connection to
-/// an untrusted destination is independently scored by `egress_policy`.
+/// an untrusted destination is independently scored by `egress-policy`.
 #[tokio::test]
 async fn accept_own_credential_outbound_use_does_not_fire() {
     let proxy = proxy_with_data_flow_taint();

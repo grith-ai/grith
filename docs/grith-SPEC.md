@@ -898,14 +898,14 @@ Composite rules that fire when specific filter combinations match:
 
 [[meta_rules]]
 id = "ssh-key-access"
-conditions = [{ filter = "path_match", rule_id = "ssh-private-key", matched = true }]
+conditions = [{ filter = "path-match", rule_id = "ssh-private-key", matched = true }]
 score_override = 8.0
 message = "Direct SSH private key access"
 
 [[meta_rules]]
 id = "npm-dependency-resolution"
 conditions = [
-    { filter = "path_match", rule_id = "package-json", matched = true },
+    { filter = "path-match", rule_id = "package-json", matched = true },
     { call_type = "DirList", path_contains = "node_modules" }
 ]
 score_adjustment = -3.0
@@ -927,7 +927,7 @@ Simple filters expressed in TOML, lowering the contribution barrier:
 
 ```toml
 [rules.sensitive-ssh-key]
-type = "path_match"
+type = "path-match"
 pattern = "~/.ssh/id_*"
 operations = ["read", "write", "delete"]
 score = 5.0

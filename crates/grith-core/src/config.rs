@@ -120,6 +120,10 @@ impl AuditCompleteness {
 }
 
 /// General daemon settings (log level, audit directory, plan tier).
+// These are independent on/off daemon settings (update checks, audit sync,
+// profile updates, onboarding state), not a state machine that should be an
+// enum — so the bool count is intentional.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
@@ -136,6 +140,19 @@ pub struct GeneralConfig {
     /// Check for remote profile updates on startup. Defaults to `true`.
     /// Set to `false` to disable OTA supervisor profile overlay checks.
     pub profile_update_check: bool,
+    /// Whether the interactive first-run onboarding flow has completed.
+    /// Defaults to `false` on a brand-new install so `grith` / `grith run`
+    /// can offer guided setup once. Set to `true` by the onboarding flow,
+    /// by `grith init`, and by `scripts/setup.sh`. Pre-flag user configs
+    /// (those that predate this key) are migrated to `true` at load time so
+    /// existing users are never re-prompted after an upgrade — see
+    /// `GrithConfig::load`.
+    pub onboarded: bool,
+    /// Whether the one-line first-run notice has already been shown on a
+    /// `grith exec` invocation. Tracked separately from `onboarded` because
+    /// supervising an external tool is not the same as completing setup.
+    /// Flipped to `true` after the notice prints once.
+    pub exec_notice_seen: bool,
 }
 
 /// LLM provider configuration (provider selection, credentials, routing).
@@ -528,6 +545,12 @@ pub struct SupervisorCoreConfig {
     pub enabled: bool,
     pub default_profile: String,
     pub freeze_timeout_seconds: u64,
+    /// Seconds an operator's deny keeps auto-denying identical retries
+    /// without a fresh prompt. `0` disables replay.
+    pub deny_replay_seconds: u64,
+    /// Seconds an operator's approval keeps auto-allowing identical retries
+    /// without a fresh prompt. `0` disables replay.
+    pub approve_replay_seconds: u64,
     pub max_concurrent_sessions: usize,
     pub pty_forwarding: bool,
     /// Linux attach mechanism (`traceme` | `seize`). See [`AttachMode`].
@@ -549,6 +572,16 @@ pub struct SupervisorCoreConfig {
     /// vector). Off by default until the false-positive budget is measured.
     #[serde(default)]
     pub pty_ownership_enforce: bool,
+    /// Seconds to keep running after the daemon stops accounting for this
+    /// session before terminating it automatically. `0` (the default) means
+    /// never — the session keeps running with a loud warning and the operator
+    /// decides (work/74 Phase 3).
+    ///
+    /// Terminating by default would destroy in-progress agent work because of
+    /// a daemon-side event the user did not cause. CI, where nobody is
+    /// watching the banner, can opt into a grace period.
+    #[serde(default)]
+    pub authority_lost_terminate_after_seconds: u64,
 }
 
 /// PR 6 Phase F: per-category coverage feature flags.
@@ -574,11 +607,25 @@ pub struct CoverageConfig {
     /// Category 1: hard-deny kernel-module load/unload + kexec.
     /// No legitimate use in supervised AI tools. **Default ON.**
     pub category1_hard_deny: bool,
-    /// Category 2: proxy-evaluated chown / mount / ptrace family.
-    /// May QUEUE legitimate operations during calibration. **Default
-    /// OFF.** Enable once the relevant profile capability grants
-    /// (fs:ownership / fs:mount / process:ptrace) are wired.
+    /// Category 2 (filesystem subset): proxy-evaluated chown / mount
+    /// family. May QUEUE legitimate operations during calibration.
+    /// **Default OFF** — sandboxes and rootless container runtimes do
+    /// real mount/chown work. Enable once the relevant profile
+    /// capability grants (fs:ownership / fs:mount) are wired.
     pub category2_proxy: bool,
+    /// Category 2 (cross-process subset): proxy-evaluated ptrace /
+    /// process_vm_readv / process_vm_writev against a target OUTSIDE the
+    /// supervised process tree. **Default ON** — a supervised tool has
+    /// no legitimate reason to read a *non-descendant* process's memory,
+    /// so this is ~0 false positives and closes the scope-0 secret-theft
+    /// path (lifting decrypted secrets from another app's address space,
+    /// which `process_vm_readv` can do at `ptrace_scope=0` with no tracer
+    /// slot). Reads of an *in-tree* descendant/sibling (LeakSanitizer at
+    /// exit, crash handlers, fork/trace test harnesses) are allowed and
+    /// audit-recorded — the target is already inside the session sandbox.
+    /// `PTRACE_TRACEME` and self-targeted `process_vm` are carved out in
+    /// classify.
+    pub category2_crossprocess: bool,
     /// Category 3: namespace primitives (unshare/setns) with the
     /// profile-declared `namespace_users` carveout. **Default OFF.**
     /// Enable once the profile's `namespace_users` and
@@ -588,6 +635,16 @@ pub struct CoverageConfig {
     /// iopl / swapon / reboot, etc.). **Default ON** — same threat
     /// profile as Category 1.
     pub category4_arch_priv: bool,
+    /// Deny a tracee installing its own `NEW_LISTENER` seccomp filter — the
+    /// proven escape that out-ranks grith's interception. **Default ON.**
+    /// Its only collateral is rootless container runtimes using
+    /// seccomp-notify, which fail loudly. Turn OFF only if you must run those
+    /// under supervision and accept the exposure.
+    pub deny_self_seccomp_notify: bool,
+    /// Audit-only observation of a tracee installing a plain seccomp filter
+    /// (audit-blinding, not an escape). **Default OFF** — sandboxes
+    /// self-filter routinely, so this is noise until the volume is measured.
+    pub observe_self_seccomp_filter: bool,
 }
 
 impl Default for CoverageConfig {
@@ -595,8 +652,11 @@ impl Default for CoverageConfig {
         Self {
             category1_hard_deny: true,
             category2_proxy: false,
+            category2_crossprocess: true,
             category3_namespace: false,
             category4_arch_priv: true,
+            deny_self_seccomp_notify: true,
+            observe_self_seccomp_filter: false,
         }
     }
 }
@@ -619,12 +679,76 @@ pub struct SupervisorNoiseConfig {
     pub batch_window_ms: u64,
 }
 
-/// DNS inspection settings for supervisor DNS proxy interception.
+/// Enforcement used by both the in-line and connected-proxy DNS paths when a
+/// policy decision is queued for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SupervisorDnsProxyQueueAction {
+    #[default]
+    Refuse,
+    Forward,
+}
+
+impl std::fmt::Display for SupervisorDnsProxyQueueAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refuse => f.write_str("refuse"),
+            Self::Forward => f.write_str("forward"),
+        }
+    }
+}
+
+impl std::str::FromStr for SupervisorDnsProxyQueueAction {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "refuse" => Ok(Self::Refuse),
+            "forward" => Ok(Self::Forward),
+            _ => Err(()),
+        }
+    }
+}
+
+/// DNS inspection settings for supervisor DNS interception.
+// Each bool is an independent operator-facing TOML toggle; grouping them into
+// sub-structs would break the flat config schema for no benefit.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SupervisorDnsInspectionConfig {
     pub enabled: bool,
     pub upstream_resolver: Option<String>,
+    /// Observe DNS responses to populate the exact IP→domain cache (promotes
+    /// the recvfrom syscall to catch its exit). Query blocking is independent.
+    pub observe_responses: bool,
+    /// Deny TCP-DNS (force the inspected UDP path). TCP-DNS can't be
+    /// content-inspected, so allowing it would leave query blocking bypassable.
+    pub block_tcp_dns: bool,
+    /// Canary connected-UDP proxy. Defaults off.
+    pub connected_udp_proxy: bool,
+    /// Explicit acceptance of any network authority gained by proxy-owned
+    /// upstream sockets. Defaults false.
+    pub accept_proxy_network_authority: bool,
+    /// Wire result for QUEUE-range decisions.
+    pub proxy_queue_action: SupervisorDnsProxyQueueAction,
+    /// Largest proxied UDP response, in bytes.
+    pub proxy_max_response_bytes: usize,
+    /// Policy decision timeout before SERVFAIL.
+    pub proxy_policy_timeout_ms: u64,
+    /// Upstream response timeout before SERVFAIL.
+    pub proxy_upstream_timeout_ms: u64,
+    /// Route-task drain timeout before the worker aborts remaining tasks and
+    /// joins its owning thread.
+    pub proxy_shutdown_timeout_ms: u64,
+    /// Maximum live routes per session.
+    pub proxy_route_capacity: usize,
+    /// Maximum outstanding queries per session.
+    pub proxy_query_capacity: usize,
+    /// Proxy control-channel capacity.
+    pub proxy_control_capacity: usize,
+    /// Maximum concurrent policy evaluations.
+    pub proxy_policy_capacity: usize,
 }
 
 // --- Notification Config ---
@@ -772,6 +896,24 @@ pub struct NotifyRoutingConfig {
     pub filter_overrides: std::collections::HashMap<String, Vec<String>>,
 }
 
+impl NotifyRoutingConfig {
+    /// `filter_overrides` with legacy snake_case filter names normalised to
+    /// their kebab-case equivalents. Routing matches override keys against
+    /// live filter names, so a pre-rename config entry like
+    /// `"dlp_gate" = ["slack"]` would silently stop routing without this.
+    pub fn canonical_filter_overrides(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.filter_overrides
+            .iter()
+            .map(|(name, channels)| {
+                (
+                    grith_proxy::filters::canonical_filter_name(name).to_string(),
+                    channels.clone(),
+                )
+            })
+            .collect()
+    }
+}
+
 /// Per-channel notification rate limiting and quiet hours.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -811,6 +953,8 @@ impl Default for GeneralConfig {
             update_check: true,
             audit_sync: true,
             profile_update_check: true,
+            onboarded: false,
+            exec_notice_seen: false,
         }
     }
 }
@@ -946,6 +1090,8 @@ impl Default for SupervisorCoreConfig {
             enabled: true,
             default_profile: String::new(),
             freeze_timeout_seconds: 300,
+            deny_replay_seconds: 60,
+            approve_replay_seconds: 60,
             max_concurrent_sessions: 4,
             pty_forwarding: true,
             attach_mode: AttachMode::default(),
@@ -955,6 +1101,7 @@ impl Default for SupervisorCoreConfig {
             dns_inspection: SupervisorDnsInspectionConfig::default(),
             coverage: CoverageConfig::default(),
             pty_ownership_enforce: false,
+            authority_lost_terminate_after_seconds: 0,
         }
     }
 }
@@ -984,6 +1131,19 @@ impl Default for SupervisorDnsInspectionConfig {
         Self {
             enabled: true,
             upstream_resolver: None,
+            observe_responses: true,
+            block_tcp_dns: true,
+            connected_udp_proxy: false,
+            accept_proxy_network_authority: false,
+            proxy_queue_action: SupervisorDnsProxyQueueAction::Refuse,
+            proxy_max_response_bytes: 4096,
+            proxy_policy_timeout_ms: 1_000,
+            proxy_upstream_timeout_ms: 5_000,
+            proxy_shutdown_timeout_ms: 2_000,
+            proxy_route_capacity: 256,
+            proxy_query_capacity: 1_024,
+            proxy_control_capacity: 256,
+            proxy_policy_capacity: 128,
         }
     }
 }
@@ -1165,7 +1325,15 @@ impl GrithConfig {
 
         // Layer 1: User config (~/.config/grith/config.toml)
         let user_config_path = dirs_path("~/.config/grith/config.toml");
-        if user_config_path.exists() {
+        let user_config_exists = user_config_path.exists();
+        // Whether the user's *raw* config file explicitly declares the
+        // onboarding flag. We must inspect the raw TOML (not the merged
+        // struct) because `#[serde(default)]` silently fills a missing
+        // `onboarded` with `false`, which `merge_config` would then treat as
+        // an explicit override — indistinguishable from a real choice.
+        let user_declares_onboarded =
+            user_config_exists && raw_config_declares_general_key(&user_config_path, "onboarded");
+        if user_config_exists {
             let user = Self::from_file(&user_config_path)?;
             config = merge_config(config, user);
         }
@@ -1185,6 +1353,10 @@ impl GrithConfig {
 
         // Layer 4: Environment variable overrides
         config = apply_env_overrides(config);
+
+        // Onboarding migration: a user config that predates the onboarding
+        // flag must NOT trigger the first-run wizard after an upgrade.
+        migrate_onboarding_flags(&mut config, user_config_exists, user_declares_onboarded);
 
         Ok(config)
     }
@@ -1283,6 +1455,8 @@ impl GrithConfig {
             parse("bool")   "general.audit_sync"                => general.audit_sync;
             parse("bool")   "general.update_check"              => general.update_check;
             parse("bool")   "general.profile_update_check"      => general.profile_update_check;
+            parse("bool")   "general.onboarded"                 => general.onboarded;
+            parse("bool")   "general.exec_notice_seen"          => general.exec_notice_seen;
             parse("float")  "proxy.auto_allow_threshold"        => proxy.auto_allow_threshold;
             parse("float")  "proxy.auto_deny_threshold"         => proxy.auto_deny_threshold;
             parse("u64")    "proxy.review_timeout_seconds"      => proxy.review_timeout_seconds;
@@ -1290,9 +1464,24 @@ impl GrithConfig {
             parse("port")   "server.port"                       => server.port;
             parse("bool")   "supervisor.enabled"                => supervisor.enabled;
             parse("u64")    "supervisor.freeze_timeout_seconds" => supervisor.freeze_timeout_seconds;
+            parse("u64")    "supervisor.deny_replay_seconds"    => supervisor.deny_replay_seconds;
+            parse("u64")    "supervisor.approve_replay_seconds" => supervisor.approve_replay_seconds;
             parse("usize")  "supervisor.max_concurrent_sessions" => supervisor.max_concurrent_sessions;
             parse("bool")   "supervisor.pty_forwarding"         => supervisor.pty_forwarding;
             parse("bool")   "supervisor.dns_inspection.enabled" => supervisor.dns_inspection.enabled;
+            parse("bool")   "supervisor.dns_inspection.observe_responses" => supervisor.dns_inspection.observe_responses;
+            parse("bool")   "supervisor.dns_inspection.block_tcp_dns" => supervisor.dns_inspection.block_tcp_dns;
+            parse("bool")   "supervisor.dns_inspection.connected_udp_proxy" => supervisor.dns_inspection.connected_udp_proxy;
+            parse("bool")   "supervisor.dns_inspection.accept_proxy_network_authority" => supervisor.dns_inspection.accept_proxy_network_authority;
+            parse("DNS proxy queue action") "supervisor.dns_inspection.proxy_queue_action" => supervisor.dns_inspection.proxy_queue_action;
+            parse("usize")  "supervisor.dns_inspection.proxy_max_response_bytes" => supervisor.dns_inspection.proxy_max_response_bytes;
+            parse("u64")    "supervisor.dns_inspection.proxy_policy_timeout_ms" => supervisor.dns_inspection.proxy_policy_timeout_ms;
+            parse("u64")    "supervisor.dns_inspection.proxy_upstream_timeout_ms" => supervisor.dns_inspection.proxy_upstream_timeout_ms;
+            parse("u64")    "supervisor.dns_inspection.proxy_shutdown_timeout_ms" => supervisor.dns_inspection.proxy_shutdown_timeout_ms;
+            parse("usize")  "supervisor.dns_inspection.proxy_route_capacity" => supervisor.dns_inspection.proxy_route_capacity;
+            parse("usize")  "supervisor.dns_inspection.proxy_query_capacity" => supervisor.dns_inspection.proxy_query_capacity;
+            parse("usize")  "supervisor.dns_inspection.proxy_control_capacity" => supervisor.dns_inspection.proxy_control_capacity;
+            parse("usize")  "supervisor.dns_inspection.proxy_policy_capacity" => supervisor.dns_inspection.proxy_policy_capacity;
             parse("bool")   "notifications.enabled"             => notifications.enabled;
             parse("bool")   "notifications.desktop.enabled"     => notifications.desktop.enabled;
             parse("bool")   "notifications.slack.enabled"       => notifications.slack.enabled;
@@ -1361,6 +1550,42 @@ impl GrithConfig {
             if self.server.rate_limit.ipc_rps == 0 {
                 issues.push("server.rate_limit.ipc_rps must be > 0 when enabled".to_string());
             }
+        }
+
+        let dns = &self.supervisor.dns_inspection;
+        if dns.connected_udp_proxy && !dns.enabled {
+            issues.push(
+                "supervisor.dns_inspection.connected_udp_proxy requires \
+                 dns_inspection.enabled = true"
+                    .to_string(),
+            );
+        }
+        if dns.connected_udp_proxy && !dns.accept_proxy_network_authority {
+            issues.push(
+                "supervisor.dns_inspection.connected_udp_proxy requires \
+                 accept_proxy_network_authority = true after reviewing cgroup/firewall/socket \
+                 authority differences"
+                    .to_string(),
+            );
+        }
+        if !(512..=65_535).contains(&dns.proxy_max_response_bytes) {
+            issues.push(
+                "supervisor.dns_inspection.proxy_max_response_bytes must be in 512..=65535"
+                    .to_string(),
+            );
+        }
+        if dns.proxy_policy_timeout_ms == 0
+            || dns.proxy_upstream_timeout_ms == 0
+            || dns.proxy_shutdown_timeout_ms == 0
+        {
+            issues.push("supervisor DNS proxy timeouts must be > 0".to_string());
+        }
+        if dns.proxy_route_capacity == 0
+            || dns.proxy_query_capacity == 0
+            || dns.proxy_control_capacity == 0
+            || dns.proxy_policy_capacity == 0
+        {
+            issues.push("supervisor DNS proxy capacities must be > 0".to_string());
         }
 
         if self.supervisor.default_profile.trim().is_empty() {
@@ -1454,6 +1679,49 @@ fn embedded_default_toml() -> Option<&'static str> {
 /// Merge two configs via TOML-level deep merge.
 /// Values from `overlay` take precedence, but unset fields
 /// (absent from the overlay TOML) keep their base values.
+/// In-memory onboarding normalization applied after config layering.
+///
+/// If the user already has a config file but it does not declare
+/// `general.onboarded`, the install predates the onboarding flag — treat that
+/// machine as already onboarded (and suppress the one-time exec notice) so an
+/// upgrade never surprises the user with a first-run wizard. A fresh install
+/// (no user config file) keeps the embedded default of `false` and stays
+/// eligible. This never rewrites the user's file — it is purely in-memory.
+///
+/// Edge case: because the decision is keyed only on whether the *user* config
+/// file declares the flag, a pre-flag user config combined with a project-local
+/// `.grith/config.toml` or `--config` file that explicitly sets
+/// `general.onboarded = false` will have that downstream `false` normalized to
+/// `true`. `onboarded` is a managed flag not meant to be hand-set in project /
+/// explicit layers, so this is acceptable.
+fn migrate_onboarding_flags(
+    config: &mut GrithConfig,
+    user_config_exists: bool,
+    user_declares_onboarded: bool,
+) {
+    if user_config_exists && !user_declares_onboarded {
+        config.general.onboarded = true;
+        config.general.exec_notice_seen = true;
+    }
+}
+
+/// Returns `true` if the raw TOML at `path` explicitly declares
+/// `[general].<key>`. Used by onboarding migration to distinguish "the user
+/// chose a value" from "serde defaulted a missing key". Any read/parse error
+/// is treated as "not declared" (the caller's safe-by-default branch).
+fn raw_config_declares_general_key(path: &Path, key: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return false;
+    };
+    value
+        .get("general")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|general| general.contains_key(key))
+}
+
 fn merge_config(base: GrithConfig, overlay: GrithConfig) -> GrithConfig {
     // Serialize both to TOML Value, deep merge, then deserialize back.
     let base_val = toml::Value::try_from(&base).unwrap_or(toml::Value::Table(Default::default()));
@@ -1535,6 +1803,17 @@ fn apply_env_overrides(mut config: GrithConfig) -> GrithConfig {
     env_parse!(config, "GRITH_SUPERVISOR_ENABLED"            => supervisor.enabled);
     env_parse!(config, "GRITH_SUPERVISOR_TIMEOUT"            => supervisor.freeze_timeout_seconds);
     env_parse!(config, "GRITH_SUPERVISOR_DNS_INSPECTION_ENABLED" => supervisor.dns_inspection.enabled);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_CONNECTED_UDP_PROXY" => supervisor.dns_inspection.connected_udp_proxy);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_ACCEPT_PROXY_NETWORK_AUTHORITY" => supervisor.dns_inspection.accept_proxy_network_authority);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_QUEUE_ACTION" => supervisor.dns_inspection.proxy_queue_action);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_MAX_RESPONSE_BYTES" => supervisor.dns_inspection.proxy_max_response_bytes);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_POLICY_TIMEOUT_MS" => supervisor.dns_inspection.proxy_policy_timeout_ms);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_UPSTREAM_TIMEOUT_MS" => supervisor.dns_inspection.proxy_upstream_timeout_ms);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_SHUTDOWN_TIMEOUT_MS" => supervisor.dns_inspection.proxy_shutdown_timeout_ms);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_ROUTE_CAPACITY" => supervisor.dns_inspection.proxy_route_capacity);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_QUERY_CAPACITY" => supervisor.dns_inspection.proxy_query_capacity);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_CONTROL_CAPACITY" => supervisor.dns_inspection.proxy_control_capacity);
+    env_parse!(config, "GRITH_SUPERVISOR_DNS_PROXY_POLICY_CAPACITY" => supervisor.dns_inspection.proxy_policy_capacity);
     env_parse!(config, "GRITH_NOTIFICATIONS_ENABLED"         => notifications.enabled);
     env_parse!(config, "GRITH_NOTIFICATIONS_DESKTOP_ENABLED" => notifications.desktop.enabled);
     env_parse!(config, "GRITH_NOTIFICATIONS_SLACK_ENABLED"   => notifications.slack.enabled);
@@ -1605,6 +1884,194 @@ mod tests {
         assert_eq!(config.proxy.auto_deny_threshold, 8.0);
         assert_eq!(config.server.port, 3141);
         assert_eq!(config.llm.default_provider, "ollama");
+        // A brand-new install is not yet onboarded.
+        assert!(!config.general.onboarded);
+        assert!(!config.general.exec_notice_seen);
+    }
+
+    #[test]
+    fn test_connected_dns_proxy_defaults_and_toml_surface() {
+        let defaults = GrithConfig::default();
+        let dns = &defaults.supervisor.dns_inspection;
+        assert!(!dns.connected_udp_proxy);
+        assert!(!dns.accept_proxy_network_authority);
+        assert_eq!(
+            dns.proxy_queue_action,
+            SupervisorDnsProxyQueueAction::Refuse
+        );
+        assert_eq!(dns.proxy_max_response_bytes, 4096);
+        assert_eq!(dns.proxy_policy_timeout_ms, 1_000);
+        assert_eq!(dns.proxy_upstream_timeout_ms, 5_000);
+        assert_eq!(dns.proxy_shutdown_timeout_ms, 2_000);
+        assert_eq!(dns.proxy_route_capacity, 256);
+        assert_eq!(dns.proxy_query_capacity, 1_024);
+        assert_eq!(dns.proxy_control_capacity, 256);
+        assert_eq!(dns.proxy_policy_capacity, 128);
+
+        let parsed: GrithConfig = toml::from_str(
+            r#"
+                [supervisor.dns_inspection]
+                connected_udp_proxy = true
+                accept_proxy_network_authority = true
+                proxy_queue_action = "forward"
+                proxy_max_response_bytes = 1232
+                proxy_policy_timeout_ms = 250
+                proxy_upstream_timeout_ms = 750
+                proxy_shutdown_timeout_ms = 500
+                proxy_route_capacity = 8
+                proxy_query_capacity = 32
+                proxy_control_capacity = 16
+                proxy_policy_capacity = 4
+            "#,
+        )
+        .unwrap();
+        let dns = &parsed.supervisor.dns_inspection;
+        assert!(dns.connected_udp_proxy);
+        assert!(dns.accept_proxy_network_authority);
+        assert_eq!(
+            dns.proxy_queue_action,
+            SupervisorDnsProxyQueueAction::Forward
+        );
+        assert_eq!(dns.proxy_max_response_bytes, 1232);
+        assert_eq!(dns.proxy_policy_timeout_ms, 250);
+        assert_eq!(dns.proxy_upstream_timeout_ms, 750);
+        assert_eq!(dns.proxy_shutdown_timeout_ms, 500);
+        assert_eq!(dns.proxy_route_capacity, 8);
+        assert_eq!(dns.proxy_query_capacity, 32);
+        assert_eq!(dns.proxy_control_capacity, 16);
+        assert_eq!(dns.proxy_policy_capacity, 4);
+    }
+
+    #[test]
+    fn test_checked_in_default_toml_keeps_connected_dns_proxy_off() {
+        let parsed: GrithConfig =
+            toml::from_str(include_str!("../../../config/default.toml")).unwrap();
+        let dns = &parsed.supervisor.dns_inspection;
+        assert!(!dns.connected_udp_proxy);
+        assert!(!dns.accept_proxy_network_authority);
+        assert_eq!(
+            dns.proxy_queue_action,
+            SupervisorDnsProxyQueueAction::Refuse
+        );
+        assert_eq!(dns.proxy_max_response_bytes, 4096);
+        assert_eq!(dns.proxy_policy_timeout_ms, 1_000);
+        assert_eq!(dns.proxy_upstream_timeout_ms, 5_000);
+        assert_eq!(dns.proxy_shutdown_timeout_ms, 2_000);
+        assert_eq!(dns.proxy_route_capacity, 256);
+        assert_eq!(dns.proxy_query_capacity, 1_024);
+        assert_eq!(dns.proxy_control_capacity, 256);
+        assert_eq!(dns.proxy_policy_capacity, 128);
+    }
+
+    #[test]
+    fn test_connected_dns_proxy_set_value_surface() {
+        let mut config = GrithConfig::default();
+        config
+            .set_value("supervisor.dns_inspection.connected_udp_proxy", "true")
+            .unwrap();
+        config
+            .set_value(
+                "supervisor.dns_inspection.accept_proxy_network_authority",
+                "true",
+            )
+            .unwrap();
+        config
+            .set_value("supervisor.dns_inspection.proxy_queue_action", "forward")
+            .unwrap();
+        config
+            .set_value("supervisor.dns_inspection.proxy_max_response_bytes", "1232")
+            .unwrap();
+        assert!(config.supervisor.dns_inspection.connected_udp_proxy);
+        assert!(
+            config
+                .supervisor
+                .dns_inspection
+                .accept_proxy_network_authority
+        );
+        assert_eq!(
+            config.supervisor.dns_inspection.proxy_queue_action,
+            SupervisorDnsProxyQueueAction::Forward
+        );
+        assert_eq!(
+            config.supervisor.dns_inspection.proxy_max_response_bytes,
+            1232
+        );
+        assert!(config
+            .set_value("supervisor.dns_inspection.proxy_queue_action", "wait",)
+            .is_err());
+    }
+
+    #[test]
+    fn test_set_onboarding_flags() {
+        let mut config = GrithConfig::default();
+        let old = config.set_value("general.onboarded", "true").unwrap();
+        assert_eq!(old, "false");
+        assert!(config.general.onboarded);
+        let old = config
+            .set_value("general.exec_notice_seen", "true")
+            .unwrap();
+        assert_eq!(old, "false");
+        assert!(config.general.exec_notice_seen);
+    }
+
+    #[test]
+    fn test_raw_config_declares_general_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_key = dir.path().join("with.toml");
+        std::fs::write(&with_key, "[general]\nonboarded = false\n").unwrap();
+        assert!(raw_config_declares_general_key(&with_key, "onboarded"));
+
+        let without_key = dir.path().join("without.toml");
+        std::fs::write(&without_key, "[general]\nlog_level = \"info\"\n").unwrap();
+        assert!(!raw_config_declares_general_key(&without_key, "onboarded"));
+
+        let no_general = dir.path().join("none.toml");
+        std::fs::write(&no_general, "[proxy]\nauto_allow_threshold = 1.0\n").unwrap();
+        assert!(!raw_config_declares_general_key(&no_general, "onboarded"));
+
+        let missing = dir.path().join("missing.toml");
+        assert!(!raw_config_declares_general_key(&missing, "onboarded"));
+
+        // TOML dotted-key form parses into a `general` table, so it is
+        // correctly detected as a declaration.
+        let dotted = dir.path().join("dotted.toml");
+        std::fs::write(&dotted, "general.onboarded = true\n").unwrap();
+        assert!(raw_config_declares_general_key(&dotted, "onboarded"));
+
+        // Inline-table form likewise.
+        let inline = dir.path().join("inline.toml");
+        std::fs::write(&inline, "general = { onboarded = true }\n").unwrap();
+        assert!(raw_config_declares_general_key(&inline, "onboarded"));
+    }
+
+    #[test]
+    fn test_migrate_onboarding_flags_preflag_config_treated_as_onboarded() {
+        // Existing user config that predates the flag → migrate to onboarded,
+        // and suppress the one-time exec notice, so upgrades never re-prompt.
+        let mut config = GrithConfig::default();
+        assert!(!config.general.onboarded);
+        migrate_onboarding_flags(&mut config, true, false);
+        assert!(config.general.onboarded);
+        assert!(config.general.exec_notice_seen);
+    }
+
+    #[test]
+    fn test_migrate_onboarding_flags_fresh_install_stays_eligible() {
+        // No user config file → fresh install → stays not-onboarded.
+        let mut config = GrithConfig::default();
+        migrate_onboarding_flags(&mut config, false, false);
+        assert!(!config.general.onboarded);
+        assert!(!config.general.exec_notice_seen);
+    }
+
+    #[test]
+    fn test_migrate_onboarding_flags_explicit_choice_respected() {
+        // User config explicitly declares the key → respect their value
+        // (here: explicitly not onboarded, e.g. they want the wizard).
+        let mut config = GrithConfig::default();
+        config.general.onboarded = false;
+        migrate_onboarding_flags(&mut config, true, true);
+        assert!(!config.general.onboarded);
     }
 
     #[test]
@@ -1749,6 +2216,31 @@ enabled = false
     }
 
     #[test]
+    fn test_validate_connected_dns_proxy_requires_authority_acceptance_and_bounds() {
+        let mut config = GrithConfig::default();
+        config.supervisor.default_profile = "generic".to_string();
+        config.supervisor.dns_inspection.connected_udp_proxy = true;
+        let issues = config.validate();
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("accept_proxy_network_authority")));
+
+        config
+            .supervisor
+            .dns_inspection
+            .accept_proxy_network_authority = true;
+        config.supervisor.dns_inspection.proxy_max_response_bytes = 0;
+        config.supervisor.dns_inspection.proxy_query_capacity = 0;
+        config.supervisor.dns_inspection.proxy_policy_timeout_ms = 0;
+        let issues = config.validate();
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("proxy_max_response_bytes")));
+        assert!(issues.iter().any(|issue| issue.contains("capacities")));
+        assert!(issues.iter().any(|issue| issue.contains("timeouts")));
+    }
+
+    #[test]
     fn test_validate_bad_log_level() {
         let mut config = GrithConfig::default();
         config.general.log_level = "verbose".to_string();
@@ -1869,5 +2361,36 @@ significant_deviation_score = 4.25
 
         let issues = config.validate();
         assert!(!issues.iter().any(|i| i.contains("server.rate_limit")));
+    }
+
+    #[test]
+    fn test_notify_routing_canonicalises_legacy_filter_override_keys() {
+        // A pre-rename config carries snake_case filter names in
+        // notifications.routing.filter_overrides. The routing engine
+        // matches keys against live kebab-case filter names, so the
+        // handoff must normalise them.
+        let mut routing = NotifyRoutingConfig::default();
+        routing
+            .filter_overrides
+            .insert("dlp_gate".to_string(), vec!["slack".to_string()]);
+        routing
+            .filter_overrides
+            .insert("secret_scan".to_string(), vec!["email".to_string()]);
+        routing
+            .filter_overrides
+            .insert("canary".to_string(), vec!["pagerduty".to_string()]);
+
+        let canonical = routing.canonical_filter_overrides();
+        assert_eq!(canonical.get("dlp-gate"), Some(&vec!["slack".to_string()]));
+        assert_eq!(
+            canonical.get("secret-scan"),
+            Some(&vec!["email".to_string()])
+        );
+        assert_eq!(
+            canonical.get("canary"),
+            Some(&vec!["pagerduty".to_string()])
+        );
+        assert!(!canonical.contains_key("dlp_gate"));
+        assert!(!canonical.contains_key("secret_scan"));
     }
 }

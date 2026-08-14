@@ -65,6 +65,17 @@ impl SecurityFilter for ArgumentFilter {
                 }
                 self.check_path(new_path)
             }
+            // Check the target first — it is the sensitive side of a link —
+            // then the link path, which can itself be a traversal attempt.
+            ToolCallType::FileLink {
+                target, link_path, ..
+            } => {
+                let result = self.check_path(target)?;
+                if result.matched {
+                    return Ok(result);
+                }
+                self.check_path(link_path)
+            }
             ToolCallType::ShellExec { .. } | ToolCallType::ProcessSpawn { .. } => {
                 match ctx.full_command() {
                     Some(full) => self.check_command(&full),

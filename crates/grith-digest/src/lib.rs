@@ -21,4 +21,7 @@ pub use notification::{
 };
 pub use queue::DigestQueue;
 pub use scheduler::DigestScheduler;
-pub use types::{DigestItem, DigestStatus, ReviewAction, ReviewOutcome};
+pub use types::{
+    DigestItem, DigestStatus, PermissionReviewAction, ReviewAction, ReviewOutcome,
+    ScopedAllowRequest,
+};

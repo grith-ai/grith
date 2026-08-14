@@ -12,11 +12,11 @@ use crate::types::FilterResult;
 
 /// Filter name prefixes that indicate exfiltration-related detections.
 const EXFIL_FILTERS: &[&str] = &[
-    "egress_policy",
-    "dlp_gate",
+    "egress-policy",
+    "dlp-gate",
     "canary",
-    "session_containment",
-    "egress_rate",
+    "session-containment",
+    "egress-rate",
 ];
 
 /// Examine filter results and return human-readable annotation strings
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_exfil_annotations_non_exfil_filter() {
         let results = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "ssh-key",
             5.0,
             Severity::Critical,
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn test_exfil_annotations_egress_policy() {
         let results = vec![FilterResult::matched(
-            "egress_policy",
+            "egress-policy",
             "untrusted-destination",
             4.0,
             Severity::Warning,
@@ -140,14 +140,14 @@ mod tests {
         let annotations = exfil_annotations(&results);
         assert_eq!(annotations.len(), 1);
         assert!(annotations[0].contains("[EXFIL]"));
-        assert!(annotations[0].contains("egress_policy"));
+        assert!(annotations[0].contains("egress-policy"));
         assert!(annotations[0].contains("untrusted-destination"));
     }
 
     #[test]
     fn test_exfil_annotations_dlp_gate() {
         let results = vec![FilterResult::matched(
-            "dlp_gate",
+            "dlp-gate",
             "api-key-detected",
             6.0,
             Severity::Error,
@@ -155,7 +155,7 @@ mod tests {
         )];
         let annotations = exfil_annotations(&results);
         assert_eq!(annotations.len(), 1);
-        assert!(annotations[0].contains("dlp_gate"));
+        assert!(annotations[0].contains("dlp-gate"));
     }
 
     #[test]
@@ -176,15 +176,15 @@ mod tests {
     fn test_exfil_annotations_multiple() {
         let results = vec![
             FilterResult::matched(
-                "egress_policy",
+                "egress-policy",
                 "untrusted-dest",
                 3.0,
                 Severity::Warning,
                 "untrusted",
             ),
-            FilterResult::no_match("path_match"),
+            FilterResult::no_match("path-match"),
             FilterResult::matched(
-                "dlp_gate",
+                "dlp-gate",
                 "token-found",
                 5.0,
                 Severity::Error,
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn test_has_exfil_detections() {
         let no_exfil = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "test",
             1.0,
             Severity::Notice,
@@ -214,7 +214,7 @@ mod tests {
         assert!(!has_exfil_detections(&no_exfil));
 
         let with_exfil = vec![FilterResult::matched(
-            "egress_rate",
+            "egress-rate",
             "burst",
             4.0,
             Severity::Warning,
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_classify_protocol_http() {
         let results = vec![FilterResult::matched(
-            "egress_policy",
+            "egress-policy",
             "http-outbound",
             3.0,
             Severity::Warning,
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn test_classify_protocol_none() {
         let results = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "generic",
             1.0,
             Severity::Notice,
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn test_extract_destination_from_url() {
         let results = vec![FilterResult::matched(
-            "egress_policy",
+            "egress-policy",
             "untrusted",
             3.0,
             Severity::Warning,
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_extract_destination_none() {
         let results = vec![FilterResult::matched(
-            "egress_rate",
+            "egress-rate",
             "burst",
             4.0,
             Severity::Warning,
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_unmatched_exfil_filter_not_annotated() {
-        let results = vec![FilterResult::no_match("egress_policy")];
+        let results = vec![FilterResult::no_match("egress-policy")];
         assert!(exfil_annotations(&results).is_empty());
         assert!(!has_exfil_detections(&results));
     }

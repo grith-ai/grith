@@ -1,77 +1,42 @@
 @import "tailwindcss";
+@import "./grith-theme.css";
+@import "./grith-fonts.css";
 
-@theme {
-  /* Brand — matches grith-website design system */
-  --color-green: #00a85a;
-  --color-green-dark: #008548;
-  --color-green-light: #e6f9ef;
-  --color-green-border: #b4e6cc;
+/*
+ * Design tokens and fonts come from the canonical grith theme copies above
+ * (source: grith-website/packages/theme/src; generated - do not hand-edit).
+ * Dark is the default theme; the inline FOUC guard in index.html sets
+ * data-theme on <html> before first paint and ThemeToggle flips it at
+ * runtime (plan tasks LD1/F4).
+ *
+ * Note: grith-theme.css maps Tailwind tokens via `@theme inline`, which does
+ * NOT emit runtime --color-* custom properties. Hand-authored rules below
+ * therefore use the raw var(--g-*) properties so they stay theme-reactive.
+ *
+ * Dashboard-only additions live BELOW the generated imports, never inside
+ * them. As of LD1 every dashboard token maps onto a canonical one, so no
+ * extension tokens are needed - everything below is component-level styling.
+ */
 
-  /* Backgrounds & surfaces */
-  --color-grith-bg: #ffffff;
-  --color-grith-surface: #f3f5f8;
-  --color-grith-surface-alt: #eaecf1;
-
-  /* Borders */
-  --color-grith-border: #e2e6eb;
-  --color-grith-border-hover: #d0d5dc;
-
-  /* Text */
-  --color-grith-text: #0d1117;
-  --color-grith-text-bright: #0d1117;
-  --color-grith-muted: #57606a;
-  --color-grith-dim: #8b949e;
-
-  /* Status — semantic colours shared with website */
-  --color-status-allow-green: #00a85a;
-  --color-status-queue-amber: #bf8700;
-  --color-status-deny-red: #d1242f;
-
-  /* Status light backgrounds */
-  --color-status-allow-light: #e6f9ef;
-  --color-status-queue-light: #fff8e1;
-  --color-status-deny-light: #fef1f2;
-
-  /* Accent — green (matches brand) */
-  --color-accent: #00a85a;
-  --color-accent-hover: #008548;
-  --color-accent-light: #e6f9ef;
-
-  /* Info / purple */
-  --color-info: #0969da;
-  --color-info-light: #edf5ff;
-  --color-purple: #8250df;
-  --color-purple-light: #f3eeff;
-
-  /* Terminal (dark code blocks) */
-  --color-terminal-bg: #0d1117;
-  --color-terminal-text: #e6edf3;
-  --color-terminal-border: #21262d;
-
-  /* Radius — slightly larger to match website */
-  --radius-card: 12px;
-  --radius-input: 8px;
-
-  /* Typography — Inter + JetBrains Mono */
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+/* color-scheme follows the theme - grith-theme.css sets tokens only */
+:root {
+  color-scheme: dark;
 }
 
-/* Base styles — light mode */
-html {
+:root[data-theme="light"] {
   color-scheme: light;
 }
 
 body {
-  @apply bg-grith-bg text-grith-text;
+  @apply bg-bg text-text font-body;
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
 ::selection {
-  background-color: rgba(0, 168, 90, 0.15);
-  color: #0d1117;
+  background-color: var(--g-accent-tint-border);
+  color: var(--g-text);
 }
 
 /* Scrollbar styling */
@@ -81,30 +46,30 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--color-grith-surface);
+  background: var(--g-surface);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--color-grith-border-hover);
+  background: var(--g-border-strong);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-grith-dim);
+  background: var(--g-muted);
 }
 
-/* Score bar gradients */
+/* Score bar gradient - allow to queue to deny along the score axis */
 .score-bar {
   background: linear-gradient(
     to right,
-    var(--color-status-allow-green) 0%,
-    var(--color-status-queue-amber) 37.5%,
-    var(--color-status-deny-red) 100%
+    var(--g-accent) 0%,
+    var(--g-warning) 37.5%,
+    var(--g-danger) 100%
   );
 }
 
 /* Monospace text */
-.font-mono {
+.font-code {
   font-feature-settings: "liga" 0;
 }
 
@@ -162,9 +127,11 @@ body {
   }
 }
 
-/* Hero atmosphere: deep terminal background + green aurora + fine grid. */
+/* Hero atmosphere: deep terminal background + green aurora + fine grid.
+   Fixed-dark in both themes, so it sits on the terminal token and the
+   canonical accent #00e5a0 (LD3) - no off-palette greens. */
 .grith-hero {
-  background-color: #0a0c10;
+  background-color: var(--g-code-bg);
   position: relative;
   overflow: hidden;
   isolation: isolate;
@@ -176,7 +143,7 @@ body {
   height: 140%;
   background:
     radial-gradient(60% 80% at 78% 8%, rgba(0, 229, 160, 0.22), transparent 60%),
-    radial-gradient(45% 60% at 12% 4%, rgba(0, 168, 90, 0.14), transparent 60%);
+    radial-gradient(45% 60% at 12% 4%, rgba(0, 229, 160, 0.1), transparent 60%);
   animation: grith-glow-drift 14s ease-in-out infinite;
   z-index: -1;
 }

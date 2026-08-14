@@ -168,7 +168,7 @@ async fn s3_remove_prod_bucket_denies() {
 async fn s3_remove_staging_object_allows() {
     // §1.4: a single-object, non-production delete is routine and must ALLOW.
     // The destructive-action filter stays silent, and (after the egress
-    // object-storage-URI fix) `egress_policy` no longer flags the `s3://…`
+    // object-storage-URI fix) `egress-policy` no longer flags the `s3://…`
     // bucket as an unknown network destination, so the composite is ALLOW.
     let cmd = "aws s3 rm s3://staging-builds/old-artifact.zip";
     assert_destructive_action_silent(shell(cmd), "s3 rm: destructive-action silent").await;

@@ -27,6 +27,12 @@ pub struct MetaCondition {
     pub call_type: Option<String>,
     pub path_contains: Option<String>,
     pub taint_source: Option<String>,
+    /// Matches when any filter result carries this metadata key set to `true`
+    /// (e.g. egress-policy's `exfil_shape`). Lets a meta-rule combine a signal
+    /// that a filter surfaces as metadata — rather than as its single collapsed
+    /// rule_id — with signals from other filters.
+    #[serde(default)]
+    pub metadata_flag: Option<String>,
 }
 
 /// Engine that evaluates meta-rules against filter results.
@@ -80,8 +86,12 @@ impl MetaRuleEngine {
     ) -> bool {
         // Check filter-based conditions
         if let Some(filter_name) = &condition.filter {
+            // Normalise legacy snake_case filter names so a stale user- or
+            // cwd-local meta_rules.toml copy (which takes load precedence)
+            // keeps matching after the kebab-case rename.
+            let want = crate::filters::canonical_filter_name(filter_name);
             let filter_match = results.iter().any(|r| {
-                let name_matches = r.filter_name == *filter_name;
+                let name_matches = r.filter_name == want;
                 let rule_matches = condition
                     .rule_id
                     .as_ref()
@@ -105,6 +115,7 @@ impl MetaRuleEngine {
                 ToolCallType::ShellExec { .. } => "ShellExec",
                 ToolCallType::HttpRequest { .. } => "HttpRequest",
                 ToolCallType::FileRename { .. } => "FileRename",
+                ToolCallType::FileLink { .. } => "FileLink",
                 ToolCallType::FileChmod { .. } => "FileChmod",
                 ToolCallType::DirCreate { .. } => "DirCreate",
                 ToolCallType::NetConnect { .. } => "NetConnect",
@@ -161,6 +172,16 @@ impl MetaRuleEngine {
             }
         }
 
+        // Metadata-flag condition: any result carrying `metadata[flag] == true`.
+        if let Some(flag) = &condition.metadata_flag {
+            let flag_set = results
+                .iter()
+                .any(|r| r.metadata.get(flag).and_then(|v| v.as_bool()) == Some(true));
+            if !flag_set {
+                return false;
+            }
+        }
+
         true
     }
 }
@@ -179,7 +200,7 @@ mod tests {
     fn test_no_rules_no_adjustment() {
         let engine = MetaRuleEngine::new(vec![]);
         let results = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "ssh-private-key",
             5.0,
             Severity::Critical,
@@ -197,12 +218,13 @@ mod tests {
             id: "npm-dependency-resolution".into(),
             conditions: vec![
                 MetaCondition {
-                    filter: Some("path_match".into()),
+                    filter: Some("path-match".into()),
                     rule_id: Some("package-json".into()),
                     matched: Some(true),
                     call_type: None,
                     path_contains: None,
                     taint_source: None,
+                    metadata_flag: None,
                 },
                 MetaCondition {
                     filter: None,
@@ -211,6 +233,7 @@ mod tests {
                     call_type: Some("DirList".into()),
                     path_contains: Some("node_modules".into()),
                     taint_source: None,
+                    metadata_flag: None,
                 },
             ],
             score_override: None,
@@ -219,7 +242,7 @@ mod tests {
         }]);
 
         let results = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "package-json",
             2.0,
             Severity::Notice,
@@ -232,17 +255,97 @@ mod tests {
         assert_eq!(engine.evaluate(&results, &ctx), -3.0);
     }
 
+    fn cond_metadata_flag(flag: &str) -> MetaCondition {
+        MetaCondition {
+            filter: None,
+            rule_id: None,
+            matched: None,
+            call_type: None,
+            path_contains: None,
+            taint_source: None,
+            metadata_flag: Some(flag.into()),
+        }
+    }
+
+    fn cond_filter_matched(filter: &str) -> MetaCondition {
+        MetaCondition {
+            filter: Some(filter.into()),
+            rule_id: None,
+            matched: Some(true),
+            call_type: None,
+            path_contains: None,
+            taint_source: None,
+            metadata_flag: None,
+        }
+    }
+
+    /// C2: the `exfil_shape` metadata flag combines with a reputation signal
+    /// (a different filter) to sharpen — but only when BOTH are present.
+    #[test]
+    fn c2_exfil_shape_flag_combines_with_reputation() {
+        let engine = MetaRuleEngine::new(vec![MetaRule {
+            id: "exfil-shape-to-low-reputation".into(),
+            conditions: vec![
+                cond_metadata_flag("exfil_shape"),
+                cond_filter_matched("reputation"),
+            ],
+            score_override: None,
+            score_adjustment: Some(2.5),
+            message: "test".into(),
+        }]);
+        let ctx = make_ctx(ToolCallType::HttpRequest {
+            method: "POST".into(),
+            url: "https://1.2.3.4/x".into(),
+        });
+
+        // egress-policy's collapsed result carries the shape flag even though
+        // unknown-destination is its winning rule_id.
+        let mut shaped = FilterResult::matched(
+            "egress-policy",
+            "unknown-destination",
+            3.5,
+            Severity::Warning,
+            "unknown",
+        );
+        shaped
+            .metadata
+            .insert("exfil_shape".into(), serde_json::Value::Bool(true));
+        let rep = FilterResult::matched(
+            "reputation",
+            "raw-ip-destination",
+            3.0,
+            Severity::Warning,
+            "raw ip",
+        );
+
+        // Flag + reputation → fires.
+        assert_eq!(engine.evaluate(&[shaped.clone(), rep.clone()], &ctx), 2.5);
+        // Flag alone (no reputation) → no fire.
+        assert_eq!(engine.evaluate(std::slice::from_ref(&shaped), &ctx), 0.0);
+        // Reputation but no shape flag (a plain unknown-dest) → no fire: no new
+        // escalation on a non-shaped call.
+        let plain = FilterResult::matched(
+            "egress-policy",
+            "unknown-destination",
+            3.5,
+            Severity::Warning,
+            "unknown",
+        );
+        assert_eq!(engine.evaluate(&[plain, rep], &ctx), 0.0);
+    }
+
     #[test]
     fn test_score_override_fires() {
         let engine = MetaRuleEngine::new(vec![MetaRule {
             id: "ssh-key-access".into(),
             conditions: vec![MetaCondition {
-                filter: Some("path_match".into()),
+                filter: Some("path-match".into()),
                 rule_id: Some("ssh-private-key".into()),
                 matched: Some(true),
                 call_type: None,
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             }],
             score_override: Some(8.0),
             score_adjustment: None,
@@ -250,7 +353,7 @@ mod tests {
         }]);
 
         let results = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "ssh-private-key",
             5.0,
             Severity::Critical,
@@ -266,16 +369,54 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_snake_case_filter_condition_still_matches() {
+        // A stale user/cwd-local meta_rules.toml copy predating the
+        // kebab-case rename says `filter = "path_match"`. It must keep
+        // matching live results named "path-match" — the ssh-key-access
+        // 8.0 override silently disappearing would be a security
+        // regression.
+        let engine = MetaRuleEngine::new(vec![MetaRule {
+            id: "ssh-key-access".into(),
+            conditions: vec![MetaCondition {
+                filter: Some("path_match".into()),
+                rule_id: Some("ssh-private-key".into()),
+                matched: Some(true),
+                call_type: None,
+                path_contains: None,
+                taint_source: None,
+                metadata_flag: None,
+            }],
+            score_override: Some(8.0),
+            score_adjustment: None,
+            message: "Direct SSH private key access".into(),
+        }]);
+
+        let results = vec![FilterResult::matched(
+            "path-match",
+            "ssh-private-key",
+            5.0,
+            Severity::Critical,
+            "SSH key",
+        )];
+        let ctx = make_ctx(ToolCallType::FileRead {
+            path: "~/.ssh/id_rsa".into(),
+        });
+
+        assert_eq!(engine.evaluate(&results, &ctx), 3.0);
+    }
+
+    #[test]
     fn test_condition_not_met() {
         let engine = MetaRuleEngine::new(vec![MetaRule {
             id: "test".into(),
             conditions: vec![MetaCondition {
-                filter: Some("path_match".into()),
+                filter: Some("path-match".into()),
                 rule_id: Some("nonexistent".into()),
                 matched: Some(true),
                 call_type: None,
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             }],
             score_override: None,
             score_adjustment: Some(5.0),
@@ -283,7 +424,7 @@ mod tests {
         }]);
 
         let results = vec![FilterResult::matched(
-            "path_match",
+            "path-match",
             "ssh-private-key",
             5.0,
             Severity::Critical,
@@ -307,6 +448,7 @@ mod tests {
                 call_type: Some("HttpRequest".into()),
                 path_contains: None,
                 taint_source: None,
+                metadata_flag: None,
             }],
             score_override: None,
             score_adjustment: Some(2.0),
@@ -331,6 +473,7 @@ mod tests {
                 call_type: Some("HttpRequest".into()),
                 path_contains: None,
                 taint_source: Some("env-file".into()),
+                metadata_flag: None,
             }],
             score_override: None,
             score_adjustment: Some(5.0),

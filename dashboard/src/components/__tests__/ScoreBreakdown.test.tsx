@@ -16,7 +16,7 @@ describe("ScoreBreakdown", () => {
   it("renders filter bars for matched filters", () => {
     const filters: FilterResultSummary[] = [
       {
-        filter_name: "path_match",
+        filter_name: "path-match",
         rule_id: "ssh-key",
         matched: true,
         score: 5.0,
@@ -24,7 +24,7 @@ describe("ScoreBreakdown", () => {
         message: "SSH key access",
       },
       {
-        filter_name: "secret_scan",
+        filter_name: "secret-scan",
         rule_id: "aws-key",
         matched: true,
         score: 3.0,
@@ -37,9 +37,9 @@ describe("ScoreBreakdown", () => {
       <ScoreBreakdown filterResults={filters} compositeScore={8.0} />,
     );
 
-    expect(screen.getAllByText("path_match").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("path-match").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("+5.0")).toBeTruthy();
-    expect(screen.getAllByText("secret_scan").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("secret-scan").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("+3.0")).toBeTruthy();
   });
 
@@ -84,7 +84,7 @@ describe("ScoreBreakdown", () => {
   it("shows DENY for high score", () => {
     const filters: FilterResultSummary[] = [
       {
-        filter_name: "path_match",
+        filter_name: "path-match",
         rule_id: "ssh-key",
         matched: true,
         score: 5.0,
@@ -92,7 +92,7 @@ describe("ScoreBreakdown", () => {
         message: "SSH key",
       },
       {
-        filter_name: "secret_scan",
+        filter_name: "secret-scan",
         rule_id: "aws-key",
         matched: true,
         score: 5.0,
@@ -111,7 +111,7 @@ describe("ScoreBreakdown", () => {
   it("renders threshold markers", () => {
     const filters: FilterResultSummary[] = [
       {
-        filter_name: "path_match",
+        filter_name: "path-match",
         rule_id: "ssh-key",
         matched: true,
         score: 5.0,
@@ -119,7 +119,7 @@ describe("ScoreBreakdown", () => {
         message: "SSH key",
       },
       {
-        filter_name: "secret_scan",
+        filter_name: "secret-scan",
         rule_id: "aws-key",
         matched: true,
         score: 5.0,

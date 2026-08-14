@@ -16,6 +16,7 @@ use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::error::{Error, Result};
@@ -45,9 +46,54 @@ fn is_fallback_relevant_syscall(nr: i64, use_seccomp: bool) -> bool {
         || (!use_seccomp && (nr == super::syscall_nr::READ || nr == super::syscall_nr::WRITE))
 }
 
+#[inline]
+fn is_thread_group_child(parent_tgid: u32, child_tgid: u32) -> bool {
+    parent_tgid == child_tgid
+}
+
+#[inline]
+fn clone_shares_fd_table(flags: Option<u64>) -> bool {
+    flags.is_some_and(|flags| flags & libc::CLONE_FILES as u64 != 0)
+}
+
+#[inline]
+fn clone_creates_private_thread_fd_table(
+    parent_tgid: u32,
+    child_tgid: u32,
+    flags: Option<u64>,
+) -> bool {
+    is_thread_group_child(parent_tgid, child_tgid) && !clone_shares_fd_table(flags)
+}
+
+/// Cap on the number of bytes read from a tracee DNS query/response buffer.
+/// DNS messages are bounded well under this (EDNS0 typically advertises
+/// 1232/4096); the cap bounds the per-message PTRACE_PEEKDATA work.
+const MAX_DNS_MSG: usize = 4096;
+const MAX_DNS_BATCH: usize = 32;
+/// Aggregate iovec cap for one `sendmmsg(2)` inspection. Without a batch-wide
+/// bound, the per-message limit permits tens of thousands of synchronous
+/// ptrace metadata reads in one stopped syscall.
+const MAX_DNS_BATCH_IOVECS: usize = 1024;
+const MSGHDR_SIZE: u64 = 56;
+const MMSGHDR_SIZE: u64 = 64;
+
 // ---------------------------------------------------------------------------
 // Internal ptrace helpers
 // ---------------------------------------------------------------------------
+
+/// The kernel's record of a stopped tracee's syscall entry
+/// (`PTRACE_GET_SYSCALL_INFO`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyscallEntryInfo {
+    /// A syscall-entry or seccomp stop: the audit arch and number of the
+    /// syscall about to be dispatched, from the kernel's own bookkeeping.
+    Entry { arch: u32, nr: u64 },
+    /// The stop carries no entry record — a syscall-exit stop, a stop that is
+    /// not a syscall stop at all, or a tracee that died in its stop.
+    NotEntry,
+    /// `PTRACE_GET_SYSCALL_INFO` itself is not supported (pre-5.3 kernel).
+    Unsupported,
+}
 
 /// The ptrace options every supervised tracee is set with. Extracted so the
 /// fail-closed invariant — `PTRACE_O_EXITKILL` is always present, so tracees
@@ -87,17 +133,45 @@ impl PtraceSupervisor {
     /// Resume the tracee and ask the kernel to stop it again at the next
     /// syscall entry or exit boundary.
     pub(super) fn resume_to_next_syscall(&self, pid: Pid, signal: Option<Signal>) -> Result<()> {
-        ptrace::syscall(pid, signal).map_err(|e| {
-            Error::InterceptionError(format!("PTRACE_SYSCALL failed for pid {pid}: {e}"))
-        })
+        match ptrace::syscall(pid, signal) {
+            Ok(()) => Ok(()),
+            // The tracee exited or was group-killed (`exit_group`) while stopped,
+            // between its stop and this resume — a benign ptrace race, not a
+            // supervisor failure. Resuming a dead tracee is a no-op; its exit is
+            // reaped by the next `waitpid`. Never fatal (matches how the SIGKILL
+            // path and `read_registers` tolerate ESRCH).
+            Err(nix::errno::Errno::ESRCH) => {
+                trace!(
+                    pid = pid.as_raw(),
+                    "PTRACE_SYSCALL: tracee gone (ESRCH); ignoring"
+                );
+                Ok(())
+            }
+            Err(e) => Err(Error::InterceptionError(format!(
+                "PTRACE_SYSCALL failed for pid {pid}: {e}"
+            ))),
+        }
     }
 
     /// Resume the tracee with `PTRACE_CONT`. Used with seccomp-BPF
     /// pre-filtering: the seccomp filter handles syscall selection, so we
     /// only need `PTRACE_CONT` instead of `PTRACE_SYSCALL`.
     pub(super) fn resume_continue(&self, pid: Pid, signal: Option<Signal>) -> Result<()> {
-        ptrace::cont(pid, signal)
-            .map_err(|e| Error::InterceptionError(format!("PTRACE_CONT failed for pid {pid}: {e}")))
+        match ptrace::cont(pid, signal) {
+            Ok(()) => Ok(()),
+            // See `resume_to_next_syscall`: a tracee that died in its stop
+            // window yields ESRCH here. Benign — never fatal.
+            Err(nix::errno::Errno::ESRCH) => {
+                trace!(
+                    pid = pid.as_raw(),
+                    "PTRACE_CONT: tracee gone (ESRCH); ignoring"
+                );
+                Ok(())
+            }
+            Err(e) => Err(Error::InterceptionError(format!(
+                "PTRACE_CONT failed for pid {pid}: {e}"
+            ))),
+        }
     }
 
     /// Resume the tracee using the appropriate method based on whether
@@ -118,6 +192,16 @@ impl PtraceSupervisor {
         // confirmed wedge: clone threads landed in the syscall-fallback arm and
         // desynced). The PTRACE_SYSCALL fallback remains for attach-without-
         // seccomp sessions only.
+        // B13: a thread holding a connected datagram socket aimed at a
+        // non-loopback destination is stepped so its write/writev become
+        // visible. Checked before the seccomp gate — those syscalls are not in
+        // the filter, so PTRACE_CONT would run them unobserved. The window is
+        // bounded by ConnectedDgramStepping (opened at connect to a
+        // non-loopback peer, closed once the destination is allowed).
+        if self.tid_is_stepping(tid) {
+            self.last_resume_primitive.insert(tid, "SYSCALL");
+            return self.resume_to_next_syscall(pid, signal);
+        }
         if self.seccomp_session || self.seccomp_tracees.contains(&tid) {
             self.last_resume_primitive.insert(tid, "CONT");
             self.resume_continue(pid, signal)
@@ -127,11 +211,495 @@ impl PtraceSupervisor {
         }
     }
 
+    /// True for destinations whose traffic never needs stepping: loopback and
+    /// the unspecified address. This is the volume carve-out — DNS to
+    /// `127.0.0.53` and local services are the bulk of connected-datagram
+    /// traffic, and a loopback peer is not egress. IPv4-mapped IPv6 loopback
+    /// (`::ffff:127.0.0.1`) is unwrapped so it cannot be used to dodge the
+    /// check in the other direction.
+    pub(super) fn is_loopback_destination(destination: &std::net::SocketAddr) -> bool {
+        let ip = match destination.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(destination.ip(), std::net::IpAddr::V4),
+            other => other,
+        };
+        ip.is_loopback() || ip.is_unspecified()
+    }
+
+    /// Whether the thread `tid` should be resumed with `PTRACE_SYSCALL`.
+    ///
+    /// Keyed by the *process*, not the thread: the fd table is shared across a
+    /// thread group, so a sibling that never issued the `connect` can still
+    /// write the socket. Every thread of a process holding such a socket is
+    /// stepped.
+    pub(super) fn tid_is_stepping(&self, tid: u32) -> bool {
+        self.tid_tgids
+            .get(&tid)
+            .is_some_and(|tgid| self.stepping.contains_key(tgid))
+    }
+
+    /// Begin surfacing writes to `fd` — a datagram socket in `tgid` now
+    /// connected to a non-loopback peer (go-live review B13).
+    pub(super) fn promote_stepping(
+        &mut self,
+        tgid: u32,
+        fd: i32,
+        destination: std::net::SocketAddr,
+    ) {
+        let state = self.stepping.entry(tgid).or_default();
+        if state.fds.insert(fd) {
+            debug!(
+                tgid,
+                fd,
+                %destination,
+                tracked_fds = state.fds.len(),
+                event = "connected_dgram_stepping_promoted",
+                "stepping process so writes to a connected datagram socket are scored"
+            );
+        }
+    }
+
+    /// Stop tracking one fd. Stepping ends only when the process has no
+    /// tracked fds left — a process may hold several connected sockets at
+    /// once, and forgetting one must not un-cover the others.
+    pub(super) fn demote_stepping_fd(&mut self, tgid: u32, fd: i32, reason: &'static str) {
+        let Some(state) = self.stepping.get_mut(&tgid) else {
+            return;
+        };
+        if !state.fds.remove(&fd) {
+            return;
+        }
+        let remaining = state.fds.len();
+        if remaining == 0 {
+            self.stepping.remove(&tgid);
+        }
+        debug!(
+            tgid,
+            fd,
+            reason,
+            remaining,
+            event = "connected_dgram_stepping_demoted",
+            "stopped tracking a connected datagram socket"
+        );
+    }
+
+    /// Stop stepping the socket that `fd` refers to, by socket identity.
+    ///
+    /// `dup(2)` gives one socket several fd numbers, and the tracked fd is the
+    /// one the `connect` was on. A write through a *different* alias must
+    /// still demote the original, or the whole process stays two-stopped for
+    /// the rest of its life (go-live review round 2). The tracker shares
+    /// identity across dups, so this removes every tracked fd of the same
+    /// socket, plus the written fd itself as a fallback.
+    pub(super) fn demote_stepping_socket(&mut self, tgid: u32, fd: i32) {
+        let target = self.dns_tracker.socket_id(tgid, fd);
+        let Some(state) = self.stepping.get(&tgid) else {
+            return;
+        };
+        let tracked: Vec<i32> = state.fds.iter().copied().collect();
+        let mut to_remove: Vec<i32> = Vec::new();
+        for tracked_fd in tracked {
+            if tracked_fd == fd
+                || (target.is_some() && self.dns_tracker.socket_id(tgid, tracked_fd) == target)
+            {
+                to_remove.push(tracked_fd);
+            }
+        }
+        // The written fd may itself be tracked (the common, non-dup case).
+        if !to_remove.contains(&fd) {
+            to_remove.push(fd);
+        }
+        for f in to_remove {
+            self.demote_stepping_fd(tgid, f, "connected-datagram socket no longer stepped");
+        }
+    }
+
+    /// Stop tracking every fd of `tgid` (the process going away).
+    pub(super) fn demote_stepping_tgid(&mut self, tgid: u32, reason: &'static str) {
+        if self.stepping.remove(&tgid).is_some() {
+            debug!(
+                tgid,
+                reason,
+                event = "connected_dgram_stepping_demoted",
+                "stopped stepping process for connected-datagram writes"
+            );
+        }
+    }
+
+    /// Re-evaluate connected-datagram stepping across an `execve` (go-live
+    /// review B13 residual).
+    ///
+    /// A connected non-loopback datagram socket the pre-exec image opened
+    /// survives exec unless it was `FD_CLOEXEC`; callers prune the tracker to the
+    /// surviving fds *before* invoking this. Stepping is re-derived from the
+    /// sockets that survive **in the tracker**, not from the pre-exec
+    /// `state.fds`: a `dup`'d non-CLOEXEC alias shares socket identity but is a
+    /// distinct fd number absent from `state.fds`, and can be the ONLY survivor
+    /// when the fd the `connect` happened on was `FD_CLOEXEC`. Missing that alias
+    /// reopened the exact per-write bypass B13 closes. The old image's threads
+    /// are gone, so the whole stepping entry (fds + pending `awaiting`
+    /// decisions) is cleared before re-arming survivors.
+    fn resync_stepping_after_exec(&mut self, tgid: u32) {
+        if !self.stepping.contains_key(&tgid) {
+            return;
+        }
+        self.demote_stepping_tgid(tgid, "re-evaluating stepping across exec");
+        self.rearm_surviving_connected_dgram_fds(tgid);
+    }
+
+    /// (Re-)arm stepping for every fd of `tgid` that is *currently* a connected
+    /// off-host datagram socket in the tracker — including `dup`'d aliases,
+    /// resolved through shared socket identity. Additive and idempotent (it
+    /// never demotes), so it is safe to call after any targeted demote without
+    /// disturbing pending write decisions on other threads. This is what keeps a
+    /// surviving alias stepped after the fd the connect happened on is closed
+    /// (no-exec variant) or `FD_CLOEXEC`-dropped across exec.
+    fn rearm_surviving_connected_dgram_fds(&mut self, tgid: u32) {
+        let mut survivors = 0usize;
+        for fd in self.dns_tracker.tracked_fds(tgid) {
+            if let Some(dest) = self.connected_dgram_egress_target(tgid, fd) {
+                self.promote_stepping(tgid, fd, dest);
+                survivors += 1;
+            }
+        }
+        if survivors > 0 {
+            debug!(
+                tgid,
+                survivors,
+                event = "connected_dgram_stepping_rearmed",
+                "re-armed stepping for surviving connected datagram sockets, including dup aliases (B13)"
+            );
+        }
+    }
+
+    /// Resolve the pending write decision for `tid`.
+    ///
+    /// `allowed` ends tracking for the fd that write named; a denial keeps it,
+    /// because a thread that has tried to reach a rejected destination will
+    /// try again. Either way the awaiting entry is cleared — leaving it set
+    /// would make the next unrelated allowed syscall on this thread look like
+    /// the decision and end stepping without one.
+    pub(super) fn settle_stepping_decision(&mut self, tid: u32, allowed: bool) {
+        let Some(tgid) = self.tid_tgids.get(&tid).copied() else {
+            return;
+        };
+        let Some(state) = self.stepping.get_mut(&tgid) else {
+            return;
+        };
+        let Some(fd) = state.awaiting.remove(&tid) else {
+            return;
+        };
+        if allowed {
+            // Demote by socket identity: the awaiting fd may be a dup'd alias
+            // whose number is not the one in `state.fds`.
+            self.demote_stepping_socket(tgid, fd);
+        }
+    }
+
+    /// The destination a write to `fd` would reach, if that fd is a connected
+    /// datagram socket aimed off-host.
+    ///
+    /// Resolved from the fd being written rather than from any fd recorded
+    /// earlier: `dup(2)` gives one socket several descriptor numbers, and the
+    /// tracker shares socket identity across them, so this catches every
+    /// alias. It also re-checks liveness — the fd may have been closed and
+    /// reused, or reconnected, since.
+    pub(super) fn connected_dgram_egress_target(
+        &self,
+        tgid: u32,
+        fd: i32,
+    ) -> Option<std::net::SocketAddr> {
+        if self.dns_tracker.socket_type(tgid, fd)
+            != Some(super::dns_socket_tracker::SocketType::Datagram)
+        {
+            return None;
+        }
+        self.dns_tracker
+            .connected_destination(tgid, fd)
+            .filter(|d| !Self::is_loopback_destination(d))
+    }
+
+    /// Build the egress event for a write on a connected datagram socket.
+    ///
+    /// Reusing `NetConnect` means the whole existing path applies unchanged:
+    /// the local carve-out, reverse-DNS enrichment, scoring, audit, and
+    /// allow/deny of this very syscall.
+    pub(super) fn connected_dgram_write_event(
+        tgid: u32,
+        tid: u32,
+        fd: i32,
+        destination: std::net::SocketAddr,
+        nr: i64,
+    ) -> SyscallEvent {
+        warn!(
+            tid,
+            tgid,
+            fd,
+            %destination,
+            syscall_nr = nr,
+            event = "connected_dgram_write_scored",
+            "write(2) on a connected datagram socket surfaced as egress"
+        );
+        SyscallEvent {
+            pid: tgid,
+            tid,
+            timestamp: Utc::now(),
+            kind: crate::interceptor::SyscallKind::NetConnect {
+                address: destination.ip().to_string(),
+                port: destination.port(),
+                protocol: crate::interceptor::NetProtocol::Udp,
+            },
+            raw_syscall_nr: nr,
+        }
+    }
+
+    /// Classify the ABI of the syscall a stopped tracee is entering, using the
+    /// kernel's own syscall-entry record rather than the seccomp filter's
+    /// return data (go-live review B1).
+    ///
+    /// Returns `None` for an ordinary x86_64 syscall, `Some(kind)` for one the
+    /// x86_64 syscall table cannot describe.
+    ///
+    /// Why not the filter's `SECCOMP_RET_DATA`: a supervised process can
+    /// install its own seccomp filter — `seccomp(2)` is not trapped, and grith
+    /// itself sets `PR_SET_NO_NEW_PRIVS`, so nothing stands in the way. When
+    /// several filters return the same action, the tracer sees the data of the
+    /// most recently installed one, which is the tracee's. It could therefore
+    /// zero grith's marker and have an `int 0x80` classified through the
+    /// x86_64 table. `PTRACE_GET_SYSCALL_INFO` is filled in by the kernel from
+    /// its own entry bookkeeping and no filter can influence it.
+    ///
+    /// Why not the `cs` selector: `int 0x80` issued from 64-bit code keeps
+    /// `cs == 0x33`, so it does not distinguish the compat entry (measured).
+    ///
+    /// On a kernel without `PTRACE_GET_SYSCALL_INFO` (pre-5.3) this falls back
+    /// to the filter data at seccomp stops — the only place that data is
+    /// current — and to the syscall number register elsewhere.
+    ///
+    /// `at_seccomp_stop` must be true only when the current stop is a
+    /// `PTRACE_EVENT_SECCOMP` stop. See `classify_foreign_abi` for why the
+    /// distinction is load-bearing.
+    pub(super) fn foreign_abi_at_stop(
+        &self,
+        pid: Pid,
+        at_seccomp_stop: bool,
+    ) -> Option<crate::interceptor::ForeignAbiKind> {
+        Self::classify_foreign_abi(
+            Self::syscall_info(pid),
+            at_seccomp_stop,
+            || ptrace::getevent(pid).map(|d| d as u64).unwrap_or(0),
+            || {
+                self.read_registers(pid)
+                    .ok()
+                    .flatten()
+                    .map(|regs| regs.orig_rax)
+            },
+        )
+    }
+
+    /// The pure decision behind `foreign_abi_at_stop`: kernel entry record
+    /// first, weaker sources only where they are actually meaningful.
+    ///
+    /// `event_data` (`PTRACE_GETEVENTMSG`) is consulted ONLY when the entry
+    /// record is unsupported (pre-5.3) AND the stop is a seccomp stop — the
+    /// one place the message is that stop's `SECCOMP_RET_DATA`. At syscall
+    /// stops on ≥5.3 the kernel sets the message itself, to
+    /// `PTRACE_EVENTMSG_SYSCALL_ENTRY` (1) / `PTRACE_EVENTMSG_SYSCALL_EXIT`
+    /// (2) — and 2 is numerically equal to `SECCOMP_TRACE_DATA_X32`.
+    /// Consulting the message at a syscall stop therefore classified every
+    /// exit stop as an x32 syscall: the resulting hard-deny injected EPERM
+    /// into ordinary completing syscalls, and on `futex(2)` glibc responded
+    /// by aborting the whole supervised tree (B1 round 3).
+    ///
+    /// `entry_nr` (`orig_rax`) is the pre-5.3 fallback at non-seccomp stops:
+    /// an x32 syscall is identifiable from bit 30 of the number the tracee
+    /// itself loaded, while `int 0x80` cannot be told apart from a 64-bit
+    /// call there (`cs` reads 0x33 for both) — a documented pre-5.3
+    /// attach-mode gap.
+    fn classify_foreign_abi(
+        info: SyscallEntryInfo,
+        at_seccomp_stop: bool,
+        event_data: impl FnOnce() -> u64,
+        entry_nr: impl FnOnce() -> Option<u64>,
+    ) -> Option<crate::interceptor::ForeignAbiKind> {
+        use crate::interceptor::ForeignAbiKind;
+
+        match info {
+            SyscallEntryInfo::Entry { arch, nr } => {
+                if arch != super::seccomp::AUDIT_ARCH_X86_64 {
+                    Some(ForeignAbiKind::CompatArch)
+                } else if nr & u64::from(super::seccomp::X32_SYSCALL_BIT) != 0 {
+                    Some(ForeignAbiKind::X32)
+                } else {
+                    // An ordinary x86_64 syscall, including an unknown or
+                    // negative number. Those are left to normal
+                    // classification, which declines to handle them and lets
+                    // the kernel answer ENOSYS — turning a feature probe into
+                    // EPERM would break `#define __NR_foo -1` idioms and fill
+                    // the audit log with denials of nothing.
+                    None
+                }
+            }
+            // No entry record at this stop: nothing is about to execute, so
+            // there is nothing to classify — and neither fallback source is
+            // trustworthy here.
+            SyscallEntryInfo::NotEntry => None,
+            SyscallEntryInfo::Unsupported if at_seccomp_stop => {
+                // Pre-5.3 seccomp stop: the event message is this stop's
+                // filter marker, the best signal left. (A tracee-installed
+                // filter can forge it on an action tie — accepted for
+                // pre-5.3 kernels only; ≥5.3 never reaches this arm.)
+                let data = event_data();
+                if data == u64::from(super::seccomp::SECCOMP_TRACE_DATA_X32) {
+                    Some(ForeignAbiKind::X32)
+                } else if data == u64::from(super::seccomp::SECCOMP_TRACE_DATA_FOREIGN_ARCH) {
+                    Some(ForeignAbiKind::CompatArch)
+                } else {
+                    None
+                }
+            }
+            SyscallEntryInfo::Unsupported => {
+                // Pre-5.3 syscall stop (attach mode): the number the tracee
+                // loaded is the only honest signal. Bit 30 marks x32; any
+                // bit above it marks a negative or garbage value that is not
+                // a syscall number at all and gets the kernel's own ENOSYS.
+                match entry_nr() {
+                    Some(nr)
+                        if nr >> 31 == 0
+                            && nr & u64::from(super::seccomp::X32_SYSCALL_BIT) != 0 =>
+                    {
+                        Some(crate::interceptor::ForeignAbiKind::X32)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// `PTRACE_GET_SYSCALL_INFO` → the kernel's syscall-entry record.
+    ///
+    /// The three-way split matters: "this stop carries no entry record"
+    /// (`NotEntry`) and "the kernel cannot answer at all" (`Unsupported`,
+    /// pre-5.3) demand different fallbacks. Conflating them let a stale
+    /// `PTRACE_GETEVENTMSG` marker condemn an ordinary syscall on a modern
+    /// kernel whenever a syscall-exit stop was misjudged as an entry
+    /// (B1 round 3).
+    fn syscall_info(pid: Pid) -> SyscallEntryInfo {
+        /// `struct ptrace_syscall_info`, prefix only — everything up to and
+        /// including the entry/seccomp `nr`. Both the ENTRY and SECCOMP
+        /// variants place `nr` at the same offset, so the shared prefix is
+        /// enough and the union tail can be ignored.
+        #[repr(C)]
+        #[derive(Default)]
+        struct SyscallInfoPrefix {
+            op: u8,
+            _pad: [u8; 3],
+            arch: u32,
+            instruction_pointer: u64,
+            stack_pointer: u64,
+            nr: u64,
+        }
+
+        const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
+        const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+        const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
+
+        let mut info = SyscallInfoPrefix::default();
+        // SAFETY: `info` is a live, correctly-aligned allocation and we pass
+        // its exact size; the kernel writes at most that many bytes.
+        let ret = unsafe {
+            libc::ptrace(
+                // `as _` so the request adapts to `libc::ptrace`'s first
+                // argument type, which is `c_uint` on glibc but `c_int` on
+                // musl — the mismatch that failed the musl release build.
+                PTRACE_GET_SYSCALL_INFO as _,
+                pid.as_raw(),
+                std::mem::size_of::<SyscallInfoPrefix>(),
+                std::ptr::addr_of_mut!(info),
+            )
+        };
+        if ret <= 0 {
+            // ESRCH: the tracee died in its stop — there is no entry record
+            // to read, and that is `NotEntry`, not a licence to guess from
+            // weaker sources. Anything else (EIO on pre-5.3) means the
+            // request itself is unknown.
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                SyscallEntryInfo::NotEntry
+            } else {
+                SyscallEntryInfo::Unsupported
+            };
+        }
+        if info.op != PTRACE_SYSCALL_INFO_ENTRY && info.op != PTRACE_SYSCALL_INFO_SECCOMP {
+            return SyscallEntryInfo::NotEntry;
+        }
+        SyscallEntryInfo::Entry {
+            arch: info.arch,
+            nr: info.nr,
+        }
+    }
+
+    /// Whether a `PTRACE_SYSCALL` stop is a syscall **exit** rather than an
+    /// entry — from the kernel's own record, so no per-tid entry/exit toggle
+    /// is needed (that toggle desynchronised whenever a promoted syscall's
+    /// exit was consumed by another handler first — go-live review round 2).
+    ///
+    /// `Some(true)` = exit, `Some(false)` = entry/seccomp, `None` = the
+    /// request is unsupported (pre-5.3), where the caller falls back to the
+    /// `rax == -ENOSYS` entry heuristic.
+    fn syscall_stop_is_exit(pid: Pid) -> Option<bool> {
+        #[repr(C)]
+        #[derive(Default)]
+        struct OpOnly {
+            op: u8,
+            _pad: [u8; 3],
+            _arch: u32,
+        }
+        const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
+        const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
+
+        let mut info = OpOnly::default();
+        // SAFETY: `info` is live and correctly aligned; the kernel writes at
+        // most `size_of` bytes.
+        let ret = unsafe {
+            libc::ptrace(
+                // `as _` so the request adapts to `libc::ptrace`'s first
+                // argument type, which is `c_uint` on glibc but `c_int` on
+                // musl — the mismatch that failed the musl release build.
+                PTRACE_GET_SYSCALL_INFO as _,
+                pid.as_raw(),
+                std::mem::size_of::<OpOnly>(),
+                std::ptr::addr_of_mut!(info),
+            )
+        };
+        if ret <= 0 {
+            return None;
+        }
+        Some(info.op == PTRACE_SYSCALL_INFO_EXIT)
+    }
+
     /// Read the x86_64 general-purpose register file from a stopped tracee.
-    pub(super) fn read_registers(&self, pid: Pid) -> Result<libc::user_regs_struct> {
-        ptrace::getregs(pid).map_err(|e| {
-            Error::InterceptionError(format!("PTRACE_GETREGS failed for pid {pid}: {e}"))
-        })
+    ///
+    /// Returns `Ok(None)` when the tracee no longer exists (ESRCH). A tracee
+    /// can be SIGKILLed — including by a sibling thread's `exit_group(2)` —
+    /// even while sitting in a ptrace stop, so a queued wait status can
+    /// outlive its thread. That race is benign (the exit is reaped by the
+    /// next `waitpid`) and must never end the session.
+    pub(super) fn read_registers(&self, pid: Pid) -> Result<Option<libc::user_regs_struct>> {
+        match ptrace::getregs(pid) {
+            Ok(regs) => Ok(Some(regs)),
+            Err(nix::errno::Errno::ESRCH) => {
+                trace!(
+                    pid = pid.as_raw(),
+                    event = "tracee_gone_at_stop",
+                    "PTRACE_GETREGS: tracee gone (ESRCH); treating stop as stale"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(Error::InterceptionError(format!(
+                "PTRACE_GETREGS failed for pid {pid}: {e}"
+            ))),
+        }
     }
 
     /// Read a null-terminated C string from the tracee's virtual address space.
@@ -207,85 +775,325 @@ impl PtraceSupervisor {
         Ok(result)
     }
 
-    /// Write arbitrary bytes to a tracee's address space using PTRACE_POKEDATA.
-    ///
-    /// Writes one `i64` (8 bytes) at a time. For partial writes (< 8 bytes),
-    /// reads the existing word first and merges the new bytes to avoid
-    /// corrupting adjacent memory.
-    pub(super) fn write_tracee_data(&self, pid: Pid, addr: u64, data: &[u8]) -> Result<()> {
-        let word_size = std::mem::size_of::<i64>();
-        let mut offset = 0usize;
+    fn read_tracee_u32(&self, pid: Pid, addr: u64) -> Option<u32> {
+        let bytes = self.read_tracee_bytes(pid, addr, 4).ok()?;
+        Some(u32::from_ne_bytes(bytes.try_into().ok()?))
+    }
 
-        while offset < data.len() {
-            let remaining = data.len() - offset;
-            let current_addr = addr + offset as u64;
+    fn read_tracee_u64(&self, pid: Pid, addr: u64) -> Option<u64> {
+        let bytes = self.read_tracee_bytes(pid, addr, 8).ok()?;
+        Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+    }
 
-            let word: i64 = if remaining >= word_size {
-                // Full word write
-                i64::from_ne_bytes(data[offset..offset + word_size].try_into().unwrap())
+    fn read_socket_addr(&self, pid: Pid, addr: u64, len: usize) -> Option<SocketAddr> {
+        if addr == 0 || len < 2 {
+            return None;
+        }
+        let bytes = self.read_tracee_bytes(pid, addr, len.min(28)).ok()?;
+        let family = u16::from_ne_bytes(bytes.get(0..2)?.try_into().ok()?) as i32;
+        match family {
+            libc::AF_INET if bytes.len() >= 16 => {
+                let port = u16::from_be_bytes(bytes.get(2..4)?.try_into().ok()?);
+                let octets: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
+                Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
+            }
+            libc::AF_INET6 if bytes.len() >= 28 => {
+                let port = u16::from_be_bytes(bytes.get(2..4)?.try_into().ok()?);
+                let octets: [u8; 16] = bytes.get(8..24)?.try_into().ok()?;
+                let scope_id = u32::from_ne_bytes(bytes.get(24..28)?.try_into().ok()?);
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                    Ipv6Addr::from(octets),
+                    port,
+                    0,
+                    scope_id,
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// Read and concatenate an x86_64 `iovec[]`, bounded by `limit`.
+    fn read_iovecs(&self, pid: Pid, iov_ptr: u64, iovlen: usize, limit: usize) -> Option<Vec<u8>> {
+        if iov_ptr == 0 || iovlen == 0 || iovlen > 1024 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for index in 0..iovlen {
+            if out.len() >= limit {
+                break;
+            }
+            let entry = iov_ptr.checked_add((index as u64).checked_mul(16)?)?;
+            let base = self.read_tracee_u64(pid, entry)?;
+            let len = self.read_tracee_u64(pid, entry + 8)? as usize;
+            if base == 0 && len != 0 {
+                return None;
+            }
+            let take = len.min(limit - out.len());
+            if take > 0 {
+                out.extend(self.read_tracee_bytes(pid, base, take).ok()?);
+            }
+        }
+        Some(out)
+    }
+
+    /// Read a send-side `iovec[]` and report whether the kernel-visible
+    /// payload exceeds the inspection bound. Every entry is examined even
+    /// after the byte buffer fills so a valid DNS prefix cannot hide an
+    /// uninspected suffix.
+    fn read_send_iovecs(
+        &self,
+        pid: Pid,
+        iov_ptr: u64,
+        iovlen: usize,
+        limit: usize,
+    ) -> Option<(Vec<u8>, bool)> {
+        if iov_ptr == 0 || iovlen == 0 || iovlen > 1024 {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut total_len = 0usize;
+        for index in 0..iovlen {
+            let entry = iov_ptr.checked_add((index as u64).checked_mul(16)?)?;
+            let base = self.read_tracee_u64(pid, entry)?;
+            let len = usize::try_from(self.read_tracee_u64(pid, entry + 8)?).ok()?;
+            if base == 0 && len != 0 {
+                return None;
+            }
+            total_len = total_len.checked_add(len)?;
+            let take = len.min(limit.saturating_sub(out.len()));
+            if take > 0 {
+                out.extend(self.read_tracee_bytes(pid, base, take).ok()?);
+            }
+        }
+        Some((out, total_len > limit))
+    }
+
+    /// Decode the destination and payload from one x86_64 `msghdr`.
+    fn read_msghdr(
+        &self,
+        pid: Pid,
+        msghdr_ptr: u64,
+        payload_limit: usize,
+    ) -> Option<(Option<SocketAddr>, bool, Vec<u8>, bool)> {
+        let name_ptr = self.read_tracee_u64(pid, msghdr_ptr)?;
+        let name_len = self.read_tracee_u32(pid, msghdr_ptr + 8)? as usize;
+        let iov_ptr = self.read_tracee_u64(pid, msghdr_ptr + 16)?;
+        let iovlen = self.read_tracee_u64(pid, msghdr_ptr + 24)? as usize;
+        let has_explicit_destination = name_ptr != 0;
+        let destination = if !has_explicit_destination {
+            None
+        } else {
+            let family_bytes = self.read_tracee_bytes(pid, name_ptr, 2).ok()?;
+            let family = u16::from_ne_bytes(family_bytes.try_into().ok()?) as i32;
+            if matches!(family, libc::AF_INET | libc::AF_INET6) {
+                Some(self.read_socket_addr(pid, name_ptr, name_len)?)
             } else {
-                // Partial word: read existing, overlay new bytes
-                let existing =
-                    ptrace::read(pid, current_addr as *mut libc::c_void).map_err(|e| {
-                        Error::InterceptionError(format!(
-                            "PTRACE_PEEKDATA at {current_addr:#x} for pid {pid}: {e}"
-                        ))
-                    })?;
-                let mut buf = existing.to_ne_bytes();
-                buf[..remaining].copy_from_slice(&data[offset..]);
-                i64::from_ne_bytes(buf)
-            };
+                None
+            }
+        };
+        let (payload, oversized) = self.read_send_iovecs(pid, iov_ptr, iovlen, payload_limit)?;
+        Some((destination, has_explicit_destination, payload, oversized))
+    }
 
-            ptrace::write(pid, current_addr as *mut libc::c_void, word as libc::c_long).map_err(
-                |e| {
-                    Error::InterceptionError(format!(
-                        "PTRACE_POKEDATA at {current_addr:#x} for pid {pid}: {e}"
-                    ))
-                },
-            )?;
+    fn read_recv_msghdr(&self, pid: Pid, msghdr_ptr: u64, returned_len: usize) -> Option<Vec<u8>> {
+        let iov_ptr = self.read_tracee_u64(pid, msghdr_ptr + 16)?;
+        let iovlen = self.read_tracee_u64(pid, msghdr_ptr + 24)? as usize;
+        self.read_iovecs(pid, iov_ptr, iovlen, returned_len.min(MAX_DNS_MSG))
+    }
 
+    /// Read exactly `len` bytes from tracee memory at `addr`, word-by-word via
+    /// `PTRACE_PEEKDATA`. Used to read the DNS query buffer (at `sendto`) and
+    /// a kernel-filled response buffer (at a receive exit). `len` is
+    /// capped by the caller (DNS messages are bounded).
+    pub(super) fn read_tracee_bytes(&self, pid: Pid, addr: u64, len: usize) -> Result<Vec<u8>> {
+        let word_size = std::mem::size_of::<i64>();
+        let mut out = Vec::with_capacity(len);
+        let mut offset = 0usize;
+        while offset < len {
+            let current_addr = addr + offset as u64;
+            let word = ptrace::read(pid, current_addr as *mut libc::c_void).map_err(|e| {
+                Error::InterceptionError(format!(
+                    "PTRACE_PEEKDATA at {current_addr:#x} for pid {pid}: {e}"
+                ))
+            })?;
+            let bytes = word.to_ne_bytes();
+            let take = word_size.min(len - offset);
+            out.extend_from_slice(&bytes[..take]);
             offset += word_size;
         }
-
-        Ok(())
+        Ok(out)
     }
 
     /// Handle a ptrace process-creation event (fork/vfork/clone) by
     /// extracting the new child PID and registering it for supervision.
     ///
-    /// The `event` parameter distinguishes forks (PTRACE_EVENT_FORK=1,
-    /// PTRACE_EVENT_VFORK=2) from thread clones (PTRACE_EVENT_CLONE=3).
-    /// Thread clones are tracked in `supervised` (they need ptrace
-    /// management) but are also recorded in `thread_tids` so that callers
-    /// can distinguish threads from processes.
+    /// Thread/process identity is derived from the kernel-reported TGIDs, not
+    /// from the ptrace event number. `PTRACE_EVENT_CLONE` can describe a
+    /// separate process when its exit signal is not `SIGCHLD`.
     pub(super) fn handle_ptrace_event(&mut self, pid: Pid, event: i32) -> Result<Option<u32>> {
         let child_pid = ptrace::getevent(pid).map_err(|e| {
             Error::InterceptionError(format!("PTRACE_GETEVENTMSG failed for pid {pid}: {e}"))
         })? as u32;
 
-        // PTRACE_EVENT_CLONE (3) typically indicates a new thread rather
-        // than a new process. We still must trace it (it gets ptrace stops)
-        // but record it separately so it is not confused with a full child
-        // process in process-tree tracking.
-        let is_thread_clone = event == libc::PTRACE_EVENT_CLONE;
+        // Register first so a later fail-closed error still lets the outer
+        // supervisor terminate the newly-created tracee.
+        self.supervised.insert(child_pid);
+        if self.seccomp_tracees.contains(&(pid.as_raw() as u32)) {
+            self.seccomp_tracees.insert(child_pid);
+        }
+
+        // Belt-and-suspenders: re-assert the trace options on the new child
+        // rather than trusting kernel inheritance of `PTRACE_O_TRACEEXEC`. If
+        // the child's very first act is `execve` (the `posix_spawn`
+        // fork-then-exec shape), a missing TRACEEXEC would drop its
+        // `PTRACE_EVENT_EXEC` and the spawn would go untagged. Best-effort: the
+        // child may not be individually ptrace-stopped yet (ESRCH) — options
+        // are idempotent and the provenance backfill in the event handler is
+        // the durable safety net, so a failure here is not fatal.
+        let _ = self.set_trace_options(Pid::from_raw(child_pid as i32));
+
+        let parent_tid = pid.as_raw() as u32;
+        let clone_snapshot = self.pending_clone_fd_table.remove(&parent_tid);
+        let exact_identity_required = self.connected_dns_proxy.is_some();
+        let parent_tgid = match Self::resolve_tgid(parent_tid) {
+            Some(tgid) => tgid,
+            None if exact_identity_required => {
+                return Err(Error::InterceptionError(format!(
+                    "could not resolve parent TGID for clone event from tid {parent_tid}"
+                )));
+            }
+            None => parent_tid,
+        };
+        let child_tgid = match Self::resolve_tgid(child_pid) {
+            Some(tgid) => tgid,
+            None if exact_identity_required => {
+                return Err(Error::InterceptionError(format!(
+                    "could not resolve child TGID for clone event child {child_pid}"
+                )));
+            }
+            None => child_pid,
+        };
+        self.tid_tgids.insert(parent_tid, parent_tgid);
+        self.tid_tgids.insert(child_pid, child_tgid);
+
+        // `vfork(2)` has fixed non-CLONE_FILES semantics. Every other child
+        // event in a proxy-enabled seccomp session must be backed by the exact
+        // entry-time snapshot. In particular, never re-read clone3's mutable
+        // `struct clone_args` after the child already exists.
+        let clone_flags = if event == libc::PTRACE_EVENT_VFORK {
+            Some(0)
+        } else if let Some(snapshot) = clone_snapshot {
+            debug!(
+                parent = parent_tid,
+                syscall_nr = snapshot.syscall_nr,
+                clone_flags = snapshot.flags,
+                "using entry-time clone FD-table snapshot"
+            );
+            Some(snapshot.flags)
+        } else if exact_identity_required {
+            return Err(self.terminate_after_dns_redirect_failure(
+                parent_tgid,
+                "child creation lacked an exact entry-time FD-table snapshot",
+            ));
+        } else {
+            self.read_registers(pid)
+                .ok()
+                .flatten()
+                .and_then(|regs| match regs.orig_rax as i64 {
+                    super::syscall_nr::FORK => Some(0),
+                    super::syscall_nr::CLONE => Some(regs.rdi),
+                    _ => None,
+                })
+        };
+        let is_thread_clone = is_thread_group_child(parent_tgid, child_tgid);
+
+        // The current tracker has one FD-table identity per TGID. Linux permits
+        // CLONE_THREAD without CLONE_FILES, which would create two tables in
+        // one TGID and make subsequent DNS ownership ambiguous. The clone has
+        // already happened by this ptrace event, so a proxy-enabled session
+        // must terminate rather than resume either task.
+        if self.connected_dns_proxy.is_some()
+            && clone_creates_private_thread_fd_table(parent_tgid, child_tgid, clone_flags)
+        {
+            self.thread_tids.insert(child_pid);
+            return Err(self.terminate_after_dns_redirect_failure(
+                parent_tgid,
+                "CLONE_THREAD without a provable CLONE_FILES share is unsupported \
+                 while connected DNS proxying is active",
+            ));
+        }
 
         if is_thread_clone {
             debug!(
-                parent = pid.as_raw(),
+                parent = parent_tid,
+                parent_tgid,
                 thread_tid = child_pid,
-                "new thread detected via PTRACE_EVENT_CLONE"
+                "new thread detected from matching TGID"
             );
             self.thread_tids.insert(child_pid);
         } else {
             info!(
-                parent = pid.as_raw(),
+                parent = parent_tid,
+                parent_tgid,
                 child = child_pid,
+                child_tgid,
                 "new child process detected via ptrace event"
             );
         }
-        self.supervised.insert(child_pid);
-        if self.seccomp_tracees.contains(&(pid.as_raw() as u32)) {
-            self.seccomp_tracees.insert(child_pid);
+        if child_tgid != parent_tgid {
+            let released = self.dns_tracker.inherit_process(
+                parent_tgid,
+                child_tgid,
+                clone_shares_fd_table(clone_flags),
+            );
+            for route_id in released {
+                let Some(control) = &self.connected_dns_proxy else {
+                    return Err(Error::InterceptionError(format!(
+                        "inherited FD-table replacement released connected DNS route {} without a live control plane",
+                        route_id.0
+                    )));
+                };
+                control
+                    .release_route(Self::connected_route_id(route_id))
+                    .map_err(|error| {
+                        Error::InterceptionError(format!(
+                            "failed to release connected DNS route {} displaced by child inheritance: {error}",
+                            route_id.0
+                        ))
+                    })?;
+            }
+
+            // B13: a fork child inherits the fd table — including any
+            // connected non-loopback datagram socket — but gets a new TGID,
+            // and stepping is keyed by TGID. Without propagating, the child's
+            // write egresses unobserved (go-live review round 2). The child
+            // holds the same fd numbers, and `inherit_process` above copied
+            // the tracker's socket identity, so the parent's tracked fds are
+            // the child's connected sockets too.
+            if let Some(parent_state) = self.stepping.get(&parent_tgid) {
+                let inherited: Vec<i32> = parent_state.fds.iter().copied().collect();
+                if !inherited.is_empty() {
+                    let child_state = self.stepping.entry(child_tgid).or_default();
+                    for fd in &inherited {
+                        child_state.fds.insert(*fd);
+                    }
+                    debug!(
+                        parent_tgid,
+                        child_tgid,
+                        fds = inherited.len(),
+                        event = "connected_dgram_stepping_inherited",
+                        "fork child inherits connected-datagram stepping"
+                    );
+                }
+            }
+        }
+
+        // The kernel may report a clone child's initial stop before the
+        // parent's PTRACE_EVENT_* stop. Only release that child after its exact
+        // TGID and FD-table inheritance are committed above.
+        if self.pending_child_initial_stops.remove(&child_pid) {
+            record_event(self, child_pid, "ptrace-event:child-inheritance-ready");
+            self.resume_tracee(Pid::from_raw(child_pid as i32), None)?;
         }
 
         Ok(Some(child_pid))
@@ -304,6 +1112,366 @@ impl PtraceSupervisor {
             }
         }
         None
+    }
+
+    /// Inspect every DNS message carried by one outbound syscall. `None`
+    /// means the syscall did not target DNS. `Some` always routes through the
+    /// handler's allow/deny path, including explicit parse failures.
+    fn inspect_dns_send(
+        &mut self,
+        pid: Pid,
+        tgid: u32,
+        fd: i32,
+        nr: i64,
+        regs: &libc::user_regs_struct,
+    ) -> Option<crate::interceptor::DnsQueryInspection> {
+        // Ownership is selected by shared socket route, not syscall shape.
+        // A proxy-owned send is inspected by the route worker even when libc
+        // lowers `send()` to sendto/sendmsg. Recording it here would create a
+        // duplicate policy decision and inline transaction.
+        if self.dns_tracker.is_connected_proxy(tgid, fd) {
+            return None;
+        }
+        if self.dns_tracker.socket_type(tgid, fd)
+            == Some(super::dns_socket_tracker::SocketType::Other)
+        {
+            return None;
+        }
+        let mut messages: Vec<(Option<SocketAddr>, bool, Vec<u8>, bool)> = Vec::new();
+        match nr {
+            super::syscall_nr::SENDTO => {
+                let destination = if regs.r8 == 0 {
+                    None
+                } else {
+                    match self.read_socket_addr(pid, regs.r8, regs.r9 as usize) {
+                        Some(addr) => Some(addr),
+                        None => {
+                            // A non-null, unreadable destination is a
+                            // classification failure. The caller will deny the
+                            // syscall through the normal fail-closed path.
+                            return None;
+                        }
+                    }
+                };
+                let payload = match self.read_tracee_bytes(
+                    pid,
+                    regs.rsi,
+                    (regs.rdx as usize).min(MAX_DNS_MSG),
+                ) {
+                    Ok(payload) => payload,
+                    Err(_)
+                        if destination.is_some_and(|addr| addr.port() == 53)
+                            || self.dns_tracker.is_dns(tgid, fd) =>
+                    {
+                        return Some(crate::interceptor::DnsQueryInspection {
+                            queries: Vec::new(),
+                            parse_error: Some("dns-port53-payload-read-failed".into()),
+                        });
+                    }
+                    Err(_) => return None,
+                };
+                messages.push((
+                    destination,
+                    regs.r8 != 0,
+                    payload,
+                    regs.rdx as usize > MAX_DNS_MSG,
+                ));
+            }
+            super::syscall_nr::SENDMSG => {
+                let Some(message) = self.read_msghdr(pid, regs.rsi, MAX_DNS_MSG) else {
+                    return Some(crate::interceptor::DnsQueryInspection {
+                        queries: Vec::new(),
+                        parse_error: Some("sendmsg-inspection-failed".into()),
+                    });
+                };
+                messages.push(message);
+            }
+            super::syscall_nr::SENDMMSG => {
+                let vlen = regs.rdx as usize;
+                if vlen == 0 {
+                    return None;
+                }
+                if vlen > MAX_DNS_BATCH {
+                    // A tracked DNS socket proves the entire oversized batch is
+                    // DNS. For an unconnected socket we cannot safely exclude a
+                    // port-53 destination hidden beyond the cap, so fail closed
+                    // while DNS inspection is active.
+                    return Some(crate::interceptor::DnsQueryInspection {
+                        queries: Vec::new(),
+                        parse_error: Some(format!(
+                            "dns-sendmmsg-batch-too-large:{vlen}>{MAX_DNS_BATCH}"
+                        )),
+                    });
+                }
+                let mut total_iovecs = 0usize;
+                for index in 0..vlen {
+                    let header = regs.rsi.checked_add((index as u64) * MMSGHDR_SIZE)?;
+                    let iovlen = self.read_tracee_u64(pid, header + 24)? as usize;
+                    total_iovecs = total_iovecs.checked_add(iovlen)?;
+                    if total_iovecs > MAX_DNS_BATCH_IOVECS {
+                        return Some(crate::interceptor::DnsQueryInspection {
+                            queries: Vec::new(),
+                            parse_error: Some(format!(
+                                "sendmmsg-iovec-budget-exceeded:{}>{MAX_DNS_BATCH_IOVECS}",
+                                total_iovecs
+                            )),
+                        });
+                    }
+                    let Some(message) = self.read_msghdr(pid, header, MAX_DNS_MSG) else {
+                        return Some(crate::interceptor::DnsQueryInspection {
+                            queries: Vec::new(),
+                            parse_error: Some(format!(
+                                "sendmmsg-inspection-failed-at-index:{index}"
+                            )),
+                        });
+                    };
+                    messages.push(message);
+                }
+            }
+            _ => return None,
+        }
+
+        let connected = self.dns_tracker.connected_destination(tgid, fd);
+        let mut dns_payloads = Vec::new();
+        let mut saw_non_dns = false;
+        for (explicit_destination, has_explicit_destination, payload, oversized) in messages {
+            let effective = if has_explicit_destination {
+                explicit_destination
+            } else {
+                connected
+            };
+            if effective.is_some_and(|addr| addr.port() == 53)
+                || (effective.is_none() && self.dns_tracker.is_dns(tgid, fd))
+            {
+                if oversized {
+                    return Some(crate::interceptor::DnsQueryInspection {
+                        queries: Vec::new(),
+                        parse_error: Some(format!("dns-payload-too-large:>{MAX_DNS_MSG}")),
+                    });
+                }
+                if let Some(destination) = effective {
+                    self.dns_tracker.discover_dns(tgid, fd, destination);
+                    trace!(
+                        tgid,
+                        tid = pid.as_raw(),
+                        fd,
+                        resolver = %destination,
+                        source = if explicit_destination.is_some() { "message" } else { "connect" },
+                        "DNS socket discovered"
+                    );
+                }
+                dns_payloads.push(payload);
+            } else {
+                saw_non_dns = true;
+            }
+        }
+        if dns_payloads.is_empty() {
+            return None;
+        }
+        if saw_non_dns {
+            return Some(crate::interceptor::DnsQueryInspection {
+                queries: Vec::new(),
+                parse_error: Some("dns-sendmmsg-mixed-destinations".into()),
+            });
+        }
+
+        let mut queries = Vec::with_capacity(dns_payloads.len());
+        let mut transactions = Vec::with_capacity(dns_payloads.len());
+        for payload in dns_payloads {
+            let Some(parsed) = crate::dns_proxy::parse_query(&payload) else {
+                warn!(
+                    tgid,
+                    tid = pid.as_raw(),
+                    fd,
+                    syscall_nr = nr,
+                    "outbound port-53 payload is not valid DNS"
+                );
+                return Some(crate::interceptor::DnsQueryInspection {
+                    queries: Vec::new(),
+                    parse_error: Some("dns-port53-unparseable".into()),
+                });
+            };
+            trace!(
+                tgid,
+                tid = pid.as_raw(),
+                fd,
+                dns_id = parsed.id,
+                qtype = %parsed.query_type,
+                "DNS query inspected"
+            );
+            transactions.push(super::dns_socket_tracker::QueryMetadata {
+                id: parsed.id,
+                domain: parsed.domain.clone(),
+                qtype: parsed.qtype,
+            });
+            queries.push((parsed.domain, parsed.query_type));
+        }
+        let Some(socket_id) = self.dns_tracker.socket_id(tgid, fd) else {
+            return Some(crate::interceptor::DnsQueryInspection {
+                queries: Vec::new(),
+                parse_error: Some("dns-socket-identity-lost".into()),
+            });
+        };
+        for transaction in transactions.iter().cloned() {
+            self.dns_tracker
+                .remember_query_for_socket(socket_id, transaction);
+        }
+        self.pending_inline_dns_transactions.insert(
+            pid.as_raw() as u32,
+            super::PendingInlineDnsTransactions {
+                socket_id,
+                queries: transactions,
+            },
+        );
+        Some(crate::interceptor::DnsQueryInspection {
+            queries,
+            parse_error: None,
+        })
+    }
+
+    /// Return true only for a send form whose peer cannot be changed through
+    /// mutable tracee memory after this ptrace stop.
+    ///
+    /// `send()` lowers to `sendto(..., NULL, 0)` on x86_64, so a null `r8`
+    /// safely uses the socket's connected proxy peer. `sendmsg` and
+    /// `sendmmsg` keep `msg_name` in caller-owned memory; a sibling could turn
+    /// a checked null pointer into an explicit direct destination before the
+    /// kernel copies the header. Deny both message APIs until the supervisor
+    /// can substitute an immutable/scratch header.
+    fn proxy_send_uses_supported_connected_form(nr: i64, regs: &libc::user_regs_struct) -> bool {
+        nr == super::syscall_nr::SENDTO && regs.r8 == 0
+    }
+
+    fn record_dns_response(&mut self, pending: super::DnsRecvPending, response: &[u8]) {
+        let response_api = match pending.kind {
+            super::DnsRecvKind::From { .. } => "recvfrom",
+            super::DnsRecvKind::Msg { .. } => "recvmsg",
+            super::DnsRecvKind::Mmsg { .. } => "recvmmsg",
+        };
+        let Some(parsed) = crate::dns_proxy::parse_response(response) else {
+            warn!(
+                tgid = pending.tgid,
+                fd = pending.fd,
+                response_api,
+                "DNS response parse failed; response ignored"
+            );
+            return;
+        };
+        let Some(query) = self.dns_tracker.take_matching_query_for_socket(
+            pending.socket_id,
+            parsed.id,
+            &parsed.domain,
+            parsed.qtype,
+        ) else {
+            warn!(
+                tgid = pending.tgid,
+                fd = pending.fd,
+                dns_id = parsed.id,
+                "unsolicited or conflicting DNS response ignored"
+            );
+            return;
+        };
+        let answer_count = parsed.answers.len();
+        if let Some(cache) = &self.dns_cache {
+            match cache.lock() {
+                Ok(mut cache) => {
+                    if let Err(error) = cache.commit_observed_batch(
+                        &query.domain,
+                        parsed
+                            .answers
+                            .into_iter()
+                            .map(|answer| (answer.ip, answer.ttl)),
+                        pending.tgid,
+                    ) {
+                        warn!(
+                            tgid = pending.tgid,
+                            fd = pending.fd,
+                            error = %error,
+                            "DNS response cache batch rejected"
+                        );
+                        return;
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        tgid = pending.tgid,
+                        fd = pending.fd,
+                        "DNS response cache lock poisoned"
+                    );
+                    return;
+                }
+            }
+        }
+        trace!(
+            tgid = pending.tgid,
+            fd = pending.fd,
+            dns_id = parsed.id,
+            answer_count,
+            response_api,
+            "DNS response attributed"
+        );
+    }
+
+    fn connected_route_id(
+        route_id: super::dns_socket_tracker::DnsRouteId,
+    ) -> crate::connected_dns_proxy::ConnectedDnsRouteId {
+        crate::connected_dns_proxy::ConnectedDnsRouteId(route_id.0)
+    }
+
+    async fn release_connected_route(
+        &self,
+        route_id: super::dns_socket_tracker::DnsRouteId,
+    ) -> Result<()> {
+        let Some(control) = &self.connected_dns_proxy else {
+            return Err(Error::InterceptionError(format!(
+                "connected DNS route {} has no live proxy control plane",
+                route_id.0
+            )));
+        };
+        control
+            .release_route(Self::connected_route_id(route_id))
+            .map_err(|error| {
+                Error::InterceptionError(format!(
+                    "failed to release connected DNS route {}: {error}",
+                    route_id.0
+                ))
+            })
+    }
+
+    async fn release_connected_routes(
+        &self,
+        route_ids: impl IntoIterator<Item = super::dns_socket_tracker::DnsRouteId>,
+    ) -> Result<()> {
+        for route_id in route_ids {
+            self.release_connected_route(route_id).await?;
+        }
+        Ok(())
+    }
+
+    fn sockaddr_family(&self, pid: Pid, sockaddr_ptr: u64) -> Option<i32> {
+        if sockaddr_ptr == 0 {
+            return None;
+        }
+        let word = ptrace::read(pid, sockaddr_ptr as *mut libc::c_void).ok()?;
+        let bytes = word.to_ne_bytes();
+        Some(u16::from_ne_bytes([bytes[0], bytes[1]]) as i32)
+    }
+
+    fn terminate_after_dns_redirect_failure(&self, tgid: u32, reason: &str) -> Error {
+        if let Err(error) = nix::sys::signal::kill(Pid::from_raw(tgid as i32), Signal::SIGKILL) {
+            warn!(
+                tgid,
+                error = %error,
+                "failed to terminate tracee after connected DNS redirect failure"
+            );
+        }
+        Error::InterceptionError(format!(
+            "fatal connected DNS redirect failure for tgid {tgid}: {reason}"
+        ))
+    }
+
+    fn proxy_route_requires_session_termination_on_detach(&self) -> bool {
+        self.dns_tracker.has_connected_proxy_routes() || !self.pending_dns_connect_exit.is_empty()
     }
 
     /// Read the executable path and command-line arguments for a process
@@ -339,6 +1507,74 @@ impl SyscallInterceptor for PtraceSupervisor {
         self.attach_mode = mode;
     }
 
+    fn set_dns_inspection(
+        &mut self,
+        cache: std::sync::Arc<std::sync::Mutex<crate::dns_cache::DnsCache>>,
+        observe_responses: bool,
+        block_tcp_dns: bool,
+    ) {
+        self.enable_dns_inspection(cache, observe_responses, block_tcp_dns);
+    }
+
+    fn set_connected_dns_proxy(
+        &mut self,
+        control: crate::connected_dns_proxy::ConnectedDnsProxyControl,
+    ) -> Result<()> {
+        if !self.seccomp_session {
+            return Err(Error::ConfigError(
+                "connected UDP DNS proxy is supported only for processes \
+                 spawned under the seccomp-ptrace path; attach sessions cannot \
+                 guarantee pre-connect redirection"
+                    .into(),
+            ));
+        }
+        self.enable_connected_dns_proxy(control);
+        Ok(())
+    }
+
+    async fn terminate_all(&mut self) -> Result<()> {
+        let tgids: std::collections::HashSet<u32> = self
+            .supervised
+            .iter()
+            .map(|tid| Self::resolve_tgid(*tid).unwrap_or(*tid))
+            .collect();
+        let mut first_error = None;
+        for tgid in tgids {
+            if let Err(error) = nix::sys::signal::kill(Pid::from_raw(tgid as i32), Signal::SIGKILL)
+            {
+                if error != nix::errno::Errno::ESRCH && first_error.is_none() {
+                    first_error = Some((tgid, error));
+                }
+            }
+        }
+        if let Some((tgid, error)) = first_error {
+            return Err(Error::InterceptionError(format!(
+                "failed to terminate supervised process {tgid}: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn take_tcp_dns_deny(&mut self, tid: u32) -> bool {
+        self.pending_tcp_dns_deny.remove(&tid)
+    }
+
+    fn take_dns_query(&mut self, tid: u32) -> Option<crate::interceptor::DnsQueryInspection> {
+        self.pending_dns_query.remove(&tid)
+    }
+
+    fn finish_dns_query(&mut self, tid: u32, allowed: bool) {
+        let Some(pending) = self.pending_inline_dns_transactions.remove(&tid) else {
+            return;
+        };
+        if !allowed {
+            for query in &pending.queries {
+                self.dns_tracker
+                    .forget_query_for_socket(pending.socket_id, query);
+            }
+        }
+    }
+
     /// Attach to an already-running process by PID.
     ///
     /// Sends `PTRACE_ATTACH` which delivers a `SIGSTOP` to the target. The
@@ -360,6 +1596,8 @@ impl SyscallInterceptor for PtraceSupervisor {
 
         self.set_trace_options(nix_pid)?;
         self.supervised.insert(pid);
+        self.tid_tgids
+            .insert(pid, Self::resolve_tgid(pid).unwrap_or(pid));
         if self.root_pid.is_none() {
             self.root_pid = Some(pid);
         }
@@ -414,6 +1652,45 @@ impl SyscallInterceptor for PtraceSupervisor {
         }
 
         loop {
+            if let Some(control) = &self.connected_dns_proxy {
+                match control.health() {
+                    crate::connected_dns_proxy::ConnectedDnsProxyHealth::Ready => {}
+                    crate::connected_dns_proxy::ConnectedDnsProxyHealth::Starting => {
+                        return Err(Error::InterceptionError(
+                            "connected DNS proxy returned to starting state".into(),
+                        ));
+                    }
+                    crate::connected_dns_proxy::ConnectedDnsProxyHealth::Unhealthy(reason) => {
+                        let tgids: std::collections::HashSet<u32> = self
+                            .supervised
+                            .iter()
+                            .map(|tid| Self::resolve_tgid(*tid).unwrap_or(*tid))
+                            .collect();
+                        for tgid in tgids {
+                            let _ =
+                                nix::sys::signal::kill(Pid::from_raw(tgid as i32), Signal::SIGKILL);
+                        }
+                        return Err(Error::InterceptionError(format!(
+                            "connected DNS proxy became unhealthy: {reason}"
+                        )));
+                    }
+                    crate::connected_dns_proxy::ConnectedDnsProxyHealth::Stopped => {
+                        let tgids: std::collections::HashSet<u32> = self
+                            .supervised
+                            .iter()
+                            .map(|tid| Self::resolve_tgid(*tid).unwrap_or(*tid))
+                            .collect();
+                        for tgid in tgids {
+                            let _ =
+                                nix::sys::signal::kill(Pid::from_raw(tgid as i32), Signal::SIGKILL);
+                        }
+                        return Err(Error::InterceptionError(
+                            "connected DNS proxy stopped during an active session".into(),
+                        ));
+                    }
+                }
+            }
+
             // Drain all ready events (non-blocking). SIGCHLD can coalesce,
             // so we must drain everything before waiting for the next signal.
             let status = match waitpid(
@@ -433,7 +1710,20 @@ impl SyscallInterceptor for PtraceSupervisor {
                     self.supervised.clear();
                     self.in_syscall_entry.clear();
                     self.thread_tids.clear();
+                    self.tid_tgids.clear();
+                    self.pending_clone_fd_table.clear();
+                    self.pending_child_initial_stops.clear();
                     self.seccomp_tracees.clear();
+                    let released = self.dns_tracker.clear();
+                    self.release_connected_routes(released).await?;
+                    self.pending_dns_recv_exit.clear();
+                    self.pending_dns_connect_exit.clear();
+                    self.pending_udp_connect_exit.clear();
+                    self.pending_dns_query.clear();
+                    self.pending_inline_dns_transactions.clear();
+                    self.pending_socket_exit.clear();
+                    self.pending_fd_exit.clear();
+                    self.pending_tcp_dns_deny.clear();
                     return Ok(None);
                 }
                 Err(e) => {
@@ -455,19 +1745,652 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // Seccomp stop: a security-relevant syscall.
                         // The process is stopped *before* the syscall
                         // executes — no entry/exit toggle needed.
-                        let regs = self.read_registers(pid)?;
+                        //
+                        // The filter routes syscalls it cannot interpret to
+                        // TRACE so they produce a stop at all (go-live review
+                        // B1); the *decision* is made here, from the kernel's
+                        // own record of the syscall entry.
+                        //
+                        // It deliberately does NOT trust the filter's
+                        // SECCOMP_RET_DATA. A tracee may install its own
+                        // seccomp filter — `seccomp(2)` is not trapped, and
+                        // grith itself sets PR_SET_NO_NEW_PRIVS — and when
+                        // two filters return the same action the data of the
+                        // most recently installed one is what the tracer
+                        // sees. A supervised process could therefore zero
+                        // grith's marker and have its foreign-ABI syscall
+                        // classified through the x86_64 table.
+                        // PTRACE_GET_SYSCALL_INFO comes from the kernel's
+                        // syscall-entry bookkeeping instead, so no filter the
+                        // tracee installs can influence it.
+                        let abi = self.foreign_abi_at_stop(pid, true);
+                        if let Some(abi) = abi {
+                            let tid = pid_u32;
+                            let tgid = Self::resolve_tgid(tid).unwrap_or(tid);
+                            self.tid_tgids.insert(tid, tgid);
+                            // Registers are well-defined even for compat
+                            // tracees; the *number* is foreign. Record it for
+                            // forensics only. `read_registers` yields `None`
+                            // if the tracee was killed at the stop — record -1.
+                            let raw_nr = self
+                                .read_registers(pid)
+                                .ok()
+                                .flatten()
+                                .map(|r| r.orig_rax as i64)
+                                .unwrap_or(-1);
+                            warn!(
+                                pid = tgid,
+                                tid,
+                                abi = ?abi,
+                                raw_nr,
+                                "foreign-ABI syscall trapped by seccomp fail-closed arch check"
+                            );
+                            record_event(self, tid, "seccomp-foreign-abi");
+                            return Ok(Some(SyscallEvent {
+                                pid: tgid,
+                                tid,
+                                timestamp: Utc::now(),
+                                kind: crate::interceptor::SyscallKind::ForeignAbiSyscall {
+                                    abi,
+                                    raw_nr,
+                                },
+                                raw_syscall_nr: raw_nr,
+                            }));
+                        }
+                        // The tracee can be killed (sibling exit_group,
+                        // SIGKILL) while sitting in this stop, leaving a
+                        // queued event with no thread behind it. Skip it;
+                        // the exit is reaped by the next waitpid and no
+                        // syscall executes.
+                        let Some(regs) = self.read_registers(pid)? else {
+                            record_event(self, pid_u32, "seccomp-stop:tracee-gone");
+                            continue;
+                        };
                         let nr = regs.orig_rax as i64;
+                        let tid = pid_u32;
+                        let tgid = Self::resolve_tgid(tid).unwrap_or(tid);
+                        self.tid_tgids.insert(tid, tgid);
+                        let fd = regs.rdi as i32;
+
+                        // Capture clone FD-sharing at the pre-exec seccomp
+                        // stop. clone3's flags are supplied through mutable
+                        // tracee memory; reading them later at the ptrace
+                        // child event is too late to establish provenance.
+                        self.pending_clone_fd_table.remove(&tid);
+                        if matches!(
+                            nr,
+                            super::syscall_nr::FORK
+                                | super::syscall_nr::CLONE
+                                | super::syscall_nr::CLONE3
+                        ) {
+                            let snapshot = match nr {
+                                super::syscall_nr::FORK => Some(super::CloneFdTablePending {
+                                    syscall_nr: nr,
+                                    flags: 0,
+                                }),
+                                super::syscall_nr::CLONE => Some(super::CloneFdTablePending {
+                                    syscall_nr: nr,
+                                    flags: regs.rdi,
+                                }),
+                                super::syscall_nr::CLONE3 if regs.rdi != 0 && regs.rsi >= 8 => self
+                                    .read_tracee_u64(pid, regs.rdi)
+                                    .map(|flags| super::CloneFdTablePending {
+                                        syscall_nr: nr,
+                                        flags,
+                                    }),
+                                _ => None,
+                            };
+                            if let Some(snapshot) = snapshot {
+                                self.pending_clone_fd_table.insert(tid, snapshot);
+                            } else if self.connected_dns_proxy.is_some()
+                                && nr == super::syscall_nr::CLONE3
+                            {
+                                warn!(
+                                    tgid,
+                                    tid,
+                                    "denying clone3 because its entry-time flags were unreadable"
+                                );
+                                self.deny(tid).await?;
+                                continue;
+                            }
+                        }
+
+                        // These operations create a private FD table for one
+                        // thread without changing its TGID. Until the tracker
+                        // carries per-thread table identities, allowing them
+                        // would make later DNS state ambiguous. Fail closed
+                        // instead of silently losing inspection coverage.
+                        if (nr == super::syscall_nr::CLOSE_RANGE && regs.rdx & 2 != 0)
+                            || (nr == super::syscall_nr::UNSHARE
+                                && regs.rdi & libc::CLONE_FILES as u64 != 0)
+                        {
+                            warn!(
+                                tgid,
+                                tid,
+                                syscall_nr = nr,
+                                "denying FD-table unshare unsupported by DNS tracker"
+                            );
+                            self.deny(tid).await?;
+                            continue;
+                        }
+
+                        // Maintain socket descriptor lifecycle at successful
+                        // syscall exit. Only lifecycle operations are promoted;
+                        // ordinary reads/writes remain outside the trap set.
+                        let lifecycle = match nr {
+                            // Only promote a close(2) to the two-stop exit dance
+                            // when `fd` is a *tracked socket*. The exit handler
+                            // (`dns_tracker.close`) is a no-op for any other fd,
+                            // so promoting a non-socket close buys nothing and
+                            // costs a second ptrace stop. Runtimes with heavy fd
+                            // churn (e.g. Bun, which Claude Code runs on) close
+                            // thousands of files/pipes; promoting each one was
+                            // ~2x the ptrace cost per close and a wedge surface
+                            // (the two-stop dance is where threads wedge under
+                            // concurrency). An unpromoted close falls through to
+                            // `classify_syscall`, which returns `Ok(None)` for
+                            // CLOSE (see classify.rs) -> allowed. Behaviourally
+                            // equivalent; validated by the fd-lifecycle repro.
+                            super::syscall_nr::CLOSE
+                                if self.dns_tracker.socket_type(tgid, fd).is_some() =>
+                            {
+                                Some(super::FdLifecyclePending::Close { tgid, fd })
+                            }
+                            super::syscall_nr::CLOSE_RANGE if regs.rdx & 4 == 0 => {
+                                Some(super::FdLifecyclePending::CloseRange {
+                                    tgid,
+                                    first: regs.rdi as u32,
+                                    last: regs.rsi as u32,
+                                })
+                            }
+                            // FOLLOW-UP (deferred by decision, 2026-07-27): dup*
+                            // is still promoted unconditionally, unlike close(2)
+                            // above. A socket-membership gate would trim the
+                            // two-stop dance here too, but the safe gate is more
+                            // than close's single check: promote iff the SOURCE
+                            // fd is a tracked socket OR (for dup2/dup3) the TARGET
+                            // fd (regs.rsi) is a tracked socket — because dup2/dup3
+                            // silently close an already-open target, which the
+                            // tracker must observe to untrack it. Must fail toward
+                            // promoting when uncertain: a missed promotion leaves
+                            // the fd->socket map stale, which is a DNS-inspection
+                            // blind spot (not an enforcement bypass — classify.rs
+                            // returns Ok(None) for dup, so it is never scored). Low
+                            // value (close was the dominant fd-churn win); treat as
+                            // security-relevant and validate with the fdchurn repro
+                            // + ptrace_* tests before shipping. See memory
+                            // fd-lifecycle-promotion-wedge.
+                            super::syscall_nr::DUP
+                            | super::syscall_nr::DUP2
+                            | super::syscall_nr::DUP3 => Some(super::FdLifecyclePending::Dup {
+                                tgid,
+                                source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                            }),
+                            super::syscall_nr::FCNTL
+                                if matches!(
+                                    regs.rsi as i32,
+                                    libc::F_DUPFD | libc::F_DUPFD_CLOEXEC
+                                ) =>
+                            {
+                                Some(super::FdLifecyclePending::Dup {
+                                    tgid,
+                                    source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(pending) = lifecycle {
+                            self.pending_fd_exit.insert(tid, pending);
+                            record_event(self, tid, "fd-lifecycle-promote");
+                            self.resume_to_next_syscall(pid, None)?;
+                            continue;
+                        }
+
+                        // A proxy-routed socket has exactly one inspection
+                        // owner. Only sendto with a register-level null peer
+                        // (including libc send()) is safe to resume. Message
+                        // headers live in mutable tracee memory, so sendmsg and
+                        // sendmmsg fail closed even when msg_name currently
+                        // appears null.
+                        if self.dns_tracker.is_connected_proxy(tgid, fd)
+                            && matches!(
+                                nr,
+                                super::syscall_nr::SENDTO
+                                    | super::syscall_nr::SENDMSG
+                                    | super::syscall_nr::SENDMMSG
+                            )
+                        {
+                            if Self::proxy_send_uses_supported_connected_form(nr, &regs) {
+                                record_event(self, tid, "dns-proxy-send");
+                                self.resume_continue(pid, None)?;
+                                continue;
+                            }
+                            self.pending_dns_query.insert(
+                                tid,
+                                crate::interceptor::DnsQueryInspection {
+                                    queries: Vec::new(),
+                                    parse_error: Some(
+                                        "dns-proxy-unsupported-send-form-denied".into(),
+                                    ),
+                                },
+                            );
+                            record_event(self, tid, "dns-proxy-send-deny");
+                            return Ok(Some(SyscallEvent {
+                                pid: tgid,
+                                tid,
+                                timestamp: Utc::now(),
+                                kind: crate::interceptor::SyscallKind::NetSendTo {
+                                    address: String::new(),
+                                    port: 53,
+                                },
+                                raw_syscall_nr: nr,
+                            }));
+                        }
+
+                        // ---- In-line DNS owner (direct resolver path) ----
+                        // A receive on a tracked DNS socket: promote this ONE
+                        // syscall to PTRACE_SYSCALL so we catch its EXIT and read
+                        // the kernel-filled response for exact IP→domain. CONT is
+                        // restored at the exit stop. Read-only — never denies.
+                        // Safe against the clone-child wedge: this is an existing
+                        // tid mid-recvfrom, not a freshly-cloned child racing its
+                        // seccomp registration.
+                        if self.dns_cache.is_some()
+                            && self.dns_observe_responses
+                            && matches!(
+                                nr,
+                                super::syscall_nr::RECVFROM
+                                    | super::syscall_nr::RECVMSG
+                                    | super::syscall_nr::RECVMMSG
+                            )
+                            && self.dns_tracker.is_dns(tgid, fd)
+                            && !self.dns_tracker.is_connected_proxy(tgid, fd)
+                        {
+                            let Some(socket_id) = self.dns_tracker.hold_socket(tgid, fd) else {
+                                warn!(
+                                    tgid,
+                                    tid,
+                                    fd,
+                                    "DNS receive raced a socket peer mutation; skipping attribution"
+                                );
+                                self.resume_continue(pid, None)?;
+                                continue;
+                            };
+                            let kind = match nr {
+                                super::syscall_nr::RECVFROM => super::DnsRecvKind::From {
+                                    buf_ptr: regs.rsi,
+                                    buf_len: (regs.rdx as usize).min(MAX_DNS_MSG),
+                                },
+                                super::syscall_nr::RECVMSG => super::DnsRecvKind::Msg {
+                                    msghdr_ptr: regs.rsi,
+                                },
+                                super::syscall_nr::RECVMMSG => super::DnsRecvKind::Mmsg {
+                                    msgvec_ptr: regs.rsi,
+                                    vlen: (regs.rdx as usize).min(MAX_DNS_BATCH),
+                                },
+                                _ => unreachable!(),
+                            };
+                            self.pending_dns_recv_exit.insert(
+                                tid,
+                                super::DnsRecvPending {
+                                    tgid,
+                                    fd,
+                                    socket_id,
+                                    kind,
+                                },
+                            );
+                            record_event(self, tid, "dns-recv-promote");
+                            self.resume_to_next_syscall(pid, None)?;
+                            continue;
+                        }
+                        // socket(): learn the type (stream/datagram) of every
+                        // AF_INET/AF_INET6 socket by promoting to catch the
+                        // returned fd at exit. The type is unreliable at
+                        // connect-entry via /proc/net (a fresh socket isn't in
+                        // the tables yet), so we record it from the socket() type
+                        // arg. Used for TCP-DNS detection at a :53 connect AND to
+                        // distinguish TCP vs UDP connects so UDP egress can be
+                        // deferred to the send.
+                        if nr == super::syscall_nr::SOCKET
+                            && matches!(regs.rdi as i32, libc::AF_INET | libc::AF_INET6)
+                        {
+                            let socket_type = match (regs.rsi as i32) & 0xFF {
+                                libc::SOCK_STREAM => super::dns_socket_tracker::SocketType::Stream,
+                                libc::SOCK_DGRAM => super::dns_socket_tracker::SocketType::Datagram,
+                                _ => super::dns_socket_tracker::SocketType::Other,
+                            };
+                            self.pending_socket_exit
+                                .insert(tid, super::SocketPending { tgid, socket_type });
+                            record_event(self, tid, "inet-socket-promote");
+                            self.resume_to_next_syscall(pid, None)?;
+                            continue;
+                        }
+                        // Discover DNS from either a prior connect or the
+                        // syscall's explicit destination, then strictly inspect
+                        // every message in the send before allowing it.
+                        if self.dns_cache.is_some()
+                            && matches!(
+                                nr,
+                                super::syscall_nr::SENDTO
+                                    | super::syscall_nr::SENDMSG
+                                    | super::syscall_nr::SENDMMSG
+                            )
+                        {
+                            if let Some(inspection) =
+                                self.inspect_dns_send(pid, tgid, fd, nr, &regs)
+                            {
+                                self.pending_dns_query.insert(tid, inspection);
+                                record_event(self, tid, "seccomp");
+                                return Ok(Some(SyscallEvent {
+                                    pid: tgid,
+                                    tid,
+                                    timestamp: Utc::now(),
+                                    kind: crate::interceptor::SyscallKind::NetSendTo {
+                                        address: String::new(),
+                                        port: 53,
+                                    },
+                                    raw_syscall_nr: nr,
+                                }));
+                            }
+                        }
+                        // Non-DNS connected-UDP send: egress is judged HERE (the
+                        // send carries data), not at the connect. Surface the dest
+                        // recorded at connect AS a NetConnect so it flows through
+                        // the normal egress path (reverse-map + score + audit +
+                        // allow/deny of this send). A connected UDP socket that
+                        // never sends (getaddrinfo's source-selection probe) is
+                        // thus never scored. The session allowlist / reputation
+                        // cache the decision so repeated sends don't re-prompt.
+                        if matches!(
+                            nr,
+                            super::syscall_nr::SENDTO
+                                | super::syscall_nr::SENDMSG
+                                | super::syscall_nr::SENDMMSG
+                        ) {
+                            if let Some(peer) = self.dns_tracker.connected_destination(tgid, fd) {
+                                if self.dns_tracker.socket_type(tgid, fd)
+                                    == Some(super::dns_socket_tracker::SocketType::Datagram)
+                                {
+                                    // The explicit destination WINS over the
+                                    // connected peer: Linux delivers a
+                                    // connected UDP send to the address the
+                                    // send names, so scoring the recorded peer
+                                    // would name the wrong host and let the
+                                    // real egress through (go-live review
+                                    // round 2). sendto: dest_addr in r8 /
+                                    // addrlen in r9. sendmsg/sendmmsg: msg_name
+                                    // in the (first) msghdr at rsi.
+                                    let explicit = match nr {
+                                        super::syscall_nr::SENDTO if regs.r8 != 0 => self
+                                            .read_sockaddr(pid, regs.r8, regs.r9 as usize, None)?
+                                            .filter(|(a, _, _)| !a.is_empty())
+                                            .map(|(a, p, _)| (a, p)),
+                                        super::syscall_nr::SENDMSG
+                                        | super::syscall_nr::SENDMMSG => {
+                                            self.read_msghdr_destination(pid, regs.rsi)?
+                                        }
+                                        _ => None,
+                                    };
+                                    let (address, port) = explicit
+                                        .unwrap_or_else(|| (peer.ip().to_string(), peer.port()));
+
+                                    record_event(self, tid, "seccomp");
+                                    // Register the pending decision so an allow
+                                    // ends stepping for a send-only socket
+                                    // (which never issues write/writev),
+                                    // otherwise the process stays two-stopped
+                                    // for the socket's whole lifetime.
+                                    if let Some(state) = self.stepping.get_mut(&tgid) {
+                                        if state.fds.contains(&fd) {
+                                            state.awaiting.insert(tid, fd);
+                                        }
+                                    }
+                                    return Ok(Some(SyscallEvent {
+                                        pid: tgid,
+                                        tid,
+                                        timestamp: Utc::now(),
+                                        kind: crate::interceptor::SyscallKind::NetConnect {
+                                            address,
+                                            port,
+                                            protocol: crate::interceptor::NetProtocol::Udp,
+                                        },
+                                        raw_syscall_nr: nr,
+                                    }));
+                                }
+                            }
+                        }
+
+                        // Track datagram connect state only after the kernel
+                        // reports success. Connected DNS routes additionally
+                        // substitute the peer for one syscall and register the
+                        // resulting local tuple before the caller resumes.
+                        if nr == super::syscall_nr::CONNECT
+                            && self.dns_tracker.socket_type(tgid, fd)
+                                == Some(super::dns_socket_tracker::SocketType::Datagram)
+                        {
+                            let family = self.sockaddr_family(pid, regs.rsi);
+                            if family == Some(libc::AF_UNSPEC) {
+                                let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd) else {
+                                    self.deny(tid).await?;
+                                    continue;
+                                };
+                                self.pending_udp_connect_exit.insert(
+                                    tid,
+                                    super::UdpConnectPending {
+                                        socket_id,
+                                        destination: None,
+                                        fd,
+                                    },
+                                );
+                                record_event(self, tid, "udp-disconnect-promote");
+                                self.resume_to_next_syscall(pid, None)?;
+                                continue;
+                            }
+
+                            if let (Some(control), Some(original_resolver)) = (
+                                self.connected_dns_proxy.clone(),
+                                self.read_socket_addr(pid, regs.rsi, regs.rdx as usize),
+                            ) {
+                                if original_resolver.port() == 53 {
+                                    match super::dns_redirect::shares_supervisor_netns(tid) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            warn!(
+                                                tgid,
+                                                tid,
+                                                "denying connected DNS across network namespaces"
+                                            );
+                                            self.deny(tid).await?;
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            warn!(
+                                                tgid,
+                                                tid,
+                                                error = %error,
+                                                "network namespace check failed; denying connected DNS"
+                                            );
+                                            self.deny(tid).await?;
+                                            continue;
+                                        }
+                                    }
+
+                                    let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd)
+                                    else {
+                                        self.deny(tid).await?;
+                                        continue;
+                                    };
+                                    let provenance =
+                                        crate::connected_dns_proxy::DnsRouteProvenance {
+                                            tgid,
+                                            creator_tid: tid,
+                                            socket_id: socket_id.0,
+                                        };
+                                    let route = match control
+                                        .create_route(original_resolver, provenance)
+                                    {
+                                        Ok(route) => route,
+                                        Err(error) => {
+                                            self.dns_tracker.unpin_socket(socket_id);
+                                            warn!(
+                                                tgid,
+                                                tid,
+                                                error = %error,
+                                                "connected DNS route creation failed; denying connect"
+                                            );
+                                            self.deny(tid).await?;
+                                            continue;
+                                        }
+                                    };
+                                    let sockaddr =
+                                        match super::dns_redirect::replace_connect_sockaddr(
+                                            pid,
+                                            regs.rsi,
+                                            regs.rdx as u32,
+                                            route.endpoint,
+                                        ) {
+                                            Ok(sockaddr) => sockaddr,
+                                            Err(error) => {
+                                                let _ = control.release_route(route.route_id);
+                                                self.dns_tracker.unpin_socket(socket_id);
+                                                return Err(self
+                                                    .terminate_after_dns_redirect_failure(
+                                                        tgid,
+                                                        &format!(
+                                                            "connected DNS sockaddr rewrite failed: {error}"
+                                                        ),
+                                                    ));
+                                            }
+                                        };
+                                    self.pending_dns_connect_exit.insert(
+                                        tid,
+                                        super::DnsConnectPending {
+                                            tgid,
+                                            fd,
+                                            socket_id,
+                                            original_resolver,
+                                            route,
+                                            sockaddr,
+                                        },
+                                    );
+                                    record_event(self, tid, "dns-connect-promote");
+                                    self.resume_to_next_syscall(pid, None)?;
+                                    continue;
+                                } else if self.dns_tracker.is_connected_proxy(tgid, fd) {
+                                    warn!(
+                                        tgid,
+                                        tid,
+                                        %original_resolver,
+                                        "denying non-DNS reconnect of a proxy-owned UDP socket"
+                                    );
+                                    self.deny(tid).await?;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if nr == super::syscall_nr::CONNECT
+                            && self.connected_dns_proxy.is_some()
+                            && matches!(
+                                self.dns_tracker.socket_type(tgid, fd),
+                                None | Some(super::dns_socket_tracker::SocketType::Other)
+                            )
+                            && self
+                                .read_socket_addr(pid, regs.rsi, regs.rdx as usize)
+                                .is_some_and(|destination| destination.port() == 53)
+                        {
+                            warn!(
+                                tgid,
+                                tid,
+                                fd,
+                                "denying UDP/53-capable connect on an untracked socket while connected DNS proxy is required"
+                            );
+                            self.deny(tid).await?;
+                            continue;
+                        }
 
                         match self.classify_syscall(pid, &regs) {
                             Ok(Some(kind)) => {
-                                let tid = pid_u32;
                                 let tgid = Self::resolve_tgid(tid).unwrap_or(tid);
 
-                                let sockaddr_addr = match nr {
-                                    super::syscall_nr::CONNECT => Some(regs.rsi),
-                                    super::syscall_nr::SENDTO if regs.r8 != 0 => Some(regs.r8),
-                                    _ => None,
-                                };
+                                // Connect handling:
+                                // - `:53` (DNS on): route to the in-line DNS path
+                                //   (stream → TCP-DNS deny flag; datagram → tracked
+                                //   DNS socket). Returned as an event + allowed.
+                                // - any other UDP connect: defer egress to the
+                                //   send. Record the dest and allow the connect
+                                //   WITHOUT scoring — a UDP connect sends no data,
+                                //   so scoring it (as today) false-positives on
+                                //   getaddrinfo's source-selection probe.
+                                // - TCP / other: fall through, scored at connect.
+                                if let crate::interceptor::SyscallKind::NetConnect {
+                                    address,
+                                    port,
+                                    protocol,
+                                } = &kind
+                                {
+                                    let fd = regs.rdi as i32;
+                                    let mut known_type = self.dns_tracker.socket_type(tgid, fd);
+                                    if known_type.is_none()
+                                        && matches!(
+                                            protocol,
+                                            crate::interceptor::NetProtocol::Tcp
+                                                | crate::interceptor::NetProtocol::Udp
+                                        )
+                                    {
+                                        let socket_type =
+                                            if *protocol == crate::interceptor::NetProtocol::Udp {
+                                                super::dns_socket_tracker::SocketType::Datagram
+                                            } else {
+                                                super::dns_socket_tracker::SocketType::Stream
+                                            };
+                                        self.dns_tracker.observe_socket(tgid, fd, socket_type);
+                                        known_type = Some(socket_type);
+                                    }
+                                    let is_udp = known_type
+                                        == Some(super::dns_socket_tracker::SocketType::Datagram);
+                                    if *port == 53 && self.dns_cache.is_some() {
+                                        // TCP-DNS deny only on a CONFIRMED stream
+                                        // socket — never deny a UDP DNS socket.
+                                        if self.block_tcp_dns
+                                            && known_type
+                                                == Some(
+                                                    super::dns_socket_tracker::SocketType::Stream,
+                                                )
+                                        {
+                                            self.pending_tcp_dns_deny.insert(tid);
+                                        }
+                                    }
+                                    if is_udp {
+                                        let Some(destination) = address
+                                            .parse::<IpAddr>()
+                                            .ok()
+                                            .map(|ip| SocketAddr::new(ip, *port))
+                                        else {
+                                            self.deny(tid).await?;
+                                            continue;
+                                        };
+                                        let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd)
+                                        else {
+                                            self.deny(tid).await?;
+                                            continue;
+                                        };
+                                        self.pending_udp_connect_exit.insert(
+                                            tid,
+                                            super::UdpConnectPending {
+                                                socket_id,
+                                                destination: Some(destination),
+                                                fd,
+                                            },
+                                        );
+                                        // Defer UDP egress to the send, but
+                                        // catch connect exit before committing
+                                        // shared peer state.
+                                        record_event(self, tid, "udp-connect-promote");
+                                        self.resume_to_next_syscall(pid, None)?;
+                                        continue;
+                                    }
+                                }
 
                                 trace!(
                                     pid = tgid,
@@ -482,7 +2405,6 @@ impl SyscallInterceptor for PtraceSupervisor {
                                     timestamp: Utc::now(),
                                     kind,
                                     raw_syscall_nr: nr,
-                                    sockaddr_addr,
                                 }));
                             }
                             Ok(None) => {
@@ -522,6 +2444,34 @@ impl SyscallInterceptor for PtraceSupervisor {
                     // (not seccomp) and the original args are gone.
                     if event == libc::PTRACE_EVENT_EXEC {
                         let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
+                        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid_u32}/fd")) {
+                            let live_fds = entries
+                                .filter_map(|entry| {
+                                    entry
+                                        .ok()?
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .parse::<i32>()
+                                        .ok()
+                                })
+                                .collect();
+                            let released = self.dns_tracker.retain_fds(tgid, &live_fds);
+                            self.release_connected_routes(released).await?;
+                            // B13 (exec-survival residual): a connected non-loopback
+                            // datagram socket the OLD image opened survives execve
+                            // unless it was FD_CLOEXEC — the tracker was just pruned
+                            // to the live fds above, so a survivor keeps its
+                            // Datagram type + connected destination. A blanket
+                            // demote here would stop stepping the survivor, so a
+                            // `write(fd, secret)` in the NEW image would egress
+                            // untrapped and unaudited. Re-evaluate per fd instead:
+                            // keep stepping every fd that is still a connected
+                            // off-host datagram socket (mirror of the fork-child
+                            // re-arm), demote the rest. There is no "next connect"
+                            // for an already-connected socket, so this is the only
+                            // place stepping can be re-armed across exec.
+                            self.resync_stepping_after_exec(tgid);
+                        }
                         let (path, args) = Self::read_exec_info(pid_u32);
                         let kind = crate::interceptor::SyscallKind::ProcessExec { path, args };
                         trace!(
@@ -536,33 +2486,40 @@ impl SyscallInterceptor for PtraceSupervisor {
                             timestamp: Utc::now(),
                             kind,
                             raw_syscall_nr: super::syscall_nr::EXECVE,
-                            sockaddr_addr: None,
                         }));
                     }
 
-                    // Fork/vfork/clone event — track the new child.
-                    if let Ok(Some(child_pid)) = self.handle_ptrace_event(pid, event) {
-                        debug!(
-                            parent = pid.as_raw(),
-                            child = child_pid,
-                            "auto-tracing new child"
-                        );
-                        // Emit a ProcessFork event with the actual child PID.
-                        let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
-                        let kind = crate::interceptor::SyscallKind::ProcessFork { child_pid };
-                        record_event(self, pid_u32, "ptrace-event:fork-or-clone");
-                        // Initialise the new child's tracking so the watchdog
-                        // doesn't false-positive it as "never seen any event"
-                        // before its own first stop arrives.
-                        record_event(self, child_pid, "ptrace-event:child-of");
-                        return Ok(Some(SyscallEvent {
-                            pid: tgid,
-                            tid: pid_u32,
-                            timestamp: Utc::now(),
-                            kind,
-                            raw_syscall_nr: super::syscall_nr::CLONE,
-                            sockaddr_addr: None,
-                        }));
+                    // Fork/vfork/clone event — track the new child. Errors are
+                    // session-fatal: resuming after an ambiguous FD-table
+                    // inheritance would make connected-DNS ownership unsafe.
+                    if matches!(
+                        event,
+                        libc::PTRACE_EVENT_FORK
+                            | libc::PTRACE_EVENT_VFORK
+                            | libc::PTRACE_EVENT_CLONE
+                    ) {
+                        if let Some(child_pid) = self.handle_ptrace_event(pid, event)? {
+                            debug!(
+                                parent = pid.as_raw(),
+                                child = child_pid,
+                                "auto-tracing new child"
+                            );
+                            // Emit a ProcessFork event with the actual child PID.
+                            let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
+                            let kind = crate::interceptor::SyscallKind::ProcessFork { child_pid };
+                            record_event(self, pid_u32, "ptrace-event:fork-or-clone");
+                            // Initialise the new child's tracking so the watchdog
+                            // doesn't false-positive it as "never seen any event"
+                            // before its own first stop arrives.
+                            record_event(self, child_pid, "ptrace-event:child-of");
+                            return Ok(Some(SyscallEvent {
+                                pid: tgid,
+                                tid: pid_u32,
+                                timestamp: Utc::now(),
+                                kind,
+                                raw_syscall_nr: super::syscall_nr::CLONE,
+                            }));
+                        }
                     }
                     // Unhandled PTRACE_EVENT_* — release the tracee but
                     // surface a warn so the next investigation has the event
@@ -584,17 +2541,733 @@ impl SyscallInterceptor for PtraceSupervisor {
                 // (without seccomp) and edge cases.
                 WaitStatus::PtraceSyscall(pid) => {
                     let pid_u32 = pid.as_raw() as u32;
+
+                    if let Some(pending) = self.pending_dns_connect_exit.remove(&pid_u32) {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        record_event(self, pid_u32, "dns-connect-exit");
+                        let result = self
+                            .read_registers(pid)
+                            .ok()
+                            .flatten()
+                            .map(|regs| regs.rax as i64)
+                            .unwrap_or(-(libc::EIO as i64));
+
+                        if let Err(error) = pending.sockaddr.restore(pid) {
+                            if let Some(control) = &self.connected_dns_proxy {
+                                let _ = control.release_route(pending.route.route_id);
+                            }
+                            self.dns_tracker.unpin_socket(pending.socket_id);
+                            return Err(self.terminate_after_dns_redirect_failure(
+                                pending.tgid,
+                                &format!("sockaddr restoration failed: {error}"),
+                            ));
+                        }
+
+                        if result < 0 {
+                            if let Some(control) = &self.connected_dns_proxy {
+                                control
+                                    .release_route(pending.route.route_id)
+                                    .map_err(|error| {
+                                        Error::InterceptionError(format!(
+                                            "failed to release route after DNS connect error: {error}"
+                                        ))
+                                    })?;
+                            }
+                            if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id)
+                            {
+                                self.release_connected_route(route_id).await?;
+                            }
+                            self.resume_tracee(pid, None)?;
+                            continue;
+                        }
+
+                        if !self.dns_tracker.socket_matches(
+                            pending.tgid,
+                            pending.fd,
+                            pending.socket_id,
+                        ) {
+                            if let Some(control) = &self.connected_dns_proxy {
+                                let _ = control.release_route(pending.route.route_id);
+                            }
+                            self.dns_tracker.unpin_socket(pending.socket_id);
+                            return Err(self.terminate_after_dns_redirect_failure(
+                                pending.tgid,
+                                "socket descriptor was closed or reused before route registration",
+                            ));
+                        }
+
+                        let family = if pending.original_resolver.is_ipv4() {
+                            libc::AF_INET
+                        } else {
+                            libc::AF_INET6
+                        };
+                        let client = match super::dns_redirect::socket_local_addr(
+                            pending.tgid,
+                            pending.fd,
+                            family,
+                        ) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                if let Some(control) = &self.connected_dns_proxy {
+                                    let _ = control.release_route(pending.route.route_id);
+                                }
+                                self.dns_tracker.unpin_socket(pending.socket_id);
+                                return Err(self.terminate_after_dns_redirect_failure(
+                                    pending.tgid,
+                                    &format!("client tuple registration lookup failed: {error}"),
+                                ));
+                            }
+                        };
+                        let Some(control) = self.connected_dns_proxy.clone() else {
+                            self.dns_tracker.unpin_socket(pending.socket_id);
+                            return Err(self.terminate_after_dns_redirect_failure(
+                                pending.tgid,
+                                "proxy control plane disappeared after connect",
+                            ));
+                        };
+                        if let Err(error) = control.register_client(pending.route.route_id, client)
+                        {
+                            let _ = control.release_route(pending.route.route_id);
+                            self.dns_tracker.unpin_socket(pending.socket_id);
+                            return Err(self.terminate_after_dns_redirect_failure(
+                                pending.tgid,
+                                &format!("client tuple registration failed: {error}"),
+                            ));
+                        }
+
+                        let transition = match self.dns_tracker.set_connected_proxy_for_socket(
+                            pending.socket_id,
+                            super::dns_socket_tracker::DnsRouteId(pending.route.route_id.get()),
+                            pending.original_resolver,
+                            pending.route.endpoint,
+                        ) {
+                            Some(transition) => transition,
+                            None => {
+                                let _ = control.release_route(pending.route.route_id);
+                                self.dns_tracker.unpin_socket(pending.socket_id);
+                                return Err(self.terminate_after_dns_redirect_failure(
+                                    pending.tgid,
+                                    "shared socket state disappeared before route commit",
+                                ));
+                            }
+                        };
+                        if let Err(error) = control.activate_route(pending.route.route_id) {
+                            let _ = control.release_route(pending.route.route_id);
+                            self.dns_tracker.unpin_socket(pending.socket_id);
+                            return Err(self.terminate_after_dns_redirect_failure(
+                                pending.tgid,
+                                &format!("client route activation failed: {error}"),
+                            ));
+                        }
+                        if let Some(route_id) = transition.released_route {
+                            self.release_connected_route(route_id).await?;
+                        }
+                        if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                            self.release_connected_route(route_id).await?;
+                        }
+                        trace!(
+                            tgid = pending.tgid,
+                            tid = pid_u32,
+                            fd = pending.fd,
+                            route_id = pending.route.route_id.get(),
+                            %client,
+                            resolver = %pending.original_resolver,
+                            endpoint = %pending.route.endpoint,
+                            "connected DNS proxy route committed"
+                        );
+                        self.resume_tracee(pid, None)?;
+                        continue;
+                    }
+
+                    if let Some(pending) = self.pending_udp_connect_exit.remove(&pid_u32) {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        record_event(self, pid_u32, "udp-connect-exit");
+                        let succeeded = self
+                            .read_registers(pid)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|regs| (regs.rax as i64) >= 0);
+                        if succeeded {
+                            let released = match pending.destination {
+                                Some(destination) => self
+                                    .dns_tracker
+                                    .connect_socket(pending.socket_id, destination),
+                                None => self.dns_tracker.disconnect_socket(pending.socket_id),
+                            };
+                            if let Some(route_id) = released {
+                                self.release_connected_route(route_id).await?;
+                            }
+                            // B13: once this socket is pointed at a
+                            // non-loopback peer, a plain write(2) on it is an
+                            // egress the proxy never sees. Step this thread
+                            // until that write is judged. A disconnect or a
+                            // loopback re-connect ends the need.
+                            let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
+                            match pending.destination {
+                                Some(destination)
+                                    if !Self::is_loopback_destination(&destination) =>
+                                {
+                                    self.promote_stepping(tgid, pending.fd, destination);
+                                }
+                                _ => self.demote_stepping_fd(
+                                    tgid,
+                                    pending.fd,
+                                    "datagram socket disconnected or aimed at loopback",
+                                ),
+                            }
+                        }
+                        if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                            self.release_connected_route(route_id).await?;
+                        }
+                        self.resume_tracee(pid, None)?;
+                        continue;
+                    }
+
+                    // In-line DNS: the EXIT stop of a receive we promoted at its
+                    // seccomp entry. Read the kernel-filled response, record exact
+                    // IP→domain, restore CONT. MUST run before the fallback
+                    // in_syscall_entry toggle so it doesn't corrupt that
+                    // bookkeeping. Read-only — any failure just skips the cache
+                    // and still restores the tracee.
+                    if let Some(pending) = self.pending_dns_recv_exit.remove(&pid_u32) {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        record_event(self, pid_u32, "dns-recv-exit");
+                        if let Ok(Some(regs)) = self.read_registers(pid) {
+                            let n = regs.rax as i64;
+                            if n > 0 {
+                                match pending.kind {
+                                    super::DnsRecvKind::From { buf_ptr, buf_len } => {
+                                        if n as usize <= MAX_DNS_MSG {
+                                            let len = (n as usize).min(buf_len);
+                                            if let Ok(response) =
+                                                self.read_tracee_bytes(pid, buf_ptr, len)
+                                            {
+                                                self.record_dns_response(pending, &response);
+                                            }
+                                        }
+                                    }
+                                    super::DnsRecvKind::Msg { msghdr_ptr } => {
+                                        if n as usize <= MAX_DNS_MSG {
+                                            if let Some(response) =
+                                                self.read_recv_msghdr(pid, msghdr_ptr, n as usize)
+                                            {
+                                                self.record_dns_response(pending, &response);
+                                            }
+                                        }
+                                    }
+                                    super::DnsRecvKind::Mmsg { msgvec_ptr, vlen } => {
+                                        let count = (n as usize).min(vlen);
+                                        for index in 0..count {
+                                            let header = msgvec_ptr + (index as u64) * MMSGHDR_SIZE;
+                                            let Some(len) =
+                                                self.read_tracee_u32(pid, header + MSGHDR_SIZE)
+                                            else {
+                                                break;
+                                            };
+                                            if len as usize <= MAX_DNS_MSG {
+                                                if let Some(response) =
+                                                    self.read_recv_msghdr(pid, header, len as usize)
+                                                {
+                                                    self.record_dns_response(pending, &response);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(route_id) =
+                            self.dns_tracker.release_socket_hold(pending.socket_id)
+                        {
+                            self.release_connected_route(route_id).await?;
+                        }
+                        self.resume_tracee(pid, None)?;
+                        continue;
+                    }
+
+                    // socket() exit we promoted at its seccomp entry: learn the
+                    // returned fd and record whether it's a stream (TCP) socket,
+                    // so a later connect to :53 on it can be blocked as TCP-DNS.
+                    // Kept accurate across fd reuse (stream → insert, dgram →
+                    // remove). Runs before the fallback in_syscall_entry toggle.
+                    if let Some(pending) = self.pending_socket_exit.remove(&pid_u32) {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        record_event(self, pid_u32, "inet-socket-exit");
+                        if let Ok(Some(regs)) = self.read_registers(pid) {
+                            let fd = regs.rax as i64;
+                            if fd >= 0 {
+                                let released = self.dns_tracker.observe_socket(
+                                    pending.tgid,
+                                    fd as i32,
+                                    pending.socket_type,
+                                );
+                                if let Some(route_id) = released {
+                                    self.release_connected_route(route_id).await?;
+                                }
+                            }
+                        }
+                        self.resume_tracee(pid, None)?;
+                        continue;
+                    }
+
+                    if let Some(pending) = self.pending_fd_exit.remove(&pid_u32) {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        record_event(self, pid_u32, "fd-lifecycle-exit");
+                        let held_source = match pending {
+                            super::FdLifecyclePending::Dup { source_socket, .. } => source_socket,
+                            super::FdLifecyclePending::Close { .. }
+                            | super::FdLifecyclePending::CloseRange { .. } => None,
+                        };
+                        // Tracee died in this exit stop. Mirror the Exited-arm
+                        // cleanup for a pending fd event: release any held
+                        // source socket so route holds stay balanced; the reap
+                        // of this tid handles the rest.
+                        let Some(regs) = self.read_registers(pid)? else {
+                            if let Some(socket_id) = held_source {
+                                if let Some(route_id) =
+                                    self.dns_tracker.release_socket_hold(socket_id)
+                                {
+                                    self.release_connected_route(route_id).await?;
+                                }
+                            }
+                            record_event(self, pid_u32, "fd-lifecycle-exit:tracee-gone");
+                            continue;
+                        };
+                        let result = regs.rax as i64;
+                        let released = match pending {
+                            // Linux releases an FD early in close(2), even
+                            // when later flush/writeback reports EINTR or
+                            // I/O failure. EBADF also proves any tracked
+                            // mapping was stale, so reconcile every close
+                            // result.
+                            super::FdLifecyclePending::Close { tgid, fd } => {
+                                self.dns_tracker.close(tgid, fd).into_iter().collect()
+                            }
+                            super::FdLifecyclePending::CloseRange { tgid, first, last }
+                                if result >= 0 =>
+                            {
+                                self.dns_tracker.close_range(tgid, first, last)
+                            }
+                            super::FdLifecyclePending::Dup {
+                                tgid,
+                                source_socket,
+                            } if result >= 0 => match source_socket {
+                                Some(socket_id) => self.dns_tracker.duplicate_socket(
+                                    tgid,
+                                    socket_id,
+                                    result as i32,
+                                ),
+                                None => self.dns_tracker.close(tgid, result as i32),
+                            }
+                            .into_iter()
+                            .collect(),
+                            super::FdLifecyclePending::CloseRange { .. }
+                            | super::FdLifecyclePending::Dup { .. } => Vec::new(),
+                        };
+                        if !released.is_empty() {
+                            self.release_connected_routes(released).await?;
+                        }
+                        if let Some(socket_id) = held_source {
+                            if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id)
+                            {
+                                self.release_connected_route(route_id).await?;
+                            }
+                        }
+                        // B13: a closed fd cannot be written to, so nothing
+                        // needs stepping for it any more. Closing the window
+                        // promptly is what keeps the wedge-sensitive two-stop
+                        // dance rare.
+                        match pending {
+                            super::FdLifecyclePending::Close { tgid, fd } => {
+                                let was_stepping = self.stepping.contains_key(&tgid);
+                                self.demote_stepping_fd(tgid, fd, "tracked fd closed");
+                                // B13 (no-exec dup variant): a dup'd non-CLOEXEC
+                                // alias can outlive the fd the connect happened
+                                // on. The tracker already dropped the closed fd
+                                // (above); if the socket survives on another live
+                                // fd, keep stepping it — demote_stepping_fd only
+                                // removed the closed fd number, not the alias.
+                                if was_stepping {
+                                    self.rearm_surviving_connected_dgram_fds(tgid);
+                                }
+                            }
+                            super::FdLifecyclePending::CloseRange { tgid, first, last } => {
+                                let closed: Vec<i32> = self
+                                    .stepping
+                                    .get(&tgid)
+                                    .map(|state| {
+                                        state
+                                            .fds
+                                            .iter()
+                                            .copied()
+                                            .filter(|fd| *fd >= first as i32 && *fd <= last as i32)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                for fd in closed {
+                                    self.demote_stepping_fd(
+                                        tgid,
+                                        fd,
+                                        "tracked fd closed by close_range",
+                                    );
+                                }
+                            }
+                            // A dup ADDS an alias for the same socket; the
+                            // write check resolves any alias through the
+                            // tracker, so nothing to add or remove here.
+                            super::FdLifecyclePending::Dup { .. } => {}
+                        }
+                        self.resume_tracee(pid, None)?;
+                        continue;
+                    }
+
+                    // B13: a thread of a process holding a connected
+                    // non-loopback datagram socket. Only in a seccomp
+                    // session — an attach session already stops on every
+                    // syscall and classifies it below, so short-circuiting
+                    // here would leave such a process effectively
+                    // unsupervised for everything except the write.
+                    //
+                    // Stop ordering matters. The kernel reports the
+                    // syscall-entry stop *before* the seccomp stop
+                    // (`syscall_trace_enter` calls the ptrace report first,
+                    // "to catch any tracer changes"), so a security-relevant
+                    // syscall on a stepped thread produces entry → seccomp →
+                    // exit. Only write/writev are acted on here; everything
+                    // else is waved through so the seccomp stop remains the
+                    // single place a syscall is classified.
+                    if self.seccomp_session && self.tid_is_stepping(pid_u32) {
+                        // Entry vs exit comes from the kernel's own record, not
+                        // a per-tid toggle — the toggle desynced whenever a
+                        // promoted syscall's exit stop was consumed by another
+                        // handler (socket/connect/dns/fd-lifecycle) before
+                        // reaching here, after which every write was judged at
+                        // its exit, i.e. after the datagram was already sent
+                        // (go-live review round 2).
+                        let is_exit = Self::syscall_stop_is_exit(pid);
+                        // The stepped thread can be killed (sibling exit_group,
+                        // SIGKILL) while stopped here; its stepping state is
+                        // reaped with its thread-exit, so skip the stale stop.
+                        let Some(regs) = self.read_registers(pid)? else {
+                            record_event(self, pid_u32, "dgram-write-step:tracee-gone");
+                            continue;
+                        };
+                        // Fallback for pre-5.3 kernels: at entry the kernel
+                        // seeds rax with -ENOSYS; at exit rax holds the return.
+                        let at_entry = match is_exit {
+                            Some(exit) => !exit,
+                            None => regs.rax as i64 == -(libc::ENOSYS as i64),
+                        };
+                        if !at_entry {
+                            // Exit stop — the write already ran (or was
+                            // cancelled by deny). Nothing to do.
+                            self.resume_tracee(pid, None)?;
+                            continue;
+                        }
+                        record_event(self, pid_u32, "dgram-write-step");
+
+                        let nr = regs.orig_rax as i64;
+                        if !matches!(nr, super::syscall_nr::WRITE | super::syscall_nr::WRITEV) {
+                            self.resume_to_next_syscall(pid, None)?;
+                            continue;
+                        }
+
+                        let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
+                        let write_fd = regs.rdi as i32;
+                        let Some(destination) = self.connected_dgram_egress_target(tgid, write_fd)
+                        else {
+                            // Not egress: an ordinary file, the PTY, or a
+                            // socket that is no longer a non-loopback connected
+                            // datagram. Stop stepping the underlying socket
+                            // (resolved through the tracker so a dup'd alias
+                            // demotes the original, not a phantom fd — go-live
+                            // review round 2), then keep going.
+                            self.demote_stepping_socket(tgid, write_fd);
+                            self.resume_to_next_syscall(pid, None)?;
+                            continue;
+                        };
+
+                        if let Some(state) = self.stepping.get_mut(&tgid) {
+                            state.awaiting.insert(pid_u32, write_fd);
+                        }
+                        return Ok(Some(Self::connected_dgram_write_event(
+                            tgid,
+                            pid_u32,
+                            write_fd,
+                            destination,
+                            nr,
+                        )));
+                    }
+
                     record_event(self, pid_u32, "syscall-fallback");
 
-                    if self.in_syscall_entry.contains(&pid_u32) {
+                    // Entry vs exit comes from the kernel's own record, like
+                    // the stepped-write path above — the per-tid toggle
+                    // desyncs whenever another handler consumes a stop out of
+                    // pattern, after which every exit was judged as an entry
+                    // (and fed to the foreign-ABI check below with no entry
+                    // record behind it — B1 round 3). The toggle is still
+                    // maintained (insert at entry, remove at exit) because it
+                    // doubles as the "inside a syscall" marker elsewhere, but
+                    // it only *decides* on pre-5.3 kernels.
+                    let at_exit = Self::syscall_stop_is_exit(pid)
+                        .unwrap_or_else(|| self.in_syscall_entry.contains(&pid_u32));
+                    if at_exit {
                         self.in_syscall_entry.remove(&pid_u32);
                         self.resume_tracee(pid, None)?;
                         continue;
                     }
                     self.in_syscall_entry.insert(pid_u32);
 
-                    let regs = self.read_registers(pid)?;
+                    // B1 round-2: the attach-mode fallback (no seccomp) has no
+                    // arch check, so `int 0x80` was classified straight
+                    // through the x86_64 table and ran unsupervised under
+                    // `grith exec --attach`. Take the ABI from the kernel's
+                    // own syscall-entry record — the same source the seccomp
+                    // arm uses — and route a foreign-ABI syscall to the
+                    // hard-deny path. deny() cancels the syscall; its exit
+                    // stop is consumed by the exit branch above.
+                    if let Some(abi) = self.foreign_abi_at_stop(pid, false) {
+                        let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
+                        self.tid_tgids.insert(pid_u32, tgid);
+                        let raw_nr = self
+                            .read_registers(pid)
+                            .ok()
+                            .flatten()
+                            .map(|r| r.orig_rax as i64)
+                            .unwrap_or(-1);
+                        warn!(
+                            pid = tgid,
+                            tid = pid_u32,
+                            abi = ?abi,
+                            raw_nr,
+                            "foreign-ABI syscall trapped in attach-mode fallback"
+                        );
+                        record_event(self, pid_u32, "syscall-fallback-foreign-abi");
+                        return Ok(Some(SyscallEvent {
+                            pid: tgid,
+                            tid: pid_u32,
+                            timestamp: Utc::now(),
+                            kind: crate::interceptor::SyscallKind::ForeignAbiSyscall {
+                                abi,
+                                raw_nr,
+                            },
+                            raw_syscall_nr: raw_nr,
+                        }));
+                    }
+
+                    // Tracee died in this stop; undo the entry toggle so a
+                    // reused tid cannot inherit a stale entry/exit phase.
+                    let Some(regs) = self.read_registers(pid)? else {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        record_event(self, pid_u32, "syscall-fallback:tracee-gone");
+                        continue;
+                    };
                     let nr = regs.orig_rax as i64;
+                    let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
+                    let fd = regs.rdi as i32;
+
+                    if (nr == super::syscall_nr::CLOSE_RANGE && regs.rdx & 2 != 0)
+                        || (nr == super::syscall_nr::UNSHARE
+                            && regs.rdi & libc::CLONE_FILES as u64 != 0)
+                    {
+                        warn!(
+                            tgid,
+                            tid = pid_u32,
+                            syscall_nr = nr,
+                            "denying FD-table unshare unsupported by DNS tracker"
+                        );
+                        self.deny(pid_u32).await?;
+                        continue;
+                    }
+
+                    // B13 attach-mode parity: an attach session stops on
+                    // every syscall already, so the connected-datagram write
+                    // is surfaced inline rather than by stepping.
+                    if matches!(nr, super::syscall_nr::WRITE | super::syscall_nr::WRITEV) {
+                        if let Some(destination) = self.connected_dgram_egress_target(tgid, fd) {
+                            return Ok(Some(Self::connected_dgram_write_event(
+                                tgid,
+                                pid_u32,
+                                fd,
+                                destination,
+                                nr,
+                            )));
+                        }
+                    }
+
+                    // Attach-mode parity for targeted DNS and FD tracking.
+                    // This fallback already stops at syscall boundaries, but
+                    // uses the same pending-exit records as the seccomp path.
+                    let lifecycle = match nr {
+                        super::syscall_nr::CLOSE => {
+                            Some(super::FdLifecyclePending::Close { tgid, fd })
+                        }
+                        super::syscall_nr::CLOSE_RANGE if regs.rdx & 4 == 0 => {
+                            Some(super::FdLifecyclePending::CloseRange {
+                                tgid,
+                                first: regs.rdi as u32,
+                                last: regs.rsi as u32,
+                            })
+                        }
+                        super::syscall_nr::DUP
+                        | super::syscall_nr::DUP2
+                        | super::syscall_nr::DUP3 => Some(super::FdLifecyclePending::Dup {
+                            tgid,
+                            source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                        }),
+                        super::syscall_nr::FCNTL
+                            if matches!(regs.rsi as i32, libc::F_DUPFD | libc::F_DUPFD_CLOEXEC) =>
+                        {
+                            Some(super::FdLifecyclePending::Dup {
+                                tgid,
+                                source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(pending) = lifecycle {
+                        self.pending_fd_exit.insert(pid_u32, pending);
+                        self.resume_to_next_syscall(pid, None)?;
+                        continue;
+                    }
+
+                    if nr == super::syscall_nr::SOCKET
+                        && matches!(regs.rdi as i32, libc::AF_INET | libc::AF_INET6)
+                    {
+                        let socket_type = match (regs.rsi as i32) & 0xFF {
+                            libc::SOCK_STREAM => super::dns_socket_tracker::SocketType::Stream,
+                            libc::SOCK_DGRAM => super::dns_socket_tracker::SocketType::Datagram,
+                            _ => super::dns_socket_tracker::SocketType::Other,
+                        };
+                        self.pending_socket_exit
+                            .insert(pid_u32, super::SocketPending { tgid, socket_type });
+                        self.resume_to_next_syscall(pid, None)?;
+                        continue;
+                    }
+
+                    if self.dns_tracker.is_connected_proxy(tgid, fd)
+                        && matches!(
+                            nr,
+                            super::syscall_nr::SENDTO
+                                | super::syscall_nr::SENDMSG
+                                | super::syscall_nr::SENDMMSG
+                        )
+                    {
+                        if Self::proxy_send_uses_supported_connected_form(nr, &regs) {
+                            self.resume_tracee(pid, None)?;
+                            continue;
+                        }
+                        self.pending_dns_query.insert(
+                            pid_u32,
+                            crate::interceptor::DnsQueryInspection {
+                                queries: Vec::new(),
+                                parse_error: Some("dns-proxy-unsupported-send-form-denied".into()),
+                            },
+                        );
+                        return Ok(Some(SyscallEvent {
+                            pid: tgid,
+                            tid: pid_u32,
+                            timestamp: Utc::now(),
+                            kind: crate::interceptor::SyscallKind::NetSendTo {
+                                address: String::new(),
+                                port: 53,
+                            },
+                            raw_syscall_nr: nr,
+                        }));
+                    }
+
+                    if self.dns_cache.is_some()
+                        && self.dns_observe_responses
+                        && self.dns_tracker.is_dns(tgid, fd)
+                        && !self.dns_tracker.is_connected_proxy(tgid, fd)
+                        && matches!(
+                            nr,
+                            super::syscall_nr::RECVFROM
+                                | super::syscall_nr::RECVMSG
+                                | super::syscall_nr::RECVMMSG
+                        )
+                    {
+                        let Some(socket_id) = self.dns_tracker.hold_socket(tgid, fd) else {
+                            warn!(
+                                tgid,
+                                tid = pid_u32,
+                                fd,
+                                "DNS receive raced a socket peer mutation; skipping attribution"
+                            );
+                            self.resume_tracee(pid, None)?;
+                            continue;
+                        };
+                        let kind = match nr {
+                            super::syscall_nr::RECVFROM => super::DnsRecvKind::From {
+                                buf_ptr: regs.rsi,
+                                buf_len: (regs.rdx as usize).min(MAX_DNS_MSG),
+                            },
+                            super::syscall_nr::RECVMSG => super::DnsRecvKind::Msg {
+                                msghdr_ptr: regs.rsi,
+                            },
+                            super::syscall_nr::RECVMMSG => super::DnsRecvKind::Mmsg {
+                                msgvec_ptr: regs.rsi,
+                                vlen: (regs.rdx as usize).min(MAX_DNS_BATCH),
+                            },
+                            _ => unreachable!(),
+                        };
+                        self.pending_dns_recv_exit.insert(
+                            pid_u32,
+                            super::DnsRecvPending {
+                                tgid,
+                                fd,
+                                socket_id,
+                                kind,
+                            },
+                        );
+                        self.resume_to_next_syscall(pid, None)?;
+                        continue;
+                    }
+
+                    if self.dns_cache.is_some()
+                        && matches!(
+                            nr,
+                            super::syscall_nr::SENDTO
+                                | super::syscall_nr::SENDMSG
+                                | super::syscall_nr::SENDMMSG
+                        )
+                    {
+                        if let Some(inspection) = self.inspect_dns_send(pid, tgid, fd, nr, &regs) {
+                            self.pending_dns_query.insert(pid_u32, inspection);
+                            return Ok(Some(SyscallEvent {
+                                pid: tgid,
+                                tid: pid_u32,
+                                timestamp: Utc::now(),
+                                kind: crate::interceptor::SyscallKind::NetSendTo {
+                                    address: String::new(),
+                                    port: 53,
+                                },
+                                raw_syscall_nr: nr,
+                            }));
+                        }
+                    }
+
+                    if nr == super::syscall_nr::CONNECT
+                        && self.dns_tracker.socket_type(tgid, fd)
+                            == Some(super::dns_socket_tracker::SocketType::Datagram)
+                        && self.sockaddr_family(pid, regs.rsi) == Some(libc::AF_UNSPEC)
+                    {
+                        let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd) else {
+                            self.deny(pid_u32).await?;
+                            continue;
+                        };
+                        self.pending_udp_connect_exit.insert(
+                            pid_u32,
+                            super::UdpConnectPending {
+                                socket_id,
+                                destination: None,
+                                fd,
+                            },
+                        );
+                        self.resume_to_next_syscall(pid, None)?;
+                        continue;
+                    }
 
                     let uses_seccomp = self.seccomp_tracees.contains(&pid_u32);
                     if !is_fallback_relevant_syscall(nr, uses_seccomp) {
@@ -605,13 +3278,54 @@ impl SyscallInterceptor for PtraceSupervisor {
                     match self.classify_syscall(pid, &regs) {
                         Ok(Some(kind)) => {
                             let tid = pid_u32;
-                            let tgid = Self::resolve_tgid(tid).unwrap_or(tid);
-
-                            let sockaddr_addr = match nr {
-                                super::syscall_nr::CONNECT => Some(regs.rsi),
-                                super::syscall_nr::SENDTO if regs.r8 != 0 => Some(regs.r8),
-                                _ => None,
-                            };
+                            if let crate::interceptor::SyscallKind::NetConnect {
+                                address,
+                                port,
+                                protocol,
+                            } = &kind
+                            {
+                                let socket_type = self.dns_tracker.socket_type(tgid, fd).unwrap_or(
+                                    if *protocol == crate::interceptor::NetProtocol::Udp {
+                                        super::dns_socket_tracker::SocketType::Datagram
+                                    } else {
+                                        super::dns_socket_tracker::SocketType::Stream
+                                    },
+                                );
+                                if self.dns_tracker.socket_type(tgid, fd).is_none() {
+                                    self.dns_tracker.observe_socket(tgid, fd, socket_type);
+                                }
+                                if *port == 53
+                                    && self.block_tcp_dns
+                                    && socket_type == super::dns_socket_tracker::SocketType::Stream
+                                {
+                                    self.pending_tcp_dns_deny.insert(tid);
+                                }
+                                if socket_type == super::dns_socket_tracker::SocketType::Datagram {
+                                    let Some(destination) = address
+                                        .parse::<IpAddr>()
+                                        .ok()
+                                        .map(|ip| SocketAddr::new(ip, *port))
+                                    else {
+                                        self.deny(pid_u32).await?;
+                                        continue;
+                                    };
+                                    let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd)
+                                    else {
+                                        self.deny(pid_u32).await?;
+                                        continue;
+                                    };
+                                    self.pending_udp_connect_exit.insert(
+                                        pid_u32,
+                                        super::UdpConnectPending {
+                                            socket_id,
+                                            destination: Some(destination),
+                                            fd,
+                                        },
+                                    );
+                                    self.resume_to_next_syscall(pid, None)?;
+                                    continue;
+                                }
+                            }
 
                             trace!(
                                 pid = tgid,
@@ -625,7 +3339,6 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 timestamp: Utc::now(),
                                 kind,
                                 raw_syscall_nr: nr,
-                                sockaddr_addr,
                             }));
                         }
                         Ok(None) => {
@@ -663,6 +3376,78 @@ impl SyscallInterceptor for PtraceSupervisor {
                         signal = ?sig,
                         "signal-delivery-stop"
                     );
+
+                    // A clone child's initial ptrace stop can arrive before
+                    // the parent's PTRACE_EVENT_CLONE/FORK stop. Quarantine
+                    // that child while the proxy is enabled — resuming it now
+                    // would let it mutate inherited descriptors before the
+                    // tracker installs the exact parent table mapping — and
+                    // also whenever any process is being stepped for
+                    // connected-datagram writes (B13, go-live review round 2):
+                    // an unknown child could be a fork of a stepping process,
+                    // and resuming it before its tgid and inherited stepping
+                    // state are committed leaves a window in which its first
+                    // write egresses unobserved.
+                    if (self.connected_dns_proxy.is_some() || !self.stepping.is_empty())
+                        && !self.supervised.contains(&pid_u32)
+                    {
+                        self.supervised.insert(pid_u32);
+                        self.pending_child_initial_stops.insert(pid_u32);
+                        record_event(self, pid_u32, "ptrace-event:child-before-parent");
+                        continue;
+                    }
+
+                    // A signal-delivery-stop can preempt the exit stop of a
+                    // syscall we promoted to two-stop tracking: a connected-DNS
+                    // connect/redirect (`pending_dns_connect_exit`), a tracked
+                    // UDP connect/reconnect (`pending_udp_connect_exit`), or an
+                    // FD-lifecycle close/dup/close_range (`pending_fd_exit`). We
+                    // resumed the entry with PTRACE_SYSCALL, so the kernel stops
+                    // at a pending signal *before* the syscall-exit stop — the
+                    // syscall has not executed yet. Each `pending_*_exit` record
+                    // is cleared only by the exit handler, so its presence here
+                    // proves the exit was not seen.
+                    //
+                    // The previous behaviour terminated the whole session fail
+                    // closed here, which turned a routine `SIGCHLD` arriving
+                    // during a close/dup or a DNS connect into a fatal supervisor
+                    // crash for any multi-process tracee (`grith exec codex` /
+                    // `claude`). Instead, keep the pending record, forward the
+                    // signal (job-control/trap stops are suppressed, as on the
+                    // general path below), and resume back to the syscall
+                    // boundary: the exit stop is still delivered and reconciled
+                    // by the normal exit handler. On a transparent restart
+                    // (ERESTARTSYS) the connect re-runs with the redirect rewrite
+                    // still in tracee memory, so DNS route bookkeeping is not
+                    // bypassed — strictly safer than restoring direct-DNS bytes.
+                    // A fatal signal instead exits the tracee, and the Exited arm
+                    // clears the pending record.
+                    if self.pending_dns_connect_exit.contains_key(&pid_u32)
+                        || self.pending_udp_connect_exit.contains_key(&pid_u32)
+                        || self.pending_fd_exit.contains_key(&pid_u32)
+                    {
+                        record_event(self, pid_u32, "tracked-syscall-signal-deferred");
+                        let forward = if sig == Signal::SIGSTOP || sig == Signal::SIGTRAP {
+                            None
+                        } else {
+                            Some(sig)
+                        };
+                        self.resume_to_next_syscall(pid, forward)?;
+                        continue;
+                    }
+
+                    // A promoted response receive is read-only, so losing one
+                    // cache observation is safe. `socket()` creates previously
+                    // unknown state and remains a documented residual here.
+                    if let Some(pending) = self.pending_dns_recv_exit.remove(&pid_u32) {
+                        self.in_syscall_entry.remove(&pid_u32);
+                        if let Some(route_id) =
+                            self.dns_tracker.release_socket_hold(pending.socket_id)
+                        {
+                            let _ = self.release_connected_route(route_id).await;
+                        }
+                    }
+                    self.pending_socket_exit.remove(&pid_u32);
 
                     // Capture the PREVIOUS event kind for this tid before
                     // we overwrite it with "stopped". Used below to gate
@@ -726,6 +3511,15 @@ impl SyscallInterceptor for PtraceSupervisor {
                             | Some("allow")
                             | Some("deny")
                             | Some("ptrace-event:exec")
+                            // A thread stepped for connected-datagram writes
+                            // (B13) is as established as any other, and it is
+                            // the one paying two stops per syscall — omitting
+                            // it would disable this wedge fix for precisely
+                            // the threads most exposed to the wedge.
+                            | Some("dgram-write-step")
+                            // Likewise a thread stopped on a foreign-ABI
+                            // syscall (B1).
+                            | Some("seccomp-foreign-abi")
                     );
                     if is_jobctl_stop && is_established {
                         if let Err(e) = nix::sys::signal::kill(pid, Signal::SIGCONT) {
@@ -742,12 +3536,72 @@ impl SyscallInterceptor for PtraceSupervisor {
                 // -- Process exited normally --------------------------------------
                 WaitStatus::Exited(pid, code) => {
                     let pid_u32 = pid.as_raw() as u32;
+                    let exited_tgid = self
+                        .tid_tgids
+                        .remove(&pid_u32)
+                        .or_else(|| Self::resolve_tgid(pid_u32))
+                        .unwrap_or(pid_u32);
                     self.supervised.remove(&pid_u32);
                     self.in_syscall_entry.remove(&pid_u32);
                     self.thread_tids.remove(&pid_u32);
+                    self.pending_child_initial_stops.remove(&pid_u32);
+                    self.pending_clone_fd_table.remove(&pid_u32);
                     self.seccomp_tracees.remove(&pid_u32);
+                    // B13: this tid may have had a write awaiting a decision;
+                    // clear it from its process's stepping state (keyed by
+                    // tgid, not tid).
+                    if let Some(state) = self.stepping.get_mut(&exited_tgid) {
+                        state.awaiting.remove(&pid_u32);
+                    }
+                    // The thread group is gone only when its leader exits.
+                    if exited_tgid == pid_u32 {
+                        self.demote_stepping_tgid(pid_u32, "process exited");
+                    }
                     self.last_event_at.remove(&pid_u32);
                     self.last_event_kind.remove(&pid_u32);
+                    if let Some(pending) = self.pending_dns_recv_exit.remove(&pid_u32) {
+                        if let Some(route_id) =
+                            self.dns_tracker.release_socket_hold(pending.socket_id)
+                        {
+                            self.release_connected_route(route_id).await?;
+                        }
+                    }
+                    if let Some(pending) = self.pending_dns_connect_exit.remove(&pid_u32) {
+                        if let Some(control) = &self.connected_dns_proxy {
+                            let _ = control.release_route(pending.route.route_id);
+                        }
+                        if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                            self.release_connected_route(route_id).await?;
+                        }
+                        return Err(self.terminate_after_dns_redirect_failure(
+                            pending.tgid,
+                            &format!(
+                                "tid {pid_u32} exited during connected DNS sockaddr replacement"
+                            ),
+                        ));
+                    }
+                    if let Some(pending) = self.pending_udp_connect_exit.remove(&pid_u32) {
+                        if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                            self.release_connected_route(route_id).await?;
+                        }
+                    }
+                    self.pending_dns_query.remove(&pid_u32);
+                    self.pending_inline_dns_transactions.remove(&pid_u32);
+                    self.pending_socket_exit.remove(&pid_u32);
+                    if let Some(pending) = self.pending_fd_exit.remove(&pid_u32) {
+                        if let Some(socket_id) = pending.held_socket() {
+                            if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id)
+                            {
+                                self.release_connected_route(route_id).await?;
+                            }
+                        }
+                    }
+                    self.pending_tcp_dns_deny.remove(&pid_u32);
+                    let tgid_still_live = self.tid_tgids.values().any(|tgid| *tgid == exited_tgid);
+                    if !tgid_still_live {
+                        let released = self.dns_tracker.remove_process(exited_tgid);
+                        self.release_connected_routes(released).await?;
+                    }
                     info!(pid = pid_u32, exit_code = code, "supervised process exited");
 
                     if self.supervised.is_empty() || self.root_pid == Some(pid_u32) {
@@ -756,6 +3610,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 remaining = self.supervised.len(),
                                 "root process exited, terminating remaining children"
                             );
+                            self.terminate_all().await?;
                         }
                         return Ok(None);
                     }
@@ -765,12 +3620,72 @@ impl SyscallInterceptor for PtraceSupervisor {
                 // -- Process killed by signal -------------------------------------
                 WaitStatus::Signaled(pid, sig, _core_dumped) => {
                     let pid_u32 = pid.as_raw() as u32;
+                    let exited_tgid = self
+                        .tid_tgids
+                        .remove(&pid_u32)
+                        .or_else(|| Self::resolve_tgid(pid_u32))
+                        .unwrap_or(pid_u32);
                     self.supervised.remove(&pid_u32);
                     self.in_syscall_entry.remove(&pid_u32);
                     self.thread_tids.remove(&pid_u32);
+                    self.pending_child_initial_stops.remove(&pid_u32);
+                    self.pending_clone_fd_table.remove(&pid_u32);
                     self.seccomp_tracees.remove(&pid_u32);
+                    // B13: this tid may have had a write awaiting a decision;
+                    // clear it from its process's stepping state (keyed by
+                    // tgid, not tid).
+                    if let Some(state) = self.stepping.get_mut(&exited_tgid) {
+                        state.awaiting.remove(&pid_u32);
+                    }
+                    // The thread group is gone only when its leader exits.
+                    if exited_tgid == pid_u32 {
+                        self.demote_stepping_tgid(pid_u32, "process exited");
+                    }
                     self.last_event_at.remove(&pid_u32);
                     self.last_event_kind.remove(&pid_u32);
+                    if let Some(pending) = self.pending_dns_recv_exit.remove(&pid_u32) {
+                        if let Some(route_id) =
+                            self.dns_tracker.release_socket_hold(pending.socket_id)
+                        {
+                            self.release_connected_route(route_id).await?;
+                        }
+                    }
+                    if let Some(pending) = self.pending_dns_connect_exit.remove(&pid_u32) {
+                        if let Some(control) = &self.connected_dns_proxy {
+                            let _ = control.release_route(pending.route.route_id);
+                        }
+                        if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                            self.release_connected_route(route_id).await?;
+                        }
+                        return Err(self.terminate_after_dns_redirect_failure(
+                            pending.tgid,
+                            &format!(
+                                "tid {pid_u32} was killed by {sig:?} during connected DNS sockaddr replacement"
+                            ),
+                        ));
+                    }
+                    if let Some(pending) = self.pending_udp_connect_exit.remove(&pid_u32) {
+                        if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                            self.release_connected_route(route_id).await?;
+                        }
+                    }
+                    self.pending_dns_query.remove(&pid_u32);
+                    self.pending_inline_dns_transactions.remove(&pid_u32);
+                    self.pending_socket_exit.remove(&pid_u32);
+                    if let Some(pending) = self.pending_fd_exit.remove(&pid_u32) {
+                        if let Some(socket_id) = pending.held_socket() {
+                            if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id)
+                            {
+                                self.release_connected_route(route_id).await?;
+                            }
+                        }
+                    }
+                    self.pending_tcp_dns_deny.remove(&pid_u32);
+                    let tgid_still_live = self.tid_tgids.values().any(|tgid| *tgid == exited_tgid);
+                    if !tgid_still_live {
+                        let released = self.dns_tracker.remove_process(exited_tgid);
+                        self.release_connected_routes(released).await?;
+                    }
                     warn!(
                         pid = pid_u32,
                         signal = ?sig,
@@ -783,6 +3698,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 remaining = self.supervised.len(),
                                 "root process killed, terminating remaining children"
                             );
+                            self.terminate_all().await?;
                         }
                         return Ok(None);
                     }
@@ -827,6 +3743,11 @@ impl SyscallInterceptor for PtraceSupervisor {
         let nix_pid = Pid::from_raw(pid as i32);
         trace!(pid, "allowing syscall to proceed");
         record_event(self, pid, "allow");
+        // B13: a surfaced write on this thread has been allowed, so its
+        // destination is decided for the session and later writes to that fd
+        // would only re-derive the same answer — stop paying two ptrace stops
+        // per syscall for it.
+        self.settle_stepping_decision(pid, true);
         // Route through resume_tracee so the resume primitive is recorded for
         // wedge forensics (and the CONT/SYSCALL selection stays in one place).
         self.resume_tracee(nix_pid, None)
@@ -836,16 +3757,45 @@ impl SyscallInterceptor for PtraceSupervisor {
     async fn deny(&mut self, pid: u32) -> Result<()> {
         let nix_pid = Pid::from_raw(pid as i32);
         trace!(pid, "denying syscall");
+        // A denied clone/fork will not produce a ptrace child event; discard
+        // any entry-time inheritance snapshot so it cannot be paired with a
+        // later, unrelated event.
+        self.pending_clone_fd_table.remove(&pid);
+        // B13: a DENIED write keeps its fd tracked — a thread that has tried
+        // to reach a rejected destination will try again, and every attempt
+        // must be rejected. The awaiting entry is still cleared, or the next
+        // unrelated allowed syscall on this thread would be mistaken for the
+        // decision and end stepping silently.
+        self.settle_stepping_decision(pid, false);
 
         // Replace the syscall with an invalid number so the kernel skips
         // execution, and pre-seed the return register with -EPERM so the
         // tracee sees a real permission error instead of ENOSYS.
-        let mut regs = self.read_registers(nix_pid)?;
+        //
+        // A tracee that died in its stop cannot execute the syscall, so the
+        // denial is vacuously enforced — never fatal. This is also the path
+        // the fail-closed classify-error handler takes, so an error here
+        // would turn a benign thread death into full session teardown.
+        let Some(mut regs) = self.read_registers(nix_pid)? else {
+            record_event(self, pid, "deny:tracee-gone");
+            return Ok(());
+        };
         regs.orig_rax = u64::MAX; // -1 as u64 => invalid syscall number
         regs.rax = -(libc::EPERM as i64) as u64;
-        ptrace::setregs(nix_pid, regs).map_err(|e| {
-            Error::InterceptionError(format!("PTRACE_SETREGS (deny) failed for pid {pid}: {e}"))
-        })?;
+        match ptrace::setregs(nix_pid, regs) {
+            Ok(()) => {}
+            // Same race one step later: the tracee died between GETREGS and
+            // SETREGS. No syscall will execute; the denial holds.
+            Err(nix::errno::Errno::ESRCH) => {
+                record_event(self, pid, "deny:tracee-gone");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Error::InterceptionError(format!(
+                    "PTRACE_SETREGS (deny) failed for pid {pid}: {e}"
+                )));
+            }
+        }
 
         record_event(self, pid, "deny");
         self.resume_tracee(nix_pid, None)
@@ -871,11 +3821,67 @@ impl SyscallInterceptor for PtraceSupervisor {
 
     /// Detach from a single supervised process.
     async fn detach(&mut self, pid: u32) -> Result<()> {
+        if self.proxy_route_requires_session_termination_on_detach() {
+            warn!(
+                requested_pid = pid,
+                "refusing to detach while a connected DNS proxy route owns a \
+                 kernel socket peer; terminating the supervised session"
+            );
+            self.terminate_all().await?;
+            return Ok(());
+        }
+
         let nix_pid = Pid::from_raw(pid as i32);
+        if let Some(pending) = self.pending_dns_connect_exit.remove(&pid) {
+            if let Err(error) = pending.sockaddr.restore(nix_pid) {
+                if let Some(control) = &self.connected_dns_proxy {
+                    let _ = control.release_route(pending.route.route_id);
+                }
+                self.dns_tracker.unpin_socket(pending.socket_id);
+                return Err(self.terminate_after_dns_redirect_failure(
+                    pending.tgid,
+                    &format!("detach could not restore DNS connect sockaddr: {error}"),
+                ));
+            }
+            if let Some(control) = &self.connected_dns_proxy {
+                control
+                    .release_route(pending.route.route_id)
+                    .map_err(|error| {
+                        Error::InterceptionError(format!(
+                            "detach could not release pending DNS route: {error}"
+                        ))
+                    })?;
+            }
+            if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                self.release_connected_route(route_id).await?;
+            }
+        }
+        if let Some(pending) = self.pending_udp_connect_exit.remove(&pid) {
+            if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
+                self.release_connected_route(route_id).await?;
+            }
+        }
+        if let Some(pending) = self.pending_dns_recv_exit.remove(&pid) {
+            if let Some(route_id) = self.dns_tracker.release_socket_hold(pending.socket_id) {
+                self.release_connected_route(route_id).await?;
+            }
+        }
+        self.pending_dns_query.remove(&pid);
+        self.pending_inline_dns_transactions.remove(&pid);
+        self.pending_clone_fd_table.remove(&pid);
+        self.pending_child_initial_stops.remove(&pid);
+        if let Some(pending) = self.pending_fd_exit.remove(&pid) {
+            if let Some(socket_id) = pending.held_socket() {
+                if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id) {
+                    self.release_connected_route(route_id).await?;
+                }
+            }
+        }
         ptrace::detach(nix_pid, None).map_err(|e| {
             Error::InterceptionError(format!("PTRACE_DETACH failed for pid {pid}: {e}"))
         })?;
         self.supervised.remove(&pid);
+        self.tid_tgids.remove(&pid);
         self.in_syscall_entry.remove(&pid);
         self.thread_tids.remove(&pid);
         self.seccomp_tracees.remove(&pid);
@@ -908,6 +3914,54 @@ impl SyscallInterceptor for PtraceSupervisor {
 
     /// Detach from all supervised processes.
     async fn detach_all(&mut self) -> Result<()> {
+        if self.proxy_route_requires_session_termination_on_detach() {
+            warn!(
+                "shutdown requested with connected DNS proxy routes; terminating \
+                 tracees instead of detaching them with loopback-owned peers"
+            );
+            self.terminate_all().await?;
+
+            // The processes are no longer allowed to continue, so no tracee
+            // memory restoration is required. Tear down every pending and
+            // committed route best-effort; the session-owned worker shutdown
+            // remains the final cleanup backstop.
+            let pending_route_ids: Vec<_> = self
+                .pending_dns_connect_exit
+                .drain()
+                .map(|(_, pending)| pending.route.route_id)
+                .collect();
+            if let Some(control) = &self.connected_dns_proxy {
+                for route_id in pending_route_ids {
+                    if let Err(error) = control.release_route(route_id) {
+                        warn!(
+                            route_id = route_id.get(),
+                            error = %error,
+                            "failed to release pending DNS route after terminating tracees"
+                        );
+                    }
+                }
+            }
+            self.pending_udp_connect_exit.clear();
+            self.pending_dns_recv_exit.clear();
+            self.pending_dns_query.clear();
+            self.pending_inline_dns_transactions.clear();
+            self.pending_fd_exit.clear();
+            self.pending_clone_fd_table.clear();
+            self.pending_child_initial_stops.clear();
+            self.tid_tgids.clear();
+            let released = self.dns_tracker.clear();
+            for route_id in released {
+                if let Err(error) = self.release_connected_route(route_id).await {
+                    warn!(
+                        route_id = route_id.0,
+                        error = %error,
+                        "failed to release committed DNS route after terminating tracees"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         let pids: Vec<u32> = self.supervised.iter().copied().collect();
         for pid in pids {
             if let Err(e) = self.detach(pid).await {
@@ -918,6 +3972,8 @@ impl SyscallInterceptor for PtraceSupervisor {
                 );
             }
         }
+        let released = self.dns_tracker.clear();
+        self.release_connected_routes(released).await?;
         Ok(())
     }
 
@@ -943,69 +3999,6 @@ impl SyscallInterceptor for PtraceSupervisor {
                 true
             }
         }
-    }
-
-    /// Rewrite a tracee's sockaddr to redirect DNS to our local proxy.
-    ///
-    /// Rewrites both the port and the IP address to `127.0.0.1:<new_port>`.
-    /// This is necessary because the original destination may be any DNS
-    /// resolver IP (e.g., `127.0.0.53` for systemd-resolved), but our proxy
-    /// only listens on `127.0.0.1`.
-    async fn rewrite_sockaddr_port(
-        &mut self,
-        pid: u32,
-        sockaddr_addr: u64,
-        new_port: u16,
-    ) -> Result<()> {
-        let nix_pid = Pid::from_raw(pid as i32);
-        let word0 = ptrace::read(nix_pid, sockaddr_addr as *mut libc::c_void).map_err(|e| {
-            Error::InterceptionError(format!(
-                "PTRACE_PEEKDATA (sockaddr family) at {sockaddr_addr:#x} for pid {pid}: {e}"
-            ))
-        })?;
-        let bytes0 = word0.to_ne_bytes();
-        let family = u16::from_ne_bytes([bytes0[0], bytes0[1]]) as i32;
-        let port_be = new_port.to_be_bytes();
-
-        match family {
-            libc::AF_INET => {
-                // sockaddr_in layout:
-                //   offset 0: family (2)
-                //   offset 2: port   (2)
-                //   offset 4: addr   (4)
-                let data = [port_be[0], port_be[1], 127, 0, 0, 1];
-                self.write_tracee_data(nix_pid, sockaddr_addr + 2, &data)?;
-                debug!(
-                    pid,
-                    new_port,
-                    "rewrote AF_INET sockaddr to 127.0.0.1:{} for DNS proxy redirect",
-                    new_port
-                );
-            }
-            libc::AF_INET6 => {
-                // sockaddr_in6 layout:
-                //   offset 0:  family (2)
-                //   offset 2:  port   (2)
-                //   offset 8:  addr   (16)
-                self.write_tracee_data(nix_pid, sockaddr_addr + 2, &port_be)?;
-                let mut addr = [0u8; 16];
-                addr[15] = 1; // ::1
-                self.write_tracee_data(nix_pid, sockaddr_addr + 8, &addr)?;
-                debug!(
-                    pid,
-                    new_port,
-                    "rewrote AF_INET6 sockaddr to [::1]:{} for DNS proxy redirect",
-                    new_port
-                );
-            }
-            other => {
-                return Err(Error::InterceptionError(format!(
-                    "unsupported sockaddr family {other} for DNS rewrite (pid {pid})"
-                )));
-            }
-        }
-
-        Ok(())
     }
 
     /// Return the human-readable name of the interception mechanism.
@@ -1167,6 +4160,293 @@ mod tests {
         assert!(trace_options().contains(nix::sys::ptrace::Options::PTRACE_O_TRACECLONE));
     }
 
+    // -- B13: connected-datagram write stepping -----------------------------
+    //
+    // `socket(AF_INET, SOCK_DGRAM) → connect(attacker) → write(fd, secret)`
+    // egressed with no proxy evaluation and no audit record: write/read are
+    // outside the seccomp trap set, and a connected datagram `connect` is
+    // deliberately unscored so `getaddrinfo`'s source-selection probe does not
+    // prompt. These tests pin the state machine that closes it.
+
+    fn addr(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_destinations_never_step() {
+        // The volume carve-out: DNS to 127.0.0.53 and local services are the
+        // bulk of connected-datagram traffic. Stepping them would pay two
+        // ptrace stops per syscall for no security benefit.
+        for local in [
+            "127.0.0.1:53",
+            "127.0.0.53:53",
+            "[::1]:8080",
+            "0.0.0.0:0",
+            "[::ffff:127.0.0.1]:53",
+        ] {
+            assert!(
+                PtraceSupervisor::is_loopback_destination(&addr(local)),
+                "{local} must be treated as loopback"
+            );
+        }
+        for remote in ["8.8.8.8:53", "[2001:4860:4860::8888]:53", "1.2.3.4:9999"] {
+            assert!(
+                !PtraceSupervisor::is_loopback_destination(&addr(remote)),
+                "{remote} must be treated as egress"
+            );
+        }
+    }
+
+    #[test]
+    fn promote_then_demote_restores_normal_resume() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(42, 42);
+        assert!(!sup.tid_is_stepping(42));
+
+        sup.promote_stepping(42, 7, addr("1.2.3.4:9999"));
+        assert!(sup.tid_is_stepping(42));
+
+        sup.demote_stepping_fd(42, 7, "test");
+        assert!(
+            !sup.tid_is_stepping(42),
+            "with no tracked fds left the process goes back to PTRACE_CONT"
+        );
+    }
+
+    /// B13 (exec-survival residual): a connected off-host datagram socket that
+    /// survives an `execve` (non-CLOEXEC, still in the tracker after the caller's
+    /// `retain_fds` prune) must KEEP being stepped, so a `write(2)` on it in the
+    /// new image is still trapped and scored. A blanket demote here was the hole.
+    #[test]
+    fn connected_dgram_stepping_survives_exec() {
+        use crate::platform::linux::dns_socket_tracker::SocketType;
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(50, 50);
+        // A connected off-host datagram socket, stepped (the pre-exec state).
+        sup.dns_tracker.observe_socket(50, 3, SocketType::Datagram);
+        sup.dns_tracker.connect(50, 3, addr("1.2.3.4:1234"));
+        sup.promote_stepping(50, 3, addr("1.2.3.4:1234"));
+        assert!(sup.tid_is_stepping(50));
+        assert!(sup.connected_dgram_egress_target(50, 3).is_some());
+
+        // Exec: the tracker still holds the survivor (retain_fds kept it).
+        sup.resync_stepping_after_exec(50);
+
+        assert!(
+            sup.tid_is_stepping(50),
+            "a connected off-host datagram socket that survived exec must stay stepped (B13)"
+        );
+    }
+
+    /// The mirror: an fd with no surviving connected off-host datagram socket
+    /// (CLOEXEC'd, closed, or reconnected to loopback — pruned from the tracker
+    /// before resync) is demoted across exec, restoring PTRACE_CONT.
+    #[test]
+    fn stepping_dropped_after_exec_when_socket_gone() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(60, 60);
+        // Stepped, but the tracker has no connected datagram socket for the fd.
+        sup.promote_stepping(60, 7, addr("1.2.3.4:1234"));
+        assert!(sup.tid_is_stepping(60));
+        assert!(sup.connected_dgram_egress_target(60, 7).is_none());
+
+        sup.resync_stepping_after_exec(60);
+
+        assert!(
+            !sup.tid_is_stepping(60),
+            "an fd with no surviving connected datagram socket must be demoted across exec"
+        );
+    }
+
+    /// Mixed survival: one connected socket survives, one does not — the survivor
+    /// keeps the process stepped, the other is dropped.
+    #[test]
+    fn exec_keeps_survivor_and_drops_gone_socket() {
+        use crate::platform::linux::dns_socket_tracker::SocketType;
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(70, 70);
+        sup.dns_tracker.observe_socket(70, 3, SocketType::Datagram);
+        sup.dns_tracker.connect(70, 3, addr("1.2.3.4:1234"));
+        sup.promote_stepping(70, 3, addr("1.2.3.4:1234")); // survives
+        sup.promote_stepping(70, 9, addr("5.6.7.8:1234")); // no tracker entry → gone
+
+        sup.resync_stepping_after_exec(70);
+
+        assert!(
+            sup.tid_is_stepping(70),
+            "the survivor keeps the process stepped"
+        );
+        assert!(sup.connected_dgram_egress_target(70, 3).is_some());
+    }
+
+    /// B13 (the residual the verify workflow found): a dup'd non-CLOEXEC alias
+    /// survives exec even when the fd the connect happened on was CLOEXEC. The
+    /// alias is a distinct fd number NOT in state.fds, so keying re-arm on
+    /// surviving tracker socket identity (not state.fds) is essential — else
+    /// write(alias, secret) egresses unobserved after exec.
+    #[test]
+    fn dup_alias_keeps_stepping_across_exec() {
+        use crate::platform::linux::dns_socket_tracker::SocketType;
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(80, 80);
+        sup.dns_tracker.observe_socket(80, 3, SocketType::Datagram);
+        sup.dns_tracker.connect(80, 3, addr("1.2.3.4:1234"));
+        sup.promote_stepping(80, 3, addr("1.2.3.4:1234"));
+        // dup3(3, 4) — the alias shares socket identity but is not in state.fds.
+        let sid = sup.dns_tracker.socket_id(80, 3).unwrap();
+        sup.dns_tracker.duplicate_socket(80, sid, 4);
+        // exec closes the CLOEXEC fd 3; the non-CLOEXEC alias 4 survives (the
+        // tracker was pruned to live fds before resync).
+        sup.dns_tracker.close(80, 3);
+
+        sup.resync_stepping_after_exec(80);
+
+        assert!(
+            sup.tid_is_stepping(80),
+            "the surviving dup alias must keep the process stepped across exec (B13)"
+        );
+        assert!(sup.connected_dgram_egress_target(80, 4).is_some());
+        assert!(sup.connected_dgram_egress_target(80, 3).is_none());
+    }
+
+    /// The no-exec sibling the verify workflow also flagged: close the tracked
+    /// fd, keep the alias — stepping must be retained on the surviving alias, no
+    /// execve involved. Exercises the close-path re-arm.
+    #[test]
+    fn dup_alias_keeps_stepping_after_closing_tracked_fd() {
+        use crate::platform::linux::dns_socket_tracker::SocketType;
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(90, 90);
+        sup.dns_tracker.observe_socket(90, 3, SocketType::Datagram);
+        sup.dns_tracker.connect(90, 3, addr("5.6.7.8:1234"));
+        sup.promote_stepping(90, 3, addr("5.6.7.8:1234"));
+        let sid = sup.dns_tracker.socket_id(90, 3).unwrap();
+        sup.dns_tracker.duplicate_socket(90, sid, 4);
+
+        // Simulate the tracked-fd close path: tracker drops fd 3, then the event
+        // handler demotes fd 3 and re-arms survivors.
+        sup.dns_tracker.close(90, 3);
+        sup.demote_stepping_fd(90, 3, "tracked fd closed");
+        sup.rearm_surviving_connected_dgram_fds(90);
+
+        assert!(
+            sup.tid_is_stepping(90),
+            "closing the tracked fd must not stop stepping while a connected alias survives (B13)"
+        );
+        assert!(sup.connected_dgram_egress_target(90, 4).is_some());
+    }
+
+    /// Stepping is keyed by process, not thread: the fd table is shared
+    /// across a thread group, so a sibling that never issued the connect can
+    /// still write the socket and must be stepped too.
+    #[test]
+    fn siblings_of_a_connecting_thread_are_stepped() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(100, 100); // leader, does the connect
+        sup.tid_tgids.insert(101, 100); // sibling
+        sup.tid_tgids.insert(200, 200); // unrelated process
+
+        sup.promote_stepping(100, 5, addr("1.2.3.4:9999"));
+
+        assert!(sup.tid_is_stepping(100));
+        assert!(
+            sup.tid_is_stepping(101),
+            "a sibling shares the fd table and must be stepped"
+        );
+        assert!(!sup.tid_is_stepping(200), "unrelated process untouched");
+    }
+
+    /// A process may hold several connected sockets. Forgetting one must not
+    /// un-cover the others.
+    #[test]
+    fn multiple_connected_sockets_are_tracked_independently() {
+        let mut sup = PtraceSupervisor::new();
+        sup.tid_tgids.insert(9, 9);
+        sup.promote_stepping(9, 3, addr("1.2.3.4:9999"));
+        sup.promote_stepping(9, 4, addr("5.6.7.8:9999"));
+
+        sup.demote_stepping_fd(9, 3, "test");
+        assert!(
+            sup.tid_is_stepping(9),
+            "the second socket must keep the process stepped"
+        );
+
+        sup.demote_stepping_fd(9, 4, "test");
+        assert!(!sup.tid_is_stepping(9));
+    }
+
+    /// The critical one: a DENIED write must keep its fd tracked, and must
+    /// clear the awaiting entry — otherwise the next unrelated allowed
+    /// syscall on that thread is mistaken for the decision and stepping ends
+    /// silently, letting every later write to the rejected destination
+    /// through unobserved.
+    #[test]
+    fn a_denied_write_keeps_stepping_and_clears_the_awaiting_entry() {
+        let mut sup = PtraceSupervisor::new();
+        sup.tid_tgids.insert(11, 11);
+        sup.promote_stepping(11, 6, addr("203.0.113.5:4444"));
+        sup.stepping.get_mut(&11).unwrap().awaiting.insert(11, 6);
+
+        sup.settle_stepping_decision(11, false);
+        assert!(
+            sup.tid_is_stepping(11),
+            "a rejected destination must stay covered — the thread will retry"
+        );
+        assert!(
+            sup.stepping[&11].awaiting.is_empty(),
+            "the awaiting entry must be cleared, or the next allow ends stepping"
+        );
+
+        // The next unrelated allowed syscall must NOT end stepping.
+        sup.settle_stepping_decision(11, true);
+        assert!(
+            sup.tid_is_stepping(11),
+            "an unrelated allow must not be mistaken for the write decision"
+        );
+    }
+
+    #[test]
+    fn an_allowed_write_ends_stepping_for_that_fd() {
+        let mut sup = PtraceSupervisor::new();
+        sup.tid_tgids.insert(12, 12);
+        sup.promote_stepping(12, 8, addr("203.0.113.6:4444"));
+        sup.stepping.get_mut(&12).unwrap().awaiting.insert(12, 8);
+
+        sup.settle_stepping_decision(12, true);
+        assert!(
+            !sup.tid_is_stepping(12),
+            "an allowed destination is decided for the session; stop stepping"
+        );
+    }
+
+    #[test]
+    fn writev_is_a_known_syscall_number() {
+        // The gathered-write form is the obvious way around a write-only
+        // check, so it must be recognised alongside write.
+        assert_eq!(syscall_nr::WRITE, 1);
+        assert_eq!(syscall_nr::WRITEV, 20);
+    }
+
+    /// write/writev must stay OUT of the seccomp trap set. Trapping them
+    /// globally would stop on the hottest syscalls in any workload; the whole
+    /// design rests on them being surfaced only for stepped threads.
+    #[test]
+    fn write_family_is_not_globally_trapped() {
+        assert!(!crate::platform::linux::is_security_relevant(
+            syscall_nr::WRITE
+        ));
+        assert!(!crate::platform::linux::is_security_relevant(
+            syscall_nr::WRITEV
+        ));
+    }
+
     // -- Wedge forensics: signal-mask parsing -------------------------------
 
     #[test]
@@ -1225,6 +4505,55 @@ mod tests {
         assert!(sup.thread_tids.is_empty());
     }
 
+    /// Resuming a tracee that has already died (ESRCH) must NOT be fatal — it is
+    /// a benign ptrace race (the tracee was group-killed / exited between its
+    /// stop and our resume). Regression test for the supervisor loop aborting
+    /// with "PTRACE_CONT failed ... ESRCH". A never-allocated PID yields ESRCH
+    /// from the kernel without needing to trace anything.
+    #[test]
+    fn resume_of_a_dead_tracee_is_not_fatal() {
+        let sup = PtraceSupervisor::new();
+        // Well above /proc/sys/kernel/pid_max — guaranteed not to exist.
+        let dead = Pid::from_raw(0x3fff_ffff);
+        assert!(
+            sup.resume_continue(dead, None).is_ok(),
+            "PTRACE_CONT on a dead tracee must be tolerated, not fatal"
+        );
+        assert!(
+            sup.resume_to_next_syscall(dead, None).is_ok(),
+            "PTRACE_SYSCALL on a dead tracee must be tolerated, not fatal"
+        );
+    }
+
+    /// The GETREGS twin of `resume_of_a_dead_tracee_is_not_fatal`: a tracee
+    /// killed (sibling `exit_group` / SIGKILL) while sitting in a ptrace stop
+    /// yields ESRCH from PTRACE_GETREGS, which must read as "tracee gone"
+    /// (`Ok(None)`), not a fatal interception error. Regression test for the
+    /// supervisor loop aborting with "PTRACE_GETREGS failed ... ESRCH".
+    #[test]
+    fn getregs_of_a_dead_tracee_is_not_fatal() {
+        let sup = PtraceSupervisor::new();
+        let dead = Pid::from_raw(0x3fff_ffff);
+        match sup.read_registers(dead) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a never-allocated PID cannot have readable registers"),
+            Err(e) => panic!("PTRACE_GETREGS on a dead tracee must be tolerated, got: {e}"),
+        }
+    }
+
+    /// Denying a syscall of a tracee that died in its stop must succeed
+    /// vacuously: the thread is gone, so the syscall can never execute.
+    /// This is the path the fail-closed classify-error handler takes — if it
+    /// errored, a benign thread death would tear down the whole session.
+    #[tokio::test]
+    async fn deny_of_a_dead_tracee_is_not_fatal() {
+        let mut sup = PtraceSupervisor::new();
+        assert!(
+            sup.deny(0x3fff_ffff).await.is_ok(),
+            "deny on a dead tracee must be tolerated, not fatal"
+        );
+    }
+
     #[test]
     fn default_is_same_as_new() {
         let a = PtraceSupervisor::new();
@@ -1264,6 +4593,77 @@ mod tests {
         assert!(is_fallback_relevant_syscall(syscall_nr::OPENAT, true));
     }
 
+    #[test]
+    fn proxy_send_allows_only_sendto_with_register_level_null_peer() {
+        // SAFETY: user_regs_struct contains only integer register fields, and a
+        // zeroed value is valid for this pure classification test.
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        assert!(PtraceSupervisor::proxy_send_uses_supported_connected_form(
+            syscall_nr::SENDTO,
+            &regs,
+        ));
+
+        regs.r8 = 1;
+        assert!(!PtraceSupervisor::proxy_send_uses_supported_connected_form(
+            syscall_nr::SENDTO,
+            &regs,
+        ));
+        regs.r8 = 0;
+        assert!(!PtraceSupervisor::proxy_send_uses_supported_connected_form(
+            syscall_nr::SENDMSG,
+            &regs,
+        ));
+        assert!(!PtraceSupervisor::proxy_send_uses_supported_connected_form(
+            syscall_nr::SENDMMSG,
+            &regs,
+        ));
+    }
+
+    #[test]
+    fn clone_identity_uses_tgid_and_rejects_private_thread_fd_table() {
+        let shared_flags = libc::CLONE_THREAD as u64 | libc::CLONE_FILES as u64;
+        let private_flags = libc::CLONE_THREAD as u64;
+
+        assert!(is_thread_group_child(10, 10));
+        assert!(!is_thread_group_child(10, 20));
+        assert!(!clone_creates_private_thread_fd_table(
+            10,
+            10,
+            Some(shared_flags),
+        ));
+        assert!(clone_creates_private_thread_fd_table(
+            10,
+            10,
+            Some(private_flags),
+        ));
+        assert!(clone_creates_private_thread_fd_table(10, 10, None));
+        assert!(!clone_creates_private_thread_fd_table(
+            10,
+            20,
+            Some(private_flags),
+        ));
+    }
+
+    #[test]
+    fn detach_gate_activates_only_after_proxy_route_ownership() {
+        use crate::platform::linux::dns_socket_tracker::{DnsRouteId, SocketType};
+
+        let mut sup = PtraceSupervisor::new();
+        assert!(!sup.proxy_route_requires_session_termination_on_detach());
+
+        sup.dns_tracker.observe_socket(10, 4, SocketType::Datagram);
+        sup.dns_tracker
+            .set_connected_proxy(
+                10,
+                4,
+                DnsRouteId(41),
+                "127.0.0.53:53".parse().unwrap(),
+                "127.0.0.1:40000".parse().unwrap(),
+            )
+            .unwrap();
+        assert!(sup.proxy_route_requires_session_termination_on_detach());
+    }
+
     // -- SyscallEvent construction ------------------------------------------
 
     #[test]
@@ -1277,7 +4677,6 @@ mod tests {
                 flags: OpenFlags::ReadOnly,
             },
             raw_syscall_nr: syscall_nr::OPENAT,
-            sockaddr_addr: None,
         };
         assert_eq!(event.pid, 1234);
         assert_eq!(event.raw_syscall_nr, 257);
@@ -1294,7 +4693,6 @@ mod tests {
                 args: vec!["curl".into(), "-s".into(), "https://example.com".into()],
             },
             raw_syscall_nr: syscall_nr::EXECVE,
-            sockaddr_addr: None,
         };
         if let SyscallKind::ProcessExec { path, args } = &event.kind {
             assert_eq!(path, "/usr/bin/curl");
@@ -1316,7 +4714,6 @@ mod tests {
                 protocol: NetProtocol::Tcp,
             },
             raw_syscall_nr: syscall_nr::CONNECT,
-            sockaddr_addr: None,
         };
         if let SyscallKind::NetConnect {
             address,
@@ -1340,7 +4737,6 @@ mod tests {
             timestamp: Utc::now(),
             kind: SyscallKind::PipeCreate,
             raw_syscall_nr: syscall_nr::PIPE,
-            sockaddr_addr: None,
         };
         assert_eq!(pipe.kind, SyscallKind::PipeCreate);
 
@@ -1350,8 +4746,157 @@ mod tests {
             timestamp: Utc::now(),
             kind: SyscallKind::SocketPair,
             raw_syscall_nr: syscall_nr::SOCKETPAIR,
-            sockaddr_addr: None,
         };
         assert_eq!(pair.kind, SyscallKind::SocketPair);
+    }
+
+    // -- Foreign-ABI classification (B1 round 3) ----------------------------
+
+    use crate::interceptor::ForeignAbiKind;
+
+    /// AUDIT_ARCH_I386 — any value other than x86_64 exercises the arm.
+    const ARCH_I386: u32 = 0x4000_0003;
+    const ARCH_X86_64: u32 = super::super::seccomp::AUDIT_ARCH_X86_64;
+
+    /// x32 futex: the ordinary number (202 = 0xca) with the x32 marker bit.
+    fn x32_nr() -> u64 {
+        u64::from(super::super::seccomp::X32_SYSCALL_BIT) | 0xca
+    }
+
+    fn stale_event_data_must_not_be_read() -> u64 {
+        panic!("PTRACE_GETEVENTMSG must not be consulted at this stop");
+    }
+
+    fn registers_must_not_be_read() -> Option<u64> {
+        panic!("registers must not be consulted at this stop");
+    }
+
+    /// The regression test for the B1 round-3 crash. A stop with no
+    /// syscall-entry record (e.g. a syscall exit misjudged as an entry by a
+    /// desynced toggle) arrived while the thread's `PTRACE_GETEVENTMSG`
+    /// still held a stale, marker-shaped message. The stale value must never
+    /// be consulted: the resulting spurious X32 hard-deny injected EPERM
+    /// into a real `futex(2)` and glibc aborted the whole supervised tree.
+    #[test]
+    fn no_entry_record_never_consults_stale_event_data() {
+        for at_seccomp_stop in [false, true] {
+            assert_eq!(
+                PtraceSupervisor::classify_foreign_abi(
+                    SyscallEntryInfo::NotEntry,
+                    at_seccomp_stop,
+                    stale_event_data_must_not_be_read,
+                    registers_must_not_be_read,
+                ),
+                None,
+                "a stop without an entry record must never classify as foreign"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_record_detects_foreign_arch_and_x32() {
+        assert_eq!(
+            PtraceSupervisor::classify_foreign_abi(
+                SyscallEntryInfo::Entry {
+                    arch: ARCH_I386,
+                    nr: 5,
+                },
+                true,
+                stale_event_data_must_not_be_read,
+                registers_must_not_be_read,
+            ),
+            Some(ForeignAbiKind::CompatArch),
+        );
+        assert_eq!(
+            PtraceSupervisor::classify_foreign_abi(
+                SyscallEntryInfo::Entry {
+                    arch: ARCH_X86_64,
+                    nr: x32_nr(),
+                },
+                false,
+                stale_event_data_must_not_be_read,
+                registers_must_not_be_read,
+            ),
+            Some(ForeignAbiKind::X32),
+        );
+    }
+
+    #[test]
+    fn entry_record_ordinary_x86_64_is_not_foreign() {
+        // read, write, rt_sigprocmask, futex, openat — the syscalls the
+        // stale-marker bug actually condemned in production.
+        for nr in [0u64, 1, 14, 202, 257] {
+            assert_eq!(
+                PtraceSupervisor::classify_foreign_abi(
+                    SyscallEntryInfo::Entry {
+                        arch: ARCH_X86_64,
+                        nr,
+                    },
+                    false,
+                    stale_event_data_must_not_be_read,
+                    registers_must_not_be_read,
+                ),
+                None,
+                "ordinary x86_64 syscall {nr} must not classify as foreign"
+            );
+        }
+    }
+
+    /// Pre-5.3 + seccomp stop is the ONE place the filter marker is current.
+    #[test]
+    fn pre53_seccomp_stop_uses_the_filter_marker() {
+        let cases = [
+            (
+                u64::from(super::super::seccomp::SECCOMP_TRACE_DATA_X32),
+                Some(ForeignAbiKind::X32),
+            ),
+            (
+                u64::from(super::super::seccomp::SECCOMP_TRACE_DATA_FOREIGN_ARCH),
+                Some(ForeignAbiKind::CompatArch),
+            ),
+            (0, None),
+            // A stale message shaped like an event payload (a child tid, an
+            // exit status) matches no marker.
+            (762_589, None),
+        ];
+        for (data, expected) in cases {
+            assert_eq!(
+                PtraceSupervisor::classify_foreign_abi(
+                    SyscallEntryInfo::Unsupported,
+                    true,
+                    move || data,
+                    registers_must_not_be_read,
+                ),
+                expected,
+            );
+        }
+    }
+
+    /// Pre-5.3 at a plain syscall stop: only the number register speaks —
+    /// the event message is stale there and must not be touched.
+    #[test]
+    fn pre53_syscall_stop_classifies_from_the_number_alone() {
+        let cases = [
+            // A real x32 number carries bit 30 in orig_rax itself.
+            (Some(x32_nr()), Some(ForeignAbiKind::X32)),
+            (Some(202), None),
+            // -1 feature probes (and our own deny() marker) have every high
+            // bit set: not a syscall number, kernel answers ENOSYS.
+            (Some(u64::MAX), None),
+            // Tracee died in the stop.
+            (None, None),
+        ];
+        for (nr, expected) in cases {
+            assert_eq!(
+                PtraceSupervisor::classify_foreign_abi(
+                    SyscallEntryInfo::Unsupported,
+                    false,
+                    stale_event_data_must_not_be_read,
+                    move || nr,
+                ),
+                expected,
+                "pre-5.3 syscall-stop classification of {nr:?}"
+            );
+        }
     }
 }

@@ -138,7 +138,6 @@ impl SyscallInterceptor for EndpointSecuritySupervisor {
                 args: args.to_vec(),
             },
             raw_syscall_nr: -1,
-            sockaddr_addr: None,
         });
 
         Ok(pid)

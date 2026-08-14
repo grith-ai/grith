@@ -29,9 +29,9 @@ use grith_proxy::types::{
 use uuid::Uuid;
 
 /// The daemon's Phase 1 + Phase 3 stack as it pertains to the recorded
-/// shapes. Excludes path_match / allowlist / capability / secret_scan /
-/// command / dlp_gate / canary / reputation / taint / session_containment
-/// / egress_rate because none of those contributed to the recorded
+/// shapes. Excludes path-match / allowlist / capability / secret-scan /
+/// command / dlp-gate / canary / reputation / taint / session-containment
+/// / egress-rate because none of those contributed to the recorded
 /// audit-log scores for codex.
 fn daemon_like_proxy() -> SecurityProxy {
     let mut registry = FilterRegistry::new();
@@ -63,8 +63,8 @@ fn ctx(call_type: ToolCallType) -> ToolCallContext {
 
 // ---------------------------------------------------------------------------
 // Recorded shape 1: NetListen 0.0.0.0:0 with no listener policy
-// Before PR 69: operation_risk +4.0 + egress_policy +5.0 = 9.0 → DENY
-// After  PR 69: operation_risk +0.5 + egress_policy +5.0 = 5.5 → QUEUE
+// Before PR 69: operation-risk +4.0 + egress-policy +5.0 = 9.0 → DENY
+// After  PR 69: operation-risk +0.5 + egress-policy +5.0 = 5.5 → QUEUE
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -88,19 +88,19 @@ async fn netlisten_wildcard_undeclared_queues_not_denies() {
         "composite must stay below DENY threshold; was {}",
         decision.composite_score
     );
-    // egress_policy fires the wildcard-bind-undeclared rule.
+    // egress-policy fires the wildcard-bind-undeclared rule.
     let egress_rule = decision
         .filter_results
         .iter()
-        .find(|r| r.matched && r.filter_name == "egress_policy")
-        .expect("egress_policy must fire");
+        .find(|r| r.matched && r.filter_name == "egress-policy")
+        .expect("egress-policy must fire");
     assert_eq!(egress_rule.rule_id, "wildcard-bind-undeclared");
-    // operation_risk fires the new low baseline rule, not the old +4.0.
+    // operation-risk fires the new low baseline rule, not the old +4.0.
     let op_rule = decision
         .filter_results
         .iter()
-        .find(|r| r.matched && r.filter_name == "operation_risk")
-        .expect("operation_risk must fire baseline");
+        .find(|r| r.matched && r.filter_name == "operation-risk")
+        .expect("operation-risk must fire baseline");
     assert_eq!(op_rule.rule_id, "net-listen-baseline");
     assert!(op_rule.score <= 0.5);
 }
@@ -108,7 +108,7 @@ async fn netlisten_wildcard_undeclared_queues_not_denies() {
 // ---------------------------------------------------------------------------
 // Recorded shape 2: NetListen 0.0.0.0:0 with codex MCP policy
 // (port=0, allow_clamp=true). PR 5 clamp will rewrite; proxy returns
-// the low operation_risk baseline only.
+// the low operation-risk baseline only.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -130,13 +130,13 @@ async fn netlisten_wildcard_declared_clamp_allows() {
         decision.action,
         decision.composite_score
     );
-    // No egress_policy rule fires (PR 69 Change 4 returns no_match).
+    // No egress-policy rule fires (PR 69 Change 4 returns no_match).
     assert!(
         !decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "egress_policy must stay silent under allow_clamp"
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "egress-policy must stay silent under allow_clamp"
     );
 }
 
@@ -165,7 +165,7 @@ async fn node_modules_tokenize_read_allows() {
     );
     assert!(
         !decision.filter_results.iter().any(|r| r.matched
-            && r.filter_name == "sensitive_path_heuristic"
+            && r.filter_name == "sensitive-path-heuristic"
             && r.rule_id == "secretish-filename"),
         "secretish-filename must not fire inside node_modules"
     );
@@ -188,8 +188,8 @@ async fn node_modules_token_types_read_allows() {
 
 // ---------------------------------------------------------------------------
 // Recorded shape 4: FileWrite /var/tmp/etilqs_*
-// Before PR 69: operation_risk +0.5 + behavioural +3.0 (cold-start) = 3.5 → QUEUE
-// After  PR 69: operation_risk +0.5 + behavioural no_match (routine) = 0.5 → ALLOW
+// Before PR 69: operation-risk +0.5 + behavioural +3.0 (cold-start) = 3.5 → QUEUE
+// After  PR 69: operation-risk +0.5 + behavioural no_match (routine) = 0.5 → ALLOW
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -211,8 +211,8 @@ async fn etilqs_scratch_write_allows() {
 
 // ---------------------------------------------------------------------------
 // Recorded shape 5: FileRename /tmp/node-compile-cache/.../*.tmp -> *
-// Before PR 69: operation_risk +0.3 + behavioural +3.0 (cold-start) = 3.3 → QUEUE
-// After  PR 69: operation_risk +0.3 + behavioural no_match (routine) = 0.3 → ALLOW
+// Before PR 69: operation-risk +0.3 + behavioural +3.0 (cold-start) = 3.3 → QUEUE
+// After  PR 69: operation-risk +0.3 + behavioural no_match (routine) = 0.3 → ALLOW
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

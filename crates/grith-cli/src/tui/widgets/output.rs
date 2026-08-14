@@ -125,11 +125,11 @@ mod tests {
             decision: Decision::Deny {
                 score: 9.2,
                 filters: vec![FilterHit {
-                    name: "path_match".to_string(),
+                    name: "path-match".to_string(),
                     delta: 5.0,
                 }],
             },
-            detail: "path_match +5.0 \u{00b7} score 9.2".to_string(),
+            detail: "path-match +5.0 \u{00b7} score 9.2".to_string(),
         };
         let spans = output_line_to_spans(&line);
         let text: String = spans.spans.iter().map(|s| s.content.as_ref()).collect();

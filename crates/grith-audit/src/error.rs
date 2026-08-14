@@ -25,6 +25,11 @@ pub enum Error {
 
     #[error("channel full: audit logger backpressure")]
     ChannelFull,
+
+    /// The chain is quarantined (integrity unverifiable); new appends are
+    /// refused so broken evidence is preserved rather than extended (B-CORE-1).
+    #[error("audit chain quarantined: {0}")]
+    ChainQuarantined(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

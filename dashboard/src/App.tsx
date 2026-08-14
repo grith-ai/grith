@@ -10,6 +10,7 @@ import { BillingPage } from "@/pages/Billing";
 import { InventoryPage } from "@/pages/Inventory";
 import { ListenerRewritesPage } from "@/pages/ListenerRewrites";
 import { getHealth, getSessions, shutdownServer } from "@/lib/api";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 // ---------------------------------------------------------------------------
 // Navigation items
@@ -168,20 +169,16 @@ export function App() {
   return (
     <div className="flex h-screen overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-56 flex-shrink-0 bg-white border-r border-grith-border flex flex-col">
-        {/* Logo */}
-        <div className="h-14 flex items-center px-4 border-b border-grith-border">
-          <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-lg bg-[#06070a] flex items-center justify-center">
-              <svg className="w-5 h-5" viewBox="0 0 24 26" fill="none">
-                <path d="M12 1.5L22 7v11L12 23.5 2 18V7L12 1.5z" stroke="#00e5a0" strokeWidth="1.5"/>
-                <circle cx="12" cy="12.5" r="2.5" fill="#00e5a0"/>
-              </svg>
-            </div>
-            <span className="text-grith-text font-semibold text-sm tracking-tight">
+      <aside className="w-56 flex-shrink-0 bg-surface border-r border-border flex flex-col">
+        {/* Logo - the canonical mark from public/grith.svg (accent #00e5a0
+            on its own dark tile, so it holds up in both themes) */}
+        <div className="h-14 flex items-center px-4 border-b border-border">
+          <div className="flex items-center gap-2.5 w-full">
+            <img src="/grith.svg" alt="" className="w-7 h-7 rounded-lg" />
+            <span className="text-text font-heading font-semibold text-sm tracking-tight">
               grith
             </span>
-            <span className="text-[10px] text-grith-dim font-mono ml-auto">
+            <span className="text-[10px] text-text-dim font-code ml-auto">
               {daemonVersion ? `v${daemonVersion}` : ""}
             </span>
           </div>
@@ -195,10 +192,10 @@ export function App() {
               to={item.to}
               end={item.to === "/"}
               className={({ isActive }) =>
-                `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
+                `flex items-center gap-2.5 px-3 py-2 rounded-btn text-sm transition-colors ${
                   isActive
-                    ? "bg-green-light text-green-dark font-medium"
-                    : "text-grith-muted hover:text-grith-text hover:bg-grith-surface"
+                    ? "bg-green-light text-accent-text font-medium"
+                    : "text-text-secondary hover:text-text hover:bg-surface-2"
                 }`
               }
             >
@@ -209,34 +206,35 @@ export function App() {
         </nav>
 
         {/* Status footer */}
-        <div className="px-4 py-3 border-t border-grith-border space-y-2">
+        <div className="px-4 py-3 border-t border-border space-y-2">
           <div className="flex items-center gap-2">
             <div
               className={`w-2 h-2 rounded-full ${
                 proxyActive
-                  ? "bg-status-allow-green animate-pulse"
+                  ? "bg-green animate-pulse"
                   : serverReachable
-                    ? "bg-status-queue-amber"
-                    : "bg-status-deny-red"
+                    ? "bg-warning"
+                    : "bg-danger"
               }`}
             />
             {proxyActive ? (
               <Link
                 to="/sessions"
-                className="text-xs text-grith-muted hover:text-grith-text transition-colors"
+                className="text-xs text-text-secondary hover:text-text transition-colors"
               >
                 {`${activeSessions} active session${activeSessions !== 1 ? "s" : ""}`}
               </Link>
             ) : (
-              <span className="text-xs text-grith-muted">
-                {serverReachable ? "Idle — no active sessions" : "Server unreachable"}
+              <span className="text-xs text-text-secondary">
+                {serverReachable ? "Idle - no active sessions" : "Server unreachable"}
               </span>
             )}
           </div>
+          <ThemeToggle className="w-full justify-center" />
           <button
             onClick={handleStopDashboard}
             disabled={stopping}
-            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg text-xs text-grith-muted hover:text-status-deny-red hover:bg-grith-surface transition-colors disabled:opacity-50"
+            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-btn text-xs text-text-secondary hover:text-danger-text hover:bg-surface-2 transition-colors disabled:opacity-50"
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M5.636 5.636a9 9 0 1 0 12.728 0M12 3v9" />
@@ -247,7 +245,7 @@ export function App() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-y-auto bg-grith-surface">
+      <main className="flex-1 overflow-y-auto bg-bg">
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/digest" element={<DigestPage />} />

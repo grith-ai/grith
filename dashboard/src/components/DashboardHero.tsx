@@ -8,6 +8,7 @@
  */
 
 import { ShareMenu } from "@/components/ShareMenu";
+import { chartColors } from "@/lib/chartPalette";
 import type { ShareStats } from "@/lib/shareCard";
 
 interface HeroProps {
@@ -29,6 +30,8 @@ interface HeroProps {
   planPaid?: boolean;
   /** Where the plan badge links to. */
   billingUrl?: string;
+  /** Open the existing share menu from an explicit CLI deep link. */
+  shareOnOpen?: boolean;
 }
 
 function HeroMark() {
@@ -36,10 +39,10 @@ function HeroMark() {
     <svg className="w-7 h-7" viewBox="0 0 24 26" fill="none" aria-hidden>
       <path
         d="M12 1.5L22 7v11L12 23.5 2 18V7L12 1.5z"
-        stroke="#00e5a0"
+        stroke={chartColors.accent}
         strokeWidth="1.5"
       />
-      <circle cx="12" cy="12.5" r="2.5" fill="#00e5a0" />
+      <circle cx="12" cy="12.5" r="2.5" fill={chartColors.accent} />
     </svg>
   );
 }
@@ -56,20 +59,23 @@ function HeroStat({
   tone?: "default" | "green" | "amber" | "red";
   delay: number;
 }) {
-  const toneClass =
+  const toneColor =
     tone === "green"
-      ? "text-[#00e5a0]"
+      ? chartColors.accent
       : tone === "amber"
-        ? "text-[#f0b429]"
+        ? chartColors.warning
         : tone === "red"
-          ? "text-[#ff5c69]"
-          : "text-white";
+          ? chartColors.danger
+          : undefined;
   return (
     <div
       className="grith-fade-up"
       style={{ animationDelay: `${delay}ms` }}
     >
-      <div className={`font-mono text-xl sm:text-2xl font-semibold tabular-nums ${toneClass}`}>
+      <div
+        className={`font-code text-xl sm:text-2xl font-semibold tabular-nums ${toneColor ? "" : "text-white"}`}
+        style={toneColor ? { color: toneColor } : undefined}
+      >
         {value}
       </div>
       <div className="text-[11px] uppercase tracking-[0.12em] text-white/45 mt-0.5">
@@ -92,6 +98,7 @@ export function DashboardHero({
   planLabel,
   planPaid = false,
   billingUrl = "/billing",
+  shareOnOpen = false,
 }: HeroProps) {
   const decided = allow + queue + deny;
   const pct = (n: number) => (decided > 0 ? (n / decided) * 100 : 0);
@@ -111,7 +118,7 @@ export function DashboardHero({
   };
 
   return (
-    <section className="grith-hero rounded-2xl px-6 py-7 sm:px-8 sm:py-8 mb-8 border border-white/10 shadow-[0_8px_40px_-12px_rgba(0,0,0,0.5)]">
+    <section className="grith-hero rounded-card px-6 py-7 sm:px-8 sm:py-8 mb-8 border border-white/10">
       {/* Top rail: brand + live status. `relative z-30` lifts it (and the
           share dropdown it contains) above the later headline / stat-rail
           sections, which would otherwise paint over the open menu. */}
@@ -125,7 +132,7 @@ export function DashboardHero({
             grith
           </span>
           {version && (
-            <span className="font-mono text-[11px] text-white/35">
+            <span className="font-code text-[11px] text-white/35">
               v{version}
             </span>
           )}
@@ -142,13 +149,15 @@ export function DashboardHero({
             <span className="relative flex">
               <span
                 className={`grith-pulse-ring relative w-2 h-2 rounded-full ${
-                  online ? "text-[#00e5a0]" : "text-white/30"
+                  online ? "" : "text-white/30"
                 }`}
+                style={online ? { color: chartColors.accent } : undefined}
               >
                 <span
                   className={`block w-2 h-2 rounded-full ${
-                    online ? "bg-[#00e5a0]" : "bg-white/30"
+                    online ? "" : "bg-white/30"
                   }`}
+                  style={online ? { backgroundColor: chartColors.accent } : undefined}
                 />
               </span>
             </span>
@@ -177,7 +186,7 @@ export function DashboardHero({
               )}
             </a>
           )}
-          <ShareMenu stats={shareStats} />
+          <ShareMenu stats={shareStats} autoOpen={shareOnOpen} />
         </div>
       </div>
 
@@ -185,16 +194,16 @@ export function DashboardHero({
       <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6">
         <div className="grith-fade-up" style={{ animationDelay: "120ms" }}>
           <div className="flex items-baseline gap-3">
-            <span className="font-mono text-5xl sm:text-6xl font-bold text-white tabular-nums leading-none">
+            <span className="font-code text-5xl sm:text-6xl font-bold text-white tabular-nums leading-none">
               {totalEvals.toLocaleString()}
             </span>
           </div>
           <p className="text-white/55 text-sm mt-3 max-w-md">
-            tool calls inspected under Zero Trust —{" "}
+            tool calls inspected under Zero Trust -{" "}
             <span className="text-white/90 font-medium">
               {heldBack.toLocaleString()}
             </span>{" "}
-            held back for review or denied.
+            queued for review or denied.
           </p>
         </div>
 
@@ -220,28 +229,28 @@ export function DashboardHero({
         <div className="h-2 rounded-full bg-white/[0.06] overflow-hidden flex">
           {pct(allow) > 0 && (
             <div
-              className="bg-[#00e5a0] h-full transition-all duration-700"
-              style={{ width: `${pct(allow)}%` }}
+              className="h-full transition-all duration-700"
+              style={{ width: `${pct(allow)}%`, backgroundColor: chartColors.accent }}
             />
           )}
           {pct(queue) > 0 && (
             <div
-              className="bg-[#f0b429] h-full transition-all duration-700"
-              style={{ width: `${pct(queue)}%` }}
+              className="h-full transition-all duration-700"
+              style={{ width: `${pct(queue)}%`, backgroundColor: chartColors.warning }}
             />
           )}
           {pct(deny) > 0 && (
             <div
-              className="bg-[#ff5c69] h-full transition-all duration-700"
-              style={{ width: `${pct(deny)}%` }}
+              className="h-full transition-all duration-700"
+              style={{ width: `${pct(deny)}%`, backgroundColor: chartColors.danger }}
             />
           )}
         </div>
         <div className="flex flex-wrap items-center gap-x-6 gap-y-1 mt-3 text-[12px]">
-          <Legend color="#00e5a0" label="Allowed" value={allow} pct={pct(allow)} />
-          <Legend color="#f0b429" label="Queued" value={queue} pct={pct(queue)} />
-          <Legend color="#ff5c69" label="Denied" value={deny} pct={pct(deny)} />
-          <span className="ml-auto text-white/35 font-mono text-[11px]">
+          <Legend color={chartColors.accent} label="Allowed" value={allow} pct={pct(allow)} />
+          <Legend color={chartColors.warning} label="Queued" value={queue} pct={pct(queue)} />
+          <Legend color={chartColors.danger} label="Denied" value={deny} pct={pct(deny)} />
+          <span className="ml-auto text-white/35 font-code text-[11px]">
             uptime {uptime}
           </span>
         </div>
@@ -268,7 +277,7 @@ function Legend({
         style={{ backgroundColor: color }}
       />
       <span className="text-white/80">{label}</span>
-      <span className="font-mono text-white/45">
+      <span className="font-code text-white/45">
         {value.toLocaleString()}
         <span className="text-white/25"> · {pct.toFixed(0)}%</span>
       </span>

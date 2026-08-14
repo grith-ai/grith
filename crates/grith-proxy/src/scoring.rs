@@ -15,7 +15,7 @@ pub const SCORE_DENY_THRESHOLD: f64 = 8.0;
 /// Map a numeric score to a severity level.
 ///
 /// Shared by filters that derive severity from a computed score
-/// (e.g. `egress_policy`, `session_containment`).
+/// (e.g. `egress-policy`, `session-containment`).
 pub fn severity_for(score: f64) -> Severity {
     if score >= SCORE_DENY_THRESHOLD {
         Severity::Critical

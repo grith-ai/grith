@@ -73,6 +73,16 @@ pub fn cmd_repl(
     let mut telemetry = SessionTelemetry::default();
     let repl_policy_scope = repl_policy_scope(&daemon.config.llm.default_provider);
 
+    // B12 #78: when another process owns the audit database this one is a
+    // Reader and cannot write it. Establish a client to the owning daemon so
+    // audit records are forwarded rather than dropped against a read-only
+    // handle; if the owner is unreachable, evaluation records fail closed at
+    // write time rather than executing unlogged.
+    let can_write_audit = daemon.audit_role.can_write();
+    let audit_forward_client = (!can_write_audit)
+        .then(crate::daemon::client::DaemonClient::connect)
+        .flatten();
+
     // Detect whether we have a TTY for the TUI
     let use_tui = std::io::IsTerminal::is_terminal(&std::io::stdout())
         && std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -104,6 +114,8 @@ pub fn cmd_repl(
                         let mut agent_ctx = AgentLoopContext {
                             proxy: &daemon.proxy,
                             audit_storage: &daemon.audit_storage,
+                            can_write_audit,
+                            audit_ingest: audit_forward_client.as_ref(),
                             digest_queue: &daemon.digest_queue,
                             dlp_redactor: &daemon.dlp_redactor,
                             correlation_tracker: daemon.correlation_tracker.as_ref(),
@@ -254,6 +266,8 @@ pub fn cmd_repl(
                     let mut agent_ctx = AgentLoopContext {
                         proxy: &daemon.proxy,
                         audit_storage: &daemon.audit_storage,
+                        can_write_audit,
+                        audit_ingest: audit_forward_client.as_ref(),
                         digest_queue: &daemon.digest_queue,
                         dlp_redactor: &daemon.dlp_redactor,
                         correlation_tracker: daemon.correlation_tracker.as_ref(),
@@ -377,6 +391,15 @@ pub fn cmd_run(
     project_override: Option<&str>,
     enable_color: bool,
 ) -> anyhow::Result<()> {
+    // B12 #78: resolve audit ownership and connect a forward client to the
+    // owning daemon BEFORE entering the current-thread runtime — connect()
+    // blocks on a health check, which must not run via block_in_place inside a
+    // current_thread runtime. See cmd_repl for the same rationale.
+    let can_write_audit = daemon.audit_role.can_write();
+    let audit_forward_client = (!can_write_audit)
+        .then(crate::daemon::client::DaemonClient::connect)
+        .flatten();
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -387,9 +410,12 @@ pub fn cmd_run(
         dashboard_url,
         project_override,
         enable_color,
+        can_write_audit,
+        audit_forward_client,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run_async(
     daemon: &daemon::Daemon,
     task: &str,
@@ -397,6 +423,8 @@ async fn cmd_run_async(
     dashboard_url: Option<&str>,
     project_override: Option<&str>,
     enable_color: bool,
+    can_write_audit: bool,
+    audit_forward_client: Option<crate::daemon::client::DaemonClient>,
 ) -> anyhow::Result<()> {
     tracing::info!(%task, "executing single task");
 
@@ -436,6 +464,8 @@ async fn cmd_run_async(
     let mut agent_ctx = AgentLoopContext {
         proxy: &daemon.proxy,
         audit_storage: &daemon.audit_storage,
+        can_write_audit,
+        audit_ingest: audit_forward_client.as_ref(),
         digest_queue: &daemon.digest_queue,
         dlp_redactor: &daemon.dlp_redactor,
         correlation_tracker: daemon.correlation_tracker.as_ref(),

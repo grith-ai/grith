@@ -156,7 +156,7 @@ impl RateLimitFilter {
     /// the next session. Falls back to a deterministic session-id-derived
     /// scope when `session_scope` is absent (e.g. legacy IPC callers).
     fn window_key(ctx: &ToolCallContext, category: &str) -> String {
-        let scope = ctx.scope_or_warn("rate_limit");
+        let scope = ctx.scope_or_warn("rate-limit");
         format!("{}\x00{}", scope.as_uuid(), category)
     }
 
@@ -171,6 +171,7 @@ impl RateLimitFilter {
             ToolCallType::ShellExec { .. } => "shell_exec".to_string(),
             ToolCallType::HttpRequest { .. } => "http_request".to_string(),
             ToolCallType::FileRename { .. } => "file_rename".to_string(),
+            ToolCallType::FileLink { .. } => "file_link".to_string(),
             ToolCallType::FileChmod { .. } => "file_chmod".to_string(),
             ToolCallType::DirCreate { .. } => "dir_create".to_string(),
             ToolCallType::NetConnect { .. } => "net_connect".to_string(),
@@ -218,7 +219,7 @@ impl RateLimitFilter {
 
         let limit = match self.limits.get(&category) {
             Some(l) => l,
-            None => return Ok(FilterResult::no_match("rate_limit")),
+            None => return Ok(FilterResult::no_match("rate-limit")),
         };
 
         // Risk-gated burst (default on; rollout step 4): volume is only a
@@ -235,7 +236,7 @@ impl RateLimitFilter {
         // window a later risk-bearing op of the same category is measured
         // against — the burst window then counts only risk-bearing ops.
         if self.risk_gated_burst && !Self::is_burst_risk_relevant(ctx) {
-            return Ok(FilterResult::no_match("rate_limit"));
+            return Ok(FilterResult::no_match("rate-limit"));
         }
 
         let window_key = Self::window_key(ctx, &category);
@@ -244,7 +245,7 @@ impl RateLimitFilter {
         // Check for burst first (highest severity).
         if burst_count >= limit.burst_threshold {
             return Ok(FilterResult::matched(
-                "rate_limit",
+                "rate-limit",
                 "burst-detected",
                 3.0,
                 Severity::Error,
@@ -258,7 +259,7 @@ impl RateLimitFilter {
         // Check if over the per-minute limit.
         if minute_count > limit.max_per_minute {
             return Ok(FilterResult::matched(
-                "rate_limit",
+                "rate-limit",
                 "rate-exceeded",
                 2.0,
                 Severity::Warning,
@@ -273,7 +274,7 @@ impl RateLimitFilter {
         let threshold_80 = (limit.max_per_minute as f64 * 0.8) as u32;
         if minute_count > threshold_80 {
             return Ok(FilterResult::matched(
-                "rate_limit",
+                "rate-limit",
                 "rate-approaching",
                 1.0,
                 Severity::Notice,
@@ -284,14 +285,14 @@ impl RateLimitFilter {
             ));
         }
 
-        Ok(FilterResult::no_match("rate_limit"))
+        Ok(FilterResult::no_match("rate-limit"))
     }
 }
 
 #[async_trait::async_trait]
 impl SecurityFilter for RateLimitFilter {
     fn name(&self) -> &str {
-        "rate_limit"
+        "rate-limit"
     }
 
     fn phase(&self) -> FilterPhase {

@@ -4,7 +4,7 @@
 //! Benchmark-style tests for exfiltration containment overhead.
 //!
 //! These tests measure the wall-clock overhead of the Phase 16 filters
-//! (egress_policy, session_containment, dlp_gate, egress_rate, canary)
+//! (egress-policy, session-containment, dlp-gate, egress-rate, canary)
 //! and verify that they stay within acceptable latency targets.
 //!
 //! Not using criterion to avoid adding a dependency — these use
@@ -79,7 +79,7 @@ async fn bench_egress_policy_trusted_domain() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("egress_policy (trusted domain): {mean:?}/call");
+    println!("egress-policy (trusted domain): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(1),
         "Egress policy trusted domain should be < 1ms, was {mean:?}"
@@ -103,7 +103,7 @@ async fn bench_egress_policy_unknown_domain() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("egress_policy (unknown domain): {mean:?}/call");
+    println!("egress-policy (unknown domain): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(1),
         "Egress policy unknown domain should be < 1ms, was {mean:?}"
@@ -131,7 +131,7 @@ async fn bench_dlp_gate_clean_outbound() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("dlp_gate (clean outbound): {mean:?}/call");
+    println!("dlp-gate (clean outbound): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(1),
         "DLP gate clean outbound should be < 1ms, was {mean:?}"
@@ -159,7 +159,7 @@ async fn bench_dlp_gate_with_secret() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("dlp_gate (with secret): {mean:?}/call");
+    println!("dlp-gate (with secret): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(2),
         "DLP gate with secret should be < 2ms, was {mean:?}"
@@ -183,7 +183,7 @@ async fn bench_dlp_gate_non_outbound_skip() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("dlp_gate (non-outbound skip): {mean:?}/call");
+    println!("dlp-gate (non-outbound skip): {mean:?}/call");
     assert!(
         mean < Duration::from_micros(100),
         "DLP gate skip for non-outbound should be < 100us, was {mean:?}"
@@ -211,7 +211,7 @@ async fn bench_containment_no_session_state() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("session_containment (no state): {mean:?}/call");
+    println!("session-containment (no state): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(1),
         "Session containment with no state should be < 1ms, was {mean:?}"
@@ -240,7 +240,7 @@ async fn bench_containment_with_active_containment() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("session_containment (active): {mean:?}/call");
+    println!("session-containment (active): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(1),
         "Session containment with active state should be < 1ms, was {mean:?}"
@@ -319,7 +319,7 @@ async fn bench_egress_rate_under_limits() {
         BENCH_ITERATIONS,
     )
     .await;
-    println!("egress_rate (under limits): {mean:?}/call");
+    println!("egress-rate (under limits): {mean:?}/call");
     assert!(
         mean < Duration::from_millis(1),
         "Egress rate under limits should be < 1ms, was {mean:?}"

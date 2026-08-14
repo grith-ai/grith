@@ -3,9 +3,9 @@ import { getTier } from "@/lib/api";
 import type { RefreshState, TierResponse } from "@/types/api";
 
 const TIER_COLORS: Record<string, string> = {
-  community: "bg-grith-muted/20 text-grith-muted border-grith-border",
-  pro: "bg-green/15 text-green border-green/40",
-  enterprise: "bg-purple-500/15 text-purple-400 border-purple-500/40",
+  community: "bg-transparent text-text-secondary border-border",
+  pro: "bg-green-light text-accent-text border-green-border",
+  enterprise: "bg-purple-light text-purple border-purple-border",
 };
 
 const TIER_LABELS: Record<string, string> = {
@@ -52,7 +52,7 @@ export function BillingPage() {
   if (loading) {
     return (
       <div className="p-6 flex items-center justify-center">
-        <div className="text-grith-muted text-sm">Loading billing info...</div>
+        <div className="text-text-secondary text-sm">Loading billing info...</div>
       </div>
     );
   }
@@ -60,7 +60,7 @@ export function BillingPage() {
   if (error || !tier) {
     return (
       <div className="p-6">
-        <div className="bg-status-deny-red/10 border border-status-deny-red/30 rounded-xl px-4 py-3 text-xs text-status-deny-red">
+        <div className="bg-danger-light border border-danger-border rounded-card px-4 py-3 text-xs text-danger-text">
           Failed to load billing information: {error ?? "unknown error"}
         </div>
       </div>
@@ -74,7 +74,7 @@ export function BillingPage() {
 
   return (
     <div className="p-6 max-w-4xl">
-      <h1 className="text-xl font-semibold text-grith-text mb-6">
+      <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-6">
         Plan &amp; Billing
       </h1>
 
@@ -83,20 +83,20 @@ export function BillingPage() {
       <SessionLimitNudge tier={tier} />
 
       {/* Current plan card */}
-      <div className="bg-white border border-grith-border rounded-xl p-5 mb-6">
+      <div className="bg-surface border border-border rounded-card p-5 mb-6">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
-            <span className={`inline-flex items-center px-2.5 py-1 rounded text-xs font-semibold border ${colorClass}`}>
+            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-pill font-label text-[11px] font-medium uppercase tracking-[0.08em] border ${colorClass}`}>
               {label}
             </span>
-            <span className="text-sm text-grith-text">Current Plan</span>
+            <span className="text-sm text-text">Current Plan</span>
           </div>
           {tierKey === "community" ? (
             <a
               href="https://grith.ai/pricing"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green text-white text-xs font-medium hover:bg-green-dark transition-colors"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-green text-accent-ink text-xs font-heading font-semibold hover:bg-green-dark transition-colors"
             >
               Upgrade to Pro
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -108,7 +108,7 @@ export function BillingPage() {
               href={billingUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-grith-border text-grith-muted text-xs hover:text-grith-text hover:border-grith-text/30 transition-colors"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn border border-border text-text-secondary text-xs hover:text-text hover:border-border-dark hover:bg-surface transition-colors"
             >
               Manage Subscription
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -120,16 +120,16 @@ export function BillingPage() {
 
         <div className="grid grid-cols-3 gap-4">
           <div>
-            <div className="text-xs text-grith-muted mb-1">Seats</div>
-            <div className="text-sm text-grith-text font-mono">{tier.seats}</div>
+            <div className="text-xs text-text-secondary mb-1">Seats</div>
+            <div className="text-sm text-text font-code">{tier.seats}</div>
           </div>
           <div>
-            <div className="text-xs text-grith-muted mb-1">Max Sessions</div>
-            <div className="text-sm text-grith-text font-mono">{tier.max_sessions}</div>
+            <div className="text-xs text-text-secondary mb-1">Max Sessions</div>
+            <div className="text-sm text-text font-code">{tier.max_sessions}</div>
           </div>
           <div>
-            <div className="text-xs text-grith-muted mb-1">Renewal Date</div>
-            <div className="text-sm text-grith-text font-mono">
+            <div className="text-xs text-text-secondary mb-1">Renewal Date</div>
+            <div className="text-sm text-text font-code">
               {tier.renewal_date ?? "—"}
             </div>
           </div>
@@ -137,25 +137,25 @@ export function BillingPage() {
       </div>
 
       {/* Feature comparison table */}
-      <div className="bg-white border border-grith-border rounded-xl overflow-hidden">
-        <div className="px-5 py-3 border-b border-grith-border">
-          <h2 className="text-xs text-grith-muted uppercase tracking-wider">
+      <div className="bg-surface border border-border rounded-card overflow-hidden">
+        <div className="px-5 py-3 border-b border-border">
+          <h2 className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.1em]">
             Feature Comparison
           </h2>
         </div>
         <table className="w-full text-xs">
           <thead>
-            <tr className="border-b border-grith-border">
-              <th className="text-left px-5 py-2.5 text-grith-muted font-medium">Feature</th>
-              <th className="text-center px-3 py-2.5 text-grith-muted font-medium">Community</th>
-              <th className="text-center px-3 py-2.5 text-green font-medium">Pro</th>
-              <th className="text-center px-3 py-2.5 text-purple-400 font-medium">Enterprise</th>
+            <tr className="border-b border-border font-label text-[11px] font-medium uppercase tracking-[0.08em]">
+              <th className="text-left px-5 py-2.5 text-text-dim">Feature</th>
+              <th className="text-center px-3 py-2.5 text-text-dim">Community</th>
+              <th className="text-center px-3 py-2.5 text-accent-text">Pro</th>
+              <th className="text-center px-3 py-2.5 text-purple">Enterprise</th>
             </tr>
           </thead>
           <tbody>
             {FEATURE_MATRIX.map((row) => (
-              <tr key={row.key} className="border-b border-grith-border/50 last:border-b-0">
-                <td className="px-5 py-2 text-grith-text">{row.name}</td>
+              <tr key={row.key} className="border-b border-border/50 last:border-b-0">
+                <td className="px-5 py-2 text-text">{row.name}</td>
                 <td className="text-center px-3 py-2">
                   <FeatureCheck enabled={row.community} active={tierKey === "community" && tier.features[row.key]} />
                 </td>
@@ -172,14 +172,14 @@ export function BillingPage() {
       </div>
 
       {/* CLI hint */}
-      <div className="mt-6 bg-white border border-grith-border rounded-xl p-5 text-center">
-        <p className="text-grith-muted text-xs">
+      <div className="mt-6 bg-surface border border-border rounded-card p-5 text-center">
+        <p className="text-text-secondary text-xs">
           Manage your subscription from the CLI:{" "}
-          <code className="font-mono text-green">grith pro billing</code>
+          <code className="font-code text-accent-text">grith pro billing</code>
           {" | "}
-          <code className="font-mono text-green">grith pro status</code>
+          <code className="font-code text-accent-text">grith pro status</code>
           {" | "}
-          <code className="font-mono text-green">grith pro upgrade</code>
+          <code className="font-code text-accent-text">grith pro upgrade</code>
         </p>
       </div>
     </div>
@@ -214,16 +214,16 @@ function SessionLimitNudge({ tier }: { tier: TierResponse }) {
       : "https://grith.ai/pricing");
 
   return (
-    <div className="mb-4 border border-status-queue-amber/40 bg-status-queue-amber/10 rounded-xl px-4 py-3 flex items-center justify-between gap-4">
-      <div className="text-xs text-grith-text">
-        <div className="font-semibold text-status-queue-amber">{headline}</div>
+    <div className="mb-4 border border-warning-border bg-warning-light rounded-card px-4 py-3 flex items-center justify-between gap-4">
+      <div className="text-xs text-text">
+        <div className="font-semibold text-warning-text">{headline}</div>
         <div className="opacity-80 mt-0.5">{remediation}</div>
       </div>
       <a
         href={ctaUrl}
         target="_blank"
         rel="noopener noreferrer"
-        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green text-white text-xs font-medium hover:bg-green-dark transition-colors"
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-green text-accent-ink text-xs font-heading font-semibold hover:bg-green-dark transition-colors"
       >
         {cta}
       </a>
@@ -235,7 +235,7 @@ function RefreshBanner({ refresh }: { refresh: RefreshState | null }) {
   if (!refresh) return null;
   if (refresh.air_gapped) {
     return (
-      <div className="mb-4 bg-grith-muted/10 border border-grith-border rounded-xl px-4 py-3 text-xs text-grith-muted">
+      <div className="mb-4 bg-surface border border-border rounded-card px-4 py-3 text-xs text-text-secondary">
         Air-gapped contract licence: scheduled refresh is disabled. Renewal is
         delivered out-of-band.
       </div>
@@ -257,16 +257,16 @@ function RefreshBanner({ refresh }: { refresh: RefreshState | null }) {
     refresh.last_failure_kind === "revoked" ||
     refresh.last_failure_kind === "unauthorized";
   const colorClass = isHard
-    ? "bg-status-deny-red/10 border-status-deny-red/30 text-status-deny-red"
-    : "bg-status-queue-yellow/10 border-status-queue-yellow/30 text-status-queue-yellow";
+    ? "bg-danger-light border-danger-border text-danger-text"
+    : "bg-warning-light border-warning-border text-warning-text";
   const remediation =
     refresh.last_failure_kind === "unauthorized"
       ? "Run `grith pro login` to refresh credentials."
       : refresh.last_failure_kind === "revoked"
         ? "Renew your subscription in the dashboard."
-        : "Network failure — the daemon will retry automatically.";
+        : "Network failure - the daemon will retry automatically.";
   return (
-    <div className={`mb-4 border rounded-xl px-4 py-3 text-xs ${colorClass}`}>
+    <div className={`mb-4 border rounded-card px-4 py-3 text-xs ${colorClass}`}>
       <div className="font-semibold">
         Licence refresh failed {days !== null ? `${days} day(s) ago` : "recently"}
         {" "}
@@ -283,17 +283,17 @@ function RefreshBanner({ refresh }: { refresh: RefreshState | null }) {
 
 function FeatureCheck({ enabled, active }: { enabled: boolean; active?: boolean }) {
   if (!enabled) {
-    return <span className="text-grith-muted/40">—</span>;
+    return <span className="text-text-secondary/40">—</span>;
   }
   if (active) {
     return (
-      <svg className="w-4 h-4 mx-auto text-status-allow-green" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+      <svg className="w-4 h-4 mx-auto text-accent-text" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
       </svg>
     );
   }
   return (
-    <svg className="w-4 h-4 mx-auto text-grith-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <svg className="w-4 h-4 mx-auto text-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
     </svg>
   );

@@ -35,6 +35,36 @@ fn enforce_chain_integrity(
             "AUDIT_CHAIN_BROKEN",
         )
         .into_response()),
+        // work/74 Phase 6: a genuine discontinuity between archived and active
+        // history. Distinct code from BROKEN so operators can tell "the two
+        // segments don't join" apart from "a record was altered".
+        Ok(grith_audit::ChainVerification::AnchorMismatch {
+            boundary_sequence,
+            expected_prev_hash,
+            found_prev_hash,
+            first_sequence,
+        }) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "audit archive boundary at sequence {boundary_sequence} expects prev_hash \
+                 {expected_prev_hash} but active segment starts at {first_sequence} with \
+                 {found_prev_hash:?}"
+            ),
+            "AUDIT_CHAIN_ANCHOR_MISMATCH",
+        )
+        .into_response()),
+        // work/74 §9: the anchor is missing, not the data. The daemon recovers
+        // this at startup from cold storage; if a read arrives first, report it
+        // as unavailable rather than as tampering — and never repair here.
+        Ok(grith_audit::ChainVerification::Unanchored { first_sequence }) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "audit chain is unanchored: active segment starts at sequence {first_sequence} \
+                 with no archive boundary. Records are intact; run `grith audit diagnose`."
+            ),
+            "AUDIT_CHAIN_UNANCHORED",
+        )
+        .into_response()),
         Err(e) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("audit chain verification failed: {e}"),

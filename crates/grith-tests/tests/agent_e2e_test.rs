@@ -218,6 +218,7 @@ async fn simulate_tool_execution(
 
             tool_call_type: call_type.to_string(),
             arguments_summary: tool_call.arguments.to_string(),
+            decision_reason: None,
             composite_score: score,
             severity: grith_digest::types::ScoreSeverity::Medium,
             filter_breakdown: vec![],
@@ -394,7 +395,7 @@ async fn test_e2e_borderline_tool_call_queued_with_digest() {
     ));
     let digest_queue = Arc::new(DigestQueue::open_in_memory().expect("digest queue"));
 
-    // A .pem read scores 4.0 (path_match `*.pem`) — squarely in the QUEUE band
+    // A .pem read scores 4.0 (path-match `*.pem`) — squarely in the QUEUE band
     // (3.0 < score <= 8.0) under the fixed thresholds, so it exercises the
     // queue → audit + digest path without relying on any cold-start widening.
     let mock = MockLlm::new(vec![CompletionResponse {

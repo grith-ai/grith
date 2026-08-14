@@ -60,11 +60,19 @@ impl Default for EgressRateConfig {
 /// Per-session egress tracking state.
 #[derive(Debug)]
 struct SessionEgressState {
-    /// Timestamps of all outbound (egress) calls.
+    /// Timestamps of *all* outbound (egress) calls, routine or not. Drives the
+    /// read-then-send correlation signal, which stays sensitive regardless of
+    /// destination trust (defence-in-depth against a mis-curated trust list).
     egress_timestamps: Vec<Instant>,
-    /// Unique destination hosts seen in the current minute window.
+    /// Timestamps of *non-routine* egress only. Drives the purely volumetric
+    /// anomaly signals (burst, rate-exceeded). Egress to an operator- or
+    /// profile-trusted destination is the expected baseline, not an anomaly, so
+    /// it is excluded here (A#2 — kills the headless-browser startup prompt
+    /// storm without lowering the exfil bar).
+    counted_egress_timestamps: Vec<Instant>,
+    /// Unique *non-routine* destination hosts seen in the current minute window.
     destinations: Vec<(String, Instant)>,
-    /// Unique destination ports seen in the current minute window.
+    /// Unique *non-routine* destination ports seen in the current minute window.
     ports: Vec<(u16, Instant)>,
     /// Timestamps of file-read calls (for read-then-send detection).
     read_timestamps: Vec<Instant>,
@@ -76,6 +84,7 @@ impl SessionEgressState {
     fn new() -> Self {
         Self {
             egress_timestamps: Vec::new(),
+            counted_egress_timestamps: Vec::new(),
             destinations: Vec::new(),
             ports: Vec::new(),
             read_timestamps: Vec::new(),
@@ -86,6 +95,7 @@ impl SessionEgressState {
     /// Prune all timestamps older than `cutoff`.
     fn prune(&mut self, cutoff: Instant) {
         self.egress_timestamps.retain(|t| *t >= cutoff);
+        self.counted_egress_timestamps.retain(|t| *t >= cutoff);
         self.destinations.retain(|(_, t)| *t >= cutoff);
         self.ports.retain(|(_, t)| *t >= cutoff);
         self.read_timestamps.retain(|t| *t >= cutoff);
@@ -116,19 +126,65 @@ impl SessionEgressState {
 /// - `+1.5` egress during cooldown period
 pub struct EgressRateFilter {
     config: EgressRateConfig,
+    /// Operator-global trusted destination domains (mirrors egress-policy's
+    /// `trusted_domains`). Egress to a trusted destination is excluded from the
+    /// volumetric anomaly counters (A#2).
+    trusted_domains: HashSet<String>,
+    /// Per-profile trusted destinations (mirrors egress-policy's
+    /// `profile_trusted`), keyed by lowercased profile name from the
+    /// `ToolCallContext`.
+    profile_trusted: HashMap<String, HashSet<String>>,
     sessions: Mutex<HashMap<Uuid, SessionEgressState>>,
 }
 
 impl EgressRateFilter {
     pub fn from_config(config: EgressRateConfig) -> Self {
+        Self::from_config_with_trust(config, Vec::new(), HashMap::new())
+    }
+
+    /// Construct with destination-trust awareness so routine/allowlisted egress
+    /// is excluded from the volumetric anomaly counters (A#2). The trust inputs
+    /// mirror the egress-policy filter's `trusted_domains` /
+    /// `profile_trusted_domains` so the two filters agree on what "routine"
+    /// means. In supervisor mode a session-allowlisted destination already
+    /// bypasses the proxy entirely; this exemption is the backstop for the two
+    /// paths where that bypass does not apply — the built-in agent (Path 1) and
+    /// a supervised session under containment, where the allowlist is not
+    /// consulted and every call runs the full pipeline.
+    pub fn from_config_with_trust(
+        config: EgressRateConfig,
+        trusted_domains: Vec<String>,
+        profile_trusted_domains: HashMap<String, Vec<String>>,
+    ) -> Self {
         Self {
             config,
+            trusted_domains: normalize_domain_set(trusted_domains),
+            profile_trusted: profile_trusted_domains
+                .into_iter()
+                .map(|(name, domains)| (name.to_lowercase(), normalize_domain_set(domains)))
+                .collect(),
             sessions: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::from_config(EgressRateConfig::default())
+    }
+
+    /// True when the current egress call targets an operator- or profile-trusted
+    /// destination — a routine/allowlisted host that must not count toward the
+    /// volumetric anomaly signals (burst / rate / spread).
+    fn is_routine_destination(&self, ctx: &ToolCallContext) -> bool {
+        let Some(host) = Self::extract_destination_host(&ctx.call_type) else {
+            return false;
+        };
+        if host_in_domain_set(&self.trusted_domains, &host) {
+            return true;
+        }
+        ctx.profile_name
+            .as_ref()
+            .and_then(|name| self.profile_trusted.get(&name.to_lowercase()))
+            .is_some_and(|set| host_in_domain_set(set, &host))
     }
 
     /// Check whether a call type is an outbound egress call.
@@ -221,7 +277,7 @@ impl EgressRateFilter {
             && recent_egress >= self.config.read_then_send_egress_threshold
         {
             Some(FilterResult::matched(
-                "egress_rate",
+                "egress-rate",
                 "read-then-send-spike",
                 5.0,
                 Severity::Critical,
@@ -240,7 +296,7 @@ impl EgressRateFilter {
         let burst_window_start =
             instant_sub(now, Duration::from_secs(self.config.burst_window_seconds));
         let burst_count = state
-            .egress_timestamps
+            .counted_egress_timestamps
             .iter()
             .filter(|t| **t >= burst_window_start)
             .count() as u32;
@@ -248,7 +304,7 @@ impl EgressRateFilter {
         if burst_count >= self.config.burst_threshold {
             state.cooldown_until = Some(now + Duration::from_secs(self.config.cooldown_seconds));
             Some(FilterResult::matched(
-                "egress_rate",
+                "egress-rate",
                 "egress-burst",
                 4.0,
                 Severity::Error,
@@ -268,7 +324,7 @@ impl EgressRateFilter {
             state.destinations.iter().map(|(h, _)| h.as_str()).collect();
         if unique_dests.len() as u32 > self.config.max_unique_destinations_per_minute {
             Some(FilterResult::matched(
-                "egress_rate",
+                "egress-rate",
                 "egress-dest-spread",
                 3.0,
                 Severity::Error,
@@ -288,7 +344,7 @@ impl EgressRateFilter {
         let unique_ports: HashSet<u16> = state.ports.iter().map(|(p, _)| *p).collect();
         if unique_ports.len() as u32 > self.config.max_unique_ports_per_minute {
             Some(FilterResult::matched(
-                "egress_rate",
+                "egress-rate",
                 "egress-port-spread",
                 2.5,
                 Severity::Warning,
@@ -305,10 +361,10 @@ impl EgressRateFilter {
 
     /// Check if the egress rate (calls per minute) has been exceeded.
     fn check_rate_exceeded(&self, state: &SessionEgressState) -> Option<FilterResult> {
-        let egress_count = state.egress_timestamps.len() as u32;
+        let egress_count = state.counted_egress_timestamps.len() as u32;
         if egress_count > self.config.max_egress_per_minute {
             Some(FilterResult::matched(
-                "egress_rate",
+                "egress-rate",
                 "egress-rate-exceeded",
                 2.0,
                 Severity::Warning,
@@ -327,7 +383,7 @@ impl EgressRateFilter {
         if let Some(until) = state.cooldown_until {
             if now < until {
                 return Some(FilterResult::matched(
-                    "egress_rate",
+                    "egress-rate",
                     "egress-cooldown",
                     1.5,
                     Severity::Notice,
@@ -352,8 +408,12 @@ impl EgressRateFilter {
 
         // Only track egress and read calls.
         if !is_egress && !is_read {
-            return Ok(FilterResult::no_match("egress_rate"));
+            return Ok(FilterResult::no_match("egress-rate"));
         }
+
+        // Resolve routine-ness before locking (borrows `self`, not the session
+        // map). Only egress calls carry a destination.
+        let routine = is_egress && self.is_routine_destination(ctx);
 
         let mut sessions = self.sessions.lock().expect("lock poisoned");
         let state = sessions
@@ -367,20 +427,27 @@ impl EgressRateFilter {
         // Record reads for read-then-send tracking.
         if is_read {
             state.read_timestamps.push(now);
-            return Ok(FilterResult::no_match("egress_rate"));
+            return Ok(FilterResult::no_match("egress-rate"));
         }
 
         // --- From here on, it's an egress call ---
 
-        // Record the egress call.
+        // Record every egress call for the read-then-send correlation signal —
+        // this stays sensitive regardless of destination trust.
         state.egress_timestamps.push(now);
 
-        // Record destination host and port.
-        if let Some(host) = Self::extract_destination_host(&ctx.call_type) {
-            state.destinations.push((host, now));
-        }
-        if let Some(port) = Self::extract_destination_port(&ctx.call_type) {
-            state.ports.push((port, now));
+        // Routine/allowlisted destinations are the expected baseline: exclude
+        // them from the volumetric anomaly counters (burst / rate / spread) so
+        // a browser's routine startup burst to trusted infrastructure does not
+        // flag. Non-routine egress is counted and its host/port recorded.
+        if !routine {
+            state.counted_egress_timestamps.push(now);
+            if let Some(host) = Self::extract_destination_host(&ctx.call_type) {
+                state.destinations.push((host, now));
+            }
+            if let Some(port) = Self::extract_destination_port(&ctx.call_type) {
+                state.ports.push((port, now));
+            }
         }
 
         let mut best: Option<FilterResult> = None;
@@ -391,7 +458,7 @@ impl EgressRateFilter {
         best = select_higher(best, self.check_rate_exceeded(state));
         best = select_higher(best, self.check_cooldown(state, now));
 
-        Ok(best.unwrap_or_else(|| FilterResult::no_match("egress_rate")))
+        Ok(best.unwrap_or_else(|| FilterResult::no_match("egress-rate")))
     }
 }
 
@@ -399,6 +466,33 @@ impl EgressRateFilter {
 /// if the subtraction would underflow.
 fn instant_sub(instant: Instant, duration: Duration) -> Instant {
     instant.checked_sub(duration).unwrap_or(instant)
+}
+
+/// Normalise a domain list into a lowercase, wildcard/dot-stripped set for
+/// suffix matching (mirrors egress-policy's `normalize_domains` so the two
+/// filters agree on trust). `*.foo.com` and `.foo.com` both normalise to
+/// `foo.com`.
+fn normalize_domain_set(values: Vec<String>) -> HashSet<String> {
+    values
+        .into_iter()
+        .map(|v| {
+            v.trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .to_lowercase()
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// Suffix-match a host against a normalised domain set: `api.foo.com` matches
+/// `foo.com`, but `evilfoo.com` does not (mirrors egress-policy's
+/// `domain_matches`).
+fn host_in_domain_set(domains: &HashSet<String>, host: &str) -> bool {
+    let host = host.to_lowercase();
+    domains
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
 fn select_higher(
@@ -421,7 +515,7 @@ fn select_higher(
 #[async_trait::async_trait]
 impl SecurityFilter for EgressRateFilter {
     fn name(&self) -> &str {
-        "egress_rate"
+        "egress-rate"
     }
 
     fn phase(&self) -> FilterPhase {
@@ -971,5 +1065,144 @@ mod tests {
         assert_eq!(cfg.burst_threshold, 8);
         assert_eq!(cfg.cooldown_seconds, 30);
         assert_eq!(cfg.read_spike_threshold, 10);
+    }
+
+    // ── A#2: routine-destination exemption from volumetric counters ──
+
+    /// A rapid burst of egress to a *trusted* destination must not trip the
+    /// burst / rate / spread signals — this is the headless-browser startup
+    /// storm the exemption exists to silence.
+    #[tokio::test]
+    async fn routine_destination_burst_not_flagged() {
+        let filter = EgressRateFilter::from_config_with_trust(
+            small_limit_config(),
+            vec!["trusted.example.com".into()],
+            HashMap::new(),
+        );
+        let session = Uuid::new_v4();
+        let now = Instant::now();
+        // 6 rapid calls: > burst_threshold(4), > max_egress_per_minute(5).
+        for i in 0..6 {
+            let ctx = make_ctx(
+                ToolCallType::HttpRequest {
+                    method: "GET".into(),
+                    url: "https://api.trusted.example.com/v1/x".into(),
+                },
+                session,
+            );
+            let result = filter
+                .evaluate_at(&ctx, now + Duration::from_millis(i * 200))
+                .unwrap();
+            assert!(
+                !result.matched,
+                "routine burst must not flag (call {i}, rule {})",
+                result.rule_id
+            );
+        }
+    }
+
+    /// The same burst to an *untrusted* destination must still flag — the
+    /// exemption is destination-scoped, not a blanket disable.
+    #[tokio::test]
+    async fn non_routine_burst_still_flagged() {
+        let filter = EgressRateFilter::from_config_with_trust(
+            small_limit_config(),
+            vec!["trusted.example.com".into()],
+            HashMap::new(),
+        );
+        let session = Uuid::new_v4();
+        let now = Instant::now();
+        let mut flagged = false;
+        for i in 0..5 {
+            let ctx = make_ctx(
+                ToolCallType::NetConnect {
+                    address: "evil.example.net".into(),
+                    port: 443,
+                },
+                session,
+            );
+            let result = filter
+                .evaluate_at(&ctx, now + Duration::from_millis(i * 200))
+                .unwrap();
+            if result.rule_id == "egress-burst" {
+                flagged = true;
+            }
+        }
+        assert!(flagged, "untrusted burst must still flag");
+    }
+
+    /// The read-then-send exfil correlation stays sensitive even when the send
+    /// targets a trusted destination — routine egress is still recorded for
+    /// this signal (defence-in-depth against a mis-curated trust list).
+    #[tokio::test]
+    async fn read_then_send_fires_even_to_trusted_destination() {
+        let filter = EgressRateFilter::from_config_with_trust(
+            small_limit_config(), // read_spike=3, read_then_send_egress=2
+            vec!["trusted.example.com".into()],
+            HashMap::new(),
+        );
+        let session = Uuid::new_v4();
+        let now = Instant::now();
+        for i in 0..3 {
+            let ctx = make_ctx(
+                ToolCallType::FileRead {
+                    path: format!("/secrets/k{i}.pem"),
+                },
+                session,
+            );
+            let _ = filter.evaluate_at(&ctx, now + Duration::from_secs(i));
+        }
+        let ctx = make_ctx(
+            ToolCallType::NetConnect {
+                address: "trusted.example.com".into(),
+                port: 443,
+            },
+            session,
+        );
+        let _ = filter.evaluate_at(&ctx, now + Duration::from_secs(4));
+        let ctx = make_ctx(
+            ToolCallType::NetConnect {
+                address: "trusted.example.com".into(),
+                port: 443,
+            },
+            session,
+        );
+        let result = filter
+            .evaluate_at(&ctx, now + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(result.rule_id, "read-then-send-spike");
+    }
+
+    /// Profile-scoped trust: per-request random CDN subdomains (gvt1.com) under
+    /// the profile's trusted set are exempt from both burst and dest-spread,
+    /// keyed off `ctx.profile_name`.
+    #[tokio::test]
+    async fn profile_trusted_destination_burst_not_flagged() {
+        let mut profile_trusted = HashMap::new();
+        profile_trusted.insert("codex".to_string(), vec!["gvt1.com".to_string()]);
+        let filter =
+            EgressRateFilter::from_config_with_trust(small_limit_config(), vec![], profile_trusted);
+        let session = Uuid::new_v4();
+        let now = Instant::now();
+        // 6 distinct random subdomains — would trip dest-spread(3) and burst(4)
+        // if counted, but all match gvt1.com for the codex profile.
+        for i in 0..6 {
+            let mut ctx = make_ctx(
+                ToolCallType::NetConnect {
+                    address: format!("r{i}---sn-abc.gvt1.com"),
+                    port: 443,
+                },
+                session,
+            );
+            ctx.profile_name = Some("codex".into());
+            let result = filter
+                .evaluate_at(&ctx, now + Duration::from_millis(i * 200))
+                .unwrap();
+            assert!(
+                !result.matched,
+                "profile-trusted burst must not flag (call {i}, rule {})",
+                result.rule_id
+            );
+        }
     }
 }

@@ -16,6 +16,7 @@ const mockDigestReturn: UseDigestReturn = {
   escalate: vi.fn().mockResolvedValue(undefined),
   approveMany: vi.fn().mockResolvedValue(undefined),
   denyMany: vi.fn().mockResolvedValue(undefined),
+  clearAll: vi.fn().mockResolvedValue(undefined),
   bulkBusy: false,
   refresh: vi.fn().mockResolvedValue(undefined),
 };
@@ -55,7 +56,7 @@ const mockItem = {
       message: "Suspicious command",
     },
     {
-      filter_name: "path_match",
+      filter_name: "path-match",
       score: 2.5,
       rule_id: "env-file",
       message: "Access to env file",
@@ -177,7 +178,7 @@ describe("DigestPage", () => {
     expect(screen.getByText("(command)")).toBeTruthy();
     expect(screen.getByText("+3.0")).toBeTruthy();
     expect(screen.getByText("Access to env file")).toBeTruthy();
-    expect(screen.getByText("(path_match)")).toBeTruthy();
+    expect(screen.getByText("(path-match)")).toBeTruthy();
   });
 
   it("shows error message", () => {

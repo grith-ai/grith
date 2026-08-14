@@ -36,9 +36,9 @@ export function SessionPicker({ title, basePath, emptyHint }: SessionPickerProps
   if (error) {
     return (
       <div className="p-6">
-        <h1 className="text-xl font-semibold text-grith-text mb-4">{title}</h1>
-        <div className="bg-white border border-grith-border rounded-xl p-4">
-          <p className="text-status-deny-red text-sm">{error}</p>
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-4">{title}</h1>
+        <div className="bg-danger-light border border-danger-border rounded-card p-4">
+          <p className="text-danger-text text-sm">{error}</p>
         </div>
       </div>
     );
@@ -47,7 +47,7 @@ export function SessionPicker({ title, basePath, emptyHint }: SessionPickerProps
   if (sessions === null) {
     return (
       <div className="p-6">
-        <p className="text-grith-muted text-sm">Loading sessions…</p>
+        <p className="text-text-secondary text-sm">Loading sessions…</p>
       </div>
     );
   }
@@ -60,10 +60,10 @@ export function SessionPicker({ title, basePath, emptyHint }: SessionPickerProps
   if (sessions.length === 0) {
     return (
       <div className="p-6">
-        <h1 className="text-xl font-semibold text-grith-text mb-4">{title}</h1>
-        <div className="bg-white border border-grith-border rounded-xl p-8 text-center">
-          <p className="text-grith-text mb-1">No active sessions.</p>
-          <p className="text-grith-muted text-sm max-w-md mx-auto">
+        <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-4">{title}</h1>
+        <div className="bg-surface-2 border border-border rounded-card p-8 text-center">
+          <p className="font-heading text-[15px] font-semibold text-text mb-1">No active sessions.</p>
+          <p className="text-text-secondary text-sm max-w-md mx-auto">
             {emptyHint}
           </p>
         </div>
@@ -73,37 +73,37 @@ export function SessionPicker({ title, basePath, emptyHint }: SessionPickerProps
 
   return (
     <div className="p-6">
-      <h1 className="text-xl font-semibold text-grith-text mb-1">{title}</h1>
-      <p className="text-grith-muted text-sm mb-4">
-        Multiple sessions are active — pick one.
+      <h1 className="font-heading text-[22px] font-semibold tracking-[-0.02em] text-text mb-1">{title}</h1>
+      <p className="text-text-secondary text-sm mb-4">
+        Multiple sessions are active - pick one.
       </p>
-      <ul className="bg-white border border-grith-border rounded-xl overflow-hidden">
+      <ul className="bg-surface border border-border rounded-card overflow-hidden">
         {sessions.map((s, i) => (
           <li
             key={s.id}
-            className={i === 0 ? "" : "border-t border-grith-border"}
+            className={i === 0 ? "" : "border-t border-border"}
           >
             <button
               onClick={() => navigate(`${basePath}?session_id=${s.id}`)}
-              className="w-full text-left px-4 py-3 hover:bg-grith-surface transition-colors"
+              className="w-full text-left px-4 py-3 hover:bg-surface-2 transition-colors"
             >
               <div className="flex items-baseline justify-between gap-4">
                 <div className="text-sm">
-                  <span className="font-mono text-grith-text font-medium">
+                  <span className="font-code text-text font-medium">
                     {s.tool_name}
                   </span>
                   {s.project_name && (
-                    <span className="text-grith-muted">
+                    <span className="text-text-secondary">
                       {" "}
                       · {s.project_name}
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-grith-muted shrink-0">
+                <div className="text-xs text-text-secondary shrink-0">
                   pid {s.root_pid} · {formatUptime(s.uptime_seconds)}
                 </div>
               </div>
-              <div className="text-xs text-grith-dim font-mono mt-1 truncate">
+              <div className="text-xs text-text-dim font-code mt-1 truncate">
                 {s.id}
               </div>
             </button>

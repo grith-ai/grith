@@ -128,7 +128,12 @@ fn extract_filter_overrides(value: &toml::Value) -> HashMap<String, bool> {
     };
     for (key, value) in filters {
         if let Some(enabled) = value.as_bool() {
-            out.insert(key.clone(), enabled);
+            // Normalise legacy snake_case filter names written before the
+            // kebab-case rename so pre-rename disable preferences in
+            // config.toml / team-config.toml don't silently revert to
+            // enabled.
+            let key = grith_proxy::filters::canonical_filter_name(key).to_string();
+            out.insert(key, enabled);
         }
     }
     out
@@ -406,4 +411,47 @@ pub(crate) async fn update_config(
             "Configuration saved. Team config is shared baseline; local config overrides it. Proxy threshold changes apply after daemon restart.".into(),
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_filter_overrides;
+
+    #[test]
+    fn extract_filter_overrides_normalises_legacy_snake_case_keys() {
+        // A config.toml written before the kebab-case filter rename says
+        // `path_match = false`. It must resolve against the live filter
+        // name "path-match", not silently revert the filter to enabled.
+        let cfg: toml::Value = toml::from_str(
+            r#"
+            [dashboard.filters]
+            path_match = false
+            secret_scan = false
+            rate_limit = true
+            "#,
+        )
+        .unwrap();
+
+        let overrides = extract_filter_overrides(&cfg);
+        assert_eq!(overrides.get("path-match"), Some(&false));
+        assert_eq!(overrides.get("secret-scan"), Some(&false));
+        assert_eq!(overrides.get("rate-limit"), Some(&true));
+        assert!(!overrides.contains_key("path_match"));
+    }
+
+    #[test]
+    fn extract_filter_overrides_keeps_current_kebab_case_keys() {
+        let cfg: toml::Value = toml::from_str(
+            r#"
+            [dashboard.filters]
+            path-match = false
+            allowlist = true
+            "#,
+        )
+        .unwrap();
+
+        let overrides = extract_filter_overrides(&cfg);
+        assert_eq!(overrides.get("path-match"), Some(&false));
+        assert_eq!(overrides.get("allowlist"), Some(&true));
+    }
 }

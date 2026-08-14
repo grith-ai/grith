@@ -84,7 +84,7 @@ async fn test_read_env_file_detected() {
 
 #[tokio::test]
 async fn test_read_ssh_private_key_flagged() {
-    // Reading ~/.ssh/id_rsa should be flagged by path_match (score 5.0 for
+    // Reading ~/.ssh/id_rsa should be flagged by path-match (score 5.0 for
     // ssh-private-key). During cold start, 5.0 > 2.0 = QUEUE.
     let fixtures = TestFixtures::new();
     let ctx = make_tool_call_context(
@@ -112,7 +112,7 @@ async fn test_read_ssh_private_key_flagged() {
 async fn test_read_ssh_private_key_queued_after_warmup() {
     // Use scoring with cold_start_calls=0 to simulate post-warmup behavior.
     // After warm-up, allow threshold is 3.0, deny threshold is 8.0.
-    // SSH key read scores 5.0 (ssh-private-key from path_match).
+    // SSH key read scores 5.0 (ssh-private-key from path-match).
     // 5.0 > 3.0 = QUEUE.
     let fixtures = TestFixtures::with_scoring(ScoringConfig {
         auto_allow_threshold: 3.0,
@@ -139,7 +139,7 @@ async fn test_read_ssh_private_key_queued_after_warmup() {
 #[tokio::test]
 async fn test_http_post_with_aws_credentials_in_body() {
     // HTTP POST with AWS access key in the arguments body should be flagged
-    // by the secret_scan filter (score 5.0).
+    // by the secret-scan filter (score 5.0).
     let fixtures = TestFixtures::new();
     let ctx = make_tool_call_context(
         ToolCallType::HttpRequest {
@@ -156,8 +156,8 @@ async fn test_http_post_with_aws_credentials_in_body() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "secret_scan"),
-        "Expected secret_scan filter to flag AWS credentials"
+            .any(|r| r.matched && r.filter_name == "secret-scan"),
+        "Expected secret-scan filter to flag AWS credentials"
     );
 }
 
@@ -348,7 +348,7 @@ async fn test_shell_pipe_to_netcat_exfiltration() {
 #[tokio::test]
 async fn test_combined_sensitive_path_and_secret_in_args() {
     // Reading an SSH key file AND having a secret in the arguments should
-    // accumulate scores across both path_match and secret_scan filters.
+    // accumulate scores across both path-match and secret-scan filters.
     let fixtures = TestFixtures::new();
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
@@ -360,7 +360,7 @@ async fn test_combined_sensitive_path_and_secret_in_args() {
     );
     let decision = fixtures.proxy.evaluate(&ctx).await;
     assert_not_allowed(&decision, "SSH key read with AWS credential in args");
-    // path_match: ssh-private-key (5.0), secret_scan: aws-access-key (5.0)
+    // path-match: ssh-private-key (5.0), secret-scan: aws-access-key (5.0)
     // Total: 10.0 (both filters fire)
     assert!(
         decision.composite_score >= 5.0,
@@ -370,7 +370,7 @@ async fn test_combined_sensitive_path_and_secret_in_args() {
 
 #[tokio::test]
 async fn test_pem_file_read() {
-    // Reading a PEM certificate file should be flagged by path_match (score 4.0).
+    // Reading a PEM certificate file should be flagged by path-match (score 4.0).
     let fixtures = TestFixtures::new();
     let ctx = make_tool_call_context(
         ToolCallType::FileRead {
@@ -416,8 +416,8 @@ async fn test_shell_with_api_key_in_args() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "secret_scan"),
-        "Expected secret_scan filter to flag API key"
+            .any(|r| r.matched && r.filter_name == "secret-scan"),
+        "Expected secret-scan filter to flag API key"
     );
 }
 
@@ -446,8 +446,8 @@ async fn test_dns_exfil_via_nslookup() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "Expected egress_policy to flag nslookup"
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "Expected egress-policy to flag nslookup"
     );
 }
 
@@ -472,8 +472,8 @@ async fn test_dns_exfil_via_dig() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "Expected egress_policy to flag dig command"
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "Expected egress-policy to flag dig command"
     );
 }
 
@@ -520,8 +520,8 @@ async fn test_sftp_transfer_via_command() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "Expected egress_policy to flag sftp command"
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "Expected egress-policy to flag sftp command"
     );
 }
 
@@ -564,8 +564,8 @@ async fn test_websocket_exfil() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "Expected egress_policy to flag ws:// scheme"
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "Expected egress-policy to flag ws:// scheme"
     );
 }
 
@@ -590,8 +590,8 @@ async fn test_scp_file_transfer_exfil() {
         decision
             .filter_results
             .iter()
-            .any(|r| r.matched && r.filter_name == "egress_policy"),
-        "Expected egress_policy to flag scp command"
+            .any(|r| r.matched && r.filter_name == "egress-policy"),
+        "Expected egress-policy to flag scp command"
     );
 }
 
@@ -602,7 +602,7 @@ async fn test_scp_file_transfer_exfil() {
 #[tokio::test]
 async fn test_hex_encoded_secret_in_http_post() {
     // AWS key hex-encoded to evade naive pattern matching.
-    // The secret_scan regex still matches raw text, so hex encoding should bypass it.
+    // The secret-scan regex still matches raw text, so hex encoding should bypass it.
     // This documents the detection gap for encoded secrets.
     let fixtures = TestFixtures::new();
     let hex_key = "414b4941494f53464f444e4e374558414d504c45"; // AKIAIOSFODNN7EXAMPLE

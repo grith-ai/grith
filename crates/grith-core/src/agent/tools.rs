@@ -89,11 +89,15 @@ pub fn agent_tool_definitions() -> Vec<grith_llm::ToolDefinition> {
                 "properties": {
                     "method": {
                         "type": "string",
-                        "description": "HTTP method (GET, POST, PUT, DELETE)"
+                        "description": "HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD)"
                     },
                     "url": {
                         "type": "string",
                         "description": "The URL to request"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional request body, sent for POST/PUT/PATCH."
                     }
                 },
                 "required": ["url"]

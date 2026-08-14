@@ -681,6 +681,7 @@ mod tests {
             session_id: None,
             tool_call_type: tool_type.to_string(),
             arguments_summary: summary.to_string(),
+            decision_reason: None,
             composite_score: score,
             severity: ScoreSeverity::from_score(score),
             filter_breakdown: vec![],

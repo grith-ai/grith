@@ -7,11 +7,12 @@ on:
 
 permissions:
   contents: write
-  # cosign keyless signing and SLSA build-provenance attestation both
-  # need the workflow to be able to request a short-lived OIDC token
-  # from GitHub and write to the attestations API.
+  # cosign keyless signing needs the workflow to request a short-lived
+  # OIDC token from GitHub (used to obtain a Fulcio signing certificate).
+  # We do NOT use GitHub's attestations API — SLSA provenance is signed
+  # with cosign and shipped as a release asset (see the SLSA step below),
+  # which works on any plan including private repos.
   id-token: write
-  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -137,7 +138,7 @@ jobs:
           # Emit a CycloneDX 1.5 JSON SBOM rooted at grith-core (the
           # binary's entrypoint crate). The output describes the full
           # transitive dependency tree as resolved in Cargo.lock.
-          cargo cyclonedx -p grith-core --format json --target ${{ matrix.target }}
+          cargo cyclonedx --manifest-path crates/grith-core/Cargo.toml --format json --target ${{ matrix.target }}
           # cargo-cyclonedx writes to crates/grith-core/<name>.cdx.json
           # by default — rename to match the archive for easy pairing.
           SBOM_SRC=$(find crates/grith-core -maxdepth 1 -name "*.cdx.json" -print -quit)
@@ -164,11 +165,34 @@ jobs:
             --bundle "${{ env.ARCHIVE_NAME }}.cdx.json.cosign.bundle" \
             "${{ env.ARCHIVE_NAME }}.cdx.json"
 
-      - name: Generate SLSA build-provenance attestation (Unix)
+      # Build the SLSA v1 provenance predicate from the workflow context.
+      # This is the same predicate the first-party attestation action emits;
+      # we sign it ourselves (below) rather than persisting it to GitHub's
+      # attestations API, which is a paid feature for private repos.
+      - name: Generate SLSA build-provenance predicate (Unix)
+        id: slsa-predicate
         if: matrix.ext == ''
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: ${{ env.ARCHIVE_NAME }}
+        uses: actions/attest-build-provenance/predicate@v2
+
+      - name: Sign SLSA provenance with cosign (Unix, keyless via GitHub OIDC)
+        if: matrix.ext == ''
+        env:
+          COSIGN_YES: "true"
+          # Passed via env (not inlined into the script) so the predicate JSON
+          # cannot break shell quoting or inject into the run block.
+          PREDICATE: ${{ steps.slsa-predicate.outputs.predicate }}
+          PREDICATE_TYPE: ${{ steps.slsa-predicate.outputs.predicate-type }}
+        run: |
+          printf '%s' "$PREDICATE" > provenance-predicate.json
+          # cosign attest-blob wraps the predicate in an in-toto statement over
+          # the archive's digest and signs it keyless (Fulcio cert from the
+          # workflow's OIDC identity, anchored in Rekor) — same signer identity
+          # as the archive/SBOM signatures above. Ships as a release asset.
+          cosign attest-blob \
+            --predicate provenance-predicate.json \
+            --type "$PREDICATE_TYPE" \
+            --bundle "${{ env.ARCHIVE_NAME }}.intoto.bundle" \
+            "${{ env.ARCHIVE_NAME }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -180,6 +204,7 @@ jobs:
             ${{ env.ARCHIVE_NAME }}.cdx.json
             ${{ env.ARCHIVE_NAME }}.cosign.bundle
             ${{ env.ARCHIVE_NAME }}.cdx.json.cosign.bundle
+            ${{ env.ARCHIVE_NAME }}.intoto.bundle
           if-no-files-found: error
 
   release:

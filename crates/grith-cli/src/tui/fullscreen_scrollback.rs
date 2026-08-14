@@ -11,15 +11,13 @@
 //! to arrow keys by default and provide no scrollback for the alternate
 //! screen.
 //!
-//! Solution — maintain a parallel "scrollback mirror" `vt100::Parser` that
-//! receives each captured frame's plain-text content as new lines (one row
-//! at a time, separated by `\r\n`). The mirror is in primary-screen mode
-//! and never enters alt-screen, so each frame's lines naturally scroll off
-//! the top of the mirror's visible area into its own scrollback. When the
-//! user wheel-scrolls back in fullscreen-history mode, we render from the
-//! mirror's screen at a `set_scrollback(N)` offset — exactly the same
-//! mechanism that already powers grith's normal scrollback for
-//! line-oriented tools.
+//! Solution — retain the newest plain-text screen plus only the rows that
+//! actually scrolled out of earlier screens. Consecutive fullscreen repaints
+//! normally overlap heavily; storing every whole screen would make wheel
+//! scrollback walk through near-identical copies of the viewport. We detect
+//! the strongest vertically-moving run shared by consecutive screens. Rows
+//! displaced upward are committed; if layout chrome later moves the transcript
+//! back down, those rows are removed from history as they re-enter the screen.
 //!
 //! Frame boundaries are detected from the byte stream:
 //!
@@ -73,11 +71,11 @@ struct ObservedBoundaries {
 
 /// Accumulated scrollback + boundary-detection state.
 ///
-/// Captured frames have their plain text appended row-by-row into a
-/// `VecDeque<String>`. The live `vt100::Parser` stays untouched. On render,
-/// when the user is scrolled back, we materialise a viewport-sized window
-/// of these lines into a synthetic `vt100::Parser` and pass its screen to
-/// the existing `render_vterm` widget — same render path as the live view.
+/// `lines` contains rows proven to have moved above the viewport, while
+/// `current_frame` contains the newest captured screen. The live
+/// `vt100::Parser` stays untouched. On render, when the user is scrolled
+/// back, we materialise a viewport-sized window across committed history and
+/// the current frame into a synthetic `vt100::Parser`.
 ///
 /// Why text instead of cloned `vt100::Screen` per frame:
 /// * vt100 0.15's `set_scrollback` semantics cap usable scrollback at one
@@ -93,9 +91,11 @@ struct ObservedBoundaries {
 /// unchanged. Colour preservation is a tracked follow-up.
 #[allow(clippy::struct_excessive_bools)] // boundary state machine is intentionally flag-shaped
 pub struct FullscreenScrollback {
-    /// Accumulated text lines from captured frames, newest at the back.
-    /// FIFO-evicted past `capacity`.
+    /// Rows that have been displaced above the current screen, oldest at the
+    /// front. FIFO-evicted past `capacity`.
     lines: VecDeque<String>,
+    /// Plain-text rows from the newest captured screen.
+    current_frame: Vec<String>,
     /// Maximum lines retained.
     capacity: usize,
     /// Number of complete frames pushed since the last `clear`. Used by
@@ -135,6 +135,7 @@ impl FullscreenScrollback {
         let capacity = if enabled { HISTORY_LINE_CAPACITY } else { 0 };
         Self {
             lines: VecDeque::with_capacity(capacity.min(1024)),
+            current_frame: Vec::new(),
             capacity,
             frames_pushed: 0,
             last_signature: None,
@@ -167,9 +168,10 @@ impl FullscreenScrollback {
         self.frames_pushed == 0
     }
 
-    /// Total accumulated lines (across all captured frames + separators).
+    /// Total reconstructed transcript lines: committed history plus the
+    /// current captured screen.
     pub fn line_count(&self) -> usize {
-        self.lines.len()
+        self.lines.len() + self.current_frame.len()
     }
 
     pub fn repaint_mode(&self) -> bool {
@@ -194,21 +196,31 @@ impl FullscreenScrollback {
     /// `scroll_offset = 0` returns the most recent viewport. Larger
     /// offsets walk into older content, clamped at the oldest line.
     pub fn visible_window(&self, viewport_rows: usize, scroll_offset: usize) -> Vec<&str> {
-        let total = self.lines.len();
+        let total = self.line_count();
         if total == 0 || viewport_rows == 0 {
             return Vec::new();
         }
         // Bottom of the window sits `scroll_offset` lines above the end.
         let end = total.saturating_sub(scroll_offset);
         let start = end.saturating_sub(viewport_rows);
-        self.lines.range(start..end).map(|s| s.as_str()).collect()
+        (start..end)
+            .filter_map(|idx| {
+                if idx < self.lines.len() {
+                    self.lines.get(idx).map(String::as_str)
+                } else {
+                    self.current_frame
+                        .get(idx - self.lines.len())
+                        .map(String::as_str)
+                }
+            })
+            .collect()
     }
 
     /// Maximum scroll offset that surfaces at least one line of new content.
     /// Used to clamp wheel input so PageUp/End/wheel-up stop at the oldest
     /// available line.
     pub fn max_scroll_offset(&self, viewport_rows: usize) -> usize {
-        self.lines.len().saturating_sub(viewport_rows)
+        self.line_count().saturating_sub(viewport_rows)
     }
 
     /// Scan PTY bytes for frame boundaries and repaint signals. Idempotent
@@ -329,24 +341,23 @@ impl FullscreenScrollback {
             }
         }
 
-        // Push each row of the captured frame as a plain-text line.
-        // Trailing whitespace is trimmed so blank-padded rows don't
-        // create visually noisy padding in the scrolled view. A blank
-        // separator line between frames preserves frame boundaries
-        // when scrolling back through multiple captures.
-        //
-        // Plain text only for now (no colour). Colour preservation is a
+        // Convert the screen to plain-text rows. Trailing whitespace is
+        // trimmed so comparisons are not defeated by padding differences.
+        // Plain text only for now (no colour); colour preservation remains a
         // documented follow-up.
         let (_rows, cols) = screen.size();
-        for row_text in screen.rows(0, cols) {
-            let trimmed = row_text.trim_end();
-            self.lines.push_back(trimmed.to_string());
-        }
-        self.lines.push_back(String::new());
+        let next_frame = screen
+            .rows(0, cols)
+            .map(|row_text| row_text.trim_end().to_string())
+            .collect();
+        self.merge_frame(next_frame);
 
-        // FIFO-evict past capacity.
-        while self.lines.len() > self.capacity {
-            self.lines.pop_front();
+        // FIFO-evict past capacity, counting the current viewport toward the
+        // same soft memory cap.
+        while self.lines.len() + self.current_frame.len() > self.capacity {
+            if self.lines.pop_front().is_none() {
+                break;
+            }
         }
 
         self.last_signature = Some(signature);
@@ -365,10 +376,67 @@ impl FullscreenScrollback {
         }
     }
 
+    /// Merge a new screen into the reconstructed transcript.
+    ///
+    /// A fullscreen renderer commonly produces:
+    ///
+    /// ```text
+    /// old: header A B C D footer
+    /// new: header   B C D E footer
+    /// ```
+    ///
+    /// The shared `B C D` run moved upward by one row, proving that `A`
+    /// left the viewport. Only `A` belongs in committed history; the newest
+    /// screen already contains the rest. Same-position edits (spinners,
+    /// elapsed-time counters, input chrome) provide no positive displacement
+    /// and therefore add no history.
+    fn merge_frame(&mut self, next_frame: Vec<String>) {
+        if self.current_frame.is_empty() {
+            self.current_frame = next_frame;
+            return;
+        }
+
+        let upward = strongest_upward_overlap(&self.current_frame, &next_frame);
+        // Reversing the comparison turns a downward move into the same
+        // positive-displacement problem: `next_frame` is the "old" side and
+        // `current_frame` the "new" side.
+        let downward = strongest_upward_overlap(&next_frame, &self.current_frame);
+
+        match strongest_movement(upward, downward) {
+            Some(FrameMovement::Up(overlap)) => {
+                // `old_start - new_start` is the number of rows displaced
+                // upward. Starting at `new_start` avoids archiving fixed
+                // header rows that remained at the same screen coordinates.
+                let displaced = &self.current_frame[overlap.new_start..overlap.old_start];
+                // A short-lived unrelated startup/modal frame can prevent us
+                // from observing the matching downward move. Exact suffix
+                // dedupe is the conservative fallback: the same pixels leaving
+                // the viewport again are not a second transcript occurrence.
+                if !deque_ends_with(&self.lines, displaced) {
+                    self.lines.extend(displaced.iter().cloned());
+                }
+            }
+            Some(FrameMovement::Down(overlap)) => {
+                // These rows have re-entered at the top of the viewport. Undo
+                // the matching history suffix so a temporary composer/status
+                // expansion followed by contraction cannot archive the same
+                // transcript paragraph repeatedly.
+                let reentered = &next_frame[overlap.new_start..overlap.old_start];
+                if deque_ends_with(&self.lines, reentered) {
+                    self.lines.truncate(self.lines.len() - reentered.len());
+                }
+            }
+            None => {}
+        }
+
+        self.current_frame = next_frame;
+    }
+
     /// Wipe the scrollback + state. Used when the surface is intentionally
     /// reset (e.g. the supervised process exits and a new one starts).
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.current_frame.clear();
         self.frames_pushed = 0;
         self.last_signature = None;
         self.last_capture_at = None;
@@ -385,6 +453,106 @@ impl FullscreenScrollback {
     pub fn last_capture_at(&self) -> Option<Instant> {
         self.last_capture_at
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenOverlap {
+    old_start: usize,
+    new_start: usize,
+    matching_rows: usize,
+    nonblank_rows: usize,
+    matching_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameMovement {
+    Up(ScreenOverlap),
+    Down(ScreenOverlap),
+}
+
+fn strongest_movement(
+    upward: Option<ScreenOverlap>,
+    downward: Option<ScreenOverlap>,
+) -> Option<FrameMovement> {
+    match (upward, downward) {
+        (Some(up), Some(down)) if overlap_score(up) >= overlap_score(down) => {
+            Some(FrameMovement::Up(up))
+        }
+        (Some(_), Some(down)) => Some(FrameMovement::Down(down)),
+        (Some(up), None) => Some(FrameMovement::Up(up)),
+        (None, Some(down)) => Some(FrameMovement::Down(down)),
+        (None, None) => None,
+    }
+}
+
+fn deque_ends_with(history: &VecDeque<String>, rows: &[String]) -> bool {
+    history.len() >= rows.len() && history.range(history.len() - rows.len()..).eq(rows.iter())
+}
+
+/// Find the strongest contiguous run that moved upward between two screens.
+///
+/// Blank padding is allowed inside a run but cannot make one reliable by
+/// itself. Two nonblank rows, or one reasonably distinctive line, are enough
+/// evidence to avoid treating a repeated separator/prompt glyph as scroll.
+fn strongest_upward_overlap(old: &[String], new: &[String]) -> Option<ScreenOverlap> {
+    let mut best: Option<ScreenOverlap> = None;
+
+    // Each positive displacement is one diagonal through the old/new row
+    // matrix. Scanning each diagonal once keeps capture cost O(rows²), even
+    // for a mostly blank screen.
+    for displacement in 1..old.len() {
+        let comparable_rows = (old.len() - displacement).min(new.len());
+        let mut run_start: Option<usize> = None;
+        let mut nonblank_rows = 0;
+        let mut matching_chars = 0;
+
+        for new_row in 0..=comparable_rows {
+            let rows_match =
+                new_row < comparable_rows && old[displacement + new_row] == new[new_row];
+            if rows_match {
+                if run_start.is_none() {
+                    run_start = Some(new_row);
+                }
+                let row = old[displacement + new_row].trim();
+                if !row.is_empty() {
+                    nonblank_rows += 1;
+                    matching_chars += row.chars().count();
+                }
+                continue;
+            }
+
+            let Some(new_start) = run_start.take() else {
+                continue;
+            };
+            let candidate = ScreenOverlap {
+                old_start: displacement + new_start,
+                new_start,
+                matching_rows: new_row - new_start,
+                nonblank_rows,
+                matching_chars,
+            };
+            let reliable = candidate.nonblank_rows >= 2 || candidate.matching_chars >= 16;
+            if reliable && overlap_is_stronger(candidate, best) {
+                best = Some(candidate);
+            }
+            nonblank_rows = 0;
+            matching_chars = 0;
+        }
+    }
+
+    best
+}
+
+fn overlap_is_stronger(candidate: ScreenOverlap, current: Option<ScreenOverlap>) -> bool {
+    current.is_none_or(|current| overlap_score(candidate) > overlap_score(current))
+}
+
+fn overlap_score(overlap: ScreenOverlap) -> (usize, usize, usize) {
+    (
+        overlap.nonblank_rows,
+        overlap.matching_chars,
+        overlap.matching_rows,
+    )
 }
 
 /// Cheap, stable signature of a screen for dedupe. Includes the rendered
@@ -586,6 +754,20 @@ mod tests {
         p.screen().clone()
     }
 
+    fn screen_from_lines(lines: &[&str]) -> vt100::Screen {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        for (row, line) in lines.iter().enumerate() {
+            p.process(format!("\x1b[{};1H{line}", row + 1).as_bytes());
+        }
+        p.screen().clone()
+    }
+
+    fn capture_sync_frame(sb: &mut FullscreenScrollback, lines: &[&str]) {
+        let screen = screen_from_lines(lines);
+        sb.observe_bytes(b"\x1b[?2026h\x1b[?2026l");
+        sb.capture_if_boundary_reached(&screen, Instant::now());
+    }
+
     #[test]
     fn detects_sync_open_and_close() {
         let mut sb = FullscreenScrollback::with_default_capacity();
@@ -680,27 +862,173 @@ mod tests {
     }
 
     #[test]
-    fn capture_many_frames_accumulates_lines() {
-        // Distinct frames pushed into the line scrollback. All frame
-        // markers should be reachable via visible_window across the
-        // full accumulated history.
+    fn overlapping_repaints_commit_only_rows_that_scrolled_out() {
         let mut sb = FullscreenScrollback::with_default_capacity();
         sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
         assert!(sb.repaint_mode);
 
-        for i in 0..5u8 {
-            let frame_bytes = format!("frame{i}");
-            let s = screen_from(frame_bytes.as_bytes());
-            sb.observe_bytes(b"\x1b[?2026h\x1b[?2026l");
-            sb.capture_if_boundary_reached(&s, Instant::now());
-        }
-        assert_eq!(sb.frames_pushed(), 5);
+        capture_sync_frame(
+            &mut sb,
+            &[
+                "HEADER",
+                "oldest transcript row",
+                "shared transcript alpha",
+                "shared transcript beta",
+                "shared transcript gamma",
+                "STATUS",
+            ],
+        );
+        capture_sync_frame(
+            &mut sb,
+            &[
+                "HEADER",
+                "shared transcript alpha",
+                "shared transcript beta",
+                "shared transcript gamma",
+                "newest transcript row",
+                "STATUS",
+            ],
+        );
 
-        let all = sb.visible_window(usize::MAX, 0).join("\n");
-        for i in 0..5u8 {
-            assert!(
-                all.contains(&format!("frame{i}")),
-                "stored history missing frame{i}; got:\n{all}",
+        assert_eq!(sb.frames_pushed(), 2);
+        assert_eq!(
+            sb.lines,
+            VecDeque::from(["oldest transcript row".to_string()])
+        );
+
+        let all = sb.visible_window(usize::MAX, 0);
+        assert_eq!(
+            all.iter()
+                .filter(|line| **line == "shared transcript alpha")
+                .count(),
+            1,
+            "overlapping rows must appear once, not once per repaint"
+        );
+        assert!(all.contains(&"oldest transcript row"));
+        assert!(all.contains(&"newest transcript row"));
+    }
+
+    #[test]
+    fn chrome_only_repaint_adds_no_scrollback_rows() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+
+        capture_sync_frame(
+            &mut sb,
+            &[
+                "HEADER",
+                "stable transcript alpha",
+                "stable transcript beta",
+                "Thinking .",
+                "STATUS",
+            ],
+        );
+        let initial_line_count = sb.line_count();
+        capture_sync_frame(
+            &mut sb,
+            &[
+                "HEADER",
+                "stable transcript alpha",
+                "stable transcript beta",
+                "Thinking ..",
+                "STATUS",
+            ],
+        );
+
+        assert_eq!(sb.frames_pushed(), 2);
+        assert!(sb.lines.is_empty(), "spinner repaint must not add history");
+        assert_eq!(sb.line_count(), initial_line_count);
+    }
+
+    #[test]
+    fn resumed_session_layout_oscillation_does_not_repeat_transcript() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+
+        let expanded = [
+            "prototype paragraph first wrapped line",
+            "prototype paragraph second wrapped line",
+            "shared transcript alpha",
+            "shared transcript beta",
+            "shared transcript gamma",
+            "STATUS",
+        ];
+        let contracted = [
+            "shared transcript alpha",
+            "shared transcript beta",
+            "shared transcript gamma",
+            "new transcript row",
+            "STATUS",
+        ];
+
+        // Resumed Codex sessions can grow and shrink startup/status chrome,
+        // moving the same transcript block up, back down, then up again.
+        capture_sync_frame(&mut sb, &expanded);
+        capture_sync_frame(&mut sb, &contracted);
+        assert_eq!(
+            sb.lines,
+            VecDeque::from([
+                "prototype paragraph first wrapped line".to_string(),
+                "prototype paragraph second wrapped line".to_string(),
+            ])
+        );
+
+        capture_sync_frame(&mut sb, &expanded);
+        assert!(
+            sb.lines.is_empty(),
+            "rows that move back into the viewport must leave history"
+        );
+
+        capture_sync_frame(&mut sb, &contracted);
+        let all = sb.visible_window(usize::MAX, 0);
+        for row in [
+            "prototype paragraph first wrapped line",
+            "prototype paragraph second wrapped line",
+        ] {
+            assert_eq!(
+                all.iter().filter(|line| **line == row).count(),
+                1,
+                "layout oscillation must not repeat {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_session_interstitial_frame_does_not_defeat_dedupe() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+
+        let expanded = [
+            "prototype paragraph first wrapped line",
+            "prototype paragraph second wrapped line",
+            "shared transcript alpha",
+            "shared transcript beta",
+            "shared transcript gamma",
+        ];
+        let contracted = [
+            "shared transcript alpha",
+            "shared transcript beta",
+            "shared transcript gamma",
+            "new transcript row",
+        ];
+
+        capture_sync_frame(&mut sb, &expanded);
+        capture_sync_frame(&mut sb, &contracted);
+        // A resumed-session startup panel breaks the direct down/up overlap,
+        // then the previous layout returns and scrolls upward again.
+        capture_sync_frame(&mut sb, &["Starting MCP servers (1/2)", "esc to interrupt"]);
+        capture_sync_frame(&mut sb, &expanded);
+        capture_sync_frame(&mut sb, &contracted);
+
+        let all = sb.visible_window(usize::MAX, 0);
+        for row in [
+            "prototype paragraph first wrapped line",
+            "prototype paragraph second wrapped line",
+        ] {
+            assert_eq!(
+                all.iter().filter(|line| **line == row).count(),
+                1,
+                "interstitial repaint must not repeat {row:?}"
             );
         }
     }
@@ -755,40 +1083,42 @@ mod tests {
 
     #[test]
     fn visible_window_walks_history() {
-        // Push a chain of distinct frames, then verify the windowing
-        // API surfaces older frames as scroll_offset increases. Frame
-        // text lands at the TOP of each frame's chunk of stored lines
-        // (the frame's screen has the marker at row 0 and 23 blank
-        // padding rows below), so we walk by frame size to reveal
-        // successively older frames.
+        // Successive screens overlap like a scrolling Codex transcript.
+        // The reconstructed history should contain each transcript row once.
         let mut sb = FullscreenScrollback::with_default_capacity();
         sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
 
-        for i in 0..3u8 {
-            let s = screen_from(format!("frame{i}").as_bytes());
-            sb.observe_bytes(b"\x1b[?2026h\x1b[?2026l");
-            sb.capture_if_boundary_reached(&s, Instant::now());
-        }
+        capture_sync_frame(&mut sb, &["row zero", "row one", "row two", "row three"]);
+        capture_sync_frame(&mut sb, &["row one", "row two", "row three", "row four"]);
+        capture_sync_frame(&mut sb, &["row two", "row three", "row four", "row five"]);
         assert_eq!(sb.frames_pushed(), 3);
 
-        // Scroll back to the top should reveal the OLDEST frame's marker
-        // in the visible window (frame0 sits at the top of the stored
-        // history).
         let max = sb.max_scroll_offset(24);
         let oldest = sb.visible_window(24, max).join("\n");
         assert!(
-            oldest.contains("frame0"),
+            oldest.contains("row zero"),
             "scrolled to top should reveal oldest frame; got:\n{oldest}",
         );
-
-        // The history accumulates with the OLDEST frame at index 0 and
-        // the NEWEST at the end. line_count is N rows per frame plus
-        // separator lines between frames; total grows monotonically.
-        let total = sb.line_count();
-        assert!(
-            total >= 3 * 24,
-            "expected at least 3 frames' worth of lines, got {total}"
+        assert_eq!(
+            sb.lines,
+            VecDeque::from(["row zero".into(), "row one".into()])
         );
+
+        let all = sb.visible_window(usize::MAX, 0);
+        for expected in [
+            "row zero",
+            "row one",
+            "row two",
+            "row three",
+            "row four",
+            "row five",
+        ] {
+            assert_eq!(
+                all.iter().filter(|line| **line == expected).count(),
+                1,
+                "{expected:?} should appear exactly once in reconstructed history"
+            );
+        }
     }
 
     #[test]

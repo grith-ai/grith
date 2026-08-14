@@ -108,6 +108,8 @@ fn make_state() -> AppState {
         dashboard_pair_code: std::sync::Arc::new(std::sync::Mutex::new(None)),
         session_limit_rejections: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+        instance_id: None,
+        protocol_version: None,
     }
 }
 
@@ -124,6 +126,7 @@ fn make_digest_item(score: f64) -> DigestItem {
         session_id: None,
         tool_call_type: "ShellExec".into(),
         arguments_summary: "ls -la /home/user".into(),
+        decision_reason: None,
         composite_score: score,
         severity: ScoreSeverity::from_score(score),
         filter_breakdown: vec![FilterBreakdown {
@@ -154,7 +157,7 @@ fn make_audit_record(session_id: Uuid, score: f64) -> AuditRecord {
         score,
         ProxyActionSummary::Allow,
         vec![FilterResultSummary {
-            filter_name: "path_match".into(),
+            filter_name: "path-match".into(),
             matched: false,
             score: 0.0,
             rule_id: String::new(),
