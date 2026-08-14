@@ -176,6 +176,24 @@ attach_mode = "traceme"
 # false-positive budget. Set true to DENY them (the `echo cmd > /dev/pts/<other
 # pane>` IPC-injection vector). See work/futurework/ipc-delegated-authority-escape.md.
 pty_ownership_enforce = false
+# Enforce the authority-delegating-binary-spawn detection. When false (default),
+# spawning systemd-run / at / docker / systemctl / dbus-send / … is detected and
+# forensically logged but still allowed (audit-only). When true, such a spawn is
+# escalated Allow→QUEUE for review unless the profile's permit_authority_delegating
+# list names the binary — closing the `systemd-run --user … -- <cmd>` supervision
+# escape (the command's effect runs in a peer OUTSIDE the supervised tree, where
+# nothing it does is intercepted). Escalation is QUEUE, not deny, so you can
+# approve legitimate use once; a non-interactive session fails safe (denies).
+# Emergency override: GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN=1 (or =0 to force off).
+enforce_authority_delegating_spawn = false
+# Enforce the control-injection-IPC-socket-connect detection (session D-Bus,
+# tmux, screen, X11). When false (default) such a connect is audit-only
+# (auto-allowed as local IPC). When true it is routed to the proxy and escalated
+# Allow→QUEUE unless the profile's permit_control_sockets list authorises it.
+# Independent knob — desktop tooling touches the session bus routinely, so this
+# has a higher false-positive surface than the spawn flag. Emergency override:
+# GRITH_ENFORCE_CONTROL_SOCKET_CONNECT=1 (or =0 to force off).
+enforce_control_socket_connect = false
 # Seconds to keep running after the daemon stops accounting for this session
 # (it answered a heartbeat with "I am not tracking you" — usually because it
 # restarted while at its session cap). 0 = never terminate: the session keeps

@@ -411,6 +411,8 @@ pub(crate) fn to_supervisor_config(
         // and inherits today's "Spawns" default.
         audit_completeness: grith_supervisor::config::AuditCompletenessLevel::default(),
         pty_ownership_enforce: core.pty_ownership_enforce,
+        enforce_authority_delegating_spawn: core.enforce_authority_delegating_spawn,
+        enforce_control_socket_connect: core.enforce_control_socket_connect,
         authority_lost_terminate_after_seconds: core.authority_lost_terminate_after_seconds,
     }
 }

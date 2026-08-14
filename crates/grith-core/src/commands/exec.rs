@@ -969,6 +969,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1002,6 +1004,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1029,6 +1033,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1058,6 +1064,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1100,6 +1108,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1127,6 +1137,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();

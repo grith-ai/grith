@@ -8,6 +8,53 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-14
+
+A supervision-escape hardening release.
+
+### Added
+
+- **Authority-delegating spawns can now be enforced, not just logged.**
+  Spawning a binary whose real work runs in a privileged or unsupervised peer
+  — `systemd-run`, `at`/`batch`, `docker`/`podman`/`nerdctl`, `kubectl`,
+  `systemctl`, `machinectl`, `loginctl`, `dbus-send`/`gdbus`/`busctl`,
+  `crontab`, `flatpak`, `nsenter`, `tmux`, `screen` — hands the command to a
+  process outside the supervised tree, where none of its file, network, or
+  secret access is intercepted or scored. This is the `systemd-run --user … --
+  <cmd>` escape class. grith already detected these spawns but only recorded
+  them (audit-only). The new `supervisor.enforce_authority_delegating_spawn`
+  flag (default **off**, env override
+  `GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN`) escalates such a spawn
+  Allow→QUEUE for review. A profile may allow specific binaries without a
+  prompt via the new `permit_authority_delegating` list (e.g.
+  `["systemd-run"]`). Escalation is QUEUE rather than deny, so an operator can
+  approve legitimate use once (the session allowlist remembers it); a
+  non-interactive session fails safe and denies.
+- **Control-injection IPC socket connects can now be enforced.** A connect to
+  a **pathname** session D-Bus (`unix:path=/run/user/<uid>/bus`), tmux, screen,
+  or X11 socket can drive a more-privileged peer to run commands on the tool's
+  behalf. The new `supervisor.enforce_control_socket_connect` flag (default
+  **off**, env override `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`) routes such a
+  connect to the proxy — instead of auto-allowing it as local IPC — and
+  escalates it Allow→QUEUE unless the profile's new `permit_control_sockets`
+  list authorises it. It is an independent knob from the spawn flag because
+  desktop tooling touches the session bus routinely (higher false-positive
+  surface). An authority-delegating spawn or control socket already on the
+  session allowlist (e.g. a profile that lists `tmux`/`docker` as a routine
+  command) is still escalated when enforcement is on — the session allowlist
+  no longer short-circuits it; the explicit `permit_*` lists are the opt-out.
+
+  Both detections remain audit-only with their flags off, so upgrading changes
+  no behaviour until an operator opts in. Known limitations / follow-ups
+  (documented in the `authority_delegation` module): (1) **abstract-namespace**
+  unix sockets (`sun_path[0] == '\0'`) currently render as an empty `unix:`
+  address, so an abstract-socket X11/D-Bus connect — which standard X11 client
+  libraries attempt first — is not yet matched by control-socket enforcement;
+  fixing the sockaddr rendering to `unix:@<name>` is tracked separately.
+  (2) the binary classifier is basename-keyed, so canonical-path/content-hash
+  hardening is needed to defeat a renamed copy. (3) proxy-side scoring would
+  extend both detections to the built-in-agent (non-supervised) path.
+
 ## [0.2.2] - 2026-08-13
 
 A security-hardening release. It closes the syscall-perimeter, audit-integrity,

@@ -142,6 +142,25 @@ pub struct SupervisorProfile {
     /// "Category 3" for the threat model.
     #[serde(default)]
     pub namespace_users: Vec<String>,
+
+    /// Authority-delegating binaries this profile may spawn without the
+    /// enforcement QUEUE (only consulted when
+    /// `supervisor.enforce_authority_delegating_spawn` is on). Each entry is a
+    /// binary basename, e.g. `"systemd-run"`. Empty (the default) permits
+    /// none — every authority-delegating spawn is queued for review. Like
+    /// `namespace_users`, this is a security capability and is **not**
+    /// inherited from parent/`[defaults]`; declare it on the leaf profile.
+    #[serde(default)]
+    pub permit_authority_delegating: Vec<String>,
+
+    /// Control-injection IPC sockets this profile may connect to without the
+    /// enforcement QUEUE (only consulted when
+    /// `supervisor.enforce_control_socket_connect` is on). Each entry is a
+    /// case-insensitive substring of the socket path, e.g.
+    /// `"/run/user/1000/bus"` or a broader `"/tmux-"`. Empty (the default)
+    /// permits none. Not inherited — declare it on the leaf profile.
+    #[serde(default)]
+    pub permit_control_sockets: Vec<String>,
 }
 
 /// PR 5 Phase B: a declared local-IPC listener entry on a profile.
@@ -1487,6 +1506,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         let entries = profile.to_allowlist_entries();
         assert_eq!(entries.len(), 6);
@@ -1516,6 +1537,8 @@ mod tests {
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         assert!(profile.to_allowlist_entries().is_empty());
     }
@@ -1610,6 +1633,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         let json = serde_json::to_string(&profile).unwrap();
         let parsed: SupervisorProfile = serde_json::from_str(&json).unwrap();
@@ -1637,6 +1662,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1804,6 +1831,8 @@ routine_destinations = ["child.com"]
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -1852,6 +1881,8 @@ routine_destinations = ["child.com"]
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
 
         let allowed = profile.build_session_allowlist();
@@ -2474,6 +2505,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         let out = profile.expand_routine_exec_roots();
         assert_eq!(out.len(), 1);
@@ -2509,6 +2542,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         let out = profile.expand_scratch_roots();
         assert_eq!(out.len(), 2, "both roots retained: {out:?}");
@@ -2540,6 +2575,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         assert!(profile.expand_routine_exec_roots().is_empty());
     }
@@ -2567,6 +2604,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         let out = profile.expand_routine_exec_roots();
         assert_eq!(out.len(), 2, "expected two glob matches: {out:?}");
@@ -2596,6 +2635,8 @@ routine_listen_addresses = []
             launch_contract: None,
             local_listener_policy: vec![],
             namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
         };
         let allowed = profile.build_session_allowlist();
         let exec_prefix_count = allowed

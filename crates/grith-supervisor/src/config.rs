@@ -172,6 +172,29 @@ pub struct SupervisorConfig {
     /// vector). Default off until the FP budget is measured.
     #[serde(default)]
     pub pty_ownership_enforce: bool,
+
+    /// Enforce the authority-delegating-binary-spawn detection. When `false`
+    /// (default) a spawn of `systemd-run` / `at` / `docker` / `systemctl` /
+    /// `dbus-send` / … is detected and forensically logged but still allowed
+    /// (audit-only). When `true`, such a spawn is escalated Allow→QUEUE unless
+    /// the profile's `permit_authority_delegating` list authorises the binary
+    /// — closing the `systemd-run --user … -- <cmd>` supervision-escape class.
+    /// Off by default until the FP budget is measured. Env override:
+    /// `GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN`.
+    #[serde(default)]
+    pub enforce_authority_delegating_spawn: bool,
+
+    /// Enforce the control-injection-IPC-socket-connect detection. When
+    /// `false` (default) a connect to the session D-Bus / tmux / screen / X11
+    /// socket is forensically logged but auto-allowed as local IPC. When
+    /// `true`, such a connect is routed to the proxy and escalated
+    /// Allow→QUEUE unless the profile's `permit_control_sockets` list
+    /// authorises it. Higher false-positive surface than the spawn flag
+    /// (desktop tooling touches the session bus routinely), so it is an
+    /// independent knob. Env override:
+    /// `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`.
+    #[serde(default)]
+    pub enforce_control_socket_connect: bool,
 }
 
 /// Linux attach mechanism (supervisor-local mirror of
@@ -314,6 +337,8 @@ impl Default for SupervisorConfig {
             coverage: CoverageConfig::default(),
             audit_completeness: AuditCompletenessLevel::default(),
             pty_ownership_enforce: false,
+            enforce_authority_delegating_spawn: false,
+            enforce_control_socket_connect: false,
         }
     }
 }
@@ -766,6 +791,8 @@ mod tests {
             coverage: CoverageConfig::default(),
             audit_completeness: AuditCompletenessLevel::default(),
             pty_ownership_enforce: false,
+            enforce_authority_delegating_spawn: false,
+            enforce_control_socket_connect: false,
         };
         let toml_str = toml::to_string(&original).unwrap();
         let parsed: SupervisorConfig = toml::from_str(&toml_str).unwrap();

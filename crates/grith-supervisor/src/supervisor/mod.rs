@@ -11,6 +11,7 @@
 //! process tree, proxy, audit sink, digest backend, and optional WebSocket
 //! / session-state broadcasting.
 
+mod authority_delegation;
 mod dns_decision;
 mod event_handler;
 mod mass_destruction;
@@ -591,6 +592,17 @@ pub async fn run_supervisor_loop(
         .as_ref()
         .map(|p| p.merged_profile.namespace_users.clone())
         .unwrap_or_default();
+    // Authority-delegating / control-socket enforcement carveouts: the
+    // profile-declared binaries and socket paths this session may use without
+    // the enforcement QUEUE. Empty when no profile is resolved.
+    let session_permit_authority_delegating: Vec<String> = session_policy
+        .as_ref()
+        .map(|p| p.merged_profile.permit_authority_delegating.clone())
+        .unwrap_or_default();
+    let session_permit_control_sockets: Vec<String> = session_policy
+        .as_ref()
+        .map(|p| p.merged_profile.permit_control_sockets.clone())
+        .unwrap_or_default();
     // Cross-process gate refinement: probe the kernel's YAMA ptrace policy
     // once per session (it is a live sysctl, so never cached across
     // sessions). At scope >= 2 the gate can prove an out-of-tree
@@ -678,6 +690,8 @@ pub async fn run_supervisor_loop(
         scratch_roots: expanded_scratch_roots,
         local_listener_policy: session_local_listener_policy,
         namespace_users: session_namespace_users,
+        permit_authority_delegating: session_permit_authority_delegating,
+        permit_control_sockets: session_permit_control_sockets,
         // The supervised tool is spawned as a child of this process and
         // inherits its cwd, so the supervisor's cwd at session start is the
         // project root the tool was pointed at — the mass-destruction signal's

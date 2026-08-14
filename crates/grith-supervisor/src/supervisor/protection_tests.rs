@@ -361,6 +361,8 @@ impl Harness {
             scratch_roots: self.scratch_roots.clone(),
             local_listener_policy: Vec::new(),
             namespace_users: self.namespace_users.clone(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
             working_root: self.working_root.clone(),
             mass_destruction: Mutex::new(
                 super::mass_destruction::MassDestructionTracker::with_defaults(),
