@@ -6,7 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and
 will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
-## [Unreleased]
+## [0.2.4] - 2026-08-18
+
+### Security
+
+- Session trust derived from the launch directory (`${PROJECT_DIR}/**` in
+  profiles) no longer applies when `grith exec` is started from `/`, the
+  home directory, or an ancestor of it — previously such sessions silently
+  treated the entire tree, including `~/.ssh` and other credential
+  directories, as routine project files. Even from a genuine project
+  directory, launch-derived trust can no longer auto-allow reads or writes
+  of credential stores (`.ssh`, `.aws`, `.gnupg`, `.kube`, system stores,
+  grith's own config); explicitly listed profile paths are unaffected.
+- The security proxy now evaluates a file rename's DESTINATION, not only its
+  source — `mv ./benign ~/.ssh/authorized_keys` is scored on where the file
+  lands, closing the `rename(2)` analogue of the symlink-into-a-sensitive-
+  path hole.
+
+### Added
+
+- Linux aarch64 support: the CLI supervisor's ptrace + seccomp interception
+  now runs natively on `aarch64-unknown-linux-{gnu,musl}` (kernel 5.3+).
+  Release artifacts include a static `aarch64-unknown-linux-musl` binary and
+  the installer maps Linux arm64 machines to it automatically.
 
 ## [0.2.3] - 2026-08-14
 

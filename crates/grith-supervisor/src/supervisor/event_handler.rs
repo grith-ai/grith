@@ -37,7 +37,9 @@ use crate::dns_cache::DnsCache;
 use crate::error::Result;
 use crate::forensics_trace::ForensicsTraceSink;
 use crate::freezer::Freezer;
-use crate::interceptor::{OpenFlags, SyscallEvent, SyscallInterceptor, SyscallKind};
+use crate::interceptor::{
+    CrossProcessOp, OpenFlags, SyscallEvent, SyscallInterceptor, SyscallKind,
+};
 use crate::reviewer::{DigestStore, QueueReviewer};
 use crate::session_sync::SessionSync;
 use crate::syscall_map;
@@ -488,6 +490,17 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// may connect to without the enforcement QUEUE (consulted only when
     /// `config.enforce_control_socket_connect` is on). Empty permits none.
     pub(super) permit_control_sockets: Vec<String>,
+    /// Session-start-pinned SHA-256 hex of every curated authority-delegating
+    /// binary resolved on `$PATH`. A ProcessSpawn whose canonical bytes hash
+    /// into this set is a copy/hardlink of a delegating binary regardless of
+    /// its name. Empty unless `enforce_authority_delegating_spawn` was on at
+    /// session start.
+    pub(super) authority_delegating_hashes: std::collections::HashSet<String>,
+    /// Cheap prefilter paired with `authority_delegating_hashes`: the file
+    /// sizes of the pinned binaries. A spawn target whose size is absent here
+    /// can never be a byte-copy of a delegating binary, so the gate skips
+    /// hashing it (keeps routine build spawns to a single stat).
+    pub(super) authority_delegating_sizes: std::collections::HashSet<u64>,
     /// Session working root — the supervisor's cwd at session start, which the
     /// supervised tool inherits, i.e. the project the tool was pointed at. The
     /// mass-destruction signal uses it to classify deletes as in-tree (the
@@ -1264,6 +1277,16 @@ pub(super) async fn handle_syscall_event(
     // check-vs-use TOCTOU. PTRACE_TRACEME is already carved in classify.
     if let SyscallKind::CrossProcessAccess { op, target_pid } = &event.kind {
         let in_tree = *target_pid != 0 && interceptor.supervised_pids().contains(target_pid);
+        // pidfd_getfd carries no pid argument; classify resolved the target
+        // from the pidfd's fdinfo and used 0 when it could not (fdinfo
+        // unreadable, not a real pidfd, or a target invisible in grith's pid
+        // namespace). Unlike a genuine 0 pid argument to ptrace/process_vm —
+        // which the kernel unconditionally ESRCHs — an *unresolved* pidfd
+        // target must fail closed: skip the "provably dead" auto-allow below so
+        // it reaches the proxy and QUEUEs. (`kernel_blocks_cross_process`
+        // already returns false for pid 0, so only the dead-target check needs
+        // this guard; the in-tree branch already excludes 0.)
+        let pidfd_unknown_target = matches!(op, CrossProcessOp::PidfdGetfd) && *target_pid == 0;
         if in_tree {
             write_forensics_stage(
                 loop_ctx,
@@ -1305,7 +1328,7 @@ pub(super) async fn handle_syscall_event(
         // Applies at any YAMA scope (unlike the kernel-blocked check
         // below). Guarded on the caller sharing our PID namespace; see
         // `cross_process_target_provably_absent` for the TOCTOU trade.
-        if cross_process_target_provably_absent(tid, *target_pid) {
+        if !pidfd_unknown_target && cross_process_target_provably_absent(tid, *target_pid) {
             write_forensics_stage(
                 loop_ctx,
                 trace_event_id,
@@ -1813,6 +1836,7 @@ pub(super) async fn handle_syscall_event(
                 loop_ctx.config.enforce_authority_delegating_spawn,
             ) && authority_delegation::spawn_should_escalate(
                 command,
+                args,
                 &loop_ctx.permit_authority_delegating,
             );
             write_forensics_stage(
@@ -2193,7 +2217,17 @@ pub(super) async fn handle_syscall_event(
                         && !prefix.starts_with("net:")
                         && !prefix.starts_with("exec:")
                         && !prefix.starts_with("dns:")
+                        && !prefix.starts_with("projdir:")
                         && path.starts_with(prefix.as_str())
+                        // work/80: trust derived from the launch cwd (marked
+                        // by a `projdir:` twin) must never noise-allow a
+                        // credential store — `cd ~/proj && grith exec` must
+                        // not silently serve `~/proj/.aws/credentials` (this
+                        // is the read-only `ignore_read_only` fast path;
+                        // reads only, so the read key is the whole story).
+                        // Explicit literal profile entries keep overriding.
+                        && !(s.contains(&format!("projdir:{prefix}"))
+                            && syscall_map::is_credential_store_path(path))
                 })
             });
 
@@ -2301,32 +2335,55 @@ pub(super) async fn handle_syscall_event(
         .session_allowed
         .lock()
         .is_ok_and(|allowed| is_sensitive_scoped_read_match(&call_type, &allowed));
+    // Exact-command session approval: when the operator has already approved an
+    // authority-delegating spawn / control-socket connect this session, the
+    // IDENTICAL command must not be re-escalated — otherwise a probe that runs
+    // once per session (or a tool the operator uses repeatedly) re-prompts every
+    // time, since the enforcement path deliberately bypasses the broad session
+    // allowlist. Keyed on the full call identity (command + args), so approving
+    // `flatpak run foo` never covers `flatpak run bar`. Recorded on approval in
+    // `queue_and_wait`; consumed here and at the escalation site below.
+    //
+    // Disabled under containment: post-contamination the session's taint can
+    // change between identical runs, so a previously-approved delegating command
+    // must be re-scrutinised (mirrors approve-replay being disabled under
+    // containment).
+    let already_user_approved_delegation = !containment_active
+        && loop_ctx
+            .session_allowed
+            .lock()
+            .is_ok_and(|s| s.contains(&delegating_approval_key(&call_type)));
+
     // An authority-delegating spawn / control-injection connect that WILL be
     // enforced must not be silently allowed by the session allowlist. A profile
-    // that lists e.g. `docker` as a routine command (or an earlier operator
-    // approval) would otherwise short-circuit here and bypass enforcement
-    // entirely. The explicit `permit_authority_delegating` / `permit_control_sockets`
-    // lists remain the intended opt-out; everything else routes to the proxy
-    // and the Allow→QUEUE escalation below.
-    let delegation_would_enforce = match &call_type {
-        grith_proxy::types::ToolCallType::ProcessSpawn { command, .. } => {
-            authority_delegation::spawn_enforcement_enabled(
-                loop_ctx.config.enforce_authority_delegating_spawn,
-            ) && authority_delegation::spawn_should_escalate(
-                command,
-                &loop_ctx.permit_authority_delegating,
-            )
-        }
-        grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
-            authority_delegation::control_socket_enforcement_enabled(
-                loop_ctx.config.enforce_control_socket_connect,
-            ) && authority_delegation::control_socket_should_escalate(
-                address,
-                &loop_ctx.permit_control_sockets,
-            )
-        }
-        _ => false,
-    };
+    // that lists e.g. `docker` as a routine command would otherwise short-circuit
+    // here and bypass enforcement entirely. The explicit
+    // `permit_authority_delegating` / `permit_control_sockets` lists remain the
+    // intended opt-out; an exact-command runtime approval is honoured via
+    // `already_user_approved_delegation`; everything else routes to the proxy and
+    // the Allow→QUEUE escalation below.
+    let delegation_would_enforce = !already_user_approved_delegation
+        && match &call_type {
+            grith_proxy::types::ToolCallType::ProcessSpawn { command, args } => {
+                authority_delegation::spawn_enforcement_enabled(
+                    loop_ctx.config.enforce_authority_delegating_spawn,
+                ) && (spawn_delegation_would_enforce(loop_ctx, command, args)
+                    || authority_delegation::ssh_loopback_should_escalate(
+                        command,
+                        args,
+                        &loop_ctx.permit_authority_delegating,
+                    ))
+            }
+            grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
+                authority_delegation::control_socket_enforcement_enabled(
+                    loop_ctx.config.enforce_control_socket_connect,
+                ) && authority_delegation::control_socket_should_escalate(
+                    address,
+                    &loop_ctx.permit_control_sockets,
+                )
+            }
+            _ => false,
+        };
     if !containment_active {
         if let Some(key) = session_allowlist_key(&call_type) {
             if loop_ctx
@@ -2512,40 +2569,115 @@ pub(super) async fn handle_syscall_event(
     // supervision. Like mass-destruction, an escalation here must not be
     // auto-allowed away by reputation, so it sets its own guard.
     let mut authority_delegation_escalated = false;
-    if let grith_proxy::types::ToolCallType::ProcessSpawn { command, .. } = &ctx.call_type {
+    // When a denied decision must actually STOP the spawn rather than be a
+    // silent no-op. A `ProcessSpawn` is intercepted at `PTRACE_EVENT_EXEC` —
+    // the execve has already returned into the new program image, so
+    // `deny_syscall` (which EPERMs an *in-flight* syscall at a syscall-entry
+    // stop) has nothing to reject and the delegating binary would run anyway.
+    // For an enforced authority-delegating spawn we therefore SIGKILL the
+    // tracee on deny: the new image is loaded but has not executed its first
+    // instruction, so the kill stops `systemd-run`/`docker`/`ssh localhost`/…
+    // before it hands work to the untraced peer. Keyed on the enforcement
+    // predicate (not merely on whether escalation fired) so it also covers a
+    // delegating spawn that independently scored Queue/Deny — escalation only
+    // rewrites a base `Allow`.
+    let mut kill_on_deny = false;
+    if let grith_proxy::types::ToolCallType::ProcessSpawn { command, args } = &ctx.call_type {
+        // Canonical path + content hash come free from the SpawnProvenance PR 4
+        // already computed for this call (None if canonicalisation failed —
+        // then the raw-basename check still applies).
+        let (prov_canonical, prov_sha256) =
+            ctx.spawn_provenance.as_ref().map_or((None, None), |p| {
+                (Some(p.canonical_path.as_str()), Some(p.sha256.as_str()))
+            });
         if authority_delegation::spawn_enforcement_enabled(
             loop_ctx.config.enforce_authority_delegating_spawn,
-        ) && authority_delegation::maybe_escalate_spawn(
-            &mut decision,
-            command,
-            &loop_ctx.permit_authority_delegating,
         ) {
-            authority_delegation_escalated = true;
-            write_forensics_stage(
-                loop_ctx,
-                trace_event_id,
-                session,
-                event.pid,
-                Some(&ctx.call_type),
-                "authority_delegating_escalation",
-                Some("queue"),
-                Some(decision.composite_score),
-                Some("authority-delegating spawn escalated Allow→QUEUE"),
-            );
-            tracing::warn!(
-                command = %command,
-                tid,
-                "authority-delegating spawn: escalating Allow→QUEUE"
-            );
+            // Permit-INDEPENDENT: a permitted delegating binary is exempt from
+            // the escalation (below), but NOT from having an independent DENY
+            // (secret in argv, taint data-flow, reviewer/non-interactive deny)
+            // actually enforced. The permit list opts out of the delegation
+            // signal, not out of every other filter's verdict — so a deny of a
+            // permitted delegating spawn must still SIGKILL, or it escapes via
+            // the no-op deny at PTRACE_EVENT_EXEC.
+            kill_on_deny =
+                authority_delegation::spawn_targets_delegating_binary(
+                    command,
+                    args,
+                    prov_canonical,
+                    prov_sha256,
+                    &loop_ctx.authority_delegating_hashes,
+                ) || authority_delegation::ssh_family_loopback_destination(command, args);
+            if !already_user_approved_delegation
+                && authority_delegation::maybe_escalate_spawn_full(
+                    &mut decision,
+                    command,
+                    args,
+                    prov_canonical,
+                    prov_sha256,
+                    &loop_ctx.permit_authority_delegating,
+                    &loop_ctx.authority_delegating_hashes,
+                )
+            {
+                authority_delegation_escalated = true;
+                write_forensics_stage(
+                    loop_ctx,
+                    trace_event_id,
+                    session,
+                    event.pid,
+                    Some(&ctx.call_type),
+                    "authority_delegating_escalation",
+                    Some("queue"),
+                    Some(decision.composite_score),
+                    Some("authority-delegating spawn escalated Allow→QUEUE"),
+                );
+                tracing::warn!(
+                    command = %command,
+                    tid,
+                    "authority-delegating spawn: escalating Allow→QUEUE"
+                );
+            } else if !already_user_approved_delegation
+                && authority_delegation::maybe_escalate_ssh_loopback_spawn(
+                    &mut decision,
+                    command,
+                    args,
+                    &loop_ctx.permit_authority_delegating,
+                )
+            {
+                // ssh/scp/sftp are NOT in is_authority_delegating_binary, so the
+                // spawn escalator above returned false and control falls here —
+                // no double-escalation. The same guard skips the reputation
+                // auto-allow bypass for free.
+                authority_delegation_escalated = true;
+                write_forensics_stage(
+                    loop_ctx,
+                    trace_event_id,
+                    session,
+                    event.pid,
+                    Some(&ctx.call_type),
+                    "ssh_loopback_escalation",
+                    Some("queue"),
+                    Some(decision.composite_score),
+                    Some("ssh-family loopback spawn escalated Allow→QUEUE"),
+                );
+                tracing::warn!(
+                    command = %command,
+                    tid,
+                    "ssh-family loopback spawn: escalating Allow→QUEUE"
+                );
+            }
         }
     } else if let grith_proxy::types::ToolCallType::NetConnect { address, .. } = &ctx.call_type {
-        if authority_delegation::control_socket_enforcement_enabled(
-            loop_ctx.config.enforce_control_socket_connect,
-        ) && authority_delegation::maybe_escalate_control_socket(
-            &mut decision,
-            address,
-            &loop_ctx.permit_control_sockets,
-        ) {
+        if !already_user_approved_delegation
+            && authority_delegation::control_socket_enforcement_enabled(
+                loop_ctx.config.enforce_control_socket_connect,
+            )
+            && authority_delegation::maybe_escalate_control_socket(
+                &mut decision,
+                address,
+                &loop_ctx.permit_control_sockets,
+            )
+        {
             authority_delegation_escalated = true;
             write_forensics_stage(
                 loop_ctx,
@@ -2568,10 +2700,19 @@ pub(super) async fn handle_syscall_event(
 
     // Check if reputation would auto-allow this operation. A mass-destruction
     // or authority-delegating escalation must not be auto-allowed away, so it
-    // bypasses this block.
+    // bypasses this block. `authority_delegation_escalated` only fires when a
+    // base `Allow` was rewritten to `Queue`; a delegating spawn whose base
+    // decision was *already* `Queue` (e.g. routine baseline + a taint /
+    // behavioural contribution scoring 3.0–8.0) would not set it, and could
+    // then be reputation-auto-allowed straight past the queue — escaping
+    // supervision without ever reaching `enforce_decision`'s kill path. Gate on
+    // `delegation_would_enforce` too (the permit-aware predicate computed at the
+    // session-allowlist short-circuit): an unpermitted enforced delegating call
+    // never gets reputation-auto-allowed, regardless of its base action.
     if loop_ctx.daemon_proxy_url.is_none()
         && !mass_destruction_escalated
         && !authority_delegation_escalated
+        && !delegation_would_enforce
         && matches!(
             decision.action,
             grith_proxy::types::ProxyAction::Queue { .. }
@@ -2733,6 +2874,8 @@ pub(super) async fn handle_syscall_event(
         tid,
         event.pid,
         trace_event_id,
+        kill_on_deny,
+        delegation_would_enforce,
     )
     .await?;
 
@@ -2852,6 +2995,26 @@ pub(super) async fn handle_syscall_event(
 /// stopped and must be resumed via ptrace.  Process-tree operations (freeze /
 /// thaw of children) use the TGID from `ctx.session_id` indirectly through
 /// the session's process tree, which is keyed by TGID.
+/// Stop a denied syscall. Normally this is `deny_syscall` — set `orig_rax = -1`
+/// / `rax = -EPERM` on the in-flight syscall at its entry stop. But a
+/// `ProcessSpawn` is surfaced at `PTRACE_EVENT_EXEC`, *after* execve returned
+/// into the new program image; there is no in-flight syscall to reject, so
+/// `deny_syscall` is a silent no-op and the (already-exec'd) binary runs. When
+/// `kill_on_deny` is set (an enforced authority-delegating spawn) we SIGKILL the
+/// tracee instead: the new image is loaded but has not run its first
+/// instruction, so the kill stops it before it delegates to the untraced peer.
+async fn deny_or_kill(
+    interceptor: &mut Box<dyn SyscallInterceptor>,
+    tid: u32,
+    kill_on_deny: bool,
+) -> Result<()> {
+    if kill_on_deny {
+        interceptor.kill(tid).await
+    } else {
+        interceptor.deny(tid).await
+    }
+}
+
 async fn enforce_decision(
     interceptor: &mut Box<dyn SyscallInterceptor>,
     session: &mut SupervisorSession,
@@ -2861,6 +3024,14 @@ async fn enforce_decision(
     tid: u32,
     event_pid: u32,
     trace_event_id: Uuid,
+    // When true, a deny must SIGKILL the tracee rather than call `deny_syscall`
+    // (a no-op for a `ProcessSpawn` intercepted at `PTRACE_EVENT_EXEC`). Set for
+    // an enforced authority-delegating spawn. See the call site for the why.
+    kill_on_deny: bool,
+    // When true, this is an enforced authority-delegating call: an Approve
+    // outcome records the exact command so an identical recurrence auto-allows
+    // (propagated to `queue_and_wait`).
+    record_delegating_approval: bool,
 ) -> Result<()> {
     match &decision.action {
         ProxyAction::Allow => {
@@ -3133,8 +3304,8 @@ async fn enforce_decision(
                 if let Err(e) = loop_ctx.digest_store.enqueue(&digest_item).await {
                     tracing::error!(error = %e, "failed to enqueue informational digest item");
                 }
-                if let Err(e) = interceptor.deny(tid).await {
-                    tracing::warn!(error = %e, tid, "deny (non-interactive queue) failed");
+                if let Err(e) = deny_or_kill(interceptor, tid, kill_on_deny).await {
+                    tracing::warn!(error = %e, tid, "deny/kill (non-interactive queue) failed");
                 }
                 session.stats.total_denied += 1;
                 return Ok(());
@@ -3149,6 +3320,8 @@ async fn enforce_decision(
                 tid,
                 event_pid,
                 trace_event_id,
+                kill_on_deny,
+                record_delegating_approval,
             )
             .await
         }
@@ -3179,8 +3352,8 @@ async fn enforce_decision(
                 score = decision.composite_score,
                 "syscall denied"
             );
-            if let Err(e) = interceptor.deny(tid).await {
-                tracing::warn!(error = %e, tid, "deny failed");
+            if let Err(e) = deny_or_kill(interceptor, tid, kill_on_deny).await {
+                tracing::warn!(error = %e, tid, "deny/kill failed");
             }
             // Record implicit deny signal for reputation (lower weight than manual).
             record_reputation_observation(
@@ -3201,6 +3374,76 @@ async fn enforce_decision(
 // Queue + freeze/thaw orchestration
 // ---------------------------------------------------------------------------
 
+/// How often a queued item re-checks the session allowlist while waiting for
+/// its review - the cadence at which a scoped grant made on one prompt
+/// drains the rest of the backlog. Matches the polling reviewer's interval.
+const SCOPE_DRAIN_POLL: Duration = Duration::from_millis(250);
+
+/// True when `call_type` would be auto-allowed by the session-allowlist
+/// short-circuit in [`handle_syscall_event`] if it were re-issued right now.
+/// The same predicate, evaluated live: not under containment, not an
+/// enforced authority-delegation call, not a sensitive scoped read (those
+/// route through the proxy by design), and matching a session allowlist
+/// entry (exact or scoped prefix).
+///
+/// Used to resolve queued items after the operator grants a scoped
+/// permission on another prompt (`work/findings/mass-destruction-cargo-
+/// churn-prompt-flood-2026-08-17.md`): once the grant lands, holding the
+/// prompt buys no security - the tool could simply retry the syscall and be
+/// silently allowed - so the backlog drains instead of stacking hundreds of
+/// already-decided dialogs.
+fn session_scope_now_covers(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    session_id: Uuid,
+    call_type: &grith_proxy::types::ToolCallType,
+) -> bool {
+    if SessionStateRegistry::global()
+        .is_containment_active(SessionScopeKey::from_session_id(session_id))
+    {
+        return false;
+    }
+    // Mirror of `delegation_would_enforce` at the short-circuit: an enforced
+    // authority-delegating spawn / control-socket connect must never be
+    // drained away by a directory grant — unless the operator already approved
+    // this exact command this session (then it is auto-allowed like any other).
+    let already_user_approved_delegation = loop_ctx
+        .session_allowed
+        .lock()
+        .is_ok_and(|s| s.contains(&delegating_approval_key(call_type)));
+    let delegation_would_enforce = !already_user_approved_delegation
+        && match call_type {
+            grith_proxy::types::ToolCallType::ProcessSpawn { command, args } => {
+                authority_delegation::spawn_enforcement_enabled(
+                    loop_ctx.config.enforce_authority_delegating_spawn,
+                ) && (spawn_delegation_would_enforce(loop_ctx, command, args)
+                    || authority_delegation::ssh_loopback_should_escalate(
+                        command,
+                        args,
+                        &loop_ctx.permit_authority_delegating,
+                    ))
+            }
+            grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
+                authority_delegation::control_socket_enforcement_enabled(
+                    loop_ctx.config.enforce_control_socket_connect,
+                ) && authority_delegation::control_socket_should_escalate(
+                    address,
+                    &loop_ctx.permit_control_sockets,
+                )
+            }
+            _ => false,
+        };
+    if delegation_would_enforce {
+        return false;
+    }
+    let Some(key) = session_allowlist_key(call_type) else {
+        return false;
+    };
+    loop_ctx.session_allowed.lock().is_ok_and(|allowed| {
+        !is_sensitive_scoped_read_match(call_type, &allowed)
+            && is_session_allowlist_match(&key, &allowed, call_type)
+    })
+}
+
 async fn queue_and_wait(
     interceptor: &mut Box<dyn SyscallInterceptor>,
     session: &mut SupervisorSession,
@@ -3210,6 +3453,13 @@ async fn queue_and_wait(
     tid: u32,
     event_pid: u32,
     trace_event_id: Uuid,
+    // Propagated to `thaw_and_resume`: on a deny outcome, SIGKILL rather than
+    // no-op `deny_syscall` for an enforced authority-delegating spawn.
+    kill_on_deny: bool,
+    // When true (an enforced authority-delegating call), an Approve outcome
+    // records the exact command in the session allowlist so an identical
+    // recurrence auto-allows instead of re-escalating.
+    record_delegating_approval: bool,
 ) -> Result<()> {
     let dlp_redactor = loop_ctx.dlp_redactor;
     let containment_tracker = &loop_ctx.containment_tracker;
@@ -3270,7 +3520,7 @@ async fn queue_and_wait(
                 &loop_ctx.reputation_config,
             )),
         );
-        thaw_and_resume(interceptor, session, tid, false).await;
+        thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
         session.stats.total_denied += 1;
         return Ok(());
     }
@@ -3332,7 +3582,7 @@ async fn queue_and_wait(
         // approval accruing trust would let a tool whitewash its reputation
         // by looping one approved call. Only the original human approval
         // counts.
-        thaw_and_resume(interceptor, session, tid, true).await;
+        thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
         session.stats.total_allowed += 1;
         return Ok(());
     }
@@ -3350,14 +3600,51 @@ async fn queue_and_wait(
     // A malformed/unsafe scoped proposal is returned to Pending instead of
     // denying the exact request, so the operator can edit the proposal or
     // fall back to a single-request approval.
-    let (outcome, review_action, validated_scope) = loop {
-        let outcome = loop_ctx
-            .reviewer
-            .review(
-                &digest_item,
-                Duration::from_secs(config.freeze_timeout_seconds),
-            )
-            .await;
+    let session_id = session.id;
+    let (outcome, review_action, validated_scope, drained) = loop {
+        // Race the human review against the session allowlist: a scoped
+        // grant made while this item waits (on any other prompt) resolves
+        // it without an answer - re-issued now, the same op would
+        // short-circuit before ever reaching the proxy, so holding the
+        // prompt buys no security and stacks the queue. The digest status
+        // is written BEFORE the reviewer is cancelled so a disconnected or
+        // late reviewer cannot stomp it with an auto-deny.
+        let review = loop_ctx.reviewer.review(
+            &digest_item,
+            Duration::from_secs(config.freeze_timeout_seconds),
+        );
+        tokio::pin!(review);
+        let (outcome, drained) = loop {
+            tokio::select! {
+                outcome = &mut review => break (outcome, false),
+                () = tokio::time::sleep(SCOPE_DRAIN_POLL) => {
+                    if session_scope_now_covers(loop_ctx, session_id, &ctx.call_type) {
+                        if let Err(e) = loop_ctx
+                            .digest_store
+                            .update_status(
+                                digest_id,
+                                grith_digest::types::DigestStatus::Approved,
+                                Some("scope_drain"),
+                                Some("auto-approved: a session scope granted during review covers this target"),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                error = %e,
+                                item_id = %digest_id,
+                                "failed to record scope drain; leaving item for manual review"
+                            );
+                            continue;
+                        }
+                        loop_ctx.reviewer.cancel_review(digest_id).await;
+                        break (ReviewOutcome::Approved, true);
+                    }
+                }
+            }
+        };
+        if drained {
+            break (outcome, Some("scope_drain".to_string()), None, true);
+        }
 
         let review_action = match loop_ctx.digest_store.get(digest_id).await {
             Ok(item) => item.and_then(|item| item.review_action.clone()),
@@ -3380,7 +3667,7 @@ async fn queue_and_wait(
                     request,
                     &ctx.call_type.to_string(),
                 ) {
-                    Ok(scope) => break (outcome, review_action, Some(scope)),
+                    Ok(scope) => break (outcome, review_action, Some(scope), false),
                     Err(error) => {
                         tracing::warn!(
                             item_id = %digest_id,
@@ -3402,7 +3689,7 @@ async fn queue_and_wait(
                                 item_id = %digest_id,
                                 "failed to return invalid scoped approval to pending"
                             );
-                            break (ReviewOutcome::Denied, review_action, None);
+                            break (ReviewOutcome::Denied, review_action, None, false);
                         }
                         continue;
                     }
@@ -3430,15 +3717,50 @@ async fn queue_and_wait(
                         item_id = %digest_id,
                         "failed to return malformed review action to pending"
                     );
-                    break (ReviewOutcome::Denied, review_action, None);
+                    break (ReviewOutcome::Denied, review_action, None, false);
                 }
                 continue;
             }
         }
-        break (outcome, review_action, None);
+        break (outcome, review_action, None, false);
     };
 
     match outcome {
+        // Scope drain: resolved by a scoped session grant, not by a human
+        // answering THIS prompt. Deliberately none of the manual-approval
+        // side effects - no reputation observation (hundreds of drained
+        // items must not convert one human decision into mass trust), no
+        // exact allowlist entry (the scoped prefix already covers it), no
+        // approve-replay entry, no learned rule.
+        ReviewOutcome::Approved if drained => {
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event_pid,
+                Some(&ctx.call_type),
+                "scope_drain_resolved",
+                Some("auto-allow"),
+                Some(decision.composite_score),
+                Some("session scope granted during review covers this target"),
+            );
+            write_syscall_log(
+                loop_ctx,
+                session.root_pid,
+                &ctx.call_type,
+                decision.composite_score,
+                "auto-allow",
+                "scope drain: session scope granted during review covers this target",
+            );
+            tracing::info!(
+                event = "scope_drain_resolved",
+                session_id = %session.id,
+                item_id = %digest_id,
+                call = %replay_key,
+                "queued item resolved by a session scope granted during review - prompt withdrawn"
+            );
+            thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
+        }
         ReviewOutcome::Approved => {
             write_forensics_stage(
                 loop_ctx,
@@ -3466,6 +3788,23 @@ async fn queue_and_wait(
                 decision,
                 session.scope_name(),
             );
+            // Exact-command approval for an enforced authority-delegating call:
+            // record the full identity so an identical recurrence auto-allows
+            // this session instead of re-escalating (the broad `exec:`/`net:`
+            // allowlist entry added below is deliberately bypassed by the
+            // enforcement path, so this dedicated key is what makes an approval
+            // stick). Applies to any Approve/Always-allow of a delegating call.
+            if record_delegating_approval {
+                if let Ok(mut allowed) = loop_ctx.session_allowed.lock() {
+                    let key = delegating_approval_key(&ctx.call_type);
+                    if allowed.insert(key) {
+                        tracing::info!(
+                            call_type = %ctx.call_type,
+                            "session allowlist: authority-delegating command approved for session"
+                        );
+                    }
+                }
+            }
             // Scoped approvals deliberately do not add an exact `rw:` entry:
             // that namespace would broaden write/create intent to
             // delete/chmod on the current target.
@@ -3585,7 +3924,7 @@ async fn queue_and_wait(
                     .retain(|_, at| now.duration_since(*at) < window);
                 session.recent_approvals.insert(replay_key, now);
             }
-            thaw_and_resume(interceptor, session, tid, true).await;
+            thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
         }
         ReviewOutcome::Denied | ReviewOutcome::TimedOut => {
             let reason = if matches!(outcome, ReviewOutcome::TimedOut) {
@@ -3642,7 +3981,7 @@ async fn queue_and_wait(
                     .retain(|_, at| now.duration_since(*at) < window);
                 session.recent_denials.insert(replay_key, now);
             }
-            thaw_and_resume(interceptor, session, tid, false).await;
+            thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
             session.stats.total_denied += 1;
         }
     }
@@ -3814,17 +4153,22 @@ async fn thaw_and_resume(
     _session: &mut SupervisorSession,
     tid: u32,
     allow: bool,
+    // On a deny outcome, SIGKILL rather than the no-op `deny_syscall` for an
+    // enforced authority-delegating spawn (intercepted at `PTRACE_EVENT_EXEC`).
+    kill_on_deny: bool,
 ) {
     // No SIGCONT needed — child processes were never frozen.
     // Resume the stopped thread using its TID.
     let result = if allow {
         interceptor.allow(tid).await
     } else {
-        interceptor.deny(tid).await
+        deny_or_kill(interceptor, tid, kill_on_deny).await
     };
     if let Err(e) = result {
         let msg = if allow {
             "allow after approval failed"
+        } else if kill_on_deny {
+            "kill after review failed"
         } else {
             "deny after review failed"
         };
@@ -4355,6 +4699,71 @@ fn is_sensitive_unix_socket(path: &str) -> bool {
     if path.contains("podman.sock") {
         return true;
     }
+
+    // --- Root/host-daemon control sockets (curated LOW-FP denylist). ---
+    // Each grants RCE-equivalent control of a privileged daemon whose work
+    // runs OUTSIDE the ptrace tree (VM / container / service / print
+    // managers) = a supervision escape. Returning `true` here makes
+    // is_local_connect_address()/is_local_listen_address() report them
+    // non-local; the connect then reaches evaluate_proxy and QUEUEs as an
+    // unknown destination. QUEUE not DENY: an operator approves a legitimate
+    // use once and the session allowlist (net:unix:<path>) remembers it.
+    // Matched by SHAPE (family: multi-UID /run/user, /run vs /var/run,
+    // per-container), not fixed strings. The high-frequency benign sockets
+    // (journald, session/system D-Bus [handled by is_control_injection_socket],
+    // systemd-resolved NSS varlink under .../resolve/, X11, PulseAudio,
+    // PipeWire, nscd) are deliberately NOT matched by any branch below.
+
+    // libvirt RW control sockets: system (/run/libvirt/, /var/run/libvirt/)
+    // and session mode (/run/user/<uid>/libvirt/…). RW *-sock names
+    // (libvirt-sock, virtqemud-sock, virtnetworkd-sock, virtstoraged-sock,
+    // …); the read-only *-sock-ro variants deliberately stay local (info-only,
+    // cannot define a domain).
+    if path.contains("/libvirt/") && path.ends_with("-sock") {
+        return true;
+    }
+    // systemd manager private control socket — start/stop units = arbitrary
+    // code. Covers the system manager (/run/systemd/private) and a --user
+    // manager (/run/user/<uid>/systemd/private).
+    if path.ends_with("/systemd/private") {
+        return true;
+    }
+    // systemd manager Varlink API (io.systemd.Manager, …). ANCHORED to the
+    // manager dir on purpose: this must NOT match the high-frequency
+    // nss-resolve socket /run/systemd/resolve/io.systemd.Resolve (lives under
+    // …/resolve/, used by glibc name resolution).
+    if path.starts_with("/run/systemd/io.systemd.")
+        || path.starts_with("/var/run/systemd/io.systemd.")
+    {
+        return true;
+    }
+    // Podman Varlink API socket (no ".sock" suffix, so the podman.sock check
+    // above misses it): /run/podman/io.podman and rootless
+    // /run/user/<uid>/podman/io.podman.
+    if path.ends_with("/io.podman") {
+        return true;
+    }
+    // containerd control socket, incl. rootless (/run/user/<uid>/containerd/…)
+    // which the SENSITIVE_UNIX_SOCKETS exact list misses; and buildkit.
+    if path.ends_with("/containerd.sock") || path.ends_with("/buildkitd.sock") {
+        return true;
+    }
+    // CUPS control socket — printer/filter/driver config has a long RCE
+    // history. Anchored to the socket itself (not the whole /run/cups/ dir) to
+    // minimise the benign-print-enumeration prompt surface.
+    if path.ends_with("/cups.sock")
+        && (path.starts_with("/run/cups/") || path.starts_with("/var/run/cups/"))
+    {
+        return true;
+    }
+    // LXC per-container command socket (/var/lib/lxc/<name>/command) and the
+    // runtime dir (/run/lxc/) — driving a container escapes supervision.
+    if (path.starts_with("/var/lib/lxc/") && path.ends_with("/command"))
+        || path.starts_with("/run/lxc/")
+    {
+        return true;
+    }
+
     // SSH / GPG agent sockets (research doc §5.1 #13): a prompt injection could
     // poke the agent to sign/decrypt. They stay "sensitive" so an *unexpected*
     // process touching them is surfaced; the routine git/ssh/gpg case is carved
@@ -4675,6 +5084,78 @@ fn is_local_listen_address(address: &str) -> bool {
     false
 }
 
+/// Whether an authority-delegating ProcessSpawn of `command` should be
+/// escalated (used at the two pre-proxy short-circuit gates, where
+/// `ctx.spawn_provenance` is not yet available). Caller has already confirmed
+/// `spawn_enforcement_enabled`.
+///
+/// Cheap-first: the raw-basename match needs no filesystem I/O. Only when the
+/// raw name is not delegating do we canonicalise argv[0] (catches `run0` and
+/// symlink-copies) and — only if the canonical size collides with a pinned
+/// delegating binary — hash it (catches byte-copies/hardlinks). Canonicalise
+/// failure / an unresolved relative argv[0] falls back to the raw result (same
+/// resolution limitation as PR 4's `compute_spawn_provenance`).
+fn spawn_delegation_would_enforce(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    command: &str,
+    args: &[String],
+) -> bool {
+    let permit = &loop_ctx.permit_authority_delegating;
+    let hashes = &loop_ctx.authority_delegating_hashes;
+    // (1) raw basename — no I/O.
+    if authority_delegation::is_authority_delegating_binary(command) {
+        return authority_delegation::spawn_should_escalate_full(
+            command, args, None, None, permit, hashes,
+        );
+    }
+    // (2) canonical basename — one path resolution, catches run0/symlink-copy.
+    let Ok(canonical) = std::fs::canonicalize(command) else {
+        return false;
+    };
+    let canonical_str = canonical.to_string_lossy();
+    if authority_delegation::is_authority_delegating_binary(&canonical_str) {
+        return authority_delegation::spawn_should_escalate_full(
+            command,
+            args,
+            Some(&canonical_str),
+            None,
+            permit,
+            hashes,
+        );
+    }
+    // (3) byte-copy — size prefilter, then hash only on a size collision.
+    if hashes.is_empty() {
+        return false; // enforcement was off at session start: no pin to match
+    }
+    let Ok(meta) = std::fs::metadata(&canonical) else {
+        return false;
+    };
+    if !loop_ctx.authority_delegating_sizes.contains(&meta.len()) {
+        return false;
+    }
+    let Ok(sha) = crate::provenance::sha256_file(&canonical) else {
+        return false;
+    };
+    authority_delegation::spawn_should_escalate_full(
+        command,
+        args,
+        Some(&canonical_str),
+        Some(&sha),
+        permit,
+        hashes,
+    )
+}
+
+/// Session-allowlist key recording that the operator explicitly approved this
+/// EXACT authority-delegating call (command + args) this session. Namespaced so
+/// it never collides with a normal `exec:`/`net:` allowlist entry and is checked
+/// only by the delegation-enforcement path. Keyed on the full call identity (the
+/// same `Display` the prompt and deny/approve-replay use), so `flatpak run foo`
+/// never covers `flatpak run bar`.
+fn delegating_approval_key(call_type: &grith_proxy::types::ToolCallType) -> String {
+    format!("delegating-approved:{call_type}")
+}
+
 /// returns the address (without port) so that approving one connection to a
 /// host implicitly allows subsequent connections to the same host on any port.
 fn session_allowlist_key(call_type: &grith_proxy::types::ToolCallType) -> Option<String> {
@@ -4982,6 +5463,30 @@ fn tmp_self_created_prefix(call_type: &grith_proxy::types::ToolCallType) -> Opti
     }
 }
 
+/// Every path a call touches that a launch-derived (`projdir:`-marked)
+/// grant must not cover if it is a credential store.
+///
+/// This is the lookup key, plus the DESTINATION for a rename. The key is the
+/// source `old_path`, so a rename of a benign project file into
+/// `~/.ssh/authorized_keys` would otherwise slip the guard (review defect 1).
+fn projdir_guarded_paths<'a>(
+    key: &'a str,
+    call_type: &'a grith_proxy::types::ToolCallType,
+) -> impl Iterator<Item = &'a str> {
+    use grith_proxy::types::ToolCallType;
+    let dest = match call_type {
+        ToolCallType::FileRename { new_path, .. } => Some(new_path.as_str()),
+        _ => None,
+    };
+    std::iter::once(key).chain(dest)
+}
+
+/// True if a launch-derived grant must be denied for this call because one
+/// of the paths it touches is a credential store.
+fn projdir_grant_blocked(key: &str, call_type: &grith_proxy::types::ToolCallType) -> bool {
+    projdir_guarded_paths(key, call_type).any(crate::syscall_map::is_credential_store_path)
+}
+
 /// Return whether a session allowlist entry matches a syscall key.
 ///
 /// Matching rules:
@@ -5177,12 +5682,19 @@ fn is_session_allowlist_match(
         return matches!(call_type, ToolCallType::NamespaceOp { .. }) && allowed.contains(key);
     }
 
-    if !key.starts_with("ro-prefix:")
+    let key_is_pathish = !key.starts_with("ro-prefix:")
         && !key.starts_with("write-prefix:")
-        && !key.starts_with("delete-prefix:")
-        && allowed.contains(key)
-    {
-        return true;
+        && !key.starts_with("delete-prefix:");
+    if key_is_pathish && allowed.contains(key) {
+        // work/80: an exact key that is itself a launch-derived prefix
+        // (`cd ~/proj/.aws && grith exec` → key == projdir entry) must not
+        // exact-match into trust when it (or a rename destination) is a
+        // credential store.
+        let launch_derived_store =
+            allowed.contains(&format!("projdir:{key}")) && projdir_grant_blocked(key, call_type);
+        if !launch_derived_store {
+            return true;
+        }
     }
 
     // Prefix matching for bare-path entries. Exclude namespaced entries
@@ -5198,7 +5710,15 @@ fn is_session_allowlist_match(
             && !prefix.starts_with("rw:")
             && !prefix.starts_with("process:")
             && !prefix.starts_with("namespace:")
+            && !prefix.starts_with("projdir:")
             && key.starts_with(prefix.as_str())
+            // work/80: a prefix whose trust derives from the launch cwd
+            // (marked by a `projdir:` twin) must not auto-allow operations
+            // on credential stores — reads, writes, OR a rename whose
+            // destination is a store. Explicit literal profile entries (no
+            // twin) keep today's semantics.
+            && !(allowed.contains(&format!("projdir:{prefix}"))
+                && projdir_grant_blocked(key, call_type))
     })
 }
 
@@ -5854,6 +6374,14 @@ mod tests {
             Ok(())
         }
 
+        async fn kill(&mut self, pid: u32) -> crate::error::Result<()> {
+            // This mock does not distinguish kill from deny; both record the pid
+            // as a stopped call (enforcement kill assertions live in
+            // protection_tests::RecordingInterceptor, which tracks them apart).
+            self.state.lock().unwrap().deny_pids.push(pid);
+            Ok(())
+        }
+
         async fn freeze(&mut self, _pid: u32) -> crate::error::Result<()> {
             Ok(())
         }
@@ -6077,6 +6605,122 @@ mod tests {
         assert!(targets.contains(&200));
         assert!(targets.contains(&300));
         assert_eq!(targets.len(), 3);
+    }
+
+    /// work/80: launch-cwd-derived trust (a plain prefix with a `projdir:`
+    /// twin) must never auto-allow operations on credential stores — reads
+    /// or writes — while (a) non-store paths under the project keep matching
+    /// (the FP posture) and (b) explicit literal prefixes without a twin
+    /// keep today's override semantics.
+    #[test]
+    fn projdir_trust_never_covers_credential_stores() {
+        use grith_proxy::types::ToolCallType;
+        let read = |p: &str| ToolCallType::FileRead {
+            path: p.to_string(),
+        };
+        let write = |p: &str| ToolCallType::FileWrite {
+            path: p.to_string(),
+            content_hash: String::new(),
+        };
+
+        // Project-derived trust of /home/u/proj (twin present).
+        let mut allowed = HashSet::new();
+        allowed.insert("/home/u/proj".to_string());
+        allowed.insert("projdir:/home/u/proj".to_string());
+
+        // Ordinary project files: still routine, reads and writes.
+        assert!(is_session_allowlist_match(
+            "/home/u/proj/src/main.rs",
+            &allowed,
+            &read("/home/u/proj/src/main.rs"),
+        ));
+        assert!(is_session_allowlist_match(
+            "/home/u/proj/.env",
+            &allowed,
+            &read("/home/u/proj/.env"),
+        ));
+
+        // Credential stores under the project prefix: never.
+        for path in [
+            "/home/u/proj/.aws/credentials",
+            "/home/u/proj/.ssh/id_deploy",
+        ] {
+            assert!(
+                !is_session_allowlist_match(path, &allowed, &read(path)),
+                "projdir trust must not cover reads of {path}"
+            );
+            assert!(
+                !is_session_allowlist_match(path, &allowed, &write(path)),
+                "projdir trust must not cover writes of {path}"
+            );
+        }
+
+        // The same prefix WITHOUT a twin (explicit literal profile entry):
+        // today's explicit-trust override is preserved.
+        let mut explicit = HashSet::new();
+        explicit.insert("/home/u/proj".to_string());
+        assert!(is_session_allowlist_match(
+            "/home/u/proj/.aws/credentials",
+            &explicit,
+            &read("/home/u/proj/.aws/credentials"),
+        ));
+
+        // The marker itself must be inert: it is not a usable path prefix
+        // and must never match anything on its own.
+        let mut only_marker = HashSet::new();
+        only_marker.insert("projdir:/home/u/proj".to_string());
+        assert!(!is_session_allowlist_match(
+            "/home/u/proj/src/main.rs",
+            &only_marker,
+            &read("/home/u/proj/src/main.rs"),
+        ));
+
+        // Review defect 1: a rename whose SOURCE is an ordinary project file
+        // but whose DESTINATION is a credential store must not be covered —
+        // the key is old_path, so the destination has to be guarded too.
+        let rename = |old: &str, new: &str| ToolCallType::FileRename {
+            old_path: old.to_string(),
+            new_path: new.to_string(),
+        };
+        assert!(
+            !is_session_allowlist_match(
+                "/home/u/proj/payload",
+                &allowed,
+                &rename("/home/u/proj/payload", "/home/u/proj/.ssh/authorized_keys"),
+            ),
+            "rename INTO a project credential store must not be launch-trusted"
+        );
+        // A rename between two ordinary project files stays routine.
+        assert!(is_session_allowlist_match(
+            "/home/u/proj/a",
+            &allowed,
+            &rename("/home/u/proj/a", "/home/u/proj/b"),
+        ));
+
+        // Review defect 2: the credential DIRECTORY itself (no trailing
+        // file) is a store — a chmod of ~/proj/.aws must not be covered.
+        let chmod = |p: &str| ToolCallType::FileChmod {
+            path: p.to_string(),
+            mode: 0o777,
+        };
+        assert!(
+            !is_session_allowlist_match("/home/u/proj/.aws", &allowed, &chmod("/home/u/proj/.aws")),
+            "the credential directory itself must not be launch-trusted"
+        );
+
+        // Review defect 2 (exact arm): launch cwd IS the store dir
+        // (`cd ~/proj/.aws`), so the key equals the projdir prefix exactly.
+        let mut in_store = HashSet::new();
+        in_store.insert("/home/u/proj/.aws".to_string());
+        in_store.insert("projdir:/home/u/proj/.aws".to_string());
+        assert!(
+            !is_session_allowlist_match(
+                "/home/u/proj/.aws/credentials",
+                &in_store,
+                &read("/home/u/proj/.aws/credentials"),
+            ),
+            "launching inside a credential dir must not exact/prefix-trust its contents"
+        );
     }
 
     #[test]
@@ -6328,6 +6972,55 @@ mod tests {
             "/run/user/1000/podman/podman.sock"
         ));
         assert!(is_sensitive_unix_socket("/run/user/42/podman/podman.sock"));
+    }
+
+    /// Curated root/host-daemon control sockets must reach the proxy (QUEUE),
+    /// and — critically — the high-frequency benign sockets must STAY local.
+    #[test]
+    fn root_daemon_control_sockets_are_sensitive_but_benign_stay_local() {
+        // RCE-capable daemon control sockets → sensitive (route to proxy).
+        for p in [
+            "/run/libvirt/libvirt-sock",
+            "/var/run/libvirt/virtqemud-sock",
+            "/run/user/1000/libvirt/virtqemud-sock",
+            "/run/libvirt/virtnetworkd-sock",
+            "/run/libvirt/virtstoraged-sock",
+            "/run/systemd/private",
+            "/run/user/1000/systemd/private",
+            "/run/systemd/io.systemd.Manager",
+            "/run/podman/io.podman",
+            "/run/user/1000/podman/io.podman",
+            "/run/containerd/containerd.sock",
+            "/run/user/1000/containerd/containerd.sock",
+            "/run/buildkit/buildkitd.sock",
+            "/run/cups/cups.sock",
+            "/var/run/cups/cups.sock",
+            "/var/lib/lxc/mybox/command",
+            "/run/lxc/lock",
+        ] {
+            assert!(is_sensitive_unix_socket(p), "{p:?} should be sensitive");
+        }
+        // Benign high-frequency local IPC MUST stay local (no QUEUE storm).
+        for p in [
+            "/run/systemd/journal/socket",
+            "/run/systemd/journal/stdout",
+            // nss-resolve name resolution — MUST stay local (the key FP guard).
+            "/run/systemd/resolve/io.systemd.Resolve",
+            "/run/user/1000/bus",
+            "/run/dbus/system_bus_socket",
+            "/tmp/.X11-unix/X0",
+            "/run/user/1000/pulse/native",
+            "/run/user/1000/pipewire-0",
+            "/run/nscd/socket",
+            "/var/run/nscd/socket",
+            // Read-only libvirt is info-only, cannot define a domain.
+            "/run/libvirt/libvirt-sock-ro",
+            // CUPS is anchored to the socket file; other /run/cups/ paths stay local.
+            "/run/cups/notify.log",
+            "", // abstract-namespace socket renders empty
+        ] {
+            assert!(!is_sensitive_unix_socket(p), "{p:?} must stay local");
+        }
     }
 
     // Protection suite (research doc §5.1 #13): SSH/GPG agent sockets are
@@ -6702,6 +7395,8 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -6781,6 +7476,8 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -6948,6 +7645,8 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -7079,7 +7778,7 @@ mod tests {
     async fn phase_d_iopl_is_denied() {
         assert_event_denied(sample_phase_a_event(
             6003,
-            crate::platform::linux::syscall_nr::IOPL,
+            crate::platform::linux::arch::x86_64::syscall_nr::IOPL,
             SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Iopl,
             },
@@ -7091,7 +7790,7 @@ mod tests {
     async fn phase_d_ioperm_is_denied() {
         assert_event_denied(sample_phase_a_event(
             6004,
-            crate::platform::linux::syscall_nr::IOPERM,
+            crate::platform::linux::arch::x86_64::syscall_nr::IOPERM,
             SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Ioperm,
             },
@@ -7200,6 +7899,8 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -7260,7 +7961,7 @@ mod tests {
         assert_event_allowed_with_coverage(
             sample_phase_a_event(
                 7003,
-                crate::platform::linux::syscall_nr::CHOWN,
+                crate::platform::linux::arch::x86_64::syscall_nr::CHOWN,
                 SyscallKind::OwnershipChange {
                     op: crate::interceptor::OwnershipOp::Chown,
                     path: "/etc/passwd".into(),
@@ -8500,6 +9201,8 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating,
             permit_control_sockets,
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -8688,14 +9391,20 @@ mod tests {
         // enforcement would be a silent no-op. Uses a real root-owned system
         // binary so the exec-provenance check in is_session_allowlist_match
         // actually trusts it (a /tmp temp file would be rejected as
-        // world-writable and never exercise the interaction).
-        let candidates = [
-            "/usr/bin/systemctl",
-            "/bin/systemctl",
-            "/usr/bin/tmux",
-            "/usr/bin/docker",
+        // world-writable and never exercise the interaction). A genuinely
+        // *delegating* subcommand is used (`restart`/`new-session`/`run`) so the
+        // read-only-query exemption does not apply — a bare invocation would be
+        // a read-only query and correctly not escalate.
+        let candidates: &[(&str, &str)] = &[
+            ("/usr/bin/systemctl", "restart"),
+            ("/bin/systemctl", "restart"),
+            ("/usr/bin/tmux", "new-session"),
+            ("/usr/bin/docker", "run"),
         ];
-        let Some(bin) = candidates.iter().find(|p| std::path::Path::new(p).exists()) else {
+        let Some((bin, subcommand)) = candidates
+            .iter()
+            .find(|(p, _)| std::path::Path::new(p).exists())
+        else {
             eprintln!("skipping: no root-owned authority-delegating binary present");
             return;
         };
@@ -8704,7 +9413,7 @@ mod tests {
             crate::platform::linux::syscall_nr::EXECVE,
             SyscallKind::ProcessExec {
                 path: (*bin).to_string(),
-                args: vec![(*bin).to_string()],
+                args: vec![(*bin).to_string(), (*subcommand).to_string()],
             },
         );
         let out = run_delegation_event(
@@ -8724,5 +9433,298 @@ mod tests {
             out.total_filtered_noise, 0,
             "must not take the session-allowed auto-allow"
         );
+    }
+
+    // ---- Scope drain: queued items resolve when a scoped grant lands ----
+
+    /// A reviewer that never answers: the prompt stays open until the review
+    /// future is dropped. Records which items it was asked about and which
+    /// were cancelled out-of-band.
+    struct NeverAnsweringReviewer {
+        seen: Arc<Mutex<Vec<Uuid>>>,
+        cancelled: Arc<Mutex<Vec<Uuid>>>,
+    }
+
+    #[async_trait]
+    impl QueueReviewer for NeverAnsweringReviewer {
+        async fn review(&self, item: &DigestItem, _timeout: Duration) -> ReviewOutcome {
+            self.seen.lock().unwrap().push(item.id);
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn cancel_review(&self, item_id: Uuid) {
+            self.cancelled.lock().unwrap().push(item_id);
+        }
+    }
+
+    /// The 2026-08-17 flood repair: an item queued and waiting on a prompt
+    /// must resolve WITHOUT an operator answer once a scoped session grant
+    /// (made on some other prompt) covers its target - status Approved with
+    /// review_action `scope_drain`, syscall allowed, TUI prompt cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn scope_drain_resolves_pending_item_when_scoped_grant_lands() {
+        let tid = 4242;
+        let (mock, state) = MockInterceptor::new(vec![]);
+        let mut interceptor: Box<dyn SyscallInterceptor> = Box::new(mock);
+        let mut session = SupervisorSession::new("mock-tool", tid);
+        let proxy = allow_only_proxy();
+        let audit_storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let audit_sink: Arc<dyn crate::audit_sink::AuditSink> =
+            Arc::new(crate::audit_sink::StorageAuditSink::new(audit_storage));
+        let digest_queue = Arc::new(grith_digest::queue::DigestQueue::open_in_memory().unwrap());
+        let digest_store: Arc<dyn crate::reviewer::DigestStore> =
+            Arc::new(crate::reviewer::LocalDigestStore::new(digest_queue.clone()));
+        let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+        let correlation_tracker = Arc::new(grith_audit::CorrelationTracker::with_defaults());
+        let containment_tracker = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::new(
+                Duration::from_secs(60),
+            ),
+        );
+        let config = SupervisorConfig::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let session_allowed = Arc::new(Mutex::new(HashSet::new()));
+        let loop_ctx = SupervisorLoopContext {
+            proxy: &proxy,
+            audit_sink,
+            digest_store,
+            dlp_redactor: &dlp_redactor,
+            correlation_tracker: &correlation_tracker,
+            containment_tracker: &containment_tracker,
+            config: &config,
+            event_tx: None,
+            freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
+            read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
+            reviewer: Arc::new(NeverAnsweringReviewer {
+                seen: seen.clone(),
+                cancelled: cancelled.clone(),
+            }),
+            session_sync: None,
+            session_allowed: session_allowed.clone(),
+            dns_cache: Arc::new(Mutex::new(DnsCache::new())),
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
+            syscall_log: None,
+            forensics_trace: None,
+            reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
+            reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            daemon_proxy_url: None,
+            daemon_proxy_token: None,
+            daemon_restart: None,
+            persist_local_reputation: true,
+            routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
+            local_listener_policy: Vec::new(),
+            namespace_users: Vec::new(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
+            working_root: None,
+            mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
+        };
+
+        let ctx = ToolCallContext::new(
+            "supervisor:mock-tool",
+            ToolCallType::FileDelete {
+                path: "/repo/target/debug/deps/foo.o".into(),
+            },
+            session.id,
+        );
+        let decision =
+            grith_proxy::types::ProxyDecision::queue(1.0, vec![], Duration::from_millis(1));
+
+        // Run the wait alongside a grant that lands mid-review: the scoped
+        // rule appears 600ms in, so the drain tick at 750ms resolves the
+        // item while the reviewer is still holding its prompt open.
+        let (wait_result, ()) = tokio::join!(
+            queue_and_wait(
+                &mut interceptor,
+                &mut session,
+                &loop_ctx,
+                &ctx,
+                &decision,
+                tid,
+                tid,
+                Uuid::new_v4(),
+                false,
+                false,
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                session_allowed
+                    .lock()
+                    .unwrap()
+                    .insert("delete-prefix:/repo/target/debug/".to_string());
+            }
+        );
+        wait_result.unwrap();
+
+        let item_id = seen.lock().unwrap()[0];
+        let item = digest_queue.get_by_id(&item_id).unwrap();
+        assert_eq!(item.status, grith_digest::DigestStatus::Approved);
+        assert_eq!(item.review_action.as_deref(), Some("scope_drain"));
+        assert_eq!(
+            *cancelled.lock().unwrap(),
+            vec![item_id],
+            "the reviewer's stale prompt must be withdrawn"
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.allow_pids, vec![tid], "the held syscall must resume");
+        assert!(state.deny_pids.is_empty());
+        assert_eq!(session.stats.total_queued, 1);
+        assert_eq!(session.stats.total_denied, 0);
+    }
+
+    /// Predicate-level checks for `session_scope_now_covers` run against a
+    /// minimal loop context; only `session_allowed`, `config`, and the
+    /// delegation permit lists influence the result.
+    fn covers_with(
+        call_type: &ToolCallType,
+        allowed: HashSet<String>,
+        config: SupervisorConfig,
+        session_id: Uuid,
+    ) -> bool {
+        let proxy = allow_only_proxy();
+        let audit_storage = Arc::new(Mutex::new(
+            grith_audit::AuditStorage::open_in_memory().unwrap(),
+        ));
+        let audit_sink: Arc<dyn crate::audit_sink::AuditSink> =
+            Arc::new(crate::audit_sink::StorageAuditSink::new(audit_storage));
+        let digest_queue = Arc::new(grith_digest::queue::DigestQueue::open_in_memory().unwrap());
+        let digest_store: Arc<dyn crate::reviewer::DigestStore> =
+            Arc::new(crate::reviewer::LocalDigestStore::new(digest_queue));
+        let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
+        let correlation_tracker = Arc::new(grith_audit::CorrelationTracker::with_defaults());
+        let containment_tracker = Arc::new(
+            grith_proxy::filters::session_containment::ContainmentTracker::new(
+                Duration::from_secs(60),
+            ),
+        );
+        let loop_ctx = SupervisorLoopContext {
+            proxy: &proxy,
+            audit_sink,
+            digest_store,
+            dlp_redactor: &dlp_redactor,
+            correlation_tracker: &correlation_tracker,
+            containment_tracker: &containment_tracker,
+            config: &config,
+            event_tx: None,
+            freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
+            read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
+            reviewer: Arc::new(PanicReviewer),
+            session_sync: None,
+            session_allowed: Arc::new(Mutex::new(allowed)),
+            dns_cache: Arc::new(Mutex::new(DnsCache::new())),
+            dns_inspection_enabled: false,
+            dns_decision_service: None,
+            dns_forward_confirm: None,
+            syscall_log: None,
+            forensics_trace: None,
+            reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
+            reputation_config: grith_proxy::reputation::ReputationConfig::default(),
+            daemon_proxy_url: None,
+            daemon_proxy_token: None,
+            daemon_restart: None,
+            persist_local_reputation: true,
+            routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
+            local_listener_policy: Vec::new(),
+            namespace_users: Vec::new(),
+            permit_authority_delegating: Vec::new(),
+            permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
+            working_root: None,
+            mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
+            yama_ptrace_scope: None,
+        };
+        session_scope_now_covers(&loop_ctx, session_id, call_type)
+    }
+
+    /// Containment gates the drain exactly as it gates the live
+    /// short-circuit: once active, a matching scoped rule must not resolve
+    /// queued items - every call re-scores through the full pipeline.
+    #[test]
+    fn session_scope_now_covers_respects_containment() {
+        let call = ToolCallType::FileDelete {
+            path: "/repo/target/debug/deps/foo.o".into(),
+        };
+        let allowed: HashSet<String> =
+            HashSet::from(["delete-prefix:/repo/target/debug/".to_string()]);
+
+        let clean_session = Uuid::new_v4();
+        assert!(covers_with(
+            &call,
+            allowed.clone(),
+            SupervisorConfig::default(),
+            clean_session
+        ));
+
+        let contained_session = Uuid::new_v4();
+        SessionStateRegistry::global().activate_containment(
+            SessionScopeKey::from_session_id(contained_session),
+            grith_proxy::session_state::ContainmentReason::SensitiveAccessOutsideScope {
+                path: "/home/u/.ssh/id_rsa".into(),
+                taint_level: "critical".into(),
+            },
+        );
+        assert!(!covers_with(
+            &call,
+            allowed,
+            SupervisorConfig::default(),
+            contained_session
+        ));
+    }
+
+    /// An enforced authority-delegation call must never be drained by a
+    /// session grant - mirroring `delegation_would_enforce` at the live
+    /// short-circuit, which the enforcement escalation deliberately skips.
+    #[test]
+    fn session_scope_now_covers_never_drains_enforced_delegation() {
+        // Enforced authority-delegating spawn: blocked by the guard before
+        // allowlist matching is even consulted.
+        let spawn = ToolCallType::ProcessSpawn {
+            command: "systemd-run".into(),
+            args: vec!["--user".into()],
+        };
+        let mut enforced = SupervisorConfig::default();
+        enforced.enforce_authority_delegating_spawn = true;
+        assert!(!covers_with(
+            &spawn,
+            HashSet::from(["exec:systemd-run".to_string()]),
+            enforced,
+            Uuid::new_v4()
+        ));
+
+        // Control-injection socket connect: same guard, string-matched
+        // allowlist entries (exec entries need on-disk provenance, which a
+        // test environment cannot satisfy, so the positive control uses the
+        // socket form).
+        let connect = ToolCallType::NetConnect {
+            address: "unix:/tmp/tmux-1000/default".into(),
+            port: 0,
+        };
+        let allowed: HashSet<String> =
+            HashSet::from(["net:unix:/tmp/tmux-1000/default".to_string()]);
+
+        let mut enforced = SupervisorConfig::default();
+        enforced.enforce_control_socket_connect = true;
+        assert!(!covers_with(
+            &connect,
+            allowed.clone(),
+            enforced,
+            Uuid::new_v4()
+        ));
+
+        let mut unenforced = SupervisorConfig::default();
+        unenforced.enforce_control_socket_connect = false;
+        assert!(covers_with(&connect, allowed, unenforced, Uuid::new_v4()));
     }
 }

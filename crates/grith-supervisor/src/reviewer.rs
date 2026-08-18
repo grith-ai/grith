@@ -82,6 +82,15 @@ impl DigestStore for LocalDigestStore {
 #[async_trait]
 pub trait QueueReviewer: Send + Sync {
     async fn review(&self, item: &DigestItem, timeout: Duration) -> ReviewOutcome;
+
+    /// Withdraw an in-flight prompt for `item_id` whose review was resolved
+    /// out-of-band - e.g. a scoped session grant made on another prompt now
+    /// covers this item's target (scope drain). The caller has already
+    /// written the item's final digest status BEFORE invoking this, so an
+    /// implementation must only retract its user-facing prompt, never write
+    /// a status of its own from this path. Default: nothing to retract
+    /// (polling implementations observe the status change directly).
+    async fn cancel_review(&self, _item_id: Uuid) {}
 }
 
 /// Polls the [`DigestQueue`] for status changes at 250ms intervals.
@@ -128,6 +137,20 @@ async fn poll_digest_status(
 
     loop {
         if start.elapsed() >= timeout {
+            // Final read before the auto-deny: a review resolved
+            // out-of-band inside the last poll interval (e.g. scope drain)
+            // already carries its final status and must not be stomped.
+            match digest_store.get(item_id).await {
+                Ok(Some(item)) if item.status == DigestStatus::Approved => {
+                    return ReviewOutcome::Approved;
+                }
+                Ok(Some(item))
+                    if matches!(item.status, DigestStatus::Denied | DigestStatus::Expired) =>
+                {
+                    return ReviewOutcome::Denied;
+                }
+                _ => {}
+            }
             let now = chrono::Utc::now().to_rfc3339();
             if let Err(e) = digest_store
                 .update_status(

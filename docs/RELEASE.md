@@ -87,14 +87,15 @@ Defined in `.github/workflows/release.yml`. Triggered by pushing a `v*` tag.
 | Target | Runner | Build tool | Status |
 |--------|--------|------------|--------|
 | `x86_64-unknown-linux-musl` | ubuntu-latest | `cross` | ✅ v0.1.0 |
-| `aarch64-unknown-linux-musl` | ubuntu-latest | `cross` | ⏳ v2.0 (needs supervisor aarch64 register backend) |
+| `aarch64-unknown-linux-musl` | ubuntu-latest | `cross` | ✅ (work/78 aarch64 port) |
 | `aarch64-apple-darwin` | macos-latest | `cargo` | ⏳ v2.0 (needs Endpoint Security port) |
 | `x86_64-apple-darwin` | macos-latest | `cargo` | ⏳ v2.0 (same) |
 | `x86_64-pc-windows-msvc` | windows-latest | `cargo` | ⏳ v2.0 (needs ETW + Windows supervisor) |
 
 The active matrix in `.github/workflows/release.yml` is currently
-**Linux x86_64 only**. Re-enable the other rows in the workflow (and
-add them back to this table's Status column) when each platform's
+**Linux x86_64 + aarch64** (both static musl, built via `cross`; the
+aarch64 artifact is boot-smoked on an arm64 runner before the release
+is cut). Re-enable the macOS/Windows rows when each platform's
 supervisor backend lands.
 
 ### Steps per target

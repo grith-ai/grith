@@ -275,6 +275,27 @@ export function dismissOnboarding(): Promise<{ dismissed: boolean }> {
   });
 }
 
+/** Record that the first-run dashboard intro overlay has been acknowledged. */
+export function markIntroSeen(): Promise<{ intro_seen: boolean }> {
+  return request<{ intro_seen: boolean }>("/api/onboarding/intro-seen", {
+    method: "POST",
+  });
+}
+
+/**
+ * Persist whether grith opens the dashboard in a browser when it starts.
+ * Writes `server.auto_open_dashboard` to the daemon's local config
+ * (~/.config/grith/config.toml), which the CLI reads at its next launch.
+ */
+export function setAutoOpenDashboard(
+  enabled: boolean,
+): Promise<{ status: string; server_updated: boolean }> {
+  return request<{ status: string; server_updated: boolean }>("/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ server: { auto_open_dashboard: enabled } }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------

@@ -325,15 +325,26 @@ pub fn is_noise_path(path: &str) -> bool {
         || path.starts_with("/tmp/.") // hidden temp files
 }
 
-/// Check if a path targets a security-sensitive location that should always
-/// be evaluated by the proxy, even when `ignore_read_only` noise reduction
-/// is enabled.
+/// Check if a path targets a credential STORE — the strong, low-false-
+/// positive core of [`is_sensitive_path`]: credential-bearing directories,
+/// system credential stores, grith's own configuration, and cross-process
+/// `/proc` secret paths.
 ///
-/// Mirrors the heuristics in `grith_proxy::filters::sensitive_path` but as a
-/// lightweight boolean gate (no scoring, no severity).
-pub fn is_sensitive_path(path: &str) -> bool {
+/// Split out for work/80: `${PROJECT_DIR}`-derived session trust (the launch
+/// cwd) must never noise-allow these, no matter where the session was
+/// launched from. The weaker name-based signals (`.env`, `*.pem`, keyword
+/// filenames) are deliberately NOT here — inside a genuine project tree they
+/// are everyday files (dotenv configs, TLS test fixtures), and blocking
+/// project trust for them would re-open the prompt-flood class this repo has
+/// repeatedly fought. Those stay covered by [`is_sensitive_path`] everywhere
+/// project trust does not reach.
+pub fn is_credential_store_path(path: &str) -> bool {
     let path_lc = path.replace('\\', "/").to_lowercase();
-    let file_name = path_lc.split('/').next_back().unwrap_or_default();
+    let file_name = path_lc
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()
+        .unwrap_or_default();
 
     // Grith's own configuration files — self-protection.
     // A supervised tool must never silently read or modify grith's
@@ -342,7 +353,9 @@ pub fn is_sensitive_path(path: &str) -> bool {
         return true;
     }
 
-    // Credential-bearing directories
+    // Credential-bearing directories. Probed with a trailing slash appended
+    // so the DIRECTORY itself counts too — `chmod`/`rename`/`rmdir` of
+    // `~/proj/.aws` is as store-touching as a file inside it.
     let credential_dirs = [
         "/.ssh/",
         "/.gnupg/",
@@ -353,7 +366,32 @@ pub fn is_sensitive_path(path: &str) -> bool {
         "/.docker/",
         "/.config/gcloud/",
     ];
-    if credential_dirs.iter().any(|d| path_lc.contains(d)) {
+    let dir_probe = if path_lc.ends_with('/') {
+        path_lc.clone()
+    } else {
+        format!("{path_lc}/")
+    };
+    if credential_dirs.iter().any(|d| dir_probe.contains(d)) {
+        return true;
+    }
+
+    // Exact-filename credential files: near-zero-FP names that are ALSO the
+    // taint filter's sensitive-source list — if project trust noise-allowed
+    // their read, no taint would register and exfil scoring could never
+    // fire (research doc §5.1 #4 superset invariant). A `~/proj/.npmrc`
+    // carrying an _authToken is the everyday shape.
+    if matches!(
+        file_name,
+        ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".pgpass"
+            | ".git-credentials"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_dsa"
+            | "id_ecdsa"
+    ) {
         return true;
     }
 
@@ -366,6 +404,30 @@ pub fn is_sensitive_path(path: &str) -> bool {
         || path_lc.contains("/etc/krb5.keytab")
         || path_lc.contains("/library/keychains/")
     {
+        return true;
+    }
+
+    // Another process's environment/memory under /proc — cross-process
+    // secret theft (also checked in is_sensitive_path; here so project
+    // trust can never cover it either).
+    is_cross_process_secret_proc_path(path)
+}
+
+/// Check if a path targets a security-sensitive location that should always
+/// be evaluated by the proxy, even when `ignore_read_only` noise reduction
+/// is enabled.
+///
+/// Mirrors the heuristics in `grith_proxy::filters::sensitive_path` but as a
+/// lightweight boolean gate (no scoring, no severity). A superset of
+/// [`is_credential_store_path`] — the strong store classes plus the weaker
+/// name-based signals.
+pub fn is_sensitive_path(path: &str) -> bool {
+    let path_lc = path.replace('\\', "/").to_lowercase();
+    let file_name = path_lc.split('/').next_back().unwrap_or_default();
+
+    // The strong classes: credential dirs, system stores, grith config,
+    // cross-process /proc.
+    if is_credential_store_path(path) {
         return true;
     }
 
@@ -398,12 +460,9 @@ pub fn is_sensitive_path(path: &str) -> bool {
         return true;
     }
 
-    // Another process's environment/memory under /proc is a cross-process
-    // secret-theft vector and must reach the proxy despite the /proc fast-paths
-    // and ignore_read_only (research doc §5.1 #1).
-    if is_cross_process_secret_proc_path(path) {
-        return true;
-    }
+    // (Cross-process /proc secret paths — research doc §5.1 #1 — are part
+    // of is_credential_store_path above.)
+
     // Substring-keyword rule: a filename merely *containing* a
     // credential-ish word. This is the broadest, weakest signal and the
     // biggest false-positive source. Two carveouts keep it from mass-
@@ -1040,7 +1099,9 @@ mod tests {
         //   ProcessFork, NetSendTo, PipeCreate, SocketPair, fd read/write without path
         //
         // Known limitations:
-        //   - Linux: x86_64 only (ARM64 uses different syscall numbers/register layout)
+        //   - Linux: x86_64 and aarch64 (per-arch syscall tables + register
+        //     access live behind platform/linux/arch/; classification and
+        //     this map are arch-neutral via SysId)
         //   - macOS: Fallback mode only generates synthetic ProcessExec events
         //     Real syscall interception requires Endpoint Security entitlement (v2.0)
         //   - Windows: No supervisor implementation (Minifilter + ETW deferred to v2.0)
@@ -1107,6 +1168,61 @@ mod tests {
     fn env_files_are_sensitive() {
         assert!(is_sensitive_path("/workspace/.env"));
         assert!(is_sensitive_path("/workspace/.env.production"));
+    }
+
+    /// work/80: the strong credential-store core — what `${PROJECT_DIR}`-
+    /// derived session trust must NEVER cover — versus the weaker name-based
+    /// signals that project trust may still noise-allow inside a real
+    /// project tree.
+    #[test]
+    fn credential_store_core_is_narrower_than_sensitive() {
+        // Strong: stores.
+        for p in [
+            "/home/u/.ssh/grith_canary_key",
+            "/home/u/.aws/credentials",
+            "/home/u/.gnupg/secring.gpg",
+            "/home/u/.kube/config",
+            "/etc/shadow",
+            "/home/u/.config/grith/config.toml",
+            "/proc/123/environ",
+        ] {
+            assert!(
+                is_credential_store_path(p),
+                "{p} must be a credential store"
+            );
+            assert!(is_sensitive_path(p), "{p} must also be sensitive");
+        }
+        // Weak: sensitive, but NOT stores — everyday files inside projects.
+        for p in [
+            "/home/u/proj/.env",
+            "/home/u/proj/tls/server.pem",
+            "/home/u/proj/deploy.key",
+            "/home/u/proj/apikey_config.yaml",
+        ] {
+            assert!(is_sensitive_path(p), "{p} must be sensitive");
+            assert!(
+                !is_credential_store_path(p),
+                "{p} must NOT be a credential store (project trust may cover it)"
+            );
+        }
+        // Review defect 2: the credential DIRECTORY itself is a store.
+        for d in ["/home/u/proj/.aws", "/home/u/proj/.ssh", "/home/u/.gnupg"] {
+            assert!(is_credential_store_path(d), "dir {d} must be a store");
+        }
+        // Review defect 4: near-zero-FP credential FILES are stores too.
+        for p in [
+            "/home/u/proj/.npmrc",
+            "/home/u/proj/.netrc",
+            "/home/u/proj/.git-credentials",
+            "/home/u/proj/id_rsa",
+        ] {
+            assert!(is_credential_store_path(p), "{p} must be a store");
+        }
+        // Plainly boring paths are neither.
+        assert!(!is_credential_store_path("/home/u/proj/src/main.rs"));
+        // ...and a directory that merely CONTAINS ".aws" as a substring of a
+        // longer component is not a store (word-boundary via trailing slash).
+        assert!(!is_credential_store_path("/home/u/proj/.awsome/notes.txt"));
     }
 
     #[test]

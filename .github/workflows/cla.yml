@@ -1,0 +1,37 @@
+name: CLA
+
+# Gates external pull requests on the public mirror (grith-ai/grith) behind
+# the Contributor License Agreement in CLA.md. Signatures are recorded on the
+# cla-signatures branch, which the OSS export never touches. The repository
+# guard keeps this workflow inert on the private repo, where internal PRs do
+# not need a CLA.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    if: github.repository == 'grith-ai/grith'
+    runs-on: ubuntu-latest
+    steps:
+      - name: CLA Assistant
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+        # contributor-assistant/github-action v2.6.1. SHA-pinned because this
+        # workflow runs on pull_request_target with write permissions.
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: 'signatures/cla.json'
+          path-to-document: 'https://github.com/grith-ai/grith/blob/main/CLA.md'
+          branch: 'cla-signatures'
+          allowlist: 'djf73,dependabot[bot],github-actions[bot]'

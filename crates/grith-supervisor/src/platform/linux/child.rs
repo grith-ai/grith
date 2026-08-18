@@ -335,6 +335,11 @@ pub(super) async fn do_spawn_supervised(
     //
     // 4. In the parent branch, we only interact with the child via
     //    `waitpid` and ptrace APIs, which are safe POSIX interfaces.
+    // Pre-warm the lazily-derived syscall tables in the parent: the child
+    // builds its seccomp filter post-fork, where a first-touch OnceLock
+    // initialisation would allocate under a possibly-held allocator lock.
+    super::seccomp::prewarm_filter_tables();
+
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             // --- child process ---------------------------------------------------
@@ -389,6 +394,11 @@ pub(super) async fn do_spawn_supervised(
                 }
             }
 
+            // The child is now in a genuine ptrace stop: probe the kernel for
+            // the capabilities this backend requires (aarch64: the >= 5.3
+            // PTRACE_GET_SYSCALL_INFO floor; no-op on x86_64) before any
+            // syscall can be misread through an unsupported path.
+            super::arch::verify_kernel_support(child)?;
             sup.set_trace_options(child)?;
             sup.supervised.insert(child_pid);
             sup.tid_tgids.insert(child_pid, child_pid);
@@ -477,6 +487,10 @@ pub(super) async fn do_spawn_supervised_pty(
     // - The child calls setsid(), ioctl(TIOCSCTTY), and dup2() which are
     //   all async-signal-safe.
     // - We close the master fd in the child (it only needs the slave side).
+    // See do_spawn_supervised: pre-warm the derived syscall tables before
+    // fork so the child's seccomp-filter build allocates no new statics.
+    super::seccomp::prewarm_filter_tables();
+
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             // --- child process ---
@@ -553,6 +567,11 @@ pub(super) async fn do_spawn_supervised_pty(
                 }
             }
 
+            // The child is now in a genuine ptrace stop: probe the kernel for
+            // the capabilities this backend requires (aarch64: the >= 5.3
+            // PTRACE_GET_SYSCALL_INFO floor; no-op on x86_64) before any
+            // syscall can be misread through an unsupported path.
+            super::arch::verify_kernel_support(child)?;
             sup.set_trace_options(child)?;
             sup.supervised.insert(child_pid);
             sup.tid_tgids.insert(child_pid, child_pid);

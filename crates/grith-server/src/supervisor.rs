@@ -1103,6 +1103,10 @@ mod tests {
             Ok(())
         }
 
+        async fn kill(&mut self, _pid: u32) -> grith_supervisor::error::Result<()> {
+            Ok(())
+        }
+
         async fn freeze(&mut self, _pid: u32) -> grith_supervisor::error::Result<()> {
             Ok(())
         }

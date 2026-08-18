@@ -4,7 +4,7 @@
 
 grith produces a single binary — the grith daemon — that sits between AI tools and your operating system, evaluating every file access, network call, shell command, and process spawn against a scoring engine before allowing it to proceed.
 
-> **Currently supports Linux x86_64 only.** macOS (via Endpoint Security), Windows (via ETW), and Linux aarch64 are tracked for v2.0.
+> **Currently supports Linux x86_64 and aarch64** (kernel 5.3+ on aarch64). macOS (via Endpoint Security) and Windows (via ETW) are tracked for v2.0.
 
 Two execution paths, one security proxy:
 
@@ -20,7 +20,7 @@ Both paths converge on the same proxy filters, scoring thresholds, audit log, an
 - **Destructive-action coverage** — hard-denies catastrophic host/storage destruction (filesystem format, raw block-device overwrite, recursive removal of a system root or database data directory) and escalates destructive operations against production targets
 - **Adaptive Bayesian scoring** that learns from human review decisions
 - **Per-call security evaluation** with profile-based access control
-- **CLI supervisor** with ptrace+seccomp (Linux x86_64, full syscall interception). macOS via Endpoint Security and Windows via ETW are targeted for v2.0; Linux aarch64 needs an arch-backend port.
+- **CLI supervisor** with ptrace+seccomp (Linux x86_64 and aarch64, full syscall interception). macOS via Endpoint Security and Windows via ETW are targeted for v2.0.
 - **Process tree tracking** — follows forks, clones, and execs
 - **PTY forwarding** for transparent interactive tool sessions
 - **Human-in-the-loop digest** — queued operations freeze the process until approved
@@ -61,7 +61,7 @@ curl -fsSL https://grith.ai/install | sh -s -- --global           # install to /
 | Platform | Architecture | Status |
 |----------|-------------|--------|
 | Linux | x86_64 | ✅ supported |
-| Linux | aarch64 | ⏳ v2.0 — supervisor needs an aarch64 register backend |
+| Linux | aarch64 | ✅ supported (kernel 5.3+) |
 | macOS | Apple Silicon / Intel | ⏳ v2.0 — supervisor needs Endpoint Security port |
 | Windows | x86_64 | ⏳ v2.0 — supervisor needs ETW + a process-supervisor port |
 
@@ -71,7 +71,7 @@ curl -fsSL https://grith.ai/install | sh -s -- --global           # install to /
 
 - **Rust** 1.88+ (stable)
 - **Node.js** 22+ (for the web dashboard)
-- **Linux** x86_64 kernel 4.8+ (for the ptrace+seccomp CLI supervisor)
+- **Linux** x86_64 (kernel 4.8+) or aarch64 (kernel 5.3+), for the ptrace+seccomp CLI supervisor
 
 ### Quick build
 
@@ -329,7 +329,7 @@ proxy_test_rps = 20
 enabled = true
 default_profile = "generic"
 freeze_timeout_seconds = 300
-max_concurrent_sessions = 4
+max_concurrent_sessions = 64
 pty_forwarding = true
 
 [supervisor.noise_reduction]

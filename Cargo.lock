@@ -971,7 +971,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1230,7 +1230,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "grith-audit"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "libc",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "grith-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "grith-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "grith-digest"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "grith-docgen"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "grith-llm"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "futures",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "grith-notify"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "grith-proxy"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "grith-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "grith-supervisor"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "grith-tests"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -1500,9 +1500,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2243,7 +2243,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2581,7 +2581,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2862,7 +2862,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3288,7 +3288,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.3",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

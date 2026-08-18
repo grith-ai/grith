@@ -32,6 +32,65 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Compile-only aarch64 cross-check (runs on x86 runners): arch regressions
+  # in the supervisor fail fast in every PR without waiting for arm64
+  # hardware. Native arm64 test execution is the separate test-arm64 job.
+  cross-check-aarch64:
+    name: Cross-check (aarch64)
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-check-aarch64
+
+      - name: Install aarch64 cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Clippy (aarch64-unknown-linux-gnu)
+        run: cargo clippy --target aarch64-unknown-linux-gnu -p grith-supervisor --all-targets -- -D warnings
+
+  # Native arm64 execution of the full workspace (work/78 PR D): the
+  # supervisor's ptrace+seccomp semantics cannot be validated by qemu-user,
+  # so the aarch64 backend is tested on a real arm64 kernel here. Rust-only —
+  # the dashboard steps stay on the x86 Test job.
+  test-arm64:
+    name: Test (arm64)
+    runs-on: ubuntu-24.04-arm
+    # A wedged tracee blocks next_event() indefinitely (the in-test timeout
+    # asserts only fire between events) — bound the job instead of hanging.
+    timeout-minutes: 45
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-arm64
+
+      # The ptrace integration tests compile C helpers with `cc` at test
+      # time (a hard .expect, not a skip) and rusqlite builds bundled
+      # sqlite3 — make the toolchain explicit rather than trusting the
+      # image default.
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Run tests
+        run: cargo test --workspace
+
   test:
     name: Test
     runs-on: ubuntu-latest

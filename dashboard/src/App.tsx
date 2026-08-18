@@ -9,8 +9,14 @@ import { SettingsPage } from "@/pages/Settings";
 import { BillingPage } from "@/pages/Billing";
 import { InventoryPage } from "@/pages/Inventory";
 import { ListenerRewritesPage } from "@/pages/ListenerRewrites";
-import { getHealth, getSessions, shutdownServer } from "@/lib/api";
+import {
+  getHealth,
+  getSessions,
+  shutdownServer,
+  getOnboardingStatus,
+} from "@/lib/api";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { IntroOverlay } from "@/components/IntroOverlay";
 
 // ---------------------------------------------------------------------------
 // Navigation items
@@ -119,6 +125,20 @@ export function App() {
   // the first successful response — the sidebar chip stays blank
   // rather than showing a stale hardcoded number.
   const [daemonVersion, setDaemonVersion] = useState("");
+  // First-run explainer, shown once when the dashboard auto-opens in a browser.
+  // Gated by the server `intro_seen` marker so it appears once per machine, not
+  // once per browser.
+  const [showIntro, setShowIntro] = useState(false);
+
+  useEffect(() => {
+    getOnboardingStatus()
+      .then((status) => {
+        if (!status.intro_seen) setShowIntro(true);
+      })
+      .catch(() => {
+        // Best-effort: if status can't be read, just don't show the overlay.
+      });
+  }, []);
 
   useEffect(() => {
     async function poll() {
@@ -168,6 +188,7 @@ export function App() {
 
   return (
     <div className="flex h-screen overflow-hidden">
+      {showIntro && <IntroOverlay onClose={() => setShowIntro(false)} />}
       {/* Sidebar */}
       <aside className="w-56 flex-shrink-0 bg-surface border-r border-border flex flex-col">
         {/* Logo - the canonical mark from public/grith.svg (accent #00e5a0

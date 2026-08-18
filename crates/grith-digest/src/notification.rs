@@ -83,12 +83,15 @@ impl FeatureGate {
 
     /// Maximum concurrent supervisor sessions allowed by the license.
     ///
-    /// Community: 2, Pro: seats * 4 (min 4), Enterprise: seats * 8 (min 8).
+    /// Community (free): a hard cap of 2 — the free-tier lever. Paid tiers get a
+    /// generous flat 64: a supervised session is a local process (its own ptrace
+    /// tracer on the user's machine), so concurrency is not a meaningful server
+    /// cost and paying users should not hit a session wall in normal use. Seats
+    /// gate team features elsewhere, not local session concurrency.
     pub fn max_sessions(&self) -> usize {
         match self.tier {
             PlanTier::Community => 2,
-            PlanTier::Pro => (self.seats as usize * 4).max(4),
-            PlanTier::Enterprise => (self.seats as usize * 8).max(8),
+            PlanTier::Pro | PlanTier::Enterprise => 64,
         }
     }
 

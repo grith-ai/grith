@@ -202,6 +202,12 @@ impl SyscallInterceptor for EndpointSecuritySupervisor {
         }
     }
 
+    async fn kill(&mut self, pid: u32) -> Result<()> {
+        // Endpoint Security cannot EPERM a syscall; a `deny` here already means
+        // SIGKILL, so `kill` and `deny` are the same operation on macOS.
+        self.deny(pid).await
+    }
+
     async fn freeze(&mut self, pid: u32) -> Result<()> {
         Self::send_signal(pid, Signal::SIGSTOP, "freeze")
     }

@@ -165,8 +165,42 @@ const EPHEMERAL_ROOTS: &[&str] = &[
     "/run/",
 ];
 
+/// Regenerable build-artifact directory segments, matched as whole path
+/// components anywhere in the target. A deletion under one of these is
+/// toolchain-owned churn (compiler caches, package installs), not the user's
+/// valuable data - even when it happens outside the session's working tree.
+/// Incident: a session rooted in one repo ran `cargo` in a sibling repo and
+/// tripped the signal on hundreds of incremental artifacts under the
+/// sibling's `target/debug/` (see `work/findings/mass-destruction-cargo-
+/// churn-prompt-flood-2026-08-17.md`).
+///
+/// Deliberately narrow: unambiguous, toolchain-owned names only. Generic
+/// output dirs (`build/`, `dist/`, `out/`) hold real deliverables in some
+/// projects and must NOT be listed. Staging valuable files INTO one of
+/// these directories before deleting them does not evade the signal: the
+/// staging renames count their `old_path` (see [`destructive_target`]),
+/// which still sits in the valuable tree.
+const BUILD_ARTIFACT_SEGMENTS: &[&str] = &[
+    "/target/debug/",
+    "/target/release/",
+    "/node_modules/",
+    "/__pycache__/",
+    "/.git/objects/",
+    "/.next/",
+];
+
 fn is_ephemeral(target: &str) -> bool {
     if EPHEMERAL_ROOTS.iter().any(|p| target.starts_with(p)) {
+        return true;
+    }
+    // Absolute paths make `contains` boundary-safe here: every segment is
+    // wrapped in `/`, so `/home/u/mytarget/debug/x` does not match
+    // `/target/debug/` and `/repo/node_modules_backup/x` does not match
+    // `/node_modules/`.
+    if BUILD_ARTIFACT_SEGMENTS
+        .iter()
+        .any(|seg| target.contains(seg))
+    {
         return true;
     }
     if let Some(cache) = home_cache_prefix() {
@@ -338,6 +372,46 @@ mod tests {
             &[],
             &[]
         ));
+    }
+
+    /// The 2026-08-17 incident shape: cargo (or npm/python/git) churn in a
+    /// SIBLING repo - outside the working root, so the in-tree exclusion
+    /// misses it - must classify as ephemeral, not valuable.
+    #[test]
+    fn sibling_repo_build_artifacts_never_count() {
+        let working = Path::new("/home/u/proj-website");
+        for p in [
+            "/home/u/proj/target/debug/incremental/net-9a598f.rcgu.o",
+            "/home/u/proj/target/release/deps/libfoo.rlib",
+            "/home/u/proj/node_modules/.cache/esbuild/x.js",
+            "/home/u/proj/src/__pycache__/mod.cpython-312.pyc",
+            "/home/u/proj/.git/objects/ab/cdef0123",
+            "/home/u/proj/.next/cache/webpack/chunk.js",
+        ] {
+            assert!(
+                !is_valuable_out_of_tree(p, Some(working), &[], &[]),
+                "build artifact counted as valuable: {p}"
+            );
+        }
+    }
+
+    /// The build-dir exemption must match whole directory components only -
+    /// look-alike names that merely share a prefix or suffix still count.
+    #[test]
+    fn build_segment_lookalikes_still_count() {
+        let working = Path::new("/home/u/proj-website");
+        for p in [
+            "/home/u/mytarget/debug/data.db",
+            "/home/u/proj/targets/debug/data.db",
+            "/home/u/proj/target/debugged/data.db",
+            "/home/u/proj/node_modules_backup/real-code.js",
+            "/home/u/proj/.gitlab/objects/data.db",
+        ] {
+            assert!(
+                is_valuable_out_of_tree(p, Some(working), &[], &[]),
+                "look-alike wrongly exempted: {p}"
+            );
+        }
     }
 
     #[test]

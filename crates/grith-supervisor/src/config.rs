@@ -13,7 +13,7 @@
 //! enabled = true
 //! default_profile = "generic"
 //! freeze_timeout_seconds = 300
-//! max_concurrent_sessions = 4
+//! max_concurrent_sessions = 64
 //! pty_forwarding = true
 //!
 //! [supervisor.platform]
@@ -71,6 +71,12 @@ pub struct SupervisorConfig {
     /// Maximum number of concurrently supervised sessions. Attempting to
     /// start a new session beyond this limit returns
     /// [`Error::SessionLimitReached`](crate::error::Error::SessionLimitReached).
+    ///
+    /// This is a **local safety valve**: the daemon enforces the *lower* of
+    /// this value and the license entitlement (Community 2, paid 64), so it can
+    /// only ever tighten the cap, never raise it above the licence. It defaults
+    /// to the paid session cap (64) so it does not silently clamp a paid
+    /// entitlement; lower it if you want a hard local ceiling.
     pub max_concurrent_sessions: usize,
 
     /// Whether to allocate a PTY and forward stdin/stdout/stderr so the
@@ -322,7 +328,7 @@ impl Default for SupervisorConfig {
             freeze_timeout_seconds: 300,
             deny_replay_seconds: 60,
             approve_replay_seconds: 60,
-            max_concurrent_sessions: 4,
+            max_concurrent_sessions: 64,
             pty_forwarding: true,
             platform: PlatformConfig::default(),
             noise_reduction: NoiseConfig::default(),
@@ -625,7 +631,7 @@ mod tests {
         assert!(cfg.enabled);
         assert!(cfg.default_profile.is_empty());
         assert_eq!(cfg.freeze_timeout_seconds, 300);
-        assert_eq!(cfg.max_concurrent_sessions, 4);
+        assert_eq!(cfg.max_concurrent_sessions, 64);
         assert!(cfg.pty_forwarding);
         // require_sandbox defaults to false so existing deployments are unaffected.
         assert!(!cfg.require_sandbox);
@@ -734,7 +740,7 @@ mod tests {
         assert!(cfg.enabled);
         assert!(cfg.default_profile.is_empty());
         assert_eq!(cfg.freeze_timeout_seconds, 300);
-        assert_eq!(cfg.max_concurrent_sessions, 4);
+        assert_eq!(cfg.max_concurrent_sessions, 64);
         assert!(cfg.pty_forwarding);
         assert_eq!(cfg.platform.linux_mechanism, "ptrace");
         assert!(!cfg.platform.seccomp_pre_filter);

@@ -333,6 +333,9 @@ int main(int argc, char **argv) {
             .unwrap_or(false)
     }
 
+    /// Only the x86-gated compat/x32 tests need a no-PIE build (static
+    /// path strings below 4 GiB for 32-bit argument registers).
+    #[cfg(target_arch = "x86_64")]
     fn compile_c_program_no_pie(dir: &Path, name: &str, source: &str) -> PathBuf {
         let src_path = dir.join(format!("{name}.c"));
         let bin_path = dir.join(name);
@@ -355,6 +358,7 @@ int main(int argc, char **argv) {
         bin_path
     }
 
+    #[cfg(target_arch = "x86_64")]
     /// Run `binary`, denying only `ForeignAbiSyscall` events and allowing
     /// everything else. Returns the observed foreign-ABI events.
     async fn trace_denying_foreign_abi(binary: &Path, args: &[String]) -> Vec<SyscallKind> {
@@ -393,6 +397,10 @@ int main(int argc, char **argv) {
     ///
     /// The helper is built `-no-pie` so its static path string lives below
     /// 4 GiB and fits the 32-bit `ebx` argument register.
+    // The helper embeds x86 assembly (int 0x80 / x32 syscall instructions);
+    // the compat/x32 surfaces it exercises exist only on x86_64. arm64's
+    // foreign-ABI surface is covered by armhf_compat_binary_fails_closed_on_arm64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn int80_compat_syscall_is_intercepted_and_deniable() {
         if already_traced() {
@@ -481,6 +489,10 @@ int main(int argc, char **argv) {{
     /// through the x86_64 table (i386 `open` is 5, which is `fstat` there) and
     /// waved through. The decision is taken from `PTRACE_GET_SYSCALL_INFO`
     /// instead, which the kernel fills in and no filter can influence.
+    // The helper embeds x86 assembly (int 0x80 / x32 syscall instructions);
+    // the compat/x32 surfaces it exercises exist only on x86_64. arm64's
+    // foreign-ABI surface is covered by armhf_compat_binary_fails_closed_on_arm64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn tracee_installed_seccomp_filter_cannot_forge_the_abi_marker() {
         if already_traced() {
@@ -576,6 +588,10 @@ int main(int argc, char **argv) {{
     /// B1: x32 syscall numbers (`nr | 0x40000000`) carry
     /// `AUDIT_ARCH_X86_64` but match no entry in the x86_64 table, so before
     /// the fix they fell through the JEQ chain to `SECCOMP_RET_ALLOW`.
+    // The helper embeds x86 assembly (int 0x80 / x32 syscall instructions);
+    // the compat/x32 surfaces it exercises exist only on x86_64. arm64's
+    // foreign-ABI surface is covered by armhf_compat_binary_fails_closed_on_arm64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn x32_syscall_number_is_intercepted() {
         if already_traced() {

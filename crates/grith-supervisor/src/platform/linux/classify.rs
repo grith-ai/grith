@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 use crate::interceptor::{NetProtocol, OpenFlags, SyscallKind};
 
-use super::syscall_nr;
+use super::arch::SysId;
 use super::PtraceSupervisor;
 
 // ---------------------------------------------------------------------------
@@ -28,54 +28,56 @@ use super::PtraceSupervisor;
 // ---------------------------------------------------------------------------
 
 impl PtraceSupervisor {
-    /// Classify the current syscall (identified by register state) into a
-    /// [`SyscallKind`].
+    /// Classify the current syscall (identified by its number and argument
+    /// slots) into a [`SyscallKind`].
     ///
-    /// The x86_64 calling convention places the syscall number in `orig_rax`
-    /// and the first six arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`.
+    /// `regs` is the arch-neutral view built once per stop: `regs.nr` is the
+    /// native syscall number and `regs.args[0..=5]` the six arguments in ABI
+    /// order (see [`super::arch::SyscallRegs`]).
     ///
     /// Returns `None` for syscalls that we do not classify (should not happen
     /// for numbers in the `SECURITY_RELEVANT` set, but handled gracefully).
     pub(super) fn classify_syscall(
         &self,
         pid: Pid,
-        regs: &libc::user_regs_struct,
+        regs: &super::arch::SyscallRegs,
     ) -> Result<Option<SyscallKind>> {
-        let nr = regs.orig_rax as i64;
+        let nr = regs.nr;
+        let sid = super::arch::sys_id(nr);
         let pid_u32 = pid.as_raw() as u32;
 
-        match nr {
+        match sid {
             // ---------------------------------------------------------------
             // File open family
             // ---------------------------------------------------------------
-            syscall_nr::OPEN => {
+            Some(SysId::Open) => {
                 // open(pathname, flags, mode)
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 // O_NOFOLLOW makes the kernel refuse to follow a final-
                 // component symlink (it returns ELOOP), so scoring the
                 // target would be a false read of a file that was never
                 // opened. Resolve the link itself in that case.
-                let path = if Self::open_is_nofollow(regs.rsi) {
+                let path = if Self::open_is_nofollow(regs.args[1]) {
                     Self::canonicalize_for_tracee_nofollow(pid_u32, &path)
                 } else {
                     Self::canonicalize_for_tracee(pid_u32, &path)
                 };
-                let flags = Self::decode_open_flags(regs.rsi);
+                let flags = Self::decode_open_flags(regs.args[1]);
                 Ok(Some(SyscallKind::FileOpen { path, flags }))
             }
-            syscall_nr::OPENAT => {
+            Some(SysId::Openat) => {
                 // openat(dirfd, pathname, flags, mode)
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let dirfd = regs.rdi as i32;
-                let path = if Self::open_is_nofollow(regs.rdx) {
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let dirfd = regs.args[0] as i32;
+                let path = if Self::open_is_nofollow(regs.args[2]) {
                     Self::resolve_at_path_nofollow(pid_u32, dirfd, &raw_path)
                 } else {
                     Self::resolve_at_path(pid_u32, dirfd, &raw_path)
                 };
-                let flags = Self::decode_open_flags(regs.rdx);
+                let flags = Self::decode_open_flags(regs.args[2]);
                 Ok(Some(SyscallKind::FileOpen { path, flags }))
             }
-            syscall_nr::OPENAT2 => {
+            Some(SysId::Openat2) => {
                 // openat2(dirfd, pathname, how, size)
                 //
                 // `how` is a `struct open_how { __u64 flags, mode, resolve }`
@@ -112,10 +114,10 @@ impl PtraceSupervisor {
                 // being dereferenced.
                 const OPEN_HOW_SIZE: u64 = 24;
 
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let dirfd = regs.rdi as i32;
-                let how_ptr = regs.rdx;
-                let size = regs.r10;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let dirfd = regs.args[0] as i32;
+                let how_ptr = regs.args[2];
+                let size = regs.args[3];
 
                 let flags = if how_ptr == 0 || size < OPEN_HOW_SIZE {
                     OpenFlags::ReadOnly
@@ -137,7 +139,7 @@ impl PtraceSupervisor {
                 let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
                 Ok(Some(SyscallKind::FileOpen { path, flags }))
             }
-            syscall_nr::RMDIR => {
+            Some(SysId::Rmdir) => {
                 // rmdir(pathname) — the legacy directory removal. Its
                 // numeric neighbours were added for B2; leaving this out
                 // would have left the same class of gap one syscall over.
@@ -147,13 +149,13 @@ impl PtraceSupervisor {
                 // no-follow resolver like unlink/rename. Following would
                 // report a delete of the symlink's target for a syscall the
                 // kernel refuses.
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let path = Self::canonicalize_for_tracee_nofollow(pid_u32, &path);
                 Ok(Some(SyscallKind::FileDelete { path }))
             }
-            syscall_nr::CREAT => {
+            Some(SysId::Creat) => {
                 // creat(pathname, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC)
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let path = Self::canonicalize_for_tracee(pid_u32, &path);
                 Ok(Some(SyscallKind::FileOpen {
                     path,
@@ -165,16 +167,16 @@ impl PtraceSupervisor {
             // Truncation — destructive writes that never pass through
             // open()/write().
             // ---------------------------------------------------------------
-            syscall_nr::TRUNCATE => {
+            Some(SysId::Truncate) => {
                 // truncate(pathname, length)
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let path = Self::canonicalize_for_tracee(pid_u32, &path);
                 Ok(Some(SyscallKind::FileWrite {
                     fd: -1,
                     path: Some(path),
                 }))
             }
-            syscall_nr::FTRUNCATE => {
+            Some(SysId::Ftruncate) => {
                 // ftruncate(fd, length)
                 //
                 // ftruncate is its own control point — unlike write(2), there
@@ -183,7 +185,7 @@ impl PtraceSupervisor {
                 // maps to noise (allow-and-forget); a `<fd:N>` placeholder
                 // keeps the destructive resize visible and audited, as fchmod
                 // already does for an unresolvable fd.
-                let fd = regs.rdi as i32;
+                let fd = regs.args[0] as i32;
                 let path = Some(
                     Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>")),
                 );
@@ -193,10 +195,10 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Link creation — scored by target (see SyscallKind::FileLink)
             // ---------------------------------------------------------------
-            syscall_nr::SYMLINK => {
+            Some(SysId::Symlink) => {
                 // symlink(target, linkpath)
-                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let link_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let target = self.read_tracee_string(pid, regs.args[0], 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 Ok(Some(SyscallKind::FileLink {
                     // Resolve the target the way a later open of the link
                     // will: fully, including any symlink chain. A symlink
@@ -210,40 +212,40 @@ impl PtraceSupervisor {
                     symbolic: true,
                 }))
             }
-            syscall_nr::SYMLINKAT => {
+            Some(SysId::Symlinkat) => {
                 // symlinkat(target, newdirfd, linkpath)
-                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let link_raw = self.read_tracee_string(pid, regs.rdx, 4096)?;
-                let newdirfd = regs.rsi as i32;
+                let target = self.read_tracee_string(pid, regs.args[0], 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.args[2], 4096)?;
+                let newdirfd = regs.args[1] as i32;
                 Ok(Some(SyscallKind::FileLink {
                     target: Self::canonicalize_for_tracee(pid_u32, &target),
                     link_path: Self::resolve_at_path_nofollow(pid_u32, newdirfd, &link_raw),
                     symbolic: true,
                 }))
             }
-            syscall_nr::LINK => {
+            Some(SysId::Link) => {
                 // link(oldpath, newpath) — Linux does not follow oldpath, so
                 // the hard link is created against the link itself. Report
                 // what the kernel will act on.
-                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let link_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let target = self.read_tracee_string(pid, regs.args[0], 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 Ok(Some(SyscallKind::FileLink {
                     target: Self::canonicalize_for_tracee_nofollow(pid_u32, &target),
                     link_path: Self::canonicalize_for_tracee_nofollow(pid_u32, &link_raw),
                     symbolic: false,
                 }))
             }
-            syscall_nr::LINKAT => {
+            Some(SysId::Linkat) => {
                 // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
                 //
                 // AT_SYMLINK_FOLLOW (0x400) in `flags` makes linkat resolve
                 // oldpath, which is how a hard link to a symlink's *target*
                 // is created — score what the kernel will link to.
-                let target_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let link_raw = self.read_tracee_string(pid, regs.r10, 4096)?;
-                let olddirfd = regs.rdi as i32;
-                let newdirfd = regs.rdx as i32;
-                let follow = regs.r8 as i32 & libc::AT_SYMLINK_FOLLOW != 0;
+                let target_raw = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let link_raw = self.read_tracee_string(pid, regs.args[3], 4096)?;
+                let olddirfd = regs.args[0] as i32;
+                let newdirfd = regs.args[2] as i32;
+                let follow = regs.args[4] as i32 & libc::AT_SYMLINK_FOLLOW != 0;
                 let target = if follow {
                     Self::resolve_at_path(pid_u32, olddirfd, &target_raw)
                 } else {
@@ -259,15 +261,15 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // File read / write
             // ---------------------------------------------------------------
-            syscall_nr::READ => {
+            Some(SysId::Read) => {
                 // read(fd, buf, count)
-                let fd = regs.rdi as i32;
+                let fd = regs.args[0] as i32;
                 let path = Self::resolve_fd_path(pid_u32, fd);
                 Ok(Some(SyscallKind::FileRead { fd, path }))
             }
-            syscall_nr::WRITE => {
+            Some(SysId::Write) => {
                 // write(fd, buf, count)
-                let fd = regs.rdi as i32;
+                let fd = regs.args[0] as i32;
                 let path = Self::resolve_fd_path(pid_u32, fd);
                 Ok(Some(SyscallKind::FileWrite { fd, path }))
             }
@@ -275,11 +277,11 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Memory-mapped file read
             // ---------------------------------------------------------------
-            syscall_nr::MMAP => {
+            Some(SysId::Mmap) => {
                 // mmap(addr, length, prot, flags, fd, offset)
-                // rdi=addr, rsi=length, rdx=prot, r10=flags, r8=fd, r9=offset
-                let flags = regs.r10 as i32;
-                let fd = regs.r8 as i32;
+                // a0=addr, a1=length, a2=prot, a3=flags, a4=fd, a5=offset
+                let flags = regs.args[3] as i32;
+                let fd = regs.args[4] as i32;
                 const MAP_ANONYMOUS: i32 = 0x20;
                 if fd < 0 || (flags & MAP_ANONYMOUS != 0) {
                     // Anonymous mapping — not file-backed, no security relevance.
@@ -293,16 +295,16 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // File delete
             // ---------------------------------------------------------------
-            syscall_nr::UNLINK => {
+            Some(SysId::Unlink) => {
                 // unlink(pathname) — removes the link, never its target.
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let path = Self::canonicalize_for_tracee_nofollow(pid_u32, &path);
                 Ok(Some(SyscallKind::FileDelete { path }))
             }
-            syscall_nr::UNLINKAT => {
+            Some(SysId::Unlinkat) => {
                 // unlinkat(dirfd, pathname, flags)
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let dirfd = regs.rdi as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let dirfd = regs.args[0] as i32;
                 let path = Self::resolve_at_path_nofollow(pid_u32, dirfd, &raw_path);
                 Ok(Some(SyscallKind::FileDelete { path }))
             }
@@ -310,31 +312,31 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // File rename
             // ---------------------------------------------------------------
-            syscall_nr::RENAME => {
+            Some(SysId::Rename) => {
                 // rename(oldpath, newpath)
-                let old_path = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let new_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+                let old_path = self.read_tracee_string(pid, regs.args[0], 4096)?;
+                let new_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 // rename operates on the links themselves.
                 let old_path = Self::canonicalize_for_tracee_nofollow(pid_u32, &old_path);
                 let new_path = Self::canonicalize_for_tracee_nofollow(pid_u32, &new_path);
                 Ok(Some(SyscallKind::FileRename { old_path, new_path }))
             }
-            syscall_nr::RENAMEAT => {
+            Some(SysId::Renameat) => {
                 // renameat(olddirfd, oldpath, newdirfd, newpath)
-                let old_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let new_raw = self.read_tracee_string(pid, regs.r10, 4096)?;
-                let old_dirfd = regs.rdi as i32;
-                let new_dirfd = regs.rdx as i32;
+                let old_raw = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let new_raw = self.read_tracee_string(pid, regs.args[3], 4096)?;
+                let old_dirfd = regs.args[0] as i32;
+                let new_dirfd = regs.args[2] as i32;
                 let old_path = Self::resolve_at_path_nofollow(pid_u32, old_dirfd, &old_raw);
                 let new_path = Self::resolve_at_path_nofollow(pid_u32, new_dirfd, &new_raw);
                 Ok(Some(SyscallKind::FileRename { old_path, new_path }))
             }
-            syscall_nr::RENAMEAT2 => {
+            Some(SysId::Renameat2) => {
                 // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-                let old_raw = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let new_raw = self.read_tracee_string(pid, regs.r10, 4096)?;
-                let old_dirfd = regs.rdi as i32;
-                let new_dirfd = regs.rdx as i32;
+                let old_raw = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let new_raw = self.read_tracee_string(pid, regs.args[3], 4096)?;
+                let old_dirfd = regs.args[0] as i32;
+                let new_dirfd = regs.args[2] as i32;
                 let old_path = Self::resolve_at_path_nofollow(pid_u32, old_dirfd, &old_raw);
                 let new_path = Self::resolve_at_path_nofollow(pid_u32, new_dirfd, &new_raw);
                 Ok(Some(SyscallKind::FileRename { old_path, new_path }))
@@ -343,55 +345,55 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // File chmod
             // ---------------------------------------------------------------
-            syscall_nr::CHMOD => {
+            Some(SysId::Chmod) => {
                 // chmod(pathname, mode)
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let path = Self::canonicalize_for_tracee(pid_u32, &path);
-                let mode = regs.rsi as u32;
+                let mode = regs.args[1] as u32;
                 Ok(Some(SyscallKind::FileChmod { path, mode }))
             }
-            syscall_nr::FCHMOD => {
+            Some(SysId::Fchmod) => {
                 // fchmod(fd, mode)
-                let fd = regs.rdi as i32;
+                let fd = regs.args[0] as i32;
                 let path =
                     Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>"));
-                let mode = regs.rsi as u32;
+                let mode = regs.args[1] as u32;
                 Ok(Some(SyscallKind::FileChmod { path, mode }))
             }
-            syscall_nr::FCHMODAT => {
+            Some(SysId::Fchmodat) => {
                 // fchmodat(dirfd, pathname, mode, flags)
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let dirfd = regs.rdi as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let dirfd = regs.args[0] as i32;
                 let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
-                let mode = regs.rdx as u32;
+                let mode = regs.args[2] as u32;
                 Ok(Some(SyscallKind::FileChmod { path, mode }))
             }
 
             // ---------------------------------------------------------------
             // Directory create
             // ---------------------------------------------------------------
-            syscall_nr::MKDIR => {
+            Some(SysId::Mkdir) => {
                 // mkdir(pathname, mode)
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let path = Self::canonicalize_for_tracee(pid_u32, &path);
-                let mode = regs.rsi as u32;
+                let mode = regs.args[1] as u32;
                 Ok(Some(SyscallKind::DirCreate { path, mode }))
             }
-            syscall_nr::MKDIRAT => {
+            Some(SysId::Mkdirat) => {
                 // mkdirat(dirfd, pathname, mode)
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let dirfd = regs.rdi as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let dirfd = regs.args[0] as i32;
                 let path = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
-                let mode = regs.rdx as u32;
+                let mode = regs.args[2] as u32;
                 Ok(Some(SyscallKind::DirCreate { path, mode }))
             }
 
             // ---------------------------------------------------------------
             // Directory list
             // ---------------------------------------------------------------
-            syscall_nr::GETDENTS64 => {
+            Some(SysId::Getdents64) => {
                 // getdents64(fd, dirp, count)
-                let fd = regs.rdi as i32;
+                let fd = regs.args[0] as i32;
                 let path =
                     Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>"));
                 Ok(Some(SyscallKind::DirList { path }))
@@ -400,19 +402,19 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Process exec
             // ---------------------------------------------------------------
-            syscall_nr::EXECVE => {
+            Some(SysId::Execve) => {
                 // execve(pathname, argv, envp)
-                let path = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let args = self.read_tracee_string_array(pid, regs.rsi, 256)?;
+                let path = self.read_tracee_string(pid, regs.args[0], 4096)?;
+                let args = self.read_tracee_string_array(pid, regs.args[1], 256)?;
                 Ok(Some(SyscallKind::ProcessExec { path, args }))
             }
 
-            syscall_nr::EXECVEAT => {
+            Some(SysId::Execveat) => {
                 // execveat(dirfd, pathname, argv, envp, flags)
-                // rdi = dirfd, rsi = pathname, rdx = argv
-                let dirfd = regs.rdi as i32;
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let args = self.read_tracee_string_array(pid, regs.rdx, 256)?;
+                // a0 = dirfd, a1 = pathname, a2 = argv
+                let dirfd = regs.args[0] as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let args = self.read_tracee_string_array(pid, regs.args[2], 256)?;
 
                 // Resolve relative to dirfd. If the pathname is absolute the
                 // dirfd is ignored (kernel semantics). For relative paths,
@@ -434,7 +436,7 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Process fork / clone
             // ---------------------------------------------------------------
-            syscall_nr::FORK | syscall_nr::CLONE | syscall_nr::CLONE3 => {
+            Some(SysId::Fork) | Some(SysId::Clone) | Some(SysId::Clone3) => {
                 // At syscall-entry the child PID is not yet known (the
                 // kernel has not assigned it). We emit child_pid: 0 here.
                 //
@@ -456,13 +458,13 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Networking
             // ---------------------------------------------------------------
-            syscall_nr::CONNECT => {
+            Some(SysId::Connect) => {
                 // connect(sockfd, addr, addrlen)
-                let sockfd = regs.rdi as i32;
+                let sockfd = regs.args[0] as i32;
                 match self.read_sockaddr(
                     pid,
-                    regs.rsi,
-                    regs.rdx as usize,
+                    regs.args[1],
+                    regs.args[2] as usize,
                     Some((pid_u32, sockfd)),
                 )? {
                     Some((address, port, protocol)) => Ok(Some(SyscallKind::NetConnect {
@@ -473,11 +475,11 @@ impl PtraceSupervisor {
                     None => Ok(None), // Non-internet socket family — silently allow
                 }
             }
-            syscall_nr::BIND => {
+            Some(SysId::Bind) => {
                 // bind(sockfd, addr, addrlen)
-                let sockfd = regs.rdi as i32;
-                let sockaddr_ptr = regs.rsi;
-                let addrlen = regs.rdx as u32;
+                let sockfd = regs.args[0] as i32;
+                let sockaddr_ptr = regs.args[1];
+                let addrlen = regs.args[2] as u32;
                 match self.read_sockaddr(
                     pid,
                     sockaddr_ptr,
@@ -498,14 +500,14 @@ impl PtraceSupervisor {
                     None => Ok(None),
                 }
             }
-            syscall_nr::SENDTO => {
+            Some(SysId::Sendto) => {
                 // sendto(sockfd, buf, len, flags, dest_addr, addrlen)
-                if regs.r8 != 0 {
-                    let sockfd = regs.rdi as i32;
+                if regs.args[4] != 0 {
+                    let sockfd = regs.args[0] as i32;
                     match self.read_sockaddr(
                         pid,
-                        regs.r8,
-                        regs.r9 as usize,
+                        regs.args[4],
+                        regs.args[5] as usize,
                         Some((pid_u32, sockfd)),
                     )? {
                         Some((address, port, _protocol)) => {
@@ -527,7 +529,7 @@ impl PtraceSupervisor {
             // tracked DNS socket it is promoted to catch its syscall-exit so the
             // kernel-filled response buffer can be read for the DNS cache. Here
             // (and for any non-DNS recvfrom) it is noise → immediately resumed.
-            syscall_nr::RECVFROM | syscall_nr::RECVMSG | syscall_nr::RECVMMSG => Ok(None),
+            Some(SysId::Recvfrom) | Some(SysId::Recvmsg) | Some(SysId::Recvmmsg) => Ok(None),
 
             // sendmsg/sendmmsg on a DNS or connected socket are handled in the
             // interceptor loop before classify is reached. What reaches here
@@ -537,13 +539,13 @@ impl PtraceSupervisor {
             // review round 2). A send with no `msg_name` (msg_namelen == 0)
             // stays noise.
             //
-            // sendmsg: rsi = *msghdr. sendmmsg: rsi = *mmsghdr[], and mmsghdr
+            // sendmsg: a1 = *msghdr. sendmmsg: a1 = *mmsghdr[], and mmsghdr
             // begins with its msghdr, so the first message's header is at the
             // same offset — reading the first message covers the common
             // single-message case (a full batch scan would be unbounded
             // PEEKDATA on the hot path; documented residual).
-            syscall_nr::SENDMSG | syscall_nr::SENDMMSG => {
-                match self.read_msghdr_destination(pid, regs.rsi)? {
+            Some(SysId::Sendmsg) | Some(SysId::Sendmmsg) => {
+                match self.read_msghdr_destination(pid, regs.args[1])? {
                     Some((address, port)) => Ok(Some(SyscallKind::NetSendTo { address, port })),
                     None => Ok(None),
                 }
@@ -552,12 +554,12 @@ impl PtraceSupervisor {
             // Socket FD lifecycle is consumed by the DNS socket tracker in
             // events.rs. It is security-relevant only for maintaining exact
             // attribution state and does not produce a policy event itself.
-            syscall_nr::CLOSE
-            | syscall_nr::CLOSE_RANGE
-            | syscall_nr::DUP
-            | syscall_nr::DUP2
-            | syscall_nr::DUP3
-            | syscall_nr::FCNTL => Ok(None),
+            Some(SysId::Close)
+            | Some(SysId::CloseRange)
+            | Some(SysId::Dup)
+            | Some(SysId::Dup2)
+            | Some(SysId::Dup3)
+            | Some(SysId::Fcntl) => Ok(None),
 
             // ---------------------------------------------------------------
             // Raw socket creation
@@ -574,11 +576,11 @@ impl PtraceSupervisor {
             // time, so intercepting socket() for them would add noise and overhead
             // without security benefit.
             // ---------------------------------------------------------------
-            syscall_nr::SOCKET => {
+            Some(SysId::Socket) => {
                 // socket(domain, type, protocol)
-                let domain = regs.rdi as i32;
-                let socket_type = regs.rsi as i32;
-                let protocol = regs.rdx as i32;
+                let domain = regs.args[0] as i32;
+                let socket_type = regs.args[1] as i32;
+                let protocol = regs.args[2] as i32;
                 const AF_NETLINK: i32 = 16;
                 const AF_PACKET: i32 = 17;
                 const NETLINK_ROUTE: i32 = 0;
@@ -606,8 +608,8 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // Pipes and socket pairs
             // ---------------------------------------------------------------
-            syscall_nr::PIPE | syscall_nr::PIPE2 => Ok(Some(SyscallKind::PipeCreate)),
-            syscall_nr::SOCKETPAIR => Ok(Some(SyscallKind::SocketPair)),
+            Some(SysId::Pipe) | Some(SysId::Pipe2) => Ok(Some(SyscallKind::PipeCreate)),
+            Some(SysId::Socketpair) => Ok(Some(SyscallKind::SocketPair)),
 
             // ---------------------------------------------------------------
             // Kernel-bypass fd-to-fd transfers
@@ -624,25 +626,25 @@ impl PtraceSupervisor {
             // is an anonymous pipe or socket, resolve_fd_path returns None and
             // the filter produces a near-zero score, which is correct.
             // ---------------------------------------------------------------
-            syscall_nr::SENDFILE => {
+            Some(SysId::Sendfile) => {
                 // sendfile(out_fd, in_fd, offset, count)
-                // rdi = out_fd (destination, often a socket)
-                // rsi = in_fd  (source, often a file)
-                let in_fd = regs.rsi as i32;
+                // a0 = out_fd (destination, often a socket)
+                // a1 = in_fd  (source, often a file)
+                let in_fd = regs.args[1] as i32;
                 let path = Self::resolve_fd_path(pid_u32, in_fd);
                 Ok(Some(SyscallKind::FileRead { fd: in_fd, path }))
             }
-            syscall_nr::SPLICE => {
+            Some(SysId::Splice) => {
                 // splice(fd_in, off_in, fd_out, off_out, len, flags)
-                // rdi = fd_in (source)
-                let in_fd = regs.rdi as i32;
+                // a0 = fd_in (source)
+                let in_fd = regs.args[0] as i32;
                 let path = Self::resolve_fd_path(pid_u32, in_fd);
                 Ok(Some(SyscallKind::FileRead { fd: in_fd, path }))
             }
-            syscall_nr::TEE => {
+            Some(SysId::Tee) => {
                 // tee(fd_in, fd_out, len, flags)
-                // rdi = fd_in (source pipe)
-                let in_fd = regs.rdi as i32;
+                // a0 = fd_in (source pipe)
+                let in_fd = regs.args[0] as i32;
                 let path = Self::resolve_fd_path(pid_u32, in_fd);
                 Ok(Some(SyscallKind::FileRead { fd: in_fd, path }))
             }
@@ -663,9 +665,9 @@ impl PtraceSupervisor {
             // io_uring_setup at startup and falls back to epoll + standard
             // syscalls on EPERM, so this has no practical compatibility cost.
             // ---------------------------------------------------------------
-            syscall_nr::IO_URING_SETUP
-            | syscall_nr::IO_URING_ENTER
-            | syscall_nr::IO_URING_REGISTER => Ok(Some(SyscallKind::IoUringSetup)),
+            Some(SysId::IoUringSetup)
+            | Some(SysId::IoUringEnter)
+            | Some(SysId::IoUringRegister) => Ok(Some(SyscallKind::IoUringSetup)),
 
             // ---------------------------------------------------------------
             // Self-filter install (go-live review round 2).
@@ -675,27 +677,27 @@ impl PtraceSupervisor {
             // registers, so this decision cannot be raced by a sibling thread
             // the way an openat2 open_how can.
             // ---------------------------------------------------------------
-            syscall_nr::SECCOMP => {
-                // seccomp(op, flags, args) — rdi=op, rsi=flags.
+            Some(SysId::Seccomp) => {
+                // seccomp(op, flags, args) — a0=op, a1=flags.
                 const SECCOMP_SET_MODE_FILTER: u64 = 1;
                 const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
-                if regs.rdi != SECCOMP_SET_MODE_FILTER {
+                if regs.args[0] != SECCOMP_SET_MODE_FILTER {
                     // SET_MODE_STRICT / GET_ACTION_AVAIL / GET_NOTIF_SIZES —
                     // none can hide syscalls from grith.
                     return Ok(None);
                 }
                 Ok(Some(SyscallKind::SeccompInstall {
                     via: crate::interceptor::SeccompInstallVia::Seccomp,
-                    new_listener: regs.rsi & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0,
+                    new_listener: regs.args[1] & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0,
                 }))
             }
-            syscall_nr::PRCTL => {
-                // prctl(option, arg2, ...) — rdi=option, rsi=arg2.
+            Some(SysId::Prctl) => {
+                // prctl(option, arg2, ...) — a0=option, a1=arg2.
                 // Only PR_SET_SECCOMP(SECCOMP_MODE_FILTER) installs a filter;
                 // it has no flags argument, so it can never create a listener.
                 const PR_SET_SECCOMP: u64 = 22;
                 const SECCOMP_MODE_FILTER: u64 = 2;
-                if regs.rdi != PR_SET_SECCOMP || regs.rsi != SECCOMP_MODE_FILTER {
+                if regs.args[0] != PR_SET_SECCOMP || regs.args[1] != SECCOMP_MODE_FILTER {
                     return Ok(None);
                 }
                 Ok(Some(SyscallKind::SeccompInstall {
@@ -707,32 +709,32 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // PR 6 Phase A: kernel-module load/unload — hard-denied
             // ---------------------------------------------------------------
-            syscall_nr::INIT_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
+            Some(SysId::InitModule) => Ok(Some(SyscallKind::KernelModuleOp {
                 op: crate::interceptor::KernelModuleOpKind::Init,
             })),
-            syscall_nr::FINIT_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
+            Some(SysId::FinitModule) => Ok(Some(SyscallKind::KernelModuleOp {
                 op: crate::interceptor::KernelModuleOpKind::Finit,
             })),
-            syscall_nr::DELETE_MODULE => Ok(Some(SyscallKind::KernelModuleOp {
+            Some(SysId::DeleteModule) => Ok(Some(SyscallKind::KernelModuleOp {
                 op: crate::interceptor::KernelModuleOpKind::Delete,
             })),
 
             // ---------------------------------------------------------------
             // PR 6 Phase A: kernel-image replacement — hard-denied
             // ---------------------------------------------------------------
-            syscall_nr::KEXEC_LOAD => Ok(Some(SyscallKind::KexecLoad { from_fd: false })),
-            syscall_nr::KEXEC_FILE_LOAD => Ok(Some(SyscallKind::KexecLoad { from_fd: true })),
+            Some(SysId::KexecLoad) => Ok(Some(SyscallKind::KexecLoad { from_fd: false })),
+            Some(SysId::KexecFileLoad) => Ok(Some(SyscallKind::KexecLoad { from_fd: true })),
 
             // ---------------------------------------------------------------
             // PR 6 Phase B: ownership change family.
             //
-            // chown/lchown(path, uid, gid)        — rdi=path, rsi=uid, rdx=gid
-            // fchown(fd, uid, gid)                — rdi=fd,   rsi=uid, rdx=gid
-            // fchownat(dirfd, path, uid, gid, ..) — rdi=dirfd, rsi=path, rdx=uid, r10=gid
+            // chown/lchown(path, uid, gid)        — a0=path, a1=uid, a2=gid
+            // fchown(fd, uid, gid)                — a0=fd,   a1=uid, a2=gid
+            // fchownat(dirfd, path, uid, gid, ..) — a0=dirfd, a1=path, a2=uid, a3=gid
             // ---------------------------------------------------------------
-            syscall_nr::CHOWN | syscall_nr::LCHOWN => {
-                let raw = self.read_tracee_string(pid, regs.rdi, 4096)?;
-                let is_chown = regs.orig_rax as i64 == syscall_nr::CHOWN;
+            Some(SysId::Chown) | Some(SysId::Lchown) => {
+                let raw = self.read_tracee_string(pid, regs.args[0], 4096)?;
+                let is_chown = sid == Some(SysId::Chown);
                 // `chown` follows the final symlink; `lchown` deliberately
                 // does not — it changes the link itself. Resolving lchown's
                 // final component would report an ownership change on a file
@@ -750,27 +752,27 @@ impl PtraceSupervisor {
                         crate::interceptor::OwnershipOp::Lchown
                     },
                     path,
-                    new_uid: regs.rsi as i64,
-                    new_gid: regs.rdx as i64,
+                    new_uid: regs.args[1] as i64,
+                    new_gid: regs.args[2] as i64,
                 }))
             }
-            syscall_nr::FCHOWN => {
-                let fd = regs.rdi as i32;
+            Some(SysId::Fchown) => {
+                let fd = regs.args[0] as i32;
                 let path =
                     Self::resolve_fd_path(pid_u32, fd).unwrap_or_else(|| format!("<fd:{fd}>"));
                 Ok(Some(SyscallKind::OwnershipChange {
                     op: crate::interceptor::OwnershipOp::Fchown,
                     path,
-                    new_uid: regs.rsi as i64,
-                    new_gid: regs.rdx as i64,
+                    new_uid: regs.args[1] as i64,
+                    new_gid: regs.args[2] as i64,
                 }))
             }
-            syscall_nr::FCHOWNAT => {
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let dirfd = regs.rdi as i32;
-                // AT_SYMLINK_NOFOLLOW (0x100) in `flags` (r8) makes fchownat
+            Some(SysId::Fchownat) => {
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let dirfd = regs.args[0] as i32;
+                // AT_SYMLINK_NOFOLLOW (0x100) in `flags` (a4) makes fchownat
                 // act on the link rather than its target, exactly like lchown.
-                let follows = regs.r8 as i32 & libc::AT_SYMLINK_NOFOLLOW == 0;
+                let follows = regs.args[4] as i32 & libc::AT_SYMLINK_NOFOLLOW == 0;
                 let path = if follows {
                     Self::resolve_at_path(pid_u32, dirfd, &raw_path)
                 } else {
@@ -779,29 +781,44 @@ impl PtraceSupervisor {
                 Ok(Some(SyscallKind::OwnershipChange {
                     op: crate::interceptor::OwnershipOp::Fchownat,
                     path,
-                    new_uid: regs.rdx as i64,
-                    new_gid: regs.r10 as i64,
+                    new_uid: regs.args[2] as i64,
+                    new_gid: regs.args[3] as i64,
                 }))
             }
 
             // ---------------------------------------------------------------
             // PR 6 Phase B: filesystem mutation.
             //
-            // mount(src, target, fstype, flags, data) — rdi=src, rsi=target, rdx=fstype
-            // umount2(target, flags)                  — rdi=target
-            // pivot_root(new_root, put_old)           — rdi=new_root, rsi=put_old
-            // chroot(path)                            — rdi=path
-            // open_tree(dfd, filename, flags)         — rdi=dfd, rsi=filename
-            // move_mount(from_dfd, from, to_dfd, to)  — rdi/rsi, rdx/r10
+            // mount(src, target, fstype, flags, data) — a0=src, a1=target, a2=fstype
+            // umount2(target, flags)                  — a0=target
+            // pivot_root(new_root, put_old)           — a0=new_root, a1=put_old
+            // chroot(path)                            — a0=path
+            // open_tree(dfd, filename, flags)         — a0=dfd, a1=filename
+            // move_mount(from_dfd, from, to_dfd, to)  — a0/a1, a2/a3
             // fsopen/fsconfig/fsmount                 — fd/context-based mount API
-            // fspick(dfd, path, flags)                — rdi=dfd, rsi=path
-            // mount_setattr(dfd, path, flags, ...)    — rdi=dfd, rsi=path
+            // fspick(dfd, path, flags)                — a0=dfd, a1=path
+            // mount_setattr(dfd, path, flags, ...)    — a0=dfd, a1=path
             // ---------------------------------------------------------------
-            syscall_nr::MOUNT => {
-                let source = self.read_tracee_string(pid, regs.rdi, 4096).ok();
-                let target = self.read_tracee_string(pid, regs.rsi, 4096)?;
+            Some(SysId::Mount) => {
+                // A bind-mount source is a path; canonicalise it like the
+                // target so credential-dir markers match the real location
+                // (defeats `cd ~ && mount --bind .ssh /tmp/x` and a symlinked
+                // source). A non-path fstype label (tmpfs/proc/none passed in
+                // arg0 for non-bind mounts) has no '/', so leave it as-is rather
+                // than cwd-joining it into garbage.
+                let source = self
+                    .read_tracee_string(pid, regs.args[0], 4096)
+                    .ok()
+                    .map(|s| {
+                        if s.contains('/') {
+                            Self::canonicalize_for_tracee(pid_u32, &s)
+                        } else {
+                            s
+                        }
+                    });
+                let target = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 let target = Self::canonicalize_for_tracee(pid_u32, &target);
-                let fstype = self.read_tracee_string(pid, regs.rdx, 256).ok();
+                let fstype = self.read_tracee_string(pid, regs.args[2], 256).ok();
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Mount,
                     source,
@@ -809,8 +826,8 @@ impl PtraceSupervisor {
                     fstype,
                 }))
             }
-            syscall_nr::UMOUNT2 => {
-                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+            Some(SysId::Umount2) => {
+                let target = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let target = Self::canonicalize_for_tracee(pid_u32, &target);
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Umount2,
@@ -819,8 +836,8 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::PIVOT_ROOT => {
-                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+            Some(SysId::PivotRoot) => {
+                let target = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let target = Self::canonicalize_for_tracee(pid_u32, &target);
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::PivotRoot,
@@ -829,8 +846,8 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::CHROOT => {
-                let target = self.read_tracee_string(pid, regs.rdi, 4096)?;
+            Some(SysId::Chroot) => {
+                let target = self.read_tracee_string(pid, regs.args[0], 4096)?;
                 let target = Self::canonicalize_for_tracee(pid_u32, &target);
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Chroot,
@@ -839,9 +856,9 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::OPEN_TREE => {
-                let dirfd = regs.rdi as i32;
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+            Some(SysId::OpenTree) => {
+                let dirfd = regs.args[0] as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 let target = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::OpenTree,
@@ -850,11 +867,11 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::MOVE_MOUNT => {
-                let from_dfd = regs.rdi as i32;
-                let raw_from = self.read_tracee_string(pid, regs.rsi, 4096)?;
-                let to_dfd = regs.rdx as i32;
-                let raw_to = self.read_tracee_string(pid, regs.r10, 4096)?;
+            Some(SysId::MoveMount) => {
+                let from_dfd = regs.args[0] as i32;
+                let raw_from = self.read_tracee_string(pid, regs.args[1], 4096)?;
+                let to_dfd = regs.args[2] as i32;
+                let raw_to = self.read_tracee_string(pid, regs.args[3], 4096)?;
                 let source = if raw_from.is_empty() {
                     Some(format!("<fd:{from_dfd}>"))
                 } else {
@@ -872,8 +889,8 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::FSOPEN => {
-                let fs_name = self.read_tracee_string(pid, regs.rdi, 256)?;
+            Some(SysId::Fsopen) => {
+                let fs_name = self.read_tracee_string(pid, regs.args[0], 256)?;
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Fsopen,
                     source: None,
@@ -885,9 +902,9 @@ impl PtraceSupervisor {
                     },
                 }))
             }
-            syscall_nr::FSCONFIG => {
-                let fd = regs.rdi as i32;
-                let key = self.read_tracee_string(pid, regs.rdx, 256).ok();
+            Some(SysId::Fsconfig) => {
+                let fd = regs.args[0] as i32;
+                let key = self.read_tracee_string(pid, regs.args[2], 256).ok();
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Fsconfig,
                     source: None,
@@ -895,8 +912,8 @@ impl PtraceSupervisor {
                     fstype: key,
                 }))
             }
-            syscall_nr::FSMOUNT => {
-                let fd = regs.rdi as i32;
+            Some(SysId::Fsmount) => {
+                let fd = regs.args[0] as i32;
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Fsmount,
                     source: None,
@@ -904,9 +921,9 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::FSPICK => {
-                let dirfd = regs.rdi as i32;
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+            Some(SysId::Fspick) => {
+                let dirfd = regs.args[0] as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 let target = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::Fspick,
@@ -915,9 +932,9 @@ impl PtraceSupervisor {
                     fstype: None,
                 }))
             }
-            syscall_nr::MOUNT_SETATTR => {
-                let dirfd = regs.rdi as i32;
-                let raw_path = self.read_tracee_string(pid, regs.rsi, 4096)?;
+            Some(SysId::MountSetattr) => {
+                let dirfd = regs.args[0] as i32;
+                let raw_path = self.read_tracee_string(pid, regs.args[1], 4096)?;
                 let target = Self::resolve_at_path(pid_u32, dirfd, &raw_path);
                 Ok(Some(SyscallKind::FilesystemMutation {
                     op: crate::interceptor::FsMutationOp::MountSetattr,
@@ -930,9 +947,9 @@ impl PtraceSupervisor {
             // ---------------------------------------------------------------
             // PR 6 Phase B: cross-process access.
             //
-            // ptrace(request, pid, addr, data)              — rsi=target_pid
-            // process_vm_readv(pid, ...)                    — rdi=target_pid
-            // process_vm_writev(pid, ...)                   — rdi=target_pid
+            // ptrace(request, pid, addr, data)              — a1=target_pid
+            // process_vm_readv(pid, ...)                    — a0=target_pid
+            // process_vm_writev(pid, ...)                   — a0=target_pid
             //
             // Self-target carveout: process_vm_* against the caller's
             // own pid is benign (used by some allocators for memory
@@ -940,25 +957,25 @@ impl PtraceSupervisor {
             // supervised tool's own internal use.
             //
             // PTRACE_TRACEME carveout: `ptrace(PTRACE_TRACEME)` has
-            // request(rdi) == 0 and reads no other process's memory —
+            // request(a0) == 0 and reads no other process's memory —
             // the caller merely volunteers to be traced by its own
             // parent (crash handlers, fork/trace/exec test harnesses).
             // It grants no cross-process authority and would EPERM under
             // grith anyway (grith already holds the tracer slot), so we
-            // carve it out. Note we key on the request (rdi == 0), NOT
-            // the pid argument (rsi), which TRACEME leaves as 0.
+            // carve it out. Note we key on the request (a0 == 0), NOT
+            // the pid argument (a1), which TRACEME leaves as 0.
             // ---------------------------------------------------------------
-            syscall_nr::PTRACE => {
-                if regs.rdi == 0 {
+            Some(SysId::Ptrace) => {
+                if regs.args[0] == 0 {
                     return Ok(None);
                 }
                 Ok(Some(SyscallKind::CrossProcessAccess {
                     op: crate::interceptor::CrossProcessOp::Ptrace,
-                    target_pid: regs.rsi as u32,
+                    target_pid: regs.args[1] as u32,
                 }))
             }
-            syscall_nr::PROCESS_VM_READV => {
-                let target = regs.rdi as u32;
+            Some(SysId::ProcessVmReadv) => {
+                let target = regs.args[0] as u32;
                 if target == pid_u32 {
                     return Ok(None);
                 }
@@ -967,8 +984,8 @@ impl PtraceSupervisor {
                     target_pid: target,
                 }))
             }
-            syscall_nr::PROCESS_VM_WRITEV => {
-                let target = regs.rdi as u32;
+            Some(SysId::ProcessVmWritev) => {
+                let target = regs.args[0] as u32;
                 if target == pid_u32 {
                     return Ok(None);
                 }
@@ -977,12 +994,36 @@ impl PtraceSupervisor {
                     target_pid: target,
                 }))
             }
+            // pidfd_getfd(pidfd, targetfd, flags) — rdi=pidfd (fd referring to
+            // the TARGET process), rsi=targetfd, rdx=flags. This steals a live
+            // fd out of another process (ptrace access mode required), the same
+            // CrossProcessAccess secret-theft class as process_vm_readv.
+            //
+            // The syscall carries no pid argument; the target is the process
+            // the pidfd refers to. Resolve it from the pidfd's fdinfo `Pid:`
+            // field, which /proc renders in grith's pid namespace so it matches
+            // supervised_pids() and /proc directly. An unresolvable target
+            // (fdinfo unreadable, rdi not a real pidfd, or a process invisible
+            // in grith's ns) yields 0; event_handler.rs treats a 0 target for
+            // this op as an unknown out-of-tree target and QUEUEs (fail closed).
+            // No self-carveout is needed: a pidfd targeting the caller's own
+            // process resolves to an in-tree pid and is allowed-and-recorded by
+            // the downstream in-tree branch. pidfd_open(2)/CLONE_PIDFD need no
+            // separate coverage — every pidfd resolves through the same fdinfo.
+            Some(SysId::PidfdGetfd) => {
+                let pidfd = regs.args[0] as i32;
+                let target_pid = Self::read_fdinfo_target_pid(pid_u32, pidfd).unwrap_or(0);
+                Ok(Some(SyscallKind::CrossProcessAccess {
+                    op: crate::interceptor::CrossProcessOp::PidfdGetfd,
+                    target_pid,
+                }))
+            }
 
             // ---------------------------------------------------------------
             // PR 6 Phase C: namespace primitives.
             //
-            // unshare(flags)   — rdi = CLONE_NEW* bitmap
-            // setns(fd, nstype) — rdi = fd, rsi = nstype (CLONE_NEW* bit
+            // unshare(flags)   — a0 = CLONE_NEW* bitmap
+            // setns(fd, nstype) — a0 = fd, a1 = nstype (CLONE_NEW* bit
             //                     or 0 to defer to the fd's link)
             //
             // We always emit `NamespaceOp` regardless of which flag
@@ -993,13 +1034,13 @@ impl PtraceSupervisor {
             // call with `flags = 0` is worth logging since it shows
             // the tool was probing.
             // ---------------------------------------------------------------
-            syscall_nr::UNSHARE => Ok(Some(SyscallKind::NamespaceOp {
+            Some(SysId::Unshare) => Ok(Some(SyscallKind::NamespaceOp {
                 syscall: crate::interceptor::NamespaceSyscall::Unshare,
-                flags: regs.rdi,
+                flags: regs.args[0],
             })),
-            syscall_nr::SETNS => Ok(Some(SyscallKind::NamespaceOp {
+            Some(SysId::Setns) => Ok(Some(SyscallKind::NamespaceOp {
                 syscall: crate::interceptor::NamespaceSyscall::Setns,
-                flags: regs.rsi,
+                flags: regs.args[1],
             })),
 
             // ---------------------------------------------------------------
@@ -1008,25 +1049,25 @@ impl PtraceSupervisor {
             // bother extracting arguments; the audit record carries the
             // syscall identity, which is sufficient for forensics.
             // ---------------------------------------------------------------
-            syscall_nr::SETHOSTNAME => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Sethostname) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::SetHostname,
             })),
-            syscall_nr::SETDOMAINNAME => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Setdomainname) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::SetDomainName,
             })),
-            syscall_nr::IOPL => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Iopl) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Iopl,
             })),
-            syscall_nr::IOPERM => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Ioperm) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Ioperm,
             })),
-            syscall_nr::SWAPON => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Swapon) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Swapon,
             })),
-            syscall_nr::SWAPOFF => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Swapoff) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Swapoff,
             })),
-            syscall_nr::REBOOT => Ok(Some(SyscallKind::ArchPrivilegedOp {
+            Some(SysId::Reboot) => Ok(Some(SyscallKind::ArchPrivilegedOp {
                 op: crate::interceptor::ArchPrivOp::Reboot,
             })),
 
@@ -1080,7 +1121,7 @@ impl PtraceSupervisor {
         &self,
         pid: Pid,
         addr: u64,
-        _addrlen: usize,
+        addrlen: usize,
         sock_info: Option<(u32, i32)>,
     ) -> Result<Option<(String, u16, NetProtocol)>> {
         if addr == 0 {
@@ -1130,15 +1171,48 @@ impl PtraceSupervisor {
                 Ok(Some((ip, port, protocol)))
             }
             libc::AF_UNIX => {
-                // struct sockaddr_un { family(2), sun_path(108) }
+                // struct sockaddr_un { family(2), sun_path(108) }.
                 //
-                // Prefix the path with "unix:" so callers can distinguish
-                // Unix domain socket addresses from IP addresses without
-                // inspecting the protocol field.  Abstract-namespace sockets
-                // (sun_path[0] == '\0') produce an empty path component,
-                // yielding "unix:" which is treated as local/benign.
-                let path = self.read_tracee_string(pid, addr + 2, 108)?;
-                Ok(Some((format!("unix:{path}"), 0, NetProtocol::Unix)))
+                // Pathname socket: NUL-terminated path -> read_tracee_string.
+                // Abstract-namespace socket: sun_path[0] == '\0', name lives in
+                // sun_path[1 .. addrlen-2], NOT NUL-terminated and may embed
+                // NULs. A NUL-stopping read yields "" -> a bare "unix:" that
+                // is_control_injection_socket can never match, letting abstract
+                // X11 / session-D-Bus (the shape libX11/libdbus try first)
+                // escape control-socket enforcement. Render "unix:@<name>".
+                // bytes0[2] == sun_path[0] (struct offset 2, already in word0).
+                const SUN_PATH_OFF: u64 = 2;
+                let abstract_name_len = addrlen.saturating_sub(SUN_PATH_OFF as usize + 1);
+                if bytes0[2] == 0 && abstract_name_len > 0 {
+                    // Cap at the 107-byte sun_path payload so a bogus addrlen
+                    // cannot over-read; a read failure propagates via `?` and
+                    // fails the syscall closed, matching the pathname branch.
+                    let name_len = abstract_name_len.min(107);
+                    let base = addr + SUN_PATH_OFF + 1;
+                    let mut name = Vec::with_capacity(name_len);
+                    while name.len() < name_len {
+                        let word =
+                            ptrace::read(pid, (base + name.len() as u64) as *mut libc::c_void)
+                                .map_err(|e| {
+                                    Error::InterceptionError(format!(
+                                        "failed to read abstract sockaddr name at \
+                                     {base:#x} for pid {pid}: {e}"
+                                    ))
+                                })?;
+                        let take = (name_len - name.len()).min(8);
+                        name.extend_from_slice(&word.to_ne_bytes()[..take]);
+                    }
+                    Ok(Some((
+                        format!("unix:@{}", render_abstract_unix_name(&name)),
+                        0,
+                        NetProtocol::Unix,
+                    )))
+                } else {
+                    // Pathname socket, or an unnamed/autobind abstract socket
+                    // (addrlen <= 3) -> renders "unix:" unchanged, still local.
+                    let path = self.read_tracee_string(pid, addr + SUN_PATH_OFF, 108)?;
+                    Ok(Some((format!("unix:{path}"), 0, NetProtocol::Unix)))
+                }
             }
             other => {
                 if let Some(label) = Self::raw_socket_label(other) {
@@ -1204,6 +1278,41 @@ impl PtraceSupervisor {
     // -------------------------------------------------------------------
     // Path and flag helpers
     // -------------------------------------------------------------------
+
+    /// Resolve the target process pid referenced by a pidfd, by parsing the
+    /// `Pid:` line of `/proc/<pid>/fdinfo/<fd>`.
+    ///
+    /// A pidfd (created by `pidfd_open`, `CLONE_PIDFD`, or returned from a
+    /// previous `pidfd_getfd`) carries a `Pid:` field in its fdinfo giving the
+    /// referenced process's pid in the *reading* process's (grith's) pid
+    /// namespace — so the value compares directly against `supervised_pids()`
+    /// and `/proc`. Threads share the fd table, so reading via the stopped
+    /// tid's `/proc/<tid>/fdinfo` is correct (same convention as
+    /// `resolve_fd_path`). grith is the tracer/parent and holds
+    /// `PTRACE_MODE_READ_FSCREDS` on the tracee, so the fdinfo is readable.
+    ///
+    /// Returns `None` — treated by callers as an unknown out-of-tree target
+    /// (fail closed to the proxy QUEUE) — when the file is unreadable, `<fd>`
+    /// is not a pidfd (no `Pid:` line), the target is not visible in grith's
+    /// namespace (`Pid: 0`), or the target has been REAPED (the kernel prints
+    /// `Pid: -1` once the task is gone). In the reaped case the getfd would
+    /// itself ESRCH, so routing it to the proxy QUEUE (rather than
+    /// dead-target-suppressing it) is a harmless fail-closed over-approximation;
+    /// legitimate tools call `pidfd_getfd` on a live target before reaping it.
+    pub(super) fn read_fdinfo_target_pid(pid: u32, fd: i32) -> Option<u32> {
+        if fd < 0 {
+            return None;
+        }
+        let content = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+        let value: i32 = content
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:")?.trim().parse().ok())?;
+        if value > 0 {
+            Some(value as u32)
+        } else {
+            None
+        }
+    }
 
     /// Resolve a file descriptor to its filesystem path by reading the
     /// `/proc/<pid>/fd/<fd>` symlink.
@@ -1511,6 +1620,14 @@ pub(super) fn sockaddr_in_to_string(octets: [u8; 4]) -> String {
     std::net::Ipv4Addr::from(octets).to_string()
 }
 
+/// Render an abstract-namespace unix socket name (the raw `sun_path[1..]`
+/// bytes, which may be non-UTF8 and may embed NULs) as a lossy string.
+/// Never panics. Extracted from `read_sockaddr`'s AF_UNIX arm so the
+/// byte→string conversion is unit-testable without a live ptracee.
+pub(super) fn render_abstract_unix_name(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// PR 5 Phase A: convert the two 8-byte halves of an `in6_addr`
 /// (network byte order) into canonical zero-compressed string form.
 ///
@@ -1538,150 +1655,180 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    use crate::platform::linux::{is_security_relevant, SECURITY_RELEVANT};
+    use crate::platform::linux::arch::security_relevant_nrs;
+    use crate::platform::linux::{is_security_relevant, syscall_nr};
 
     // -- Syscall number constants -------------------------------------------
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_read_is_0() {
         assert_eq!(syscall_nr::READ, 0);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_write_is_1() {
         assert_eq!(syscall_nr::WRITE, 1);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_open_is_2() {
         assert_eq!(syscall_nr::OPEN, 2);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_pipe_is_22() {
         assert_eq!(syscall_nr::PIPE, 22);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_connect_is_42() {
         assert_eq!(syscall_nr::CONNECT, 42);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_sendto_is_44() {
         assert_eq!(syscall_nr::SENDTO, 44);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_bind_is_49() {
         assert_eq!(syscall_nr::BIND, 49);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_socketpair_is_53() {
         assert_eq!(syscall_nr::SOCKETPAIR, 53);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_clone_is_56() {
         assert_eq!(syscall_nr::CLONE, 56);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_fork_is_57() {
         assert_eq!(syscall_nr::FORK, 57);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_execve_is_59() {
         assert_eq!(syscall_nr::EXECVE, 59);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_rename_is_82() {
         assert_eq!(syscall_nr::RENAME, 82);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_mkdir_is_83() {
         assert_eq!(syscall_nr::MKDIR, 83);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_unlink_is_87() {
         assert_eq!(syscall_nr::UNLINK, 87);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_chmod_is_90() {
         assert_eq!(syscall_nr::CHMOD, 90);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_getdents64_is_217() {
         assert_eq!(syscall_nr::GETDENTS64, 217);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_openat_is_257() {
         assert_eq!(syscall_nr::OPENAT, 257);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_mkdirat_is_258() {
         assert_eq!(syscall_nr::MKDIRAT, 258);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_unlinkat_is_263() {
         assert_eq!(syscall_nr::UNLINKAT, 263);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_fchmodat_is_268() {
         assert_eq!(syscall_nr::FCHMODAT, 268);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_pipe2_is_293() {
         assert_eq!(syscall_nr::PIPE2, 293);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_renameat2_is_316() {
         assert_eq!(syscall_nr::RENAMEAT2, 316);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_mmap_is_9() {
         assert_eq!(syscall_nr::MMAP, 9);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_io_uring_setup_is_425() {
         assert_eq!(syscall_nr::IO_URING_SETUP, 425);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_io_uring_enter_is_426() {
         assert_eq!(syscall_nr::IO_URING_ENTER, 426);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_io_uring_register_is_427() {
         assert_eq!(syscall_nr::IO_URING_REGISTER, 427);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_sendfile_is_40() {
         assert_eq!(syscall_nr::SENDFILE, 40);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_splice_is_275() {
         assert_eq!(syscall_nr::SPLICE, 275);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_tee_is_276() {
         assert_eq!(syscall_nr::TEE, 276);
@@ -1689,26 +1836,31 @@ mod tests {
 
     // -- PR 6 Phase A: kernel-module + kexec syscall numbers ----------------
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_init_module_is_175() {
         assert_eq!(syscall_nr::INIT_MODULE, 175);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_finit_module_is_313() {
         assert_eq!(syscall_nr::FINIT_MODULE, 313);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_delete_module_is_176() {
         assert_eq!(syscall_nr::DELETE_MODULE, 176);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_kexec_load_is_246() {
         assert_eq!(syscall_nr::KEXEC_LOAD, 246);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_kexec_file_load_is_320() {
         assert_eq!(syscall_nr::KEXEC_FILE_LOAD, 320);
@@ -1734,6 +1886,7 @@ mod tests {
     // every one of these was *absent* from the trap set. Each was a way to
     // reach the filesystem without passing the file policy.
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn b2_syscall_numbers_are_correct() {
         assert_eq!(syscall_nr::OPENAT2, 437);
@@ -1746,6 +1899,7 @@ mod tests {
         assert_eq!(syscall_nr::LINKAT, 265);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn b2_open_truncate_and_link_family_are_security_relevant() {
         for nr in [
@@ -1770,51 +1924,61 @@ mod tests {
 
     // -- PR 6 Phase B: ownership / fs / cross-process syscall numbers ----
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_chown_is_92() {
         assert_eq!(syscall_nr::CHOWN, 92);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_fchown_is_93() {
         assert_eq!(syscall_nr::FCHOWN, 93);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_lchown_is_94() {
         assert_eq!(syscall_nr::LCHOWN, 94);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_fchownat_is_260() {
         assert_eq!(syscall_nr::FCHOWNAT, 260);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_fchmod_is_91() {
         assert_eq!(syscall_nr::FCHMOD, 91);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_mount_is_165() {
         assert_eq!(syscall_nr::MOUNT, 165);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_umount2_is_166() {
         assert_eq!(syscall_nr::UMOUNT2, 166);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_pivot_root_is_155() {
         assert_eq!(syscall_nr::PIVOT_ROOT, 155);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_chroot_is_161() {
         assert_eq!(syscall_nr::CHROOT, 161);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_new_mount_api_numbers_are_correct() {
         assert_eq!(syscall_nr::OPEN_TREE, 428);
@@ -1826,21 +1990,25 @@ mod tests {
         assert_eq!(syscall_nr::MOUNT_SETATTR, 442);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_ptrace_is_101() {
         assert_eq!(syscall_nr::PTRACE, 101);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_process_vm_readv_is_310() {
         assert_eq!(syscall_nr::PROCESS_VM_READV, 310);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_process_vm_writev_is_311() {
         assert_eq!(syscall_nr::PROCESS_VM_WRITEV, 311);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn phase_b_ownership_syscalls_are_security_relevant() {
         assert!(is_security_relevant(syscall_nr::CHOWN));
@@ -1870,15 +2038,18 @@ mod tests {
         assert!(is_security_relevant(syscall_nr::PTRACE));
         assert!(is_security_relevant(syscall_nr::PROCESS_VM_READV));
         assert!(is_security_relevant(syscall_nr::PROCESS_VM_WRITEV));
+        assert!(is_security_relevant(syscall_nr::PIDFD_GETFD));
     }
 
     // -- PR 6 Phase C: namespace primitive syscall numbers ----
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_unshare_is_272() {
         assert_eq!(syscall_nr::UNSHARE, 272);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_setns_is_308() {
         assert_eq!(syscall_nr::SETNS, 308);
@@ -1892,41 +2063,49 @@ mod tests {
 
     // -- PR 6 Phase D: architecture-specific syscall numbers ----
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_sethostname_is_170() {
         assert_eq!(syscall_nr::SETHOSTNAME, 170);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_setdomainname_is_171() {
         assert_eq!(syscall_nr::SETDOMAINNAME, 171);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_iopl_is_172() {
         assert_eq!(syscall_nr::IOPL, 172);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_ioperm_is_173() {
         assert_eq!(syscall_nr::IOPERM, 173);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_swapon_is_167() {
         assert_eq!(syscall_nr::SWAPON, 167);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_swapoff_is_168() {
         assert_eq!(syscall_nr::SWAPOFF, 168);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_reboot_is_169() {
         assert_eq!(syscall_nr::REBOOT, 169);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn phase_d_arch_privileged_syscalls_are_security_relevant() {
         assert!(is_security_relevant(syscall_nr::SETHOSTNAME));
@@ -1955,6 +2134,7 @@ mod tests {
 
     // -- Security relevance predicate ---------------------------------------
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn all_listed_syscalls_are_security_relevant() {
         let expected: Vec<i64> = vec![
@@ -1975,6 +2155,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn common_non_security_syscalls_are_not_relevant() {
         // read(0), write(1), fstat(5), lseek(8),
@@ -1990,6 +2171,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn security_relevant_list_has_expected_count() {
         // 63 distinct syscall numbers are tracked:
@@ -2008,14 +2190,18 @@ mod tests {
         // DNS hardening adds recvmsg/recvmmsg plus six FD-lifecycle forms;
         // clone3 is included so modern thread creation cannot bypass the
         // entry-time FD-table inheritance snapshot.
-        assert_eq!(SECURITY_RELEVANT.len(), 86);
+        // pidfd_getfd(438) added to close the fd-theft cross-process channel.
+        assert_eq!(security_relevant_nrs().len(), 87);
     }
 
     #[test]
     fn security_relevant_list_has_no_duplicates() {
         let mut seen = HashSet::new();
-        for &nr in SECURITY_RELEVANT {
-            assert!(seen.insert(nr), "duplicate entry {nr} in SECURITY_RELEVANT");
+        for &nr in security_relevant_nrs() {
+            assert!(
+                seen.insert(nr),
+                "duplicate entry {nr} in security_relevant_nrs"
+            );
         }
     }
 
@@ -2330,15 +2516,14 @@ mod tests {
     /// mmap with fd=-1 and MAP_ANONYMOUS → anonymous allocation, not security-relevant.
     #[test]
     fn classify_mmap_anonymous_returns_none() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::MMAP as u64;
-        regs.r10 = 0x20; // MAP_ANONYMOUS
-        regs.r8 = u64::MAX; // fd = -1 as u64
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::MMAP;
+        regs.args[3] = 0x20; // MAP_ANONYMOUS
+        regs.args[4] = u64::MAX; // fd = -1 as u64
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2351,16 +2536,15 @@ mod tests {
     /// must be allowed; AF_PACKET and other netlink families stay hard-denied.
     #[test]
     fn classify_netlink_route_allowed_packet_and_other_netlink_denied() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
 
         let socket_regs = |domain: u64, proto: u64| {
-            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.orig_rax = syscall_nr::SOCKET as u64;
-            regs.rdi = domain;
-            regs.rsi = 3; // SOCK_RAW
-            regs.rdx = proto;
+            let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+            regs.nr = syscall_nr::SOCKET;
+            regs.args[0] = domain;
+            regs.args[1] = 3; // SOCK_RAW
+            regs.args[2] = proto;
             regs
         };
 
@@ -2387,15 +2571,14 @@ mod tests {
     /// because the flag dominates.
     #[test]
     fn classify_mmap_anonymous_flag_dominates() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::MMAP as u64;
-        regs.r10 = 0x20; // MAP_ANONYMOUS set
-        regs.r8 = 0; // fd = 0 (stdin) — but MAP_ANONYMOUS dominates
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::MMAP;
+        regs.args[3] = 0x20; // MAP_ANONYMOUS set
+        regs.args[4] = 0; // fd = 0 (stdin) — but MAP_ANONYMOUS dominates
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2418,10 +2601,10 @@ mod tests {
         tmp.write_all(b"test").unwrap();
         let fd = std::os::unix::io::IntoRawFd::into_raw_fd(tmp.reopen().expect("reopen"));
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::MMAP as u64;
-        regs.r10 = 0x01; // MAP_SHARED — no MAP_ANONYMOUS bit
-        regs.r8 = fd as u64;
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::MMAP;
+        regs.args[3] = 0x01; // MAP_SHARED — no MAP_ANONYMOUS bit
+        regs.args[4] = fd as u64;
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(result.is_some(), "file-backed mmap should return Some(...)");
@@ -2457,11 +2640,11 @@ mod tests {
         let in_fd = std::os::unix::io::IntoRawFd::into_raw_fd(file);
 
         // sendfile(out_fd=99, in_fd=<file>, offset=0, count=6)
-        // rdi = out_fd, rsi = in_fd
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SENDFILE as u64;
-        regs.rdi = 99; // fake socket fd
-        regs.rsi = in_fd as u64;
+        // a0 = out_fd, a1 = in_fd
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SENDFILE;
+        regs.args[0] = 99; // fake socket fd
+        regs.args[1] = in_fd as u64;
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(result.is_some(), "sendfile should classify as Some(...)");
@@ -2483,16 +2666,15 @@ mod tests {
     /// FileRead with path=None, which the taint filter scores as near-zero.
     #[test]
     fn classify_sendfile_anonymous_fd_returns_file_read_with_none_path() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
         // Use fd 99999 which almost certainly does not exist → resolve_fd_path → None.
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SENDFILE as u64;
-        regs.rdi = 88888; // fake out_fd
-        regs.rsi = 99999; // nonexistent in_fd
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SENDFILE;
+        regs.args[0] = 88888; // fake out_fd
+        regs.args[1] = 99999; // nonexistent in_fd
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2514,15 +2696,14 @@ mod tests {
     /// splice with a real file fd on the input side is classified as FileRead.
     #[test]
     fn classify_splice_returns_file_read() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
         // splice(fd_in=99999, ...) with unresolvable fd → FileRead { path: None }
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SPLICE as u64;
-        regs.rdi = 99999; // fd_in
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SPLICE;
+        regs.args[0] = 99999; // fd_in
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(result.is_some());
@@ -2537,14 +2718,13 @@ mod tests {
     /// tee with a pipe fd is classified as FileRead.
     #[test]
     fn classify_tee_returns_file_read() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::TEE as u64;
-        regs.rdi = 99999; // fd_in
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::TEE;
+        regs.args[0] = 99999; // fd_in
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(result.is_some());
@@ -2604,6 +2784,7 @@ mod tests {
     /// Verify that every syscall number in the SECURITY_RELEVANT list has
     /// a corresponding match arm in `classify_syscall` by checking that the
     /// syscall_nr module exports a constant for each.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_module_covers_all_security_relevant_numbers() {
         let from_module: Vec<i64> = vec![
@@ -2688,6 +2869,7 @@ mod tests {
             syscall_nr::PTRACE,
             syscall_nr::PROCESS_VM_READV,
             syscall_nr::PROCESS_VM_WRITEV,
+            syscall_nr::PIDFD_GETFD,
             // PR 6 Phase C.
             syscall_nr::UNSHARE,
             syscall_nr::SETNS,
@@ -2701,7 +2883,7 @@ mod tests {
             syscall_nr::REBOOT,
         ];
 
-        let relevant_set: HashSet<i64> = SECURITY_RELEVANT.iter().copied().collect();
+        let relevant_set: HashSet<i64> = security_relevant_nrs().iter().copied().collect();
         let module_set: HashSet<i64> = from_module.into_iter().collect();
 
         assert_eq!(
@@ -2712,6 +2894,7 @@ mod tests {
 
     // -- socket() classification -------------------------------------------
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn syscall_nr_socket_is_41() {
         assert_eq!(syscall_nr::SOCKET, 41);
@@ -2720,16 +2903,15 @@ mod tests {
     /// socket(AF_PACKET, ...) → RawSocketCreate (raw link-layer access).
     #[test]
     fn classify_socket_af_packet_returns_raw_socket_create() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SOCKET as u64;
-        regs.rdi = 17; // AF_PACKET
-        regs.rsi = 3; // SOCK_RAW
-        regs.rdx = 0; // htons(ETH_P_ALL) — 0 for test
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SOCKET;
+        regs.args[0] = 17; // AF_PACKET
+        regs.args[1] = 3; // SOCK_RAW
+        regs.args[2] = 0; // htons(ETH_P_ALL) — 0 for test
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2755,16 +2937,15 @@ mod tests {
     /// `classify_netlink_route_allowed_packet_and_other_netlink_denied`.
     #[test]
     fn classify_socket_af_netlink_nonroute_returns_raw_socket_create() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SOCKET as u64;
-        regs.rdi = 16; // AF_NETLINK
-        regs.rsi = 3; // SOCK_RAW
-        regs.rdx = 12; // NETLINK_NETFILTER (not NETLINK_ROUTE)
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SOCKET;
+        regs.args[0] = 16; // AF_NETLINK
+        regs.args[1] = 3; // SOCK_RAW
+        regs.args[2] = 12; // NETLINK_NETFILTER (not NETLINK_ROUTE)
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2780,16 +2961,15 @@ mod tests {
     /// socket(AF_INET, ...) → None (intercepted at connect/bind instead).
     #[test]
     fn classify_socket_af_inet_returns_none() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SOCKET as u64;
-        regs.rdi = 2; // AF_INET
-        regs.rsi = 1; // SOCK_STREAM
-        regs.rdx = 0; // protocol
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SOCKET;
+        regs.args[0] = 2; // AF_INET
+        regs.args[1] = 1; // SOCK_STREAM
+        regs.args[2] = 0; // protocol
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2801,16 +2981,15 @@ mod tests {
     /// socket(AF_INET6, ...) → None.
     #[test]
     fn classify_socket_af_inet6_returns_none() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SOCKET as u64;
-        regs.rdi = 10; // AF_INET6
-        regs.rsi = 2; // SOCK_DGRAM
-        regs.rdx = 0;
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SOCKET;
+        regs.args[0] = 10; // AF_INET6
+        regs.args[1] = 2; // SOCK_DGRAM
+        regs.args[2] = 0;
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2822,16 +3001,15 @@ mod tests {
     /// socket(AF_UNIX, ...) → None.
     #[test]
     fn classify_socket_af_unix_returns_none() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::SOCKET as u64;
-        regs.rdi = 1; // AF_UNIX
-        regs.rsi = 1; // SOCK_STREAM
-        regs.rdx = 0;
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::SOCKET;
+        regs.args[0] = 1; // AF_UNIX
+        regs.args[1] = 1; // SOCK_STREAM
+        regs.args[2] = 0;
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2842,19 +3020,18 @@ mod tests {
 
     // ---- PR 6 Phase B: cross-process access carveouts ----
 
-    /// ptrace(PTRACE_TRACEME) — request(rdi) == 0 — is carved out (None): the
+    /// ptrace(PTRACE_TRACEME) — request(a0) == 0 — is carved out (None): the
     /// caller volunteers to be traced by its parent and reads no other
-    /// process's memory. Keyed on rdi, NOT on rsi (which TRACEME leaves 0).
+    /// process's memory. Keyed on the request arg (a0), NOT the pid arg (a1, which TRACEME leaves 0).
     #[test]
     fn classify_ptrace_traceme_returns_none() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::PTRACE as u64;
-        regs.rdi = 0; // PTRACE_TRACEME
-        regs.rsi = 0; // pid arg ignored
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::PTRACE;
+        regs.args[0] = 0; // PTRACE_TRACEME
+        regs.args[1] = 0; // pid arg ignored
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2864,18 +3041,17 @@ mod tests {
     }
 
     /// ptrace(PTRACE_ATTACH, target) — a real cross-process attach — classifies
-    /// as CrossProcessAccess carrying the target pid from rsi.
+    /// as CrossProcessAccess carrying the target pid from a1.
     #[test]
     fn classify_ptrace_attach_returns_cross_process() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
         let target = std::process::id() + 1;
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::PTRACE as u64;
-        regs.rdi = 16; // PTRACE_ATTACH
-        regs.rsi = u64::from(target);
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::PTRACE;
+        regs.args[0] = 16; // PTRACE_ATTACH
+        regs.args[1] = u64::from(target);
 
         match sup.classify_syscall(pid, &regs).unwrap() {
             Some(SyscallKind::CrossProcessAccess { op, target_pid }) => {
@@ -2890,14 +3066,13 @@ mod tests {
     /// benign intra-process memory copying.
     #[test]
     fn classify_process_vm_readv_self_returns_none() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::PROCESS_VM_READV as u64;
-        regs.rdi = u64::from(our_pid); // target == self
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::PROCESS_VM_READV;
+        regs.args[0] = u64::from(our_pid); // target == self
 
         let result = sup.classify_syscall(pid, &regs).unwrap();
         assert!(
@@ -2909,15 +3084,14 @@ mod tests {
     /// process_vm_readv against a DIFFERENT pid classifies as CrossProcessAccess.
     #[test]
     fn classify_process_vm_readv_other_returns_cross_process() {
-        use nix::libc;
         let sup = PtraceSupervisor::new();
         let our_pid = std::process::id();
         let pid = nix::unistd::Pid::from_raw(our_pid as i32);
         let target = our_pid + 1;
 
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.orig_rax = syscall_nr::PROCESS_VM_READV as u64;
-        regs.rdi = u64::from(target); // target != self
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::PROCESS_VM_READV;
+        regs.args[0] = u64::from(target); // target != self
 
         match sup.classify_syscall(pid, &regs).unwrap() {
             Some(SyscallKind::CrossProcessAccess { op, target_pid }) => {
@@ -2929,6 +3103,89 @@ mod tests {
             }
             other => panic!("expected CrossProcessAccess, got {other:?}"),
         }
+    }
+
+    /// pidfd_getfd against a real pidfd classifies as CrossProcessAccess with
+    /// the target pid resolved from the pidfd's fdinfo. Skips on pre-5.6
+    /// kernels where pidfd_open is unavailable (ENOSYS).
+    #[test]
+    fn classify_pidfd_getfd_returns_cross_process() {
+        use nix::libc;
+        let our_pid = std::process::id();
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, our_pid as libc::pid_t, 0) };
+        if pidfd < 0 {
+            eprintln!(
+                "pidfd_open unavailable; skipping classify_pidfd_getfd_returns_cross_process"
+            );
+            return;
+        }
+        let sup = PtraceSupervisor::new();
+        let pid = nix::unistd::Pid::from_raw(our_pid as i32);
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::PIDFD_GETFD;
+        regs.args[0] = pidfd as u64;
+        let result = sup.classify_syscall(pid, &regs);
+        unsafe { libc::close(pidfd as i32) };
+        match result.unwrap() {
+            Some(SyscallKind::CrossProcessAccess { op, target_pid }) => {
+                assert!(matches!(op, crate::interceptor::CrossProcessOp::PidfdGetfd));
+                assert_eq!(target_pid, our_pid);
+            }
+            other => panic!("expected CrossProcessAccess, got {other:?}"),
+        }
+    }
+
+    /// An unresolvable pidfd argument (fd not open) yields target_pid 0 — the
+    /// fail-closed sentinel the event handler routes to the proxy QUEUE.
+    #[test]
+    fn classify_pidfd_getfd_unresolvable_target_is_zero() {
+        let sup = PtraceSupervisor::new();
+        let our_pid = std::process::id();
+        let pid = nix::unistd::Pid::from_raw(our_pid as i32);
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
+        regs.nr = syscall_nr::PIDFD_GETFD;
+        regs.args[0] = 999_999; // not an open fd
+        match sup.classify_syscall(pid, &regs).unwrap() {
+            Some(SyscallKind::CrossProcessAccess { op, target_pid }) => {
+                assert!(matches!(op, crate::interceptor::CrossProcessOp::PidfdGetfd));
+                assert_eq!(target_pid, 0);
+            }
+            other => panic!("expected CrossProcessAccess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_fdinfo_target_pid_resolves_self_pidfd() {
+        use nix::libc;
+        let our_pid = std::process::id();
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, our_pid as libc::pid_t, 0) };
+        if pidfd < 0 {
+            return; // pre-5.6 kernel
+        }
+        let resolved = PtraceSupervisor::read_fdinfo_target_pid(our_pid, pidfd as i32);
+        unsafe { libc::close(pidfd as i32) };
+        assert_eq!(resolved, Some(our_pid));
+    }
+
+    #[test]
+    fn read_fdinfo_target_pid_non_pidfd_and_negative_return_none() {
+        let our_pid = std::process::id();
+        // stdin (fd 0) is not a pidfd → no `Pid:` line.
+        assert_eq!(PtraceSupervisor::read_fdinfo_target_pid(our_pid, 0), None);
+        // A negative fd is rejected outright.
+        assert_eq!(PtraceSupervisor::read_fdinfo_target_pid(our_pid, -1), None);
+    }
+
+    #[test]
+    fn render_abstract_unix_name_is_lossy_and_never_panics() {
+        assert_eq!(
+            render_abstract_unix_name(b"/tmp/.X11-unix/X0"),
+            "/tmp/.X11-unix/X0"
+        );
+        assert_eq!(render_abstract_unix_name(b""), "");
+        // Non-UTF8 bytes render lossily without panicking.
+        let lossy = render_abstract_unix_name(&[0xff, 0xfe, b'/', b'x']);
+        assert!(lossy.ends_with("/x"), "{lossy:?}");
     }
 
     // ---- PR 5 Phase A: sockaddr address-byte → string contract ----

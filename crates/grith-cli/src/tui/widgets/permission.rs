@@ -467,6 +467,395 @@ fn checkbox_span(label: &str, checked: bool, focused: bool) -> Span<'static> {
     )
 }
 
+/// Risk tier for an action verb — selects the badge colour on the header.
+#[derive(Clone, Copy, PartialEq)]
+enum VerbRole {
+    /// read / list — informational, no state change.
+    Read,
+    /// write / append / move / link / mkdir / chown — changes state.
+    Mutate,
+    /// delete / chmod — destructive or permission-altering.
+    Destroy,
+    /// run / shell — code execution.
+    Execute,
+    /// connect / listen / http / dns — network egress or exposure.
+    Network,
+    /// ptrace / namespace / mount — privileged operation.
+    Privileged,
+}
+
+impl VerbRole {
+    fn color(self) -> ratatui::style::Color {
+        match self {
+            VerbRole::Read => BLUE,
+            VerbRole::Mutate | VerbRole::Execute | VerbRole::Network => AMBER_HI,
+            VerbRole::Destroy | VerbRole::Privileged => RED,
+        }
+    }
+}
+
+/// One labelled target line rendered under the header. `label` is empty for
+/// single-target operations (the value needs no prefix).
+struct TargetRow {
+    label: &'static str,
+    value: String,
+}
+
+/// Presentation-ready decomposition of a queued call: the action verb, its risk
+/// tier, a short headline identifier (basename / host), the full target rows,
+/// and any command arguments. Built once by [`call_summary`] and rendered by
+/// both the exec panel and the floating dialog, so neither re-parses the raw
+/// `ToolCallType` string inline.
+struct CallSummary {
+    verb: String,
+    role: VerbRole,
+    headline: String,
+    targets: Vec<TargetRow>,
+    args: Option<String>,
+}
+
+/// The final path component (or the whole string when there is no `/`).
+fn basename_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return path.to_string();
+    }
+    trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+}
+
+/// The host[:port] portion of a URL, for use as a compact headline.
+fn url_host(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
+/// Build a single-target summary (one path, no secondary).
+fn single_target(verb: &str, role: VerbRole, path: &str) -> CallSummary {
+    CallSummary {
+        verb: verb.to_string(),
+        role,
+        headline: basename_of(path),
+        targets: if path.is_empty() {
+            Vec::new()
+        } else {
+            vec![TargetRow {
+                label: "",
+                value: path.to_string(),
+            }]
+        },
+        args: None,
+    }
+}
+
+/// Decompose a queued request into a verb + target(s) for display. Keyed on the
+/// call-type category (`req.call_type`, the `ToolCallType` variant name), so the
+/// parse of the canonical `Display` detail is unambiguous per variant.
+fn call_summary(req: &PermissionRequest) -> CallSummary {
+    let detail = tool_call_detail(&req.tool);
+    match req.call_type.as_str() {
+        "FileRead" => single_target("READ", VerbRole::Read, detail),
+        "DirList" => single_target("LIST", VerbRole::Read, detail),
+        "FileWrite" => single_target("WRITE", VerbRole::Mutate, detail),
+        "FileAppend" => single_target("APPEND", VerbRole::Mutate, detail),
+        "DirCreate" => single_target("CREATE DIR", VerbRole::Mutate, detail),
+        "FileDelete" => single_target("DELETE", VerbRole::Destroy, detail),
+        "FileChmod" => {
+            // detail = "<path>, <octal-mode>"
+            let (path, mode) = detail.rsplit_once(", ").unwrap_or((detail, ""));
+            CallSummary {
+                verb: "CHMOD".to_string(),
+                role: VerbRole::Destroy,
+                headline: basename_of(path),
+                targets: vec![TargetRow {
+                    label: "",
+                    value: path.to_string(),
+                }],
+                args: (!mode.is_empty()).then(|| format!("mode {mode}")),
+            }
+        }
+        "OwnershipChange" => {
+            // detail = "<target> uid=<n> gid=<n>"
+            let target = detail.split(" uid=").next().unwrap_or(detail);
+            let rest = detail[target.len()..].trim().to_string();
+            CallSummary {
+                verb: "CHOWN".to_string(),
+                role: VerbRole::Mutate,
+                headline: basename_of(target),
+                targets: vec![TargetRow {
+                    label: "",
+                    value: target.to_string(),
+                }],
+                args: (!rest.is_empty()).then_some(rest),
+            }
+        }
+        "FileRename" => {
+            // detail = "<old> -> <new>"
+            let (old, new) = detail.split_once(" -> ").unwrap_or((detail, ""));
+            CallSummary {
+                verb: "MOVE".to_string(),
+                role: VerbRole::Mutate,
+                headline: basename_of(if new.is_empty() { old } else { new }),
+                targets: vec![
+                    TargetRow {
+                        label: "from",
+                        value: old.to_string(),
+                    },
+                    TargetRow {
+                        label: "to",
+                        value: new.to_string(),
+                    },
+                ],
+                args: None,
+            }
+        }
+        "FileLink" => {
+            // detail = "<symbolic|hard> <link_path> -> <target>"
+            let (kind, rest) = detail.split_once(' ').unwrap_or(("", detail));
+            let (link_path, target) = rest.split_once(" -> ").unwrap_or((rest, ""));
+            let verb = if kind == "symbolic" {
+                "SYMLINK"
+            } else {
+                "HARD-LINK"
+            };
+            CallSummary {
+                verb: verb.to_string(),
+                role: VerbRole::Mutate,
+                headline: basename_of(link_path),
+                targets: vec![
+                    TargetRow {
+                        label: "link",
+                        value: link_path.to_string(),
+                    },
+                    TargetRow {
+                        label: "target",
+                        value: target.to_string(),
+                    },
+                ],
+                args: None,
+            }
+        }
+        "NetConnect" => CallSummary {
+            verb: "CONNECT".to_string(),
+            role: VerbRole::Network,
+            headline: detail.to_string(),
+            targets: Vec::new(),
+            args: None,
+        },
+        "NetListen" => CallSummary {
+            verb: "LISTEN".to_string(),
+            role: VerbRole::Network,
+            headline: detail.to_string(),
+            targets: Vec::new(),
+            args: None,
+        },
+        "DnsQuery" => {
+            // detail = "<domain> <type>"
+            let (domain, qtype) = detail.split_once(' ').unwrap_or((detail, ""));
+            CallSummary {
+                verb: "DNS".to_string(),
+                role: VerbRole::Network,
+                headline: domain.to_string(),
+                targets: Vec::new(),
+                args: (!qtype.is_empty()).then(|| format!("{qtype} record")),
+            }
+        }
+        "HttpRequest" => {
+            // detail = "<method> <url>"
+            let (method, url) = detail.split_once(' ').unwrap_or(("", detail));
+            let verb = if method.is_empty() {
+                "HTTP".to_string()
+            } else {
+                format!("HTTP {method}")
+            };
+            CallSummary {
+                verb,
+                role: VerbRole::Network,
+                headline: url_host(url),
+                targets: if url.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![TargetRow {
+                        label: "",
+                        value: url.to_string(),
+                    }]
+                },
+                args: None,
+            }
+        }
+        "ProcessSpawn" | "ShellExec" => spawn_summary(req, detail),
+        "CrossProcessAccess" => {
+            // detail = "<op> target_pid=<n>"
+            let (op, pid) = detail.split_once(" target_pid=").unwrap_or((detail, ""));
+            CallSummary {
+                verb: "INSPECT PROC".to_string(),
+                role: VerbRole::Privileged,
+                headline: if pid.is_empty() {
+                    op.to_string()
+                } else {
+                    format!("pid {pid}")
+                },
+                targets: Vec::new(),
+                args: (!op.is_empty()).then(|| format!("via {op}")),
+            }
+        }
+        "NamespaceOp" => {
+            // detail = "<syscall> flags=0x.."
+            let (syscall, flags) = detail.split_once(" flags=").unwrap_or((detail, ""));
+            CallSummary {
+                verb: "NAMESPACE".to_string(),
+                role: VerbRole::Privileged,
+                headline: syscall.to_string(),
+                targets: Vec::new(),
+                args: (!flags.is_empty()).then(|| format!("flags {flags}")),
+            }
+        }
+        "FilesystemMutation" => {
+            // detail = "<op> src=<s> target=<t> fstype=<f>"
+            let op = detail.split_whitespace().next().unwrap_or("mount");
+            let between = |start: &str, end: &str| -> String {
+                let Some(from) = detail.find(start) else {
+                    return String::new();
+                };
+                let rest = &detail[from + start.len()..];
+                let slice = rest.find(end).map_or(rest, |e| &rest[..e]);
+                slice.trim().to_string()
+            };
+            let target = between("target=", " fstype=");
+            let source = between("src=", " target=");
+            let mut targets = vec![TargetRow {
+                label: "",
+                value: target.clone(),
+            }];
+            if !source.is_empty() {
+                targets.push(TargetRow {
+                    label: "from",
+                    value: source,
+                });
+            }
+            CallSummary {
+                verb: op.to_uppercase(),
+                role: VerbRole::Privileged,
+                headline: basename_of(&target),
+                targets,
+                args: None,
+            }
+        }
+        other => single_target(&other.to_uppercase(), VerbRole::Mutate, detail),
+    }
+}
+
+/// Decompose a `ProcessSpawn` / `ShellExec` request. Prefers the structured
+/// JSON `command` / `spawn_args` (unambiguous even when a path contains a
+/// space); falls back to splitting the `Display` detail on the first space.
+fn spawn_summary(req: &PermissionRequest, detail: &str) -> CallSummary {
+    let parsed = serde_json::from_str::<Value>(&req.args).ok();
+    let json_command = parsed
+        .as_ref()
+        .and_then(|v| v.get("command"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let json_args = parsed
+        .as_ref()
+        .and_then(|v| v.get("spawn_args"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+
+    let (command, args) = match json_command {
+        Some(cmd) => (cmd.to_string(), json_args.unwrap_or_default()),
+        None => match detail.split_once(char::is_whitespace) {
+            Some((cmd, rest)) => (cmd.to_string(), rest.trim().to_string()),
+            None => (detail.to_string(), String::new()),
+        },
+    };
+
+    let verb = if req.call_type == "ShellExec" {
+        "SHELL"
+    } else {
+        "RUN"
+    };
+    CallSummary {
+        verb: verb.to_string(),
+        role: VerbRole::Execute,
+        headline: basename_of(&command),
+        targets: if command.is_empty() {
+            Vec::new()
+        } else {
+            vec![TargetRow {
+                label: "",
+                value: command,
+            }]
+        },
+        args: (!args.is_empty()).then_some(args),
+    }
+}
+
+/// Render a [`CallSummary`] into header + target + args lines: a bold,
+/// risk-coloured verb badge next to the identifier, then each full target on
+/// its own line, middle-truncated so the basename / host always survives.
+fn call_block_lines(summary: &CallSummary, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header: bold verb badge + bold identifier.
+    let head_budget = width
+        .saturating_sub(summary.verb.chars().count() + 2)
+        .max(4);
+    let headline = truncate_middle(&summary.headline, head_budget);
+    lines.push(Line::from(vec![
+        Span::styled(
+            summary.verb.clone(),
+            Style::new()
+                .fg(summary.role.color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            headline,
+            Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Target rows.
+    for row in &summary.targets {
+        let mut spans = vec![Span::styled("  ", Style::new().fg(TEXT_DIM))];
+        let mut budget = width.saturating_sub(2);
+        if !row.label.is_empty() {
+            let label = format!("{}  ", row.label);
+            budget = budget.saturating_sub(label.chars().count());
+            spans.push(Span::styled(label, Style::new().fg(TEXT_DIM)));
+        }
+        let budget = budget.max(4);
+        let value = if is_path_like(&row.value) {
+            shorten_path_middle(&row.value, budget)
+        } else {
+            truncate_middle(&row.value, budget)
+        };
+        spans.push(Span::styled(value, Style::new().fg(TEXT_MID)));
+        lines.push(Line::from(spans));
+    }
+
+    // Command arguments.
+    if let Some(args) = &summary.args {
+        let label = "  args  ";
+        let budget = width.saturating_sub(label.chars().count()).max(4);
+        lines.push(Line::from(vec![
+            Span::styled(label, Style::new().fg(TEXT_DIM)),
+            Span::styled(truncate_middle(args, budget), Style::new().fg(TEXT_MID)),
+        ]));
+    }
+
+    lines
+}
+
 fn render_dialog_body(
     frame: &mut Frame,
     area: Rect,
@@ -475,12 +864,16 @@ fn render_dialog_body(
     show_inspect: bool,
 ) {
     let detail_height = if show_inspect { 12 } else { 9 };
+    let max_w = (area.width as usize).saturating_sub(2);
+    let summary = call_summary(req);
+    let call_lines = call_block_lines(&summary, max_w);
+    let call_rows = (call_lines.len() as u16).clamp(1, 4);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),             // tool call title
+            Constraint::Length(call_rows),     // action verb + target(s)
             Constraint::Length(1),             // score line
-            Constraint::Length(2),             // type line (may wrap)
+            Constraint::Length(0),             // (former type line — folded into the header)
             Constraint::Length(1),             // spacer
             Constraint::Min(3),                // filter breakdown
             Constraint::Length(1),             // spacer
@@ -492,11 +885,9 @@ fn render_dialog_body(
         ])
         .split(area);
 
-    // Tool call title with process attribution
-    let max_title_len = (area.width as usize).saturating_sub(2);
-    let tool_line = title_with_provenance(&req.tool, &req.args, max_title_len);
+    // Action verb + target(s)
     frame.render_widget(
-        Paragraph::new(tool_line).style(Style::new().bg(BG_PANEL)),
+        Paragraph::new(call_lines).style(Style::new().bg(BG_PANEL)),
         chunks[0],
     );
 
@@ -531,31 +922,6 @@ fn render_dialog_body(
     frame.render_widget(
         Paragraph::new(score_line).style(Style::new().bg(BG_PANEL)),
         chunks[1],
-    );
-
-    // Type line — category + detail from inside the parentheses of tool string.
-    let detail = tool_call_detail(&req.tool);
-    let type_desc = if detail.is_empty() {
-        req.call_type.clone()
-    } else {
-        let detail_budget = max_title_len
-            .saturating_sub(req.call_type.chars().count())
-            .saturating_sub(3);
-        format!(
-            "{} — {}",
-            req.call_type,
-            shorten_tool_detail(detail, detail_budget)
-        )
-    };
-    let type_line = Line::from(vec![
-        Span::styled("type  ", Style::new().fg(TEXT_DIM)),
-        Span::styled(type_desc, Style::new().fg(TEXT_MID)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(type_line)
-            .style(Style::new().bg(BG_PANEL))
-            .wrap(Wrap { trim: true }),
-        chunks[2],
     );
 
     // Filter breakdown with bars
@@ -682,7 +1048,10 @@ fn render_dialog_body(
 fn summary_lines(req: &PermissionRequest) -> Vec<Line<'static>> {
     let provenance = parse_provenance(&req.args);
     if req.call_type == "ProcessSpawn" {
-        let mut lines = process_spawn_summary(req);
+        let mut lines = vec![Line::from(vec![Span::styled(
+            "Held because this spawn is outside the session allowlist or carries extra network risk.",
+            Style::new().fg(TEXT_DIM),
+        )])];
         if let Some((label, value)) = provenance.process_line {
             lines.push(Line::from(vec![
                 Span::styled(format!("{label}: "), Style::new().fg(TEXT_DIM)),
@@ -884,67 +1253,6 @@ fn extract_process_target(process_name: &str, args: Vec<String>) -> Option<Strin
     }
 }
 
-fn process_spawn_summary(req: &PermissionRequest) -> Vec<Line<'static>> {
-    let parsed = serde_json::from_str::<Value>(&req.args).ok();
-    let command = parsed
-        .as_ref()
-        .and_then(|value| value.get("command"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let spawn_args = parsed
-        .as_ref()
-        .and_then(|value| value.get("spawn_args"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-
-    let fallback_request = req
-        .tool
-        .find('(')
-        .zip(req.tool.rfind(')'))
-        .and_then(|(open, close)| (close > open + 1).then(|| req.tool[open + 1..close].trim()))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| req.tool.clone());
-
-    let request = if command.is_empty() {
-        fallback_request
-    } else if spawn_args.is_empty() {
-        command.clone()
-    } else {
-        format!("{command} {spawn_args}")
-    };
-
-    let binary_name = std::path::Path::new(&request)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("spawned process")
-        .to_string();
-
-    vec![
-        Line::from(vec![
-            Span::styled("spawned binary: ", Style::new().fg(TEXT_DIM)),
-            Span::styled(binary_name, Style::new().fg(WHITE).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![Span::styled(
-            "This process spawn triggered review because it is outside the session allowlist or carries extra network risk.",
-            Style::new().fg(TEXT_DIM),
-        )]),
-        Line::from(vec![
-            Span::styled("path: ", Style::new().fg(TEXT_DIM)),
-            Span::styled(request, Style::new().fg(TEXT_MID)),
-        ]),
-    ]
-}
-
 fn render_filter_bars(frame: &mut Frame, area: Rect, filters: &[crate::tui::state::FilterHit]) {
     if filters.is_empty() || area.height == 0 {
         return;
@@ -1042,12 +1350,16 @@ fn render_panel_body(
         return;
     }
     let inspect_rows: u16 = if show_inspect { 3 } else { 0 };
+    let max_w = area.width as usize;
+    let summary = call_summary(req);
+    let call_lines = call_block_lines(&summary, max_w);
+    let call_rows = (call_lines.len() as u16).clamp(1, 3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // tool title
+            Constraint::Length(call_rows),    // action verb + target(s)
             Constraint::Length(1),            // score + severity
-            Constraint::Length(1),            // type — detail
+            Constraint::Length(0),            // (former type line — folded into the header)
             Constraint::Length(1),            // blank
             Constraint::Min(2),               // filter bars
             Constraint::Length(1),            // composite score → decision
@@ -1058,11 +1370,9 @@ fn render_panel_body(
         ])
         .split(area);
 
-    // Tool title with process attribution
-    let max_w = area.width as usize;
-    let tool_line = title_with_provenance(&req.tool, &req.args, max_w);
+    // Action verb + target(s)
     frame.render_widget(
-        Paragraph::new(tool_line).style(Style::new().bg(BG_PANEL)),
+        Paragraph::new(call_lines).style(Style::new().bg(BG_PANEL)),
         chunks[0],
     );
 
@@ -1097,34 +1407,8 @@ fn render_panel_body(
         chunks[1],
     );
 
-    // Type — detail (truncated, no wrap)
-    let detail = tool_call_detail(&req.tool);
-    let type_desc = if detail.is_empty() {
-        req.call_type.clone()
-    } else {
-        let detail_budget = max_w
-            .saturating_sub(6)
-            .saturating_sub(req.call_type.chars().count())
-            .saturating_sub(3);
-        format!(
-            "{} \u{2014} {}",
-            req.call_type,
-            shorten_tool_detail(detail, detail_budget)
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("type  ", Style::new().fg(TEXT_DIM)),
-            Span::styled(
-                truncate(&type_desc, max_w.saturating_sub(6)),
-                Style::new().fg(TEXT_MID),
-            ),
-        ]))
-        .style(Style::new().bg(BG_PANEL)),
-        chunks[2],
-    );
-
-    // chunks[3] is blank spacer — rendered as empty
+    // chunks[2] (former type line) is folded into the header; chunks[3] is a
+    // blank spacer — both render as empty.
 
     // Filter bars
     render_filter_bars(frame, chunks[4], &req.filters);
@@ -1272,57 +1556,6 @@ fn render_panel_body(
     );
 }
 
-/// Build the bold title line with process attribution when available.
-///
-/// Produces e.g. `FileRead(/home/dan/.ssh/id_rsa)  ← ssh → git`
-fn title_with_provenance(tool: &str, args: &str, max_len: usize) -> Line<'static> {
-    let provenance = parse_provenance(args);
-    let bold = Style::new().fg(WHITE).add_modifier(Modifier::BOLD);
-
-    let process_name = provenance
-        .process_line
-        .as_ref()
-        .map(|(_, v)| {
-            // Strip " (pid NNN)" suffix to get just the name.
-            v.find(" (pid").map_or(v.as_str(), |i| &v[..i])
-        })
-        .filter(|n| !n.is_empty() && !n.starts_with("fork-from-"));
-    let parent_name = provenance
-        .parent_line
-        .as_ref()
-        .map(|(_, v)| v.find(" (pid").map_or(v.as_str(), |i| &v[..i]))
-        .filter(|n| !n.is_empty() && !n.starts_with("fork-from-"));
-
-    let target_hint = provenance.process_target.as_deref().unwrap_or("");
-
-    let suffix = match (process_name, parent_name) {
-        (Some(proc), Some(parent)) if !target_hint.is_empty() => {
-            format!("  \u{2190} {proc} \u{2192} {parent} ({target_hint})")
-        }
-        (Some(proc), Some(parent)) => format!("  \u{2190} {proc} \u{2192} {parent}"),
-        (Some(proc), None) if !target_hint.is_empty() => {
-            format!("  \u{2190} {proc} ({target_hint})")
-        }
-        (Some(proc), None) => format!("  \u{2190} {proc}"),
-        _ => String::new(),
-    };
-
-    let available = max_len.saturating_sub(suffix.len());
-    let tool_text = shorten_tool_call(tool, available);
-
-    if suffix.is_empty() {
-        Line::from(vec![Span::styled(tool_text, bold)])
-    } else {
-        Line::from(vec![
-            Span::styled(tool_text, bold),
-            Span::styled(
-                suffix,
-                Style::new().fg(TEXT_MID).add_modifier(Modifier::BOLD),
-            ),
-        ])
-    }
-}
-
 fn centered_rect(width: u16, height_pct: u16, r: Rect) -> Rect {
     let popup_height = (r.height * height_pct / 100).max(18);
     let popup_width = width.min(r.width.saturating_sub(4));
@@ -1393,102 +1626,6 @@ fn tool_call_detail(tool: &str) -> &str {
             })
         })
         .unwrap_or("")
-}
-
-fn shorten_tool_call(tool: &str, max: usize) -> String {
-    if tool.chars().count() <= max {
-        return tool.to_string();
-    }
-    let Some(open) = tool.find('(') else {
-        return truncate(tool, max);
-    };
-    let Some(close) = tool.rfind(')') else {
-        return truncate(tool, max);
-    };
-    if close <= open {
-        return truncate(tool, max);
-    }
-
-    let prefix = &tool[..=open];
-    let suffix = &tool[close..];
-    let fixed = prefix.chars().count() + suffix.chars().count();
-    if fixed >= max {
-        return truncate(tool, max);
-    }
-
-    let detail = &tool[open + 1..close];
-    let detail_budget = max - fixed;
-    format!(
-        "{prefix}{}{suffix}",
-        shorten_tool_detail(detail.trim(), detail_budget)
-    )
-}
-
-fn shorten_tool_detail(detail: &str, max: usize) -> String {
-    if detail.chars().count() <= max {
-        return detail.to_string();
-    }
-    // Rename-style details ("<old> -> <new>") first: they both start with a
-    // path and contain whitespace, so they must not fall into the single-path
-    // or command-line branches below.
-    if let Some((left, right)) = detail.split_once(" -> ") {
-        let sep = " -> ";
-        let sep_len = sep.chars().count();
-        if max > sep_len + 8 {
-            let side_budget = (max - sep_len) / 2;
-            let left = if is_path_like(left.trim()) {
-                shorten_path_middle(left.trim(), side_budget)
-            } else {
-                truncate(left.trim(), side_budget)
-            };
-            let right_budget = max
-                .saturating_sub(sep_len)
-                .saturating_sub(left.chars().count());
-            let right = if is_path_like(right.trim()) {
-                shorten_path_middle(right.trim(), right_budget)
-            } else {
-                truncate(right.trim(), right_budget)
-            };
-            return format!("{left}{sep}{right}");
-        }
-        return truncate(detail, max);
-    }
-    if is_path_like(detail) {
-        // A spawn/exec detail is "<binary path> <args…>" — a string that
-        // merely *starts* with a path. Middle-shortening it as one path keeps
-        // whatever follows the final '/' anywhere in the args (e.g. a URL's
-        // trailing slash) and can swallow the binary name entirely, rendering
-        // "ProcessSpawn(/tmp/…/chromiu…/)". Split and shorten the two parts
-        // separately so the binary basename always stays visible.
-        if let Some((cmd, cmd_args)) = detail.split_once(char::is_whitespace) {
-            return shorten_command_line(cmd, cmd_args, max);
-        }
-        return shorten_path_middle(detail, max);
-    }
-    truncate(detail, max)
-}
-
-/// Shorten a "<binary path> <args…>" detail so the binary's basename stays
-/// visible and the tail of the arguments (usually the target URL or final
-/// path) survives truncation.
-fn shorten_command_line(cmd: &str, args: &str, max: usize) -> String {
-    let args = args.trim();
-    if args.is_empty() {
-        return shorten_path_middle(cmd, max);
-    }
-    // Reserve roughly a third of the budget (at least 16 columns when the
-    // budget allows) for the arguments; the binary path takes the rest and
-    // keeps its basename via middle-shortening.
-    let args_reserve = (max / 3).max(16).min(max.saturating_sub(8));
-    let cmd_budget = max.saturating_sub(args_reserve + 1);
-    let cmd_short = shorten_path_middle(cmd, cmd_budget);
-    let args_budget = max
-        .saturating_sub(cmd_short.chars().count())
-        .saturating_sub(1);
-    if args_budget < 4 {
-        return truncate(&format!("{cmd_short} {args}"), max);
-    }
-    format!("{cmd_short} {}", truncate_middle(args, args_budget))
 }
 
 /// Keep the head and tail of `s`, dropping the middle. For argument lists the
@@ -1618,7 +1755,7 @@ mod tests {
     fn make_request(is_deny: bool) -> PermissionRequest {
         PermissionRequest {
             id: Uuid::new_v4(),
-            tool: "shell_exec".to_string(),
+            tool: "ShellExec(npm install lodash)".to_string(),
             args: "npm install lodash".to_string(),
             score: if is_deny { 8.5 } else { 4.2 },
             filters: vec![
@@ -1642,11 +1779,154 @@ mod tests {
             } else {
                 "medium".to_string()
             },
-            call_type: "shell \u{2013} package install".to_string(),
+            call_type: "ShellExec".to_string(),
             item_number: 1,
             total_items: 2,
             scope_enabled: false,
         }
+    }
+
+    fn summary_for(tool: &str, call_type: &str, args: &str) -> CallSummary {
+        let mut req = make_request(false);
+        req.tool = tool.to_string();
+        req.call_type = call_type.to_string();
+        req.args = args.to_string();
+        call_summary(&req)
+    }
+
+    #[test]
+    fn call_summary_single_path_uses_verb_and_basename() {
+        let s = summary_for("FileRead(/etc/passwd)", "FileRead", "");
+        assert_eq!(s.verb, "READ");
+        assert_eq!(s.headline, "passwd");
+        assert_eq!(s.targets.len(), 1);
+        assert_eq!(s.targets[0].value, "/etc/passwd");
+        assert!(s.args.is_none());
+    }
+
+    #[test]
+    fn call_summary_delete_is_destructive_tier() {
+        let s = summary_for("FileDelete(/repo/target/deps/foo.o)", "FileDelete", "");
+        assert_eq!(s.verb, "DELETE");
+        assert_eq!(s.role.color(), RED);
+    }
+
+    #[test]
+    fn call_summary_link_keeps_both_sides_labelled() {
+        let s = summary_for(
+            "FileLink(hard /home/dan/project/.git/objects/pack/tmp_obj_0BIXVU -> /home/dan/project/.git/objects/ab/cdef)",
+            "FileLink",
+            "",
+        );
+        assert_eq!(s.verb, "HARD-LINK");
+        assert_eq!(s.headline, "tmp_obj_0BIXVU");
+        assert_eq!(s.targets.len(), 2);
+        assert_eq!(s.targets[0].label, "link");
+        assert!(s.targets[0]
+            .value
+            .ends_with(".git/objects/pack/tmp_obj_0BIXVU"));
+        assert_eq!(s.targets[1].label, "target");
+        assert!(s.targets[1].value.ends_with(".git/objects/ab/cdef"));
+    }
+
+    #[test]
+    fn call_summary_symlink_verb() {
+        let s = summary_for(
+            "FileLink(symbolic /tmp/x -> /home/dan/.ssh/id_rsa)",
+            "FileLink",
+            "",
+        );
+        assert_eq!(s.verb, "SYMLINK");
+    }
+
+    #[test]
+    fn call_summary_rename_shows_from_and_to() {
+        let s = summary_for(
+            "FileRename(/tmp/node-compile/66a34524.keyBMG -> /tmp/node-compile/66a34524)",
+            "FileRename",
+            "",
+        );
+        assert_eq!(s.verb, "MOVE");
+        assert_eq!(s.headline, "66a34524");
+        assert_eq!(s.targets[0].label, "from");
+        assert!(s.targets[0].value.ends_with("66a34524.keyBMG"));
+        assert_eq!(s.targets[1].label, "to");
+        assert!(s.targets[1].value.ends_with("66a34524"));
+    }
+
+    #[test]
+    fn call_summary_spawn_splits_binary_and_args_from_detail() {
+        let s = summary_for(
+            "ProcessSpawn(/snap/snapd/27710/usr/lib/snapd/snap-confine --output json)",
+            "ProcessSpawn",
+            "not json",
+        );
+        assert_eq!(s.verb, "RUN");
+        assert_eq!(s.headline, "snap-confine");
+        assert_eq!(
+            s.targets[0].value,
+            "/snap/snapd/27710/usr/lib/snapd/snap-confine"
+        );
+        assert_eq!(s.args.as_deref(), Some("--output json"));
+    }
+
+    #[test]
+    fn call_summary_spawn_prefers_structured_json() {
+        // The Display detail glues command+args; the JSON keeps them distinct.
+        let s = summary_for(
+            "ProcessSpawn(/opt/my app/bin --flag)",
+            "ProcessSpawn",
+            r#"{"command":"/opt/my app/bin","spawn_args":["--flag","x"]}"#,
+        );
+        assert_eq!(s.headline, "bin");
+        assert_eq!(s.targets[0].value, "/opt/my app/bin");
+        assert_eq!(s.args.as_deref(), Some("--flag x"));
+    }
+
+    #[test]
+    fn call_summary_net_connect_headline_is_host_port() {
+        let s = summary_for("NetConnect(api.anthropic.com:443)", "NetConnect", "");
+        assert_eq!(s.verb, "CONNECT");
+        assert_eq!(s.headline, "api.anthropic.com:443");
+        assert!(s.targets.is_empty());
+    }
+
+    #[test]
+    fn call_summary_chmod_surfaces_mode() {
+        let s = summary_for("FileChmod(/usr/local/bin/tool, 4755)", "FileChmod", "");
+        assert_eq!(s.verb, "CHMOD");
+        assert_eq!(s.targets[0].value, "/usr/local/bin/tool");
+        assert_eq!(s.args.as_deref(), Some("mode 4755"));
+    }
+
+    #[test]
+    fn call_block_lines_keep_filename_on_long_paths() {
+        let s = summary_for(
+            "FileWrite(/tmp/node-compile-cache/v22.22.2-x64-9ac5647c-1000/66a34524.keyBMG)",
+            "FileWrite",
+            "",
+        );
+        let lines = call_block_lines(&s, 50);
+        // Header line carries the verb badge and the filename headline.
+        let header: String = lines[0]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(header.starts_with("WRITE"), "{header}");
+        assert!(header.contains("66a34524.keyBMG"), "{header}");
+        // The full-path row keeps the basename despite the width budget.
+        let path_row: String = lines[1]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(path_row.contains("..."), "{path_row}");
+        assert!(
+            path_row.trim_end().ends_with("66a34524.keyBMG"),
+            "{path_row}"
+        );
+        assert!(path_row.chars().count() <= 50, "{path_row}");
     }
 
     #[test]
@@ -1686,48 +1966,6 @@ mod tests {
         assert_eq!(truncate("hello world!", 8), "hello...");
     }
 
-    #[test]
-    fn long_file_path_is_shortened_in_the_middle() {
-        let text = shorten_tool_call(
-            "FileDelete(/home/dan/projects/PersonalProjects/Grith/grith/target/debug/deps/fp_legitimate_network.rs)",
-            58,
-        );
-        assert!(text.starts_with("FileDelete(/home/"), "{text}");
-        assert!(text.contains("..."), "{text}");
-        assert!(text.ends_with("/fp_legitimate_network.rs)"), "{text}");
-        assert!(text.chars().count() <= 58, "{text}");
-    }
-
-    /// The reported bug: a ProcessSpawn detail is "<binary path> <args…>",
-    /// and the args ended in a URL with a trailing slash. Single-path
-    /// middle-shortening preserved only that final "/" — swallowing the
-    /// binary name ("ProcessSpawn(/tmp/…/chromiu…/)"). The binary basename
-    /// and the tail of the args must both stay visible.
-    #[test]
-    fn spawn_command_line_keeps_binary_basename_and_args_tail() {
-        let text = shorten_tool_call(
-            "ProcessSpawn(/tmp/claude-1000/-home-dan-projects-VdepotPelygoProjects-nucleus-wms/752e1529-b778-4917-9c3f-20a74c88f5c2/scratchpad/chromium-92.0.4515.107/chrome-linux/chrome --headless --disable-gpu --screenshot=/tmp/shot.png --window-size=1280,1024 http://localhost:5173/)",
-            120,
-        );
-        assert!(text.contains("/chrome "), "binary basename lost: {text}");
-        assert!(
-            text.ends_with("localhost:5173/)"),
-            "args tail (target URL) lost: {text}"
-        );
-        assert!(text.chars().count() <= 120, "{text}");
-    }
-
-    /// A spawn with no args still middle-shortens as a single path.
-    #[test]
-    fn spawn_bare_binary_path_keeps_basename() {
-        let text = shorten_tool_detail(
-            "/tmp/claude-1000/some/very/long/scratchpad/path/chromium-92.0.4515.107/chrome-linux/chrome",
-            48,
-        );
-        assert!(text.ends_with("/chrome"), "{text}");
-        assert!(text.contains("..."), "{text}");
-    }
-
     /// A single path with a trailing slash keeps its last component visible
     /// rather than reducing the preserved suffix to "/".
     #[test]
@@ -1741,19 +1979,6 @@ mod tests {
             "last component lost: {text}"
         );
         assert!(text.chars().count() <= 48, "{text}");
-    }
-
-    /// Rename details between two absolute paths must keep both basenames
-    /// (the " -> " branch is checked before the path/command-line branches).
-    #[test]
-    fn rename_detail_keeps_both_basenames() {
-        let text = shorten_tool_detail(
-            "/home/dan/.pki/nssdb/very-long-directory-name-for-testing/pkcs11.txu -> /home/dan/.pki/nssdb/very-long-directory-name-for-testing/pkcs11.txt",
-            80,
-        );
-        assert!(text.contains("/pkcs11.txu"), "{text}");
-        assert!(text.contains(" -> "), "{text}");
-        assert!(text.ends_with("/pkcs11.txt"), "{text}");
     }
 
     #[test]
@@ -1970,31 +2195,19 @@ mod tests {
     }
 
     #[test]
-    fn title_with_provenance_shows_process_chain() {
-        let args = r#"{"pid":100,"process":"ssh","parent_pid":99,"parent_process":"git"}"#;
-        let line = title_with_provenance("FileRead(/home/dan/.ssh/id_rsa)", args, 120);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("ssh"), "should show ssh: {text}");
-        assert!(text.contains("git"), "should show git: {text}");
-        assert!(text.contains("FileRead"), "should show FileRead: {text}");
-    }
-
-    #[test]
-    fn title_with_provenance_omits_fork_from() {
-        let args =
-            r#"{"pid":100,"process":"fork-from-99","parent_pid":99,"parent_process":"claude"}"#;
-        let line = title_with_provenance("FileRead(/tmp/foo)", args, 120);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            !text.contains("fork-from"),
-            "should filter fork-from: {text}"
-        );
-    }
-
-    #[test]
-    fn title_with_provenance_no_args() {
-        let line = title_with_provenance("FileRead(/tmp/foo)", "", 80);
-        assert_eq!(line.spans.len(), 1);
-        assert!(line.spans[0].content.contains("FileRead"));
+    fn spawn_provenance_chain_appears_in_summary() {
+        let mut req = make_request(false);
+        req.tool = "ProcessSpawn(/usr/bin/ssh git@github.com)".to_string();
+        req.call_type = "ProcessSpawn".to_string();
+        req.args =
+            r#"{"pid":100,"process":"ssh","parent_pid":99,"parent_process":"git"}"#.to_string();
+        let lines = summary_lines(&req);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("ssh"), "should show process: {text}");
+        assert!(text.contains("git"), "should show parent: {text}");
     }
 }

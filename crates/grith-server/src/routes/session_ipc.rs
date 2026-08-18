@@ -123,8 +123,13 @@ fn session_limit_rejection_response(
 ) -> axum::response::Response {
     use grith_digest::notification::PlanTier;
 
-    let is_top_tier = tier == PlanTier::Enterprise;
-    let upgrade_url = if is_top_tier {
+    // Sessions are a free-tier lever only. Community can upgrade to a paid plan
+    // for the generous cap; the paid tiers (Pro/Enterprise) share the same flat
+    // 64, so neither an upgrade nor extra seats raises it — the only remedy at
+    // the paid limit is to close a session. Only Community gets the upgrade
+    // nudge (and the billing URL / rejection counter that powers it).
+    let is_paid = tier != PlanTier::Community;
+    let upgrade_url = if is_paid {
         None
     } else {
         Some(
@@ -133,7 +138,7 @@ fn session_limit_rejection_response(
                 .unwrap_or_else(|| "https://grith.ai/billing?ref=429".to_string()),
         )
     };
-    let remediation: Vec<&str> = if is_top_tier {
+    let remediation: Vec<&str> = if is_paid {
         vec!["close_session"]
     } else {
         vec!["close_session", "upgrade"]
@@ -141,15 +146,16 @@ fn session_limit_rejection_response(
     let message = match tier {
         PlanTier::Community => format!(
             "You're using {active} of {limit} concurrent sessions on the Community plan. \
-             Upgrade to Pro for more, or close a session with `grith exec kill <id>`."
+             Upgrade to Pro for a much higher limit, or close a session with \
+             `grith exec kill <id>`."
         ),
         PlanTier::Pro => format!(
             "You're using {active} of {limit} concurrent sessions on Pro. \
-             Add seats or close a session with `grith exec kill <id>`."
+             Close a session with `grith exec kill <id>` to start another."
         ),
         PlanTier::Enterprise => format!(
             "You're using {active} of {limit} concurrent sessions on Enterprise. \
-             Add seats or close a session with `grith exec kill <id>`."
+             Close a session with `grith exec kill <id>` to start another."
         ),
     };
 

@@ -77,9 +77,18 @@ const BYPASS_SRC: &str = r#"
 
 static int listener = -1;
 
+/* openat's number is per-arch: 257 on x86_64, 56 on aarch64 (asm-generic). */
+#if defined(__x86_64__)
+#define OPENAT_NR 257
+#elif defined(__aarch64__)
+#define OPENAT_NR 56
+#else
+#error "unsupported test architecture"
+#endif
+
 static struct sock_filter prog[] = {
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 257, 0, 1),   /* openat */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, OPENAT_NR, 0, 1),   /* openat */
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 };

@@ -39,6 +39,10 @@ struct OnboardingStatus {
     active_sessions: usize,
     /// Whether the dashboard checklist card was dismissed.
     dismissed: bool,
+    /// Whether the first-run dashboard intro overlay has been shown/acknowledged.
+    /// Gates the "this is your local dashboard, your CLI session is still
+    /// running in the terminal" explainer so it appears only once.
+    intro_seen: bool,
 }
 
 pub(crate) async fn get_onboarding_status(State(state): State<AppState>) -> impl IntoResponse {
@@ -66,6 +70,7 @@ pub(crate) async fn get_onboarding_status(State(state): State<AppState>) -> impl
         .unwrap_or(0);
 
     let dismissed = dismissed_marker(&state).exists();
+    let intro_seen = intro_seen_marker(&state).exists();
 
     Json(OnboardingStatus {
         onboarded,
@@ -76,6 +81,7 @@ pub(crate) async fn get_onboarding_status(State(state): State<AppState>) -> impl
         notifications_configured,
         active_sessions,
         dismissed,
+        intro_seen,
     })
 }
 
@@ -102,8 +108,39 @@ pub(crate) async fn dismiss_onboarding(State(state): State<AppState>) -> impl In
     }
 }
 
+/// Record that the first-run dashboard intro overlay has been acknowledged, so
+/// it is not shown again. Mirrors `dismiss_onboarding`: a marker file in the
+/// config dir, deliberately separate from `general.onboarded` and the checklist
+/// dismissal (they are different user actions).
+pub(crate) async fn mark_intro_seen(State(state): State<AppState>) -> impl IntoResponse {
+    let marker = intro_seen_marker(&state);
+    if let Some(parent) = marker.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not create config dir: {e}"),
+                "INTRO_SEEN_FAILED",
+            )
+            .into_response();
+        }
+    }
+    match std::fs::write(&marker, b"1") {
+        Ok(()) => Json(serde_json::json!({ "intro_seen": true })).into_response(),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not persist intro-seen marker: {e}"),
+            "INTRO_SEEN_FAILED",
+        )
+        .into_response(),
+    }
+}
+
 fn dismissed_marker(state: &AppState) -> PathBuf {
     state.config_dir.join("dashboard-onboarding-dismissed")
+}
+
+fn intro_seen_marker(state: &AppState) -> PathBuf {
+    state.config_dir.join("dashboard-intro-seen")
 }
 
 fn cfg_get<'a>(cfg: Option<&'a toml::Value>, path: &[&str]) -> Option<&'a toml::Value> {

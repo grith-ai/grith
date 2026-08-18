@@ -14,11 +14,9 @@
 # Supported platforms:
 #   - Linux x86_64  (static musl binary)
 #   - Linux aarch64 (static musl binary)
-#   - macOS x86_64  (Intel)
-#   - macOS aarch64 (Apple Silicon)
 #
-# Windows is not supported by this installer. Use the MSI package or
-# download the binary manually from GitHub Releases.
+# macOS (Endpoint Security) and Windows (ETW) supervisors are tracked
+# for v2.0; this installer errors with guidance on those platforms.
 #
 set -eu
 
@@ -69,21 +67,10 @@ detect_platform() {
         Linux)
             case "${arch}" in
                 x86_64)  target="x86_64-unknown-linux-musl" ;;
-                aarch64|arm64)
-                    err "Linux aarch64 is not yet supported by this installer."
-                    err ""
-                    err "grith's supervisor hard-codes x86_64 register"
-                    err "names for syscall-arg extraction. aarch64 support"
-                    err "needs an arch backend port. Track progress at:"
-                    err "  https://github.com/${REPO}/issues"
-                    err ""
-                    err "If you have an x86_64 Linux machine or VM, you"
-                    err "can install there via this same one-liner."
-                    exit 1
-                    ;;
+                aarch64|arm64) target="aarch64-unknown-linux-musl" ;;
                 *)
                     err "Unsupported Linux architecture: ${arch}"
-                    err "Currently supported: x86_64"
+                    err "Currently supported: x86_64, aarch64"
                     exit 1
                     ;;
             esac

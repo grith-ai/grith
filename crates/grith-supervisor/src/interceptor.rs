@@ -369,19 +369,20 @@ pub enum SyscallKind {
         /// Which architecture-specific privileged syscall fired.
         op: ArchPrivOp,
     },
-    /// Go-live review B1: a syscall issued under a foreign ABI — either
-    /// a non-x86_64 audit arch (`int 0x80`, a 32-bit binary) or x32
-    /// syscall numbering. The seccomp filter cannot interpret these
-    /// numbers, so it fails closed and the supervisor hard-denies in
+    /// Go-live review B1: a syscall issued under a foreign ABI — a
+    /// non-native audit arch (x86_64: `int 0x80` / a 32-bit binary;
+    /// aarch64: 32-bit compat EL0) or, on x86_64 only, x32 syscall
+    /// numbering. The seccomp filter cannot interpret these numbers, so
+    /// it fails closed and the supervisor hard-denies in
     /// `event_handler.rs` before classification, mirroring the
     /// kernel-module pattern.
     ForeignAbiSyscall {
         /// Which foreign shape fired.
         abi: ForeignAbiKind,
-        /// Raw untranslated syscall number from `orig_rax` (foreign
-        /// table for `CompatArch`; `nr | 0x40000000` for `X32`), or
-        /// `-1` when registers were unreadable. Forensic only — must
-        /// never be looked up in the x86_64 table.
+        /// Raw untranslated syscall number from the number register
+        /// (foreign table for `CompatArch`; `nr | 0x40000000` for
+        /// `X32`), or `-1` when registers were unreadable. Forensic
+        /// only — must never be looked up in the native table.
         raw_nr: i64,
     },
 }
@@ -389,10 +390,12 @@ pub enum SyscallKind {
 /// Go-live review B1: discriminator for `SyscallKind::ForeignAbiSyscall`.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ForeignAbiKind {
-    /// Non-x86_64 audit arch: `int 0x80` from a 64-bit process or a
-    /// 32-bit binary after exec.
+    /// Non-native audit arch: `int 0x80` from a 64-bit process or a
+    /// 32-bit binary after exec (x86_64); a compat-ARM EL0 binary on a
+    /// CONFIG_COMPAT arm64 kernel (aarch64).
     CompatArch,
-    /// x32 ABI: `AUDIT_ARCH_X86_64` with syscall bit 30 set.
+    /// x32 ABI: `AUDIT_ARCH_X86_64` with syscall bit 30 set. x86_64
+    /// only — no other architecture has an x32 analog.
     X32,
 }
 
@@ -473,6 +476,10 @@ pub enum CrossProcessOp {
     ProcessVmReadv,
     /// `process_vm_writev(2)` against a non-self target.
     ProcessVmWritev,
+    /// `pidfd_getfd(2)` — steal a file descriptor out of the process a pidfd
+    /// refers to. The target is resolved from the pidfd's fdinfo, not a
+    /// register pid argument.
+    PidfdGetfd,
 }
 
 /// PR 6 Phase C: discriminator for `SyscallKind::NamespaceOp`.
@@ -674,6 +681,18 @@ pub trait SyscallInterceptor: Send + Sync {
     /// The process receives `EPERM` as the syscall's return value and continues
     /// execution.
     async fn deny(&mut self, pid: u32) -> Result<()>;
+
+    /// Kill the intercepted process with `SIGKILL`.
+    ///
+    /// Used when a DENY decision must actually STOP the process rather than
+    /// EPERM one syscall. A `ProcessSpawn` is intercepted at
+    /// `PTRACE_EVENT_EXEC` — AFTER the new program image has loaded — where
+    /// [`deny`](Self::deny) is a no-op (there is no in-flight syscall to
+    /// convert to EPERM) and the program would otherwise run its first
+    /// instruction. Killing the tracee at that stop stops it before it can act
+    /// (e.g. before an authority-delegating `systemd-run` connects to the
+    /// session manager and delegates the real work to an untraced peer).
+    async fn kill(&mut self, pid: u32) -> Result<()>;
 
     /// Freeze (pause) a process.
     ///

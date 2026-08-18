@@ -144,24 +144,44 @@ impl QueueReviewer for ExecTuiQueueReviewer {
                 outcome
             }
             Err(_) => {
-                // The operator never answered. Record the auto-deny on the
-                // digest item (parity with the polling reviewer) and tell
-                // the TUI to drop the now-stale dialog so queued prompts
-                // surface instead of stacking behind a dead one.
+                // Two ways to get here: the operator never answered
+                // (timeout), or the TUI dropped the dialog - and with it
+                // `response_tx` - after `cancel_review` (scope drain).
+                // Check the item's current status first: a review resolved
+                // out-of-band already wrote its final status before the
+                // cancel, and must not be stomped with an auto-deny.
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build();
-                if let Ok(rt) = rt {
-                    let _ = rt.block_on(digest_store.update_status(
-                        item_id,
-                        DigestStatus::Denied,
-                        Some("auto_deny_timeout"),
-                        Some("auto denied after exec TUI review timeout"),
-                    ));
+                let status = rt
+                    .as_ref()
+                    .ok()
+                    .and_then(|rt| rt.block_on(digest_store.get(item_id)).ok().flatten())
+                    .map(|item| item.status);
+                match status {
+                    Some(DigestStatus::Approved) => ReviewOutcome::Approved,
+                    Some(DigestStatus::Denied) | Some(DigestStatus::Expired) => {
+                        ReviewOutcome::Denied
+                    }
+                    _ => {
+                        // Still pending (or unreadable): a genuine timeout.
+                        // Record the auto-deny (parity with the polling
+                        // reviewer) and tell the TUI to drop the now-stale
+                        // dialog so queued prompts surface instead of
+                        // stacking behind a dead one.
+                        if let Ok(rt) = rt {
+                            let _ = rt.block_on(digest_store.update_status(
+                                item_id,
+                                DigestStatus::Denied,
+                                Some("auto_deny_timeout"),
+                                Some("auto denied after exec TUI review timeout"),
+                            ));
+                        }
+                        let _ = cancel_tx
+                            .send(grith_cli::tui::exec_tui::PermissionMessage::Cancel(item_id));
+                        ReviewOutcome::TimedOut
+                    }
                 }
-                let _ =
-                    cancel_tx.send(grith_cli::tui::exec_tui::PermissionMessage::Cancel(item_id));
-                ReviewOutcome::TimedOut
             }
         });
 
@@ -172,6 +192,17 @@ impl QueueReviewer for ExecTuiQueueReviewer {
                 ReviewOutcome::Denied
             }
         }
+    }
+
+    /// Scope drain: drop the (possibly queued) TUI dialog for a review the
+    /// supervisor resolved out-of-band. Dropping the dialog also drops its
+    /// `response_tx`, which unblocks the waiting review task via a channel
+    /// disconnect; that task then reads the already-written digest status
+    /// instead of recording a timeout.
+    async fn cancel_review(&self, item_id: uuid::Uuid) {
+        let _ = self
+            .permission_tx
+            .send(grith_cli::tui::exec_tui::PermissionMessage::Cancel(item_id));
     }
 }
 
@@ -287,12 +318,25 @@ impl QueueReviewer for TerminalQueueReviewer {
                 .enable_all()
                 .build();
             if let Ok(rt) = rt {
-                let _ = rt.block_on(digest_store.update_status(
-                    item_id,
-                    status,
-                    Some(&action_str),
-                    Some(&note),
-                ));
+                // A review the supervisor resolved out-of-band while this
+                // dialog was on screen (scope drain) already carries its
+                // final status; an answer to the stale dialog must not
+                // overwrite it.
+                let still_pending = rt
+                    .block_on(digest_store.get(item_id))
+                    .ok()
+                    .flatten()
+                    .is_none_or(|item| {
+                        matches!(item.status, DigestStatus::Pending | DigestStatus::Escalated)
+                    });
+                if still_pending {
+                    let _ = rt.block_on(digest_store.update_status(
+                        item_id,
+                        status,
+                        Some(&action_str),
+                        Some(&note),
+                    ));
+                }
             }
 
             // Re-enable raw mode for PTY passthrough.
@@ -441,5 +485,71 @@ mod tests {
         let reviewed = queue.get_by_id(&item.id).unwrap();
         assert_eq!(reviewed.status, grith_digest::DigestStatus::Denied);
         assert_eq!(reviewed.review_action.as_deref(), Some("auto_deny_timeout"));
+    }
+
+    /// Scope drain: when the supervisor resolves a review out-of-band (writes
+    /// Approved, then cancels the dialog, which drops `response_tx`), the
+    /// disconnected review task must return the recorded outcome and must NOT
+    /// stomp the digest record with an auto-deny or send a second cancel.
+    #[tokio::test]
+    async fn exec_tui_reviewer_disconnect_preserves_out_of_band_resolution() {
+        let queue = Arc::new(grith_digest::DigestQueue::open_in_memory().unwrap());
+        let item = file_delete_item();
+        queue.enqueue(&item).unwrap();
+        let store: Arc<dyn DigestStore> = Arc::new(LocalDigestStore::new(queue.clone()));
+        let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
+        let reviewer = Arc::new(ExecTuiQueueReviewer::new(permission_tx, store));
+
+        let review_item = item.clone();
+        let review_task =
+            tokio::spawn(
+                async move { reviewer.review(&review_item, Duration::from_secs(5)).await },
+            );
+        let msg = tokio::task::spawn_blocking(move || {
+            permission_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        })
+        .await
+        .unwrap();
+        let grith_cli::tui::exec_tui::PermissionMessage::Request(event) = msg else {
+            panic!("expected a permission request message");
+        };
+
+        // Out-of-band resolution: the supervisor writes the final status
+        // FIRST, then the TUI drops the dialog (and with it response_tx).
+        queue
+            .update_status(
+                &item.id,
+                DigestStatus::Approved,
+                Some("scope_drain"),
+                Some("auto-approved: a session scope granted during review covers this target"),
+            )
+            .unwrap();
+        drop(event);
+
+        assert_eq!(review_task.await.unwrap(), ReviewOutcome::Approved);
+        let reviewed = queue.get_by_id(&item.id).unwrap();
+        assert_eq!(reviewed.status, grith_digest::DigestStatus::Approved);
+        assert_eq!(reviewed.review_action.as_deref(), Some("scope_drain"));
+    }
+
+    /// `cancel_review` is the supervisor's scope-drain hook: it must forward
+    /// a Cancel for the item so the TUI drops the (possibly queued) dialog.
+    #[tokio::test]
+    async fn exec_tui_reviewer_cancel_review_forwards_tui_cancel() {
+        let queue = Arc::new(grith_digest::DigestQueue::open_in_memory().unwrap());
+        let store: Arc<dyn DigestStore> = Arc::new(LocalDigestStore::new(queue));
+        let (permission_tx, permission_rx) = crossbeam_channel::unbounded();
+        let reviewer = ExecTuiQueueReviewer::new(permission_tx, store);
+
+        let id = Uuid::new_v4();
+        reviewer.cancel_review(id).await;
+
+        let msg = permission_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match msg {
+            grith_cli::tui::exec_tui::PermissionMessage::Cancel(got) => assert_eq!(got, id),
+            grith_cli::tui::exec_tui::PermissionMessage::Request(_) => {
+                panic!("expected a cancel message")
+            }
+        }
     }
 }

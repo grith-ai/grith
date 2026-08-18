@@ -610,6 +610,19 @@ pub async fn run_supervisor_loop(
     // pointless prompt.
     let yama_ptrace_scope = event_handler::probe_yama_ptrace_scope();
 
+    // Pin the SHA-256 + size of every curated authority-delegating binary on
+    // $PATH so a copy/hardlink under a novel name is caught by identity, not
+    // just basename. Built only when spawn enforcement is on at session start
+    // (env override folded in), so the default-off deployment pays nothing.
+    let (authority_delegating_hashes, authority_delegating_sizes) =
+        if authority_delegation::spawn_enforcement_enabled(
+            config.enforce_authority_delegating_spawn,
+        ) {
+            authority_delegation::build_pinned_authority_metadata()
+        } else {
+            (Default::default(), Default::default())
+        };
+
     let loop_ctx = SupervisorLoopContext {
         proxy: &proxy,
         audit_sink,
@@ -692,6 +705,8 @@ pub async fn run_supervisor_loop(
         namespace_users: session_namespace_users,
         permit_authority_delegating: session_permit_authority_delegating,
         permit_control_sockets: session_permit_control_sockets,
+        authority_delegating_hashes,
+        authority_delegating_sizes,
         // The supervised tool is spawned as a child of this process and
         // inherits its cwd, so the supervisor's cwd at session start is the
         // project root the tool was pointed at — the mass-destruction signal's
@@ -1547,6 +1562,11 @@ mod tests {
         }
 
         async fn deny(&mut self, pid: u32) -> crate::error::Result<()> {
+            self.state.lock().unwrap().deny_pids.push(pid);
+            Ok(())
+        }
+
+        async fn kill(&mut self, pid: u32) -> crate::error::Result<()> {
             self.state.lock().unwrap().deny_pids.push(pid);
             Ok(())
         }

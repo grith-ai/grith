@@ -164,6 +164,7 @@ export interface OnboardingStatus {
   notifications_configured: boolean;
   active_sessions: number;
   dismissed: boolean;
+  intro_seen: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +316,7 @@ export interface ConfigUpdateResponse {
   scope: string;
   filters_updated: number;
   proxy_updated: boolean;
+  server_updated: boolean;
   message: string;
 }
 

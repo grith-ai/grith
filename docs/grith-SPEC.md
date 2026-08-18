@@ -672,7 +672,7 @@ Profiles translate to allowlist entries in the proxy, giving score reductions fo
 | Platform | Mechanism | Status | Notes |
 |----------|-----------|--------|-------|
 | Linux x86-64 | ptrace + seccomp-BPF | v1.5 | Primary implementation |
-| Linux ARM64 | ptrace + seccomp-BPF | v1.5 | Same as x86-64, different syscall numbers |
+| Linux ARM64 | ptrace + seccomp-BPF | v1.5 | asm-generic syscall table (no legacy non-`at` calls), regset-based register access (`NT_PRSTATUS`/`NT_ARM_SYSTEM_CALL`), compat-ARM foreign-ABI surface, kernel 5.3+ (`PTRACE_GET_SYSCALL_INFO`) — see work/78 |
 | macOS (Apple Silicon) | Endpoint Security framework | v1.5 | Requires entitlement |
 | macOS (Intel) | Endpoint Security framework | v1.5 | Same as Apple Silicon |
 | Windows x86-64 | Minifilter + ETW | v2.0 | Requires driver signing |
@@ -1321,7 +1321,7 @@ tests/
 | macOS (Apple Silicon) | Primary | Endpoint Security framework | ARM64, macOS 13+ |
 | macOS (Intel) | Primary | Endpoint Security framework | x86-64, macOS 13+ |
 | Linux (x86-64) | Primary | ptrace + seccomp-BPF | Ubuntu 22.04+, Fedora 38+, Debian 12+ |
-| Linux (ARM64) | Supported | ptrace + seccomp-BPF | RPi 4+, Graviton, Ampere |
+| Linux (ARM64) | Primary | ptrace + seccomp-BPF | RPi 4+, Graviton, Ampere; kernel 5.3+ |
 | Windows (x86-64) | Primary | Minifilter + ETW (v2.0) | Windows 10 21H2+, WSL2 also supported |
 
 Distribution: single static binary per platform. Install via `curl | sh`, Homebrew, Scoop/WinGet, `cargo install`, direct download.

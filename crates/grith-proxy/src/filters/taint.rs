@@ -1431,6 +1431,24 @@ impl SecurityFilter for TaintFilter {
                 Ok(FilterResult::no_match("taint"))
             }
 
+            // Bind-mount aliasing: a mount re-exposes `source` under `target`.
+            // Reached only when the supervisor's `category2_proxy` coverage flag
+            // is enabled (default OFF). When the source is a sensitive location,
+            // register the TARGET at the source's taint level so the aliased
+            // path — whose later reads no longer match the source's sensitive
+            // markers — still taints the session. A High source (e.g. ~/.ssh)
+            // additionally activates session containment via register_taint's
+            // existing Phase-C hook.
+            ToolCallType::FilesystemMutation { source, target, .. } => {
+                if let Some(src) = source {
+                    let level = self.classify_source(src);
+                    if level != TaintLevel::None {
+                        self.register_taint(ctx, target, level);
+                    }
+                }
+                Ok(FilterResult::no_match("taint"))
+            }
+
             // Other call types: no taint concern.
             _ => Ok(FilterResult::no_match("taint")),
         }
@@ -1472,6 +1490,37 @@ mod tests {
         assert!(!result.matched);
         // But the path should be registered as tainted.
         assert_eq!(filter.tainted_path_count(), 1);
+    }
+
+    /// fix #6: a bind-mount whose SOURCE is sensitive taints the TARGET (the
+    /// aliased path), so later reads/exfil via the target are still seen even
+    /// though the target path matches no sensitive marker.
+    #[tokio::test]
+    async fn bind_mount_of_sensitive_source_taints_target() {
+        let filter = TaintFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::FilesystemMutation {
+            op: "mount".into(),
+            source: Some("/home/user/.ssh/id_rsa".into()),
+            target: "/tmp/alias".into(),
+            fstype: None,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(!result.matched); // registering taint is not itself a match
+        assert_eq!(filter.tainted_path_count(), 1);
+    }
+
+    /// A benign mount source registers no taint (inert on the opt-in path).
+    #[tokio::test]
+    async fn bind_mount_of_benign_source_is_inert() {
+        let filter = TaintFilter::with_defaults();
+        let ctx = make_ctx(ToolCallType::FilesystemMutation {
+            op: "mount".into(),
+            source: Some("/data/project".into()),
+            target: "/tmp/alias".into(),
+            fstype: None,
+        });
+        let _ = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(filter.tainted_path_count(), 0);
     }
 
     #[tokio::test]

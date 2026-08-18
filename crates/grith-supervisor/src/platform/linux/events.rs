@@ -22,6 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::error::{Error, Result};
 use crate::interceptor::{SyscallEvent, SyscallInterceptor, WedgedTracee};
 
+use super::arch::SysId;
 use super::{is_security_relevant, PtraceSupervisor};
 
 /// Record that we've just observed (or acted on) an event for `tid`.
@@ -43,7 +44,7 @@ fn record_event(sup: &mut PtraceSupervisor, tid: u32, kind: &'static str) {
 /// `read(2)`/`write(2)` to preserve prior attach-mode visibility.
 fn is_fallback_relevant_syscall(nr: i64, use_seccomp: bool) -> bool {
     is_security_relevant(nr)
-        || (!use_seccomp && (nr == super::syscall_nr::READ || nr == super::syscall_nr::WRITE))
+        || (!use_seccomp && matches!(super::arch::sys_id(nr), Some(SysId::Read | SysId::Write)))
 }
 
 #[inline]
@@ -139,7 +140,7 @@ impl PtraceSupervisor {
             // between its stop and this resume — a benign ptrace race, not a
             // supervisor failure. Resuming a dead tracee is a no-op; its exit is
             // reaped by the next `waitpid`. Never fatal (matches how the SIGKILL
-            // path and `read_registers` tolerate ESRCH).
+            // path and `arch::read_syscall_regs` tolerate ESRCH).
             Err(nix::errno::Errno::ESRCH) => {
                 trace!(
                     pid = pid.as_raw(),
@@ -489,12 +490,7 @@ impl PtraceSupervisor {
             Self::syscall_info(pid),
             at_seccomp_stop,
             || ptrace::getevent(pid).map(|d| d as u64).unwrap_or(0),
-            || {
-                self.read_registers(pid)
-                    .ok()
-                    .flatten()
-                    .map(|regs| regs.orig_rax)
-            },
+            || super::arch::read_raw_syscall_nr(pid).map(|nr| nr as u64),
         )
     }
 
@@ -527,9 +523,15 @@ impl PtraceSupervisor {
 
         match info {
             SyscallEntryInfo::Entry { arch, nr } => {
-                if arch != super::seccomp::AUDIT_ARCH_X86_64 {
+                if arch != super::arch::NATIVE_AUDIT_ARCH {
                     Some(ForeignAbiKind::CompatArch)
-                } else if nr & u64::from(super::seccomp::X32_SYSCALL_BIT) != 0 {
+                } else if cfg!(target_arch = "x86_64")
+                    && nr & u64::from(super::seccomp::X32_SYSCALL_BIT) != 0
+                {
+                    // x86_64-only: x32 is a second numbering under the native
+                    // audit arch. No other architecture has an analog — on
+                    // aarch64 the compat-ARM surface reports its own audit
+                    // arch and is caught by the branch above.
                     Some(ForeignAbiKind::X32)
                 } else {
                     // An ordinary x86_64 syscall, including an unknown or
@@ -546,6 +548,12 @@ impl PtraceSupervisor {
             // trustworthy here.
             SyscallEntryInfo::NotEntry => None,
             SyscallEntryInfo::Unsupported if at_seccomp_stop => {
+                if cfg!(not(target_arch = "x86_64")) {
+                    // Statically dead off x86_64: verify_kernel_support
+                    // refuses pre-5.3 kernels at session start on the
+                    // aarch64 backend, and the marker values are x86-shaped.
+                    return None;
+                }
                 // Pre-5.3 seccomp stop: the event message is this stop's
                 // filter marker, the best signal left. (A tracee-installed
                 // filter can forge it on an action tie — accepted for
@@ -560,6 +568,10 @@ impl PtraceSupervisor {
                 }
             }
             SyscallEntryInfo::Unsupported => {
+                if cfg!(not(target_arch = "x86_64")) {
+                    // See the seccomp-stop arm above: dead off x86_64.
+                    return None;
+                }
                 // Pre-5.3 syscall stop (attach mode): the number the tracee
                 // loaded is the only honest signal. Bit 30 marks x32; any
                 // bit above it marks a negative or garbage value that is not
@@ -586,56 +598,28 @@ impl PtraceSupervisor {
     /// kernel whenever a syscall-exit stop was misjudged as an entry
     /// (B1 round 3).
     fn syscall_info(pid: Pid) -> SyscallEntryInfo {
-        /// `struct ptrace_syscall_info`, prefix only — everything up to and
-        /// including the entry/seccomp `nr`. Both the ENTRY and SECCOMP
-        /// variants place `nr` at the same offset, so the shared prefix is
-        /// enough and the union tail can be ignored.
-        #[repr(C)]
-        #[derive(Default)]
-        struct SyscallInfoPrefix {
-            op: u8,
-            _pad: [u8; 3],
-            arch: u32,
-            instruction_pointer: u64,
-            stack_pointer: u64,
-            nr: u64,
-        }
-
-        const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
-        const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
-        const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
-
-        let mut info = SyscallInfoPrefix::default();
-        // SAFETY: `info` is a live, correctly-aligned allocation and we pass
-        // its exact size; the kernel writes at most that many bytes.
-        let ret = unsafe {
-            libc::ptrace(
-                // `as _` so the request adapts to `libc::ptrace`'s first
-                // argument type, which is `c_uint` on glibc but `c_int` on
-                // musl — the mismatch that failed the musl release build.
-                PTRACE_GET_SYSCALL_INFO as _,
-                pid.as_raw(),
-                std::mem::size_of::<SyscallInfoPrefix>(),
-                std::ptr::addr_of_mut!(info),
-            )
+        use super::arch::{
+            get_syscall_info, SyscallInfoResult, PTRACE_SYSCALL_INFO_ENTRY,
+            PTRACE_SYSCALL_INFO_SECCOMP,
         };
-        if ret <= 0 {
-            // ESRCH: the tracee died in its stop — there is no entry record
-            // to read, and that is `NotEntry`, not a licence to guess from
-            // weaker sources. Anything else (EIO on pre-5.3) means the
-            // request itself is unknown.
-            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        match get_syscall_info(pid) {
+            SyscallInfoResult::Info(info)
+                if info.op == PTRACE_SYSCALL_INFO_ENTRY
+                    || info.op == PTRACE_SYSCALL_INFO_SECCOMP =>
+            {
+                SyscallEntryInfo::Entry {
+                    arch: info.arch,
+                    nr: info.data[0],
+                }
+            }
+            // A non-entry op, or ESRCH: the tracee died in its stop — there
+            // is no entry record to read, and that is `NotEntry`, not a
+            // licence to guess from weaker sources.
+            SyscallInfoResult::Info(_) | SyscallInfoResult::TraceeGone => {
                 SyscallEntryInfo::NotEntry
-            } else {
-                SyscallEntryInfo::Unsupported
-            };
-        }
-        if info.op != PTRACE_SYSCALL_INFO_ENTRY && info.op != PTRACE_SYSCALL_INFO_SECCOMP {
-            return SyscallEntryInfo::NotEntry;
-        }
-        SyscallEntryInfo::Entry {
-            arch: info.arch,
-            nr: info.nr,
+            }
+            // EIO on pre-5.3: the request itself is unknown.
+            SyscallInfoResult::Unsupported => SyscallEntryInfo::Unsupported,
         }
     }
 
@@ -648,57 +632,12 @@ impl PtraceSupervisor {
     /// request is unsupported (pre-5.3), where the caller falls back to the
     /// `rax == -ENOSYS` entry heuristic.
     fn syscall_stop_is_exit(pid: Pid) -> Option<bool> {
-        #[repr(C)]
-        #[derive(Default)]
-        struct OpOnly {
-            op: u8,
-            _pad: [u8; 3],
-            _arch: u32,
-        }
-        const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
-        const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
-
-        let mut info = OpOnly::default();
-        // SAFETY: `info` is live and correctly aligned; the kernel writes at
-        // most `size_of` bytes.
-        let ret = unsafe {
-            libc::ptrace(
-                // `as _` so the request adapts to `libc::ptrace`'s first
-                // argument type, which is `c_uint` on glibc but `c_int` on
-                // musl — the mismatch that failed the musl release build.
-                PTRACE_GET_SYSCALL_INFO as _,
-                pid.as_raw(),
-                std::mem::size_of::<OpOnly>(),
-                std::ptr::addr_of_mut!(info),
-            )
-        };
-        if ret <= 0 {
-            return None;
-        }
-        Some(info.op == PTRACE_SYSCALL_INFO_EXIT)
-    }
-
-    /// Read the x86_64 general-purpose register file from a stopped tracee.
-    ///
-    /// Returns `Ok(None)` when the tracee no longer exists (ESRCH). A tracee
-    /// can be SIGKILLed — including by a sibling thread's `exit_group(2)` —
-    /// even while sitting in a ptrace stop, so a queued wait status can
-    /// outlive its thread. That race is benign (the exit is reaped by the
-    /// next `waitpid`) and must never end the session.
-    pub(super) fn read_registers(&self, pid: Pid) -> Result<Option<libc::user_regs_struct>> {
-        match ptrace::getregs(pid) {
-            Ok(regs) => Ok(Some(regs)),
-            Err(nix::errno::Errno::ESRCH) => {
-                trace!(
-                    pid = pid.as_raw(),
-                    event = "tracee_gone_at_stop",
-                    "PTRACE_GETREGS: tracee gone (ESRCH); treating stop as stale"
-                );
-                Ok(None)
-            }
-            Err(e) => Err(Error::InterceptionError(format!(
-                "PTRACE_GETREGS failed for pid {pid}: {e}"
-            ))),
+        use super::arch::{get_syscall_info, SyscallInfoResult, PTRACE_SYSCALL_INFO_EXIT};
+        match get_syscall_info(pid) {
+            SyscallInfoResult::Info(info) => Some(info.op == PTRACE_SYSCALL_INFO_EXIT),
+            // Tracee gone, or the request is unsupported (pre-5.3): the
+            // caller falls back to its heuristic.
+            SyscallInfoResult::TraceeGone | SyscallInfoResult::Unsupported => None,
         }
     }
 
@@ -996,12 +935,14 @@ impl PtraceSupervisor {
                 "child creation lacked an exact entry-time FD-table snapshot",
             ));
         } else {
-            self.read_registers(pid)
+            // A PTRACE_EVENT stop carries no syscall-info record, so this
+            // reads the entry-time values still held in the registers.
+            super::arch::read_syscall_regs(pid)
                 .ok()
                 .flatten()
-                .and_then(|regs| match regs.orig_rax as i64 {
-                    super::syscall_nr::FORK => Some(0),
-                    super::syscall_nr::CLONE => Some(regs.rdi),
+                .and_then(|regs| match super::arch::sys_id(regs.nr) {
+                    Some(SysId::Fork) => Some(0),
+                    Some(SysId::Clone) => Some(regs.args[0]),
                     _ => None,
                 })
         };
@@ -1123,7 +1064,7 @@ impl PtraceSupervisor {
         tgid: u32,
         fd: i32,
         nr: i64,
-        regs: &libc::user_regs_struct,
+        regs: &super::arch::SyscallRegs,
     ) -> Option<crate::interceptor::DnsQueryInspection> {
         // Ownership is selected by shared socket route, not syscall shape.
         // A proxy-owned send is inspected by the route worker even when libc
@@ -1137,13 +1078,14 @@ impl PtraceSupervisor {
         {
             return None;
         }
+        let sid = super::arch::sys_id(nr);
         let mut messages: Vec<(Option<SocketAddr>, bool, Vec<u8>, bool)> = Vec::new();
-        match nr {
-            super::syscall_nr::SENDTO => {
-                let destination = if regs.r8 == 0 {
+        match sid {
+            Some(SysId::Sendto) => {
+                let destination = if regs.args[4] == 0 {
                     None
                 } else {
-                    match self.read_socket_addr(pid, regs.r8, regs.r9 as usize) {
+                    match self.read_socket_addr(pid, regs.args[4], regs.args[5] as usize) {
                         Some(addr) => Some(addr),
                         None => {
                             // A non-null, unreadable destination is a
@@ -1155,8 +1097,8 @@ impl PtraceSupervisor {
                 };
                 let payload = match self.read_tracee_bytes(
                     pid,
-                    regs.rsi,
-                    (regs.rdx as usize).min(MAX_DNS_MSG),
+                    regs.args[1],
+                    (regs.args[2] as usize).min(MAX_DNS_MSG),
                 ) {
                     Ok(payload) => payload,
                     Err(_)
@@ -1172,13 +1114,13 @@ impl PtraceSupervisor {
                 };
                 messages.push((
                     destination,
-                    regs.r8 != 0,
+                    regs.args[4] != 0,
                     payload,
-                    regs.rdx as usize > MAX_DNS_MSG,
+                    regs.args[2] as usize > MAX_DNS_MSG,
                 ));
             }
-            super::syscall_nr::SENDMSG => {
-                let Some(message) = self.read_msghdr(pid, regs.rsi, MAX_DNS_MSG) else {
+            Some(SysId::Sendmsg) => {
+                let Some(message) = self.read_msghdr(pid, regs.args[1], MAX_DNS_MSG) else {
                     return Some(crate::interceptor::DnsQueryInspection {
                         queries: Vec::new(),
                         parse_error: Some("sendmsg-inspection-failed".into()),
@@ -1186,8 +1128,8 @@ impl PtraceSupervisor {
                 };
                 messages.push(message);
             }
-            super::syscall_nr::SENDMMSG => {
-                let vlen = regs.rdx as usize;
+            Some(SysId::Sendmmsg) => {
+                let vlen = regs.args[2] as usize;
                 if vlen == 0 {
                     return None;
                 }
@@ -1205,7 +1147,7 @@ impl PtraceSupervisor {
                 }
                 let mut total_iovecs = 0usize;
                 for index in 0..vlen {
-                    let header = regs.rsi.checked_add((index as u64) * MMSGHDR_SIZE)?;
+                    let header = regs.args[1].checked_add((index as u64) * MMSGHDR_SIZE)?;
                     let iovlen = self.read_tracee_u64(pid, header + 24)? as usize;
                     total_iovecs = total_iovecs.checked_add(iovlen)?;
                     if total_iovecs > MAX_DNS_BATCH_IOVECS {
@@ -1332,14 +1274,14 @@ impl PtraceSupervisor {
     /// Return true only for a send form whose peer cannot be changed through
     /// mutable tracee memory after this ptrace stop.
     ///
-    /// `send()` lowers to `sendto(..., NULL, 0)` on x86_64, so a null `r8`
-    /// safely uses the socket's connected proxy peer. `sendmsg` and
+    /// `send()` lowers to `sendto(..., NULL, 0)`, so a null `dest_addr`
+    /// argument safely uses the socket's connected proxy peer. `sendmsg` and
     /// `sendmmsg` keep `msg_name` in caller-owned memory; a sibling could turn
     /// a checked null pointer into an explicit direct destination before the
     /// kernel copies the header. Deny both message APIs until the supervisor
     /// can substitute an immutable/scratch header.
-    fn proxy_send_uses_supported_connected_form(nr: i64, regs: &libc::user_regs_struct) -> bool {
-        nr == super::syscall_nr::SENDTO && regs.r8 == 0
+    fn proxy_send_uses_supported_connected_form(nr: i64, regs: &super::arch::SyscallRegs) -> bool {
+        super::arch::sys_id(nr) == Some(SysId::Sendto) && regs.args[4] == 0
     }
 
     fn record_dns_response(&mut self, pending: super::DnsRecvPending, response: &[u8]) {
@@ -1594,6 +1536,9 @@ impl SyscallInterceptor for PtraceSupervisor {
             reason: format!("waitpid after attach: {e}"),
         })?;
 
+        // Attached tracee is stopped: probe required kernel capabilities
+        // (aarch64 >= 5.3 floor; no-op on x86_64) before classifying anything.
+        super::arch::verify_kernel_support(nix_pid)?;
         self.set_trace_options(nix_pid)?;
         self.supervised.insert(pid);
         self.tid_tgids
@@ -1770,14 +1715,9 @@ impl SyscallInterceptor for PtraceSupervisor {
                             self.tid_tgids.insert(tid, tgid);
                             // Registers are well-defined even for compat
                             // tracees; the *number* is foreign. Record it for
-                            // forensics only. `read_registers` yields `None`
-                            // if the tracee was killed at the stop — record -1.
-                            let raw_nr = self
-                                .read_registers(pid)
-                                .ok()
-                                .flatten()
-                                .map(|r| r.orig_rax as i64)
-                                .unwrap_or(-1);
+                            // forensics only. `None` (tracee killed at the
+                            // stop) records -1.
+                            let raw_nr = super::arch::read_raw_syscall_nr(pid).unwrap_or(-1);
                             warn!(
                                 pid = tgid,
                                 tid,
@@ -1802,15 +1742,16 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // queued event with no thread behind it. Skip it;
                         // the exit is reaped by the next waitpid and no
                         // syscall executes.
-                        let Some(regs) = self.read_registers(pid)? else {
+                        let Some(regs) = super::arch::read_syscall_regs(pid)? else {
                             record_event(self, pid_u32, "seccomp-stop:tracee-gone");
                             continue;
                         };
-                        let nr = regs.orig_rax as i64;
+                        let nr = regs.nr;
+                        let sid = super::arch::sys_id(nr);
                         let tid = pid_u32;
                         let tgid = Self::resolve_tgid(tid).unwrap_or(tid);
                         self.tid_tgids.insert(tid, tgid);
-                        let fd = regs.rdi as i32;
+                        let fd = regs.args[0] as i32;
 
                         // Capture clone FD-sharing at the pre-exec seccomp
                         // stop. clone3's flags are supplied through mutable
@@ -1818,32 +1759,32 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // child event is too late to establish provenance.
                         self.pending_clone_fd_table.remove(&tid);
                         if matches!(
-                            nr,
-                            super::syscall_nr::FORK
-                                | super::syscall_nr::CLONE
-                                | super::syscall_nr::CLONE3
+                            sid,
+                            Some(SysId::Fork) | Some(SysId::Clone) | Some(SysId::Clone3)
                         ) {
-                            let snapshot = match nr {
-                                super::syscall_nr::FORK => Some(super::CloneFdTablePending {
+                            let snapshot = match sid {
+                                Some(SysId::Fork) => Some(super::CloneFdTablePending {
                                     syscall_nr: nr,
                                     flags: 0,
                                 }),
-                                super::syscall_nr::CLONE => Some(super::CloneFdTablePending {
+                                Some(SysId::Clone) => Some(super::CloneFdTablePending {
                                     syscall_nr: nr,
-                                    flags: regs.rdi,
+                                    flags: regs.args[0],
                                 }),
-                                super::syscall_nr::CLONE3 if regs.rdi != 0 && regs.rsi >= 8 => self
-                                    .read_tracee_u64(pid, regs.rdi)
-                                    .map(|flags| super::CloneFdTablePending {
-                                        syscall_nr: nr,
-                                        flags,
-                                    }),
+                                Some(SysId::Clone3) if regs.args[0] != 0 && regs.args[1] >= 8 => {
+                                    self.read_tracee_u64(pid, regs.args[0]).map(|flags| {
+                                        super::CloneFdTablePending {
+                                            syscall_nr: nr,
+                                            flags,
+                                        }
+                                    })
+                                }
                                 _ => None,
                             };
                             if let Some(snapshot) = snapshot {
                                 self.pending_clone_fd_table.insert(tid, snapshot);
                             } else if self.connected_dns_proxy.is_some()
-                                && nr == super::syscall_nr::CLONE3
+                                && sid == Some(SysId::Clone3)
                             {
                                 warn!(
                                     tgid,
@@ -1860,9 +1801,9 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // carries per-thread table identities, allowing them
                         // would make later DNS state ambiguous. Fail closed
                         // instead of silently losing inspection coverage.
-                        if (nr == super::syscall_nr::CLOSE_RANGE && regs.rdx & 2 != 0)
-                            || (nr == super::syscall_nr::UNSHARE
-                                && regs.rdi & libc::CLONE_FILES as u64 != 0)
+                        if (sid == Some(SysId::CloseRange) && regs.args[2] & 2 != 0)
+                            || (sid == Some(SysId::Unshare)
+                                && regs.args[0] & libc::CLONE_FILES as u64 != 0)
                         {
                             warn!(
                                 tgid,
@@ -1877,7 +1818,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // Maintain socket descriptor lifecycle at successful
                         // syscall exit. Only lifecycle operations are promoted;
                         // ordinary reads/writes remain outside the trap set.
-                        let lifecycle = match nr {
+                        let lifecycle = match sid {
                             // Only promote a close(2) to the two-stop exit dance
                             // when `fd` is a *tracked socket*. The exit handler
                             // (`dns_tracker.close`) is a no-op for any other fd,
@@ -1891,16 +1832,16 @@ impl SyscallInterceptor for PtraceSupervisor {
                             // `classify_syscall`, which returns `Ok(None)` for
                             // CLOSE (see classify.rs) -> allowed. Behaviourally
                             // equivalent; validated by the fd-lifecycle repro.
-                            super::syscall_nr::CLOSE
+                            Some(SysId::Close)
                                 if self.dns_tracker.socket_type(tgid, fd).is_some() =>
                             {
                                 Some(super::FdLifecyclePending::Close { tgid, fd })
                             }
-                            super::syscall_nr::CLOSE_RANGE if regs.rdx & 4 == 0 => {
+                            Some(SysId::CloseRange) if regs.args[2] & 4 == 0 => {
                                 Some(super::FdLifecyclePending::CloseRange {
                                     tgid,
-                                    first: regs.rdi as u32,
-                                    last: regs.rsi as u32,
+                                    first: regs.args[0] as u32,
+                                    last: regs.args[1] as u32,
                                 })
                             }
                             // FOLLOW-UP (deferred by decision, 2026-07-27): dup*
@@ -1909,7 +1850,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             // two-stop dance here too, but the safe gate is more
                             // than close's single check: promote iff the SOURCE
                             // fd is a tracked socket OR (for dup2/dup3) the TARGET
-                            // fd (regs.rsi) is a tracked socket — because dup2/dup3
+                            // fd (regs.args[1]) is a tracked socket — because dup2/dup3
                             // silently close an already-open target, which the
                             // tracker must observe to untrack it. Must fail toward
                             // promoting when uncertain: a missed promotion leaves
@@ -1920,15 +1861,15 @@ impl SyscallInterceptor for PtraceSupervisor {
                             // security-relevant and validate with the fdchurn repro
                             // + ptrace_* tests before shipping. See memory
                             // fd-lifecycle-promotion-wedge.
-                            super::syscall_nr::DUP
-                            | super::syscall_nr::DUP2
-                            | super::syscall_nr::DUP3 => Some(super::FdLifecyclePending::Dup {
-                                tgid,
-                                source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
-                            }),
-                            super::syscall_nr::FCNTL
+                            Some(SysId::Dup) | Some(SysId::Dup2) | Some(SysId::Dup3) => {
+                                Some(super::FdLifecyclePending::Dup {
+                                    tgid,
+                                    source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                                })
+                            }
+                            Some(SysId::Fcntl)
                                 if matches!(
-                                    regs.rsi as i32,
+                                    regs.args[1] as i32,
                                     libc::F_DUPFD | libc::F_DUPFD_CLOEXEC
                                 ) =>
                             {
@@ -1954,10 +1895,8 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // appears null.
                         if self.dns_tracker.is_connected_proxy(tgid, fd)
                             && matches!(
-                                nr,
-                                super::syscall_nr::SENDTO
-                                    | super::syscall_nr::SENDMSG
-                                    | super::syscall_nr::SENDMMSG
+                                sid,
+                                Some(SysId::Sendto) | Some(SysId::Sendmsg) | Some(SysId::Sendmmsg)
                             )
                         {
                             if Self::proxy_send_uses_supported_connected_form(nr, &regs) {
@@ -1998,10 +1937,10 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if self.dns_cache.is_some()
                             && self.dns_observe_responses
                             && matches!(
-                                nr,
-                                super::syscall_nr::RECVFROM
-                                    | super::syscall_nr::RECVMSG
-                                    | super::syscall_nr::RECVMMSG
+                                sid,
+                                Some(SysId::Recvfrom)
+                                    | Some(SysId::Recvmsg)
+                                    | Some(SysId::Recvmmsg)
                             )
                             && self.dns_tracker.is_dns(tgid, fd)
                             && !self.dns_tracker.is_connected_proxy(tgid, fd)
@@ -2016,17 +1955,17 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 self.resume_continue(pid, None)?;
                                 continue;
                             };
-                            let kind = match nr {
-                                super::syscall_nr::RECVFROM => super::DnsRecvKind::From {
-                                    buf_ptr: regs.rsi,
-                                    buf_len: (regs.rdx as usize).min(MAX_DNS_MSG),
+                            let kind = match sid {
+                                Some(SysId::Recvfrom) => super::DnsRecvKind::From {
+                                    buf_ptr: regs.args[1],
+                                    buf_len: (regs.args[2] as usize).min(MAX_DNS_MSG),
                                 },
-                                super::syscall_nr::RECVMSG => super::DnsRecvKind::Msg {
-                                    msghdr_ptr: regs.rsi,
+                                Some(SysId::Recvmsg) => super::DnsRecvKind::Msg {
+                                    msghdr_ptr: regs.args[1],
                                 },
-                                super::syscall_nr::RECVMMSG => super::DnsRecvKind::Mmsg {
-                                    msgvec_ptr: regs.rsi,
-                                    vlen: (regs.rdx as usize).min(MAX_DNS_BATCH),
+                                Some(SysId::Recvmmsg) => super::DnsRecvKind::Mmsg {
+                                    msgvec_ptr: regs.args[1],
+                                    vlen: (regs.args[2] as usize).min(MAX_DNS_BATCH),
                                 },
                                 _ => unreachable!(),
                             };
@@ -2051,10 +1990,10 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // arg. Used for TCP-DNS detection at a :53 connect AND to
                         // distinguish TCP vs UDP connects so UDP egress can be
                         // deferred to the send.
-                        if nr == super::syscall_nr::SOCKET
-                            && matches!(regs.rdi as i32, libc::AF_INET | libc::AF_INET6)
+                        if sid == Some(SysId::Socket)
+                            && matches!(regs.args[0] as i32, libc::AF_INET | libc::AF_INET6)
                         {
-                            let socket_type = match (regs.rsi as i32) & 0xFF {
+                            let socket_type = match (regs.args[1] as i32) & 0xFF {
                                 libc::SOCK_STREAM => super::dns_socket_tracker::SocketType::Stream,
                                 libc::SOCK_DGRAM => super::dns_socket_tracker::SocketType::Datagram,
                                 _ => super::dns_socket_tracker::SocketType::Other,
@@ -2070,10 +2009,8 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // every message in the send before allowing it.
                         if self.dns_cache.is_some()
                             && matches!(
-                                nr,
-                                super::syscall_nr::SENDTO
-                                    | super::syscall_nr::SENDMSG
-                                    | super::syscall_nr::SENDMMSG
+                                sid,
+                                Some(SysId::Sendto) | Some(SysId::Sendmsg) | Some(SysId::Sendmmsg)
                             )
                         {
                             if let Some(inspection) =
@@ -2102,10 +2039,8 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // thus never scored. The session allowlist / reputation
                         // cache the decision so repeated sends don't re-prompt.
                         if matches!(
-                            nr,
-                            super::syscall_nr::SENDTO
-                                | super::syscall_nr::SENDMSG
-                                | super::syscall_nr::SENDMMSG
+                            sid,
+                            Some(SysId::Sendto) | Some(SysId::Sendmsg) | Some(SysId::Sendmmsg)
                         ) {
                             if let Some(peer) = self.dns_tracker.connected_destination(tgid, fd) {
                                 if self.dns_tracker.socket_type(tgid, fd)
@@ -2117,17 +2052,21 @@ impl SyscallInterceptor for PtraceSupervisor {
                                     // send names, so scoring the recorded peer
                                     // would name the wrong host and let the
                                     // real egress through (go-live review
-                                    // round 2). sendto: dest_addr in r8 /
-                                    // addrlen in r9. sendmsg/sendmmsg: msg_name
-                                    // in the (first) msghdr at rsi.
-                                    let explicit = match nr {
-                                        super::syscall_nr::SENDTO if regs.r8 != 0 => self
-                                            .read_sockaddr(pid, regs.r8, regs.r9 as usize, None)?
+                                    // round 2). sendto: dest_addr in a4 /
+                                    // addrlen in a5. sendmsg/sendmmsg: msg_name
+                                    // in the (first) msghdr at a1.
+                                    let explicit = match sid {
+                                        Some(SysId::Sendto) if regs.args[4] != 0 => self
+                                            .read_sockaddr(
+                                                pid,
+                                                regs.args[4],
+                                                regs.args[5] as usize,
+                                                None,
+                                            )?
                                             .filter(|(a, _, _)| !a.is_empty())
                                             .map(|(a, p, _)| (a, p)),
-                                        super::syscall_nr::SENDMSG
-                                        | super::syscall_nr::SENDMMSG => {
-                                            self.read_msghdr_destination(pid, regs.rsi)?
+                                        Some(SysId::Sendmsg) | Some(SysId::Sendmmsg) => {
+                                            self.read_msghdr_destination(pid, regs.args[1])?
                                         }
                                         _ => None,
                                     };
@@ -2164,11 +2103,11 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // reports success. Connected DNS routes additionally
                         // substitute the peer for one syscall and register the
                         // resulting local tuple before the caller resumes.
-                        if nr == super::syscall_nr::CONNECT
+                        if sid == Some(SysId::Connect)
                             && self.dns_tracker.socket_type(tgid, fd)
                                 == Some(super::dns_socket_tracker::SocketType::Datagram)
                         {
-                            let family = self.sockaddr_family(pid, regs.rsi);
+                            let family = self.sockaddr_family(pid, regs.args[1]);
                             if family == Some(libc::AF_UNSPEC) {
                                 let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd) else {
                                     self.deny(tid).await?;
@@ -2189,7 +2128,7 @@ impl SyscallInterceptor for PtraceSupervisor {
 
                             if let (Some(control), Some(original_resolver)) = (
                                 self.connected_dns_proxy.clone(),
-                                self.read_socket_addr(pid, regs.rsi, regs.rdx as usize),
+                                self.read_socket_addr(pid, regs.args[1], regs.args[2] as usize),
                             ) {
                                 if original_resolver.port() == 53 {
                                     match super::dns_redirect::shares_supervisor_netns(tid) {
@@ -2245,8 +2184,8 @@ impl SyscallInterceptor for PtraceSupervisor {
                                     let sockaddr =
                                         match super::dns_redirect::replace_connect_sockaddr(
                                             pid,
-                                            regs.rsi,
-                                            regs.rdx as u32,
+                                            regs.args[1],
+                                            regs.args[2] as u32,
                                             route.endpoint,
                                         ) {
                                             Ok(sockaddr) => sockaddr,
@@ -2289,14 +2228,14 @@ impl SyscallInterceptor for PtraceSupervisor {
                             }
                         }
 
-                        if nr == super::syscall_nr::CONNECT
+                        if sid == Some(SysId::Connect)
                             && self.connected_dns_proxy.is_some()
                             && matches!(
                                 self.dns_tracker.socket_type(tgid, fd),
                                 None | Some(super::dns_socket_tracker::SocketType::Other)
                             )
                             && self
-                                .read_socket_addr(pid, regs.rsi, regs.rdx as usize)
+                                .read_socket_addr(pid, regs.args[1], regs.args[2] as usize)
                                 .is_some_and(|destination| destination.port() == 53)
                         {
                             warn!(
@@ -2329,7 +2268,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                     protocol,
                                 } = &kind
                                 {
-                                    let fd = regs.rdi as i32;
+                                    let fd = regs.args[0] as i32;
                                     let mut known_type = self.dns_tracker.socket_type(tgid, fd);
                                     if known_type.is_none()
                                         && matches!(
@@ -2485,7 +2424,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             tid: pid_u32,
                             timestamp: Utc::now(),
                             kind,
-                            raw_syscall_nr: super::syscall_nr::EXECVE,
+                            raw_syscall_nr: super::arch::nr_of(SysId::Execve).unwrap_or(-1),
                         }));
                     }
 
@@ -2517,7 +2456,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 tid: pid_u32,
                                 timestamp: Utc::now(),
                                 kind,
-                                raw_syscall_nr: super::syscall_nr::CLONE,
+                                raw_syscall_nr: super::arch::nr_of(SysId::Clone).unwrap_or(-1),
                             }));
                         }
                     }
@@ -2545,11 +2484,9 @@ impl SyscallInterceptor for PtraceSupervisor {
                     if let Some(pending) = self.pending_dns_connect_exit.remove(&pid_u32) {
                         self.in_syscall_entry.remove(&pid_u32);
                         record_event(self, pid_u32, "dns-connect-exit");
-                        let result = self
-                            .read_registers(pid)
+                        let result = super::arch::read_return_value(pid)
                             .ok()
                             .flatten()
-                            .map(|regs| regs.rax as i64)
                             .unwrap_or(-(libc::EIO as i64));
 
                         if let Err(error) = pending.sockaddr.restore(pid) {
@@ -2682,11 +2619,10 @@ impl SyscallInterceptor for PtraceSupervisor {
                     if let Some(pending) = self.pending_udp_connect_exit.remove(&pid_u32) {
                         self.in_syscall_entry.remove(&pid_u32);
                         record_event(self, pid_u32, "udp-connect-exit");
-                        let succeeded = self
-                            .read_registers(pid)
+                        let succeeded = super::arch::read_return_value(pid)
                             .ok()
                             .flatten()
-                            .is_some_and(|regs| (regs.rax as i64) >= 0);
+                            .is_some_and(|result| result >= 0);
                         if succeeded {
                             let released = match pending.destination {
                                 Some(destination) => self
@@ -2732,8 +2668,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     if let Some(pending) = self.pending_dns_recv_exit.remove(&pid_u32) {
                         self.in_syscall_entry.remove(&pid_u32);
                         record_event(self, pid_u32, "dns-recv-exit");
-                        if let Ok(Some(regs)) = self.read_registers(pid) {
-                            let n = regs.rax as i64;
+                        if let Ok(Some(n)) = super::arch::read_return_value(pid) {
                             if n > 0 {
                                 match pending.kind {
                                     super::DnsRecvKind::From { buf_ptr, buf_len } => {
@@ -2793,8 +2728,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     if let Some(pending) = self.pending_socket_exit.remove(&pid_u32) {
                         self.in_syscall_entry.remove(&pid_u32);
                         record_event(self, pid_u32, "inet-socket-exit");
-                        if let Ok(Some(regs)) = self.read_registers(pid) {
-                            let fd = regs.rax as i64;
+                        if let Ok(Some(fd)) = super::arch::read_return_value(pid) {
                             if fd >= 0 {
                                 let released = self.dns_tracker.observe_socket(
                                     pending.tgid,
@@ -2822,7 +2756,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // cleanup for a pending fd event: release any held
                         // source socket so route holds stay balanced; the reap
                         // of this tid handles the rest.
-                        let Some(regs) = self.read_registers(pid)? else {
+                        let Some(result) = super::arch::read_return_value(pid)? else {
                             if let Some(socket_id) = held_source {
                                 if let Some(route_id) =
                                     self.dns_tracker.release_socket_hold(socket_id)
@@ -2833,7 +2767,6 @@ impl SyscallInterceptor for PtraceSupervisor {
                             record_event(self, pid_u32, "fd-lifecycle-exit:tracee-gone");
                             continue;
                         };
-                        let result = regs.rax as i64;
                         let released = match pending {
                             // Linux releases an FD early in close(2), even
                             // when later flush/writeback reports EINTR or
@@ -2948,15 +2881,21 @@ impl SyscallInterceptor for PtraceSupervisor {
                         // The stepped thread can be killed (sibling exit_group,
                         // SIGKILL) while stopped here; its stepping state is
                         // reaped with its thread-exit, so skip the stale stop.
-                        let Some(regs) = self.read_registers(pid)? else {
+                        let Some(regs) = super::arch::read_syscall_regs(pid)? else {
                             record_event(self, pid_u32, "dgram-write-step:tracee-gone");
                             continue;
                         };
                         // Fallback for pre-5.3 kernels: at entry the kernel
-                        // seeds rax with -ENOSYS; at exit rax holds the return.
+                        // seeds the return register with -ENOSYS; at exit it
+                        // holds the return value. `retval_hint` comes from the
+                        // same register fetch as the arguments (pre-5.3 always
+                        // reads the register file), so a tracee dying between
+                        // reads cannot flip the judgment.
                         let at_entry = match is_exit {
                             Some(exit) => !exit,
-                            None => regs.rax as i64 == -(libc::ENOSYS as i64),
+                            None => regs
+                                .retval_hint
+                                .is_some_and(|retval| retval == -(libc::ENOSYS as i64)),
                         };
                         if !at_entry {
                             // Exit stop — the write already ran (or was
@@ -2966,14 +2905,15 @@ impl SyscallInterceptor for PtraceSupervisor {
                         }
                         record_event(self, pid_u32, "dgram-write-step");
 
-                        let nr = regs.orig_rax as i64;
-                        if !matches!(nr, super::syscall_nr::WRITE | super::syscall_nr::WRITEV) {
+                        let nr = regs.nr;
+                        let sid = super::arch::sys_id(nr);
+                        if !matches!(sid, Some(SysId::Write) | Some(SysId::Writev)) {
                             self.resume_to_next_syscall(pid, None)?;
                             continue;
                         }
 
                         let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
-                        let write_fd = regs.rdi as i32;
+                        let write_fd = regs.args[0] as i32;
                         let Some(destination) = self.connected_dgram_egress_target(tgid, write_fd)
                         else {
                             // Not egress: an ordinary file, the PTY, or a
@@ -3030,12 +2970,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     if let Some(abi) = self.foreign_abi_at_stop(pid, false) {
                         let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
                         self.tid_tgids.insert(pid_u32, tgid);
-                        let raw_nr = self
-                            .read_registers(pid)
-                            .ok()
-                            .flatten()
-                            .map(|r| r.orig_rax as i64)
-                            .unwrap_or(-1);
+                        let raw_nr = super::arch::read_raw_syscall_nr(pid).unwrap_or(-1);
                         warn!(
                             pid = tgid,
                             tid = pid_u32,
@@ -3058,18 +2993,19 @@ impl SyscallInterceptor for PtraceSupervisor {
 
                     // Tracee died in this stop; undo the entry toggle so a
                     // reused tid cannot inherit a stale entry/exit phase.
-                    let Some(regs) = self.read_registers(pid)? else {
+                    let Some(regs) = super::arch::read_syscall_regs(pid)? else {
                         self.in_syscall_entry.remove(&pid_u32);
                         record_event(self, pid_u32, "syscall-fallback:tracee-gone");
                         continue;
                     };
-                    let nr = regs.orig_rax as i64;
+                    let nr = regs.nr;
+                    let sid = super::arch::sys_id(nr);
                     let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
-                    let fd = regs.rdi as i32;
+                    let fd = regs.args[0] as i32;
 
-                    if (nr == super::syscall_nr::CLOSE_RANGE && regs.rdx & 2 != 0)
-                        || (nr == super::syscall_nr::UNSHARE
-                            && regs.rdi & libc::CLONE_FILES as u64 != 0)
+                    if (sid == Some(SysId::CloseRange) && regs.args[2] & 2 != 0)
+                        || (sid == Some(SysId::Unshare)
+                            && regs.args[0] & libc::CLONE_FILES as u64 != 0)
                     {
                         warn!(
                             tgid,
@@ -3084,7 +3020,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     // B13 attach-mode parity: an attach session stops on
                     // every syscall already, so the connected-datagram write
                     // is surfaced inline rather than by stepping.
-                    if matches!(nr, super::syscall_nr::WRITE | super::syscall_nr::WRITEV) {
+                    if matches!(sid, Some(SysId::Write) | Some(SysId::Writev)) {
                         if let Some(destination) = self.connected_dgram_egress_target(tgid, fd) {
                             return Ok(Some(Self::connected_dgram_write_event(
                                 tgid,
@@ -3099,25 +3035,26 @@ impl SyscallInterceptor for PtraceSupervisor {
                     // Attach-mode parity for targeted DNS and FD tracking.
                     // This fallback already stops at syscall boundaries, but
                     // uses the same pending-exit records as the seccomp path.
-                    let lifecycle = match nr {
-                        super::syscall_nr::CLOSE => {
-                            Some(super::FdLifecyclePending::Close { tgid, fd })
-                        }
-                        super::syscall_nr::CLOSE_RANGE if regs.rdx & 4 == 0 => {
+                    let lifecycle = match sid {
+                        Some(SysId::Close) => Some(super::FdLifecyclePending::Close { tgid, fd }),
+                        Some(SysId::CloseRange) if regs.args[2] & 4 == 0 => {
                             Some(super::FdLifecyclePending::CloseRange {
                                 tgid,
-                                first: regs.rdi as u32,
-                                last: regs.rsi as u32,
+                                first: regs.args[0] as u32,
+                                last: regs.args[1] as u32,
                             })
                         }
-                        super::syscall_nr::DUP
-                        | super::syscall_nr::DUP2
-                        | super::syscall_nr::DUP3 => Some(super::FdLifecyclePending::Dup {
-                            tgid,
-                            source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
-                        }),
-                        super::syscall_nr::FCNTL
-                            if matches!(regs.rsi as i32, libc::F_DUPFD | libc::F_DUPFD_CLOEXEC) =>
+                        Some(SysId::Dup) | Some(SysId::Dup2) | Some(SysId::Dup3) => {
+                            Some(super::FdLifecyclePending::Dup {
+                                tgid,
+                                source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                            })
+                        }
+                        Some(SysId::Fcntl)
+                            if matches!(
+                                regs.args[1] as i32,
+                                libc::F_DUPFD | libc::F_DUPFD_CLOEXEC
+                            ) =>
                         {
                             Some(super::FdLifecyclePending::Dup {
                                 tgid,
@@ -3132,10 +3069,10 @@ impl SyscallInterceptor for PtraceSupervisor {
                         continue;
                     }
 
-                    if nr == super::syscall_nr::SOCKET
-                        && matches!(regs.rdi as i32, libc::AF_INET | libc::AF_INET6)
+                    if sid == Some(SysId::Socket)
+                        && matches!(regs.args[0] as i32, libc::AF_INET | libc::AF_INET6)
                     {
-                        let socket_type = match (regs.rsi as i32) & 0xFF {
+                        let socket_type = match (regs.args[1] as i32) & 0xFF {
                             libc::SOCK_STREAM => super::dns_socket_tracker::SocketType::Stream,
                             libc::SOCK_DGRAM => super::dns_socket_tracker::SocketType::Datagram,
                             _ => super::dns_socket_tracker::SocketType::Other,
@@ -3148,10 +3085,8 @@ impl SyscallInterceptor for PtraceSupervisor {
 
                     if self.dns_tracker.is_connected_proxy(tgid, fd)
                         && matches!(
-                            nr,
-                            super::syscall_nr::SENDTO
-                                | super::syscall_nr::SENDMSG
-                                | super::syscall_nr::SENDMMSG
+                            sid,
+                            Some(SysId::Sendto) | Some(SysId::Sendmsg) | Some(SysId::Sendmmsg)
                         )
                     {
                         if Self::proxy_send_uses_supported_connected_form(nr, &regs) {
@@ -3182,10 +3117,8 @@ impl SyscallInterceptor for PtraceSupervisor {
                         && self.dns_tracker.is_dns(tgid, fd)
                         && !self.dns_tracker.is_connected_proxy(tgid, fd)
                         && matches!(
-                            nr,
-                            super::syscall_nr::RECVFROM
-                                | super::syscall_nr::RECVMSG
-                                | super::syscall_nr::RECVMMSG
+                            sid,
+                            Some(SysId::Recvfrom) | Some(SysId::Recvmsg) | Some(SysId::Recvmmsg)
                         )
                     {
                         let Some(socket_id) = self.dns_tracker.hold_socket(tgid, fd) else {
@@ -3198,17 +3131,17 @@ impl SyscallInterceptor for PtraceSupervisor {
                             self.resume_tracee(pid, None)?;
                             continue;
                         };
-                        let kind = match nr {
-                            super::syscall_nr::RECVFROM => super::DnsRecvKind::From {
-                                buf_ptr: regs.rsi,
-                                buf_len: (regs.rdx as usize).min(MAX_DNS_MSG),
+                        let kind = match sid {
+                            Some(SysId::Recvfrom) => super::DnsRecvKind::From {
+                                buf_ptr: regs.args[1],
+                                buf_len: (regs.args[2] as usize).min(MAX_DNS_MSG),
                             },
-                            super::syscall_nr::RECVMSG => super::DnsRecvKind::Msg {
-                                msghdr_ptr: regs.rsi,
+                            Some(SysId::Recvmsg) => super::DnsRecvKind::Msg {
+                                msghdr_ptr: regs.args[1],
                             },
-                            super::syscall_nr::RECVMMSG => super::DnsRecvKind::Mmsg {
-                                msgvec_ptr: regs.rsi,
-                                vlen: (regs.rdx as usize).min(MAX_DNS_BATCH),
+                            Some(SysId::Recvmmsg) => super::DnsRecvKind::Mmsg {
+                                msgvec_ptr: regs.args[1],
+                                vlen: (regs.args[2] as usize).min(MAX_DNS_BATCH),
                             },
                             _ => unreachable!(),
                         };
@@ -3227,10 +3160,8 @@ impl SyscallInterceptor for PtraceSupervisor {
 
                     if self.dns_cache.is_some()
                         && matches!(
-                            nr,
-                            super::syscall_nr::SENDTO
-                                | super::syscall_nr::SENDMSG
-                                | super::syscall_nr::SENDMMSG
+                            sid,
+                            Some(SysId::Sendto) | Some(SysId::Sendmsg) | Some(SysId::Sendmmsg)
                         )
                     {
                         if let Some(inspection) = self.inspect_dns_send(pid, tgid, fd, nr, &regs) {
@@ -3248,10 +3179,10 @@ impl SyscallInterceptor for PtraceSupervisor {
                         }
                     }
 
-                    if nr == super::syscall_nr::CONNECT
+                    if sid == Some(SysId::Connect)
                         && self.dns_tracker.socket_type(tgid, fd)
                             == Some(super::dns_socket_tracker::SocketType::Datagram)
-                        && self.sockaddr_family(pid, regs.rsi) == Some(libc::AF_UNSPEC)
+                        && self.sockaddr_family(pid, regs.args[1]) == Some(libc::AF_UNSPEC)
                     {
                         let Some(socket_id) = self.dns_tracker.pin_socket(tgid, fd) else {
                             self.deny(pid_u32).await?;
@@ -3770,35 +3701,65 @@ impl SyscallInterceptor for PtraceSupervisor {
 
         // Replace the syscall with an invalid number so the kernel skips
         // execution, and pre-seed the return register with -EPERM so the
-        // tracee sees a real permission error instead of ENOSYS.
+        // tracee sees a real permission error instead of ENOSYS. The
+        // register mechanics are per-arch (`arch::deny_syscall`).
         //
         // A tracee that died in its stop cannot execute the syscall, so the
         // denial is vacuously enforced — never fatal. This is also the path
         // the fail-closed classify-error handler takes, so an error here
         // would turn a benign thread death into full session teardown.
-        let Some(mut regs) = self.read_registers(nix_pid)? else {
+        if !super::arch::deny_syscall(nix_pid, libc::EPERM)? {
             record_event(self, pid, "deny:tracee-gone");
             return Ok(());
-        };
-        regs.orig_rax = u64::MAX; // -1 as u64 => invalid syscall number
-        regs.rax = -(libc::EPERM as i64) as u64;
-        match ptrace::setregs(nix_pid, regs) {
-            Ok(()) => {}
-            // Same race one step later: the tracee died between GETREGS and
-            // SETREGS. No syscall will execute; the denial holds.
-            Err(nix::errno::Errno::ESRCH) => {
-                record_event(self, pid, "deny:tracee-gone");
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(Error::InterceptionError(format!(
-                    "PTRACE_SETREGS (deny) failed for pid {pid}: {e}"
-                )));
-            }
         }
 
         record_event(self, pid, "deny");
         self.resume_tracee(nix_pid, None)
+    }
+
+    /// Kill the intercepted tracee with `SIGKILL`.
+    ///
+    /// Makes a DENY effective for a `ProcessSpawn` stopped at
+    /// `PTRACE_EVENT_EXEC`, where `deny_syscall` cannot un-exec the process
+    /// (there is no in-flight syscall to convert to EPERM). We SIGKILL, then
+    /// resume the tracee so the kernel processes the now-pending fatal signal:
+    /// a `SIGKILL` cannot be suppressed by `PTRACE_CONT` and is delivered on
+    /// the return-to-userspace path, so the tracee dies **before** it executes
+    /// the new image's first instruction (`systemd-run` never connects to the
+    /// session manager). Resuming rather than relying on the stop-and-reap is
+    /// portable across kernels that hold a ptrace-stopped tracee until its next
+    /// resumption. The event loop's next `waitpid` reaps the exit and prunes
+    /// the process tree. A tracee that `SIGKILL` already reaped makes the
+    /// resume a no-op (`ESRCH`), which is expected and not an error (mirrors the
+    /// tracee-gone handling in `deny`).
+    async fn kill(&mut self, pid: u32) -> Result<()> {
+        let nix_pid = Pid::from_raw(pid as i32);
+        trace!(pid, "killing tracee (SIGKILL)");
+        // A killed spawn will not produce further ptrace events for its intended
+        // work; discard any entry-time inheritance snapshot (mirrors `deny`).
+        self.pending_clone_fd_table.remove(&pid);
+        self.settle_stepping_decision(pid, false);
+        match nix::sys::signal::kill(nix_pid, Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => {
+                return Err(Error::InterceptionError(format!(
+                    "SIGKILL to pid {pid} failed: {e}"
+                )));
+            }
+        }
+        // Resume so the pending SIGKILL is processed. On a kernel that already
+        // reaped the tracee this fails with ESRCH (or a benign resume error) —
+        // the kill is vacuously satisfied, so log at trace and carry on rather
+        // than propagate. The kill itself has already been delivered above.
+        if let Err(e) = self.resume_tracee(nix_pid, None) {
+            trace!(
+                pid,
+                error = %e,
+                "resume after SIGKILL failed (tracee already reaped) — ignoring"
+            );
+        }
+        record_event(self, pid, "kill");
+        Ok(())
     }
 
     /// Freeze a process by sending `SIGSTOP`.
@@ -4426,6 +4387,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn writev_is_a_known_syscall_number() {
         // The gathered-write form is the obvious way around a write-only
@@ -4525,19 +4487,24 @@ mod tests {
         );
     }
 
-    /// The GETREGS twin of `resume_of_a_dead_tracee_is_not_fatal`: a tracee
-    /// killed (sibling `exit_group` / SIGKILL) while sitting in a ptrace stop
-    /// yields ESRCH from PTRACE_GETREGS, which must read as "tracee gone"
-    /// (`Ok(None)`), not a fatal interception error. Regression test for the
-    /// supervisor loop aborting with "PTRACE_GETREGS failed ... ESRCH".
+    /// The register-read twin of `resume_of_a_dead_tracee_is_not_fatal`: a
+    /// tracee killed (sibling `exit_group` / SIGKILL) while sitting in a
+    /// ptrace stop yields ESRCH from the register read, which must read as
+    /// "tracee gone" (`Ok(None)`), not a fatal interception error. Regression
+    /// test for the supervisor loop aborting with "PTRACE_GETREGS failed ...
+    /// ESRCH".
     #[test]
     fn getregs_of_a_dead_tracee_is_not_fatal() {
-        let sup = PtraceSupervisor::new();
         let dead = Pid::from_raw(0x3fff_ffff);
-        match sup.read_registers(dead) {
+        match crate::platform::linux::arch::read_syscall_regs(dead) {
             Ok(None) => {}
             Ok(Some(_)) => panic!("a never-allocated PID cannot have readable registers"),
-            Err(e) => panic!("PTRACE_GETREGS on a dead tracee must be tolerated, got: {e}"),
+            Err(e) => panic!("a register read on a dead tracee must be tolerated, got: {e}"),
+        }
+        match crate::platform::linux::arch::read_return_value(dead) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a never-allocated PID cannot have a readable return value"),
+            Err(e) => panic!("a return-value read on a dead tracee must be tolerated, got: {e}"),
         }
     }
 
@@ -4595,20 +4562,18 @@ mod tests {
 
     #[test]
     fn proxy_send_allows_only_sendto_with_register_level_null_peer() {
-        // SAFETY: user_regs_struct contains only integer register fields, and a
-        // zeroed value is valid for this pure classification test.
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let mut regs = crate::platform::linux::arch::SyscallRegs::default();
         assert!(PtraceSupervisor::proxy_send_uses_supported_connected_form(
             syscall_nr::SENDTO,
             &regs,
         ));
 
-        regs.r8 = 1;
+        regs.args[4] = 1;
         assert!(!PtraceSupervisor::proxy_send_uses_supported_connected_form(
             syscall_nr::SENDTO,
             &regs,
         ));
-        regs.r8 = 0;
+        regs.args[4] = 0;
         assert!(!PtraceSupervisor::proxy_send_uses_supported_connected_form(
             syscall_nr::SENDMSG,
             &regs,
@@ -4679,7 +4644,7 @@ mod tests {
             raw_syscall_nr: syscall_nr::OPENAT,
         };
         assert_eq!(event.pid, 1234);
-        assert_eq!(event.raw_syscall_nr, 257);
+        assert_eq!(event.raw_syscall_nr, syscall_nr::OPENAT);
     }
 
     #[test]
@@ -4736,7 +4701,7 @@ mod tests {
             tid: 100,
             timestamp: Utc::now(),
             kind: SyscallKind::PipeCreate,
-            raw_syscall_nr: syscall_nr::PIPE,
+            raw_syscall_nr: syscall_nr::PIPE2,
         };
         assert_eq!(pipe.kind, SyscallKind::PipeCreate);
 
@@ -4752,13 +4717,17 @@ mod tests {
 
     // -- Foreign-ABI classification (B1 round 3) ----------------------------
 
+    #[cfg(target_arch = "x86_64")]
     use crate::interceptor::ForeignAbiKind;
 
-    /// AUDIT_ARCH_I386 — any value other than x86_64 exercises the arm.
+    /// AUDIT_ARCH_I386 — any value other than the native arch exercises the
+    /// arm. Only consumed by the x86-gated foreign-ABI tests.
+    #[cfg(target_arch = "x86_64")]
     const ARCH_I386: u32 = 0x4000_0003;
-    const ARCH_X86_64: u32 = super::super::seccomp::AUDIT_ARCH_X86_64;
+    const ARCH_X86_64: u32 = crate::platform::linux::arch::NATIVE_AUDIT_ARCH;
 
     /// x32 futex: the ordinary number (202 = 0xca) with the x32 marker bit.
+    #[cfg(target_arch = "x86_64")]
     fn x32_nr() -> u64 {
         u64::from(super::super::seccomp::X32_SYSCALL_BIT) | 0xca
     }
@@ -4793,6 +4762,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn entry_record_detects_foreign_arch_and_x32() {
         assert_eq!(
@@ -4843,6 +4813,7 @@ mod tests {
     }
 
     /// Pre-5.3 + seccomp stop is the ONE place the filter marker is current.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn pre53_seccomp_stop_uses_the_filter_marker() {
         let cases = [
@@ -4874,6 +4845,7 @@ mod tests {
 
     /// Pre-5.3 at a plain syscall stop: only the number register speaks —
     /// the event message is stale there and must not be touched.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn pre53_syscall_stop_classifies_from_the_number_alone() {
         let cases = [

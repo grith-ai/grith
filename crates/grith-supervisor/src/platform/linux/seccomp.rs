@@ -6,16 +6,23 @@
 //! Installs a BPF program that returns `SECCOMP_RET_TRACE` for
 //! security-relevant syscalls and `SECCOMP_RET_ALLOW` for everything
 //! else. When combined with `PTRACE_O_TRACESECCOMP`, this means the
-//! tracer only gets ptrace stops for the ~21 syscalls it cares about,
+//! tracer only gets ptrace stops for the syscalls it cares about,
 //! instead of stopping on every single syscall (hundreds of thousands
 //! during Node.js startup).
 //!
-//! Syscalls the filter cannot interpret fail closed: a non-x86_64
-//! audit arch (`int 0x80`, a 32-bit exec) or an x32 syscall number
-//! (`nr & 0x40000000`) returns `SECCOMP_RET_TRACE` with a non-zero
-//! `SECCOMP_RET_DATA` code so the supervisor can deny and audit the
-//! attempt without interpreting foreign-ABI registers through the
-//! x86_64 syscall table (go-live review B1).
+//! Syscalls the filter cannot interpret fail closed: a non-native
+//! audit arch (`int 0x80`, a 32-bit exec, compat EL0 on arm64) or — on
+//! x86_64 — an x32 syscall number (`nr & 0x40000000`) returns
+//! `SECCOMP_RET_TRACE` with a non-zero `SECCOMP_RET_DATA` code so the
+//! supervisor can deny and audit the attempt without interpreting
+//! foreign-ABI registers through the native syscall table (go-live
+//! review B1).
+//!
+//! The BPF opcode layer and the fail-closed return block are shared;
+//! [`build_filter_for`] is parametrised on the native audit-arch value,
+//! the trap list, and whether the x32 branch exists (an x86_64-only
+//! escape hatch — aarch64 has no x32 analog, and its compat-ARM surface
+//! is subsumed by the foreign-arch check).
 //!
 //! This module is called from the child process after `PTRACE_TRACEME`
 //! and before `execve`.
@@ -24,19 +31,7 @@
 
 use nix::libc;
 
-use super::SECURITY_RELEVANT;
-
-/// Syscall numbers that are handled by ptrace events (PTRACE_O_TRACE*)
-/// rather than seccomp. These are excluded from the seccomp filter because:
-/// - EXECVE: handled by PTRACE_EVENT_EXEC. Installing SECCOMP_RET_TRACE
-///   for execve before PTRACE_O_TRACESECCOMP is set causes ENOSYS.
-/// - CLONE/FORK: handled by PTRACE_EVENT_CLONE/FORK/VFORK.
-const PTRACE_EVENT_HANDLED: &[i64] = &[
-    super::syscall_nr::EXECVE,   // 59
-    super::syscall_nr::EXECVEAT, // 322 — also triggers PTRACE_EVENT_EXEC
-    super::syscall_nr::CLONE,    // 56
-    super::syscall_nr::FORK,     // 57
-];
+use super::arch;
 
 // ── BPF constants ──────────────────────────────────────────────────────
 
@@ -63,10 +58,11 @@ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
 
 /// `SECCOMP_RET_DATA` code carried on the TRACE return for a syscall
-/// issued under a non-x86_64 audit arch (i386 `int 0x80` or a 32-bit
-/// binary). Read by the supervisor via `PTRACE_GETEVENTMSG` at the
-/// seccomp stop; the syscall number in `orig_rax` belongs to a foreign
-/// syscall table and must not be classified.
+/// issued under a non-native audit arch (i386 `int 0x80`, a 32-bit
+/// binary, compat EL0 on arm64). Read by the supervisor via
+/// `PTRACE_GETEVENTMSG` at the seccomp stop; the syscall number in the
+/// number register belongs to a foreign syscall table and must not be
+/// classified.
 ///
 /// CAUTION: these marker values collide with the kernel's own
 /// `PTRACE_EVENTMSG_SYSCALL_ENTRY` (1) / `PTRACE_EVENTMSG_SYSCALL_EXIT`
@@ -81,25 +77,27 @@ pub(super) const SECCOMP_TRACE_DATA_FOREIGN_ARCH: u32 = 1;
 /// `SECCOMP_RET_DATA` code for an x32-ABI syscall: the audit arch is
 /// `AUDIT_ARCH_X86_64` but the number carries `X32_SYSCALL_BIT`, so it
 /// matches no entry in the x86_64 table. (See the collision CAUTION on
-/// `SECCOMP_TRACE_DATA_FOREIGN_ARCH`.)
+/// `SECCOMP_TRACE_DATA_FOREIGN_ARCH`.) x86_64-only: no other arch has
+/// an x32 analog.
 pub(super) const SECCOMP_TRACE_DATA_X32: u32 = 2;
 
 /// x32 syscall numbers are the x86_64 numbers with bit 30 set.
 pub(super) const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-// seccomp data offsets (for x86_64 little-endian)
+// seccomp data offsets (identical on every little-endian 64-bit arch)
 // offsetof(struct seccomp_data, nr) = 0
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 // offsetof(struct seccomp_data, arch) = 4
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 
-// x86_64 audit arch value
-pub(super) const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-
 // seccomp operations
 const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
 // Flag: sync filter to all threads
 const SECCOMP_FILTER_FLAG_TSYNC: libc::c_ulong = 1;
+
+/// Whether the native arch needs the x32 escape-hatch branch. Only
+/// x86_64 has a second syscall numbering under its own audit arch.
+const NATIVE_HAS_X32: bool = cfg!(target_arch = "x86_64");
 
 /// A single BPF instruction.
 #[repr(C)]
@@ -181,52 +179,90 @@ fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
-/// Build the BPF instruction array.
+/// The syscall numbers the seccomp filter traps on this architecture:
+/// the security-relevant set minus the ptrace-event-handled syscalls
+/// (execve/execveat via `PTRACE_EVENT_EXEC`; clone/fork via
+/// `PTRACE_EVENT_CLONE`/`FORK`/`VFORK` — trapping execve before
+/// `PTRACE_O_TRACESECCOMP` is set causes ENOSYS).
+fn native_trap_nrs() -> &'static [i64] {
+    static NRS: std::sync::OnceLock<Vec<i64>> = std::sync::OnceLock::new();
+    NRS.get_or_init(|| {
+        let event_handled = arch::ptrace_event_handled_nrs();
+        arch::security_relevant_nrs()
+            .iter()
+            .copied()
+            .filter(|nr| !event_handled.contains(nr))
+            .collect()
+    })
+}
+
+/// Build the BPF instruction array for the native architecture.
+fn build_filter() -> Vec<SockFilterInst> {
+    build_filter_for(arch::NATIVE_AUDIT_ARCH, native_trap_nrs(), NATIVE_HAS_X32)
+}
+
+/// Force-initialise the lazily-derived per-arch number lists.
+///
+/// `install_seccomp_filter` runs in the freshly-forked child, where a
+/// first-touch `OnceLock` initialisation would allocate post-fork — a
+/// deadlock risk if another parent thread held the allocator lock at fork
+/// time. Called by the spawn paths in the PARENT, before `fork()`, so the
+/// child's build reads only already-initialised statics — the trap list
+/// itself is cached, leaving the filter `Vec` as the child's one
+/// allocation (the pre-refactor code made two).
+pub(super) fn prewarm_filter_tables() {
+    let _ = native_trap_nrs();
+    debug_assert!(!native_trap_nrs().is_empty());
+}
+
+/// Build the BPF instruction array for a given `(native audit arch,
+/// trap list, x32 branch)` parameter set.
 ///
 /// Structure:
-/// 1. Load arch; on any non-x86_64 arch, fail closed → TRACE with
+/// 1. Load arch; on any non-native arch, fail closed → TRACE with
 ///    `SECCOMP_TRACE_DATA_FOREIGN_ARCH` (the supervisor denies it)
-/// 2. Load syscall number; reject x32 numbers (`nr >= 0x40000000`)
-///    → TRACE with `SECCOMP_TRACE_DATA_X32`
-/// 3. For each security-relevant syscall: JEQ → TRACE
+/// 2. Load syscall number; when `x32_check`, reject x32 numbers
+///    (`nr >= 0x40000000`) → TRACE with `SECCOMP_TRACE_DATA_X32`
+/// 3. For each trapped syscall: JEQ → TRACE
 /// 4. Fall through → ALLOW
 ///
-/// No path from a foreign arch or an x32 number can reach ALLOW: both
-/// checks run before the first JEQ and jump directly to dedicated
-/// return instructions.
-fn build_filter() -> Vec<SockFilterInst> {
-    let seccomp_syscalls: Vec<i64> = SECURITY_RELEVANT
-        .iter()
-        .copied()
-        .filter(|nr| !PTRACE_EVENT_HANDLED.contains(nr))
-        .collect();
-    let num_relevant = seccomp_syscalls.len();
-    // Total instructions: 2 (arch check) + 2 (load nr + x32 check)
-    // + num_relevant (JEQ checks) + 4 (ALLOW, TRACE, TRACE|foreign, TRACE|x32)
-    let total = 2 + 2 + num_relevant + 4;
-    // All jump offsets are u8; the largest (arch jf) is num_relevant + 4.
+/// No path from a foreign arch (or, on x86_64, an x32 number) can reach
+/// ALLOW: the checks run before the first JEQ and jump directly to
+/// dedicated return instructions.
+fn build_filter_for(native_arch: u32, trap_nrs: &[i64], x32_check: bool) -> Vec<SockFilterInst> {
+    let num_relevant = trap_nrs.len();
+    // Head: 2 (load arch + check) + 1 (load nr) + 1 if x32_check.
+    // Tail: ALLOW, TRACE, TRACE|foreign, + TRACE|x32 if x32_check.
+    let head = if x32_check { 4 } else { 3 };
+    let returns = if x32_check { 4 } else { 3 };
+    let total = head + num_relevant + returns;
+    // All jump offsets are u8. The largest emitted offset is the arch
+    // check's jf, which jumps from instruction [1] over the rest of the
+    // head, the whole JEQ table, ALLOW, and TRACE to land on
+    // TRACE|foreign: (head + num_relevant + 2) - 2 = head + num_relevant.
+    // Asserted on that exact quantity so a future head-only instruction
+    // cannot silently truncate in the `as u8` casts below.
     assert!(
-        u8::try_from(num_relevant + 4).is_ok(),
+        u8::try_from(head + num_relevant).is_ok(),
         "seccomp filter too large for 8-bit jump offsets"
     );
     let mut filter = Vec::with_capacity(total);
 
     // Return-instruction indices (see layout above).
-    let allow_idx = 4 + num_relevant;
+    let allow_idx = head + num_relevant;
     let foreign_idx = allow_idx + 2;
-    let x32_idx = allow_idx + 3;
 
     // [0] Load architecture
     filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
 
-    // [1] Verify x86_64 — if not, fail closed: TRACE with the
+    // [1] Verify the native arch — if not, fail closed: TRACE with the
     // foreign-arch data code so the supervisor denies without
     // interpreting the syscall number (which belongs to a foreign
     // syscall table). Never ALLOW what we cannot interpret.
     let foreign_offset = (foreign_idx - 2) as u8; // from instruction [1]+1
     filter.push(bpf_jump(
         BPF_JMP | BPF_JEQ | BPF_K,
-        AUDIT_ARCH_X86_64,
+        native_arch,
         0,              // jt: continue to next instruction
         foreign_offset, // jf: jump to TRACE|foreign-arch
     ));
@@ -234,19 +270,22 @@ fn build_filter() -> Vec<SockFilterInst> {
     // [2] Load syscall number
     filter.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
 
-    // [3] Reject x32 numbering: arch reads AUDIT_ARCH_X86_64 for x32
-    // calls, but the number has bit 30 set and matches no JEQ below —
-    // without this check it would fall through to ALLOW.
-    let x32_offset = (x32_idx - 4) as u8; // from instruction [3]+1
-    filter.push(bpf_jump(
-        BPF_JMP | BPF_JGE | BPF_K,
-        X32_SYSCALL_BIT,
-        x32_offset, // jt: nr >= 0x40000000 → TRACE|x32
-        0,          // jf: continue to the JEQ table
-    ));
+    if x32_check {
+        // [3] Reject x32 numbering: arch reads AUDIT_ARCH_X86_64 for x32
+        // calls, but the number has bit 30 set and matches no JEQ below —
+        // without this check it would fall through to ALLOW.
+        let x32_idx = allow_idx + 3;
+        let x32_offset = (x32_idx - 4) as u8; // from instruction [3]+1
+        filter.push(bpf_jump(
+            BPF_JMP | BPF_JGE | BPF_K,
+            X32_SYSCALL_BIT,
+            x32_offset, // jt: nr >= 0x40000000 → TRACE|x32
+            0,          // jf: continue to the JEQ table
+        ));
+    }
 
-    // [4..4+N] For each security-relevant syscall, jump to TRACE if match
-    for (i, &nr) in seccomp_syscalls.iter().enumerate() {
+    // [head..head+N] For each trapped syscall, jump to TRACE if match
+    for (i, &nr) in trap_nrs.iter().enumerate() {
         let remaining = num_relevant - i - 1; // JEQs remaining after this one
         let trace_offset = (remaining + 1) as u8; // skip remaining JEQs + ALLOW to reach TRACE
         filter.push(bpf_jump(
@@ -257,23 +296,25 @@ fn build_filter() -> Vec<SockFilterInst> {
         ));
     }
 
-    // [4+N] ALLOW — default for non-security-relevant syscalls
+    // [head+N] ALLOW — default for non-security-relevant syscalls
     filter.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
-    // [4+N+1] TRACE — for security-relevant syscalls
+    // [head+N+1] TRACE — for security-relevant syscalls
     filter.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_TRACE));
 
-    // [4+N+2] TRACE|foreign-arch — fail-closed for non-x86_64 ABIs
+    // [head+N+2] TRACE|foreign-arch — fail-closed for non-native ABIs
     filter.push(bpf_stmt(
         BPF_RET | BPF_K,
         SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_FOREIGN_ARCH,
     ));
 
-    // [4+N+3] TRACE|x32 — fail-closed for x32 syscall numbers
-    filter.push(bpf_stmt(
-        BPF_RET | BPF_K,
-        SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_X32,
-    ));
+    if x32_check {
+        // [head+N+3] TRACE|x32 — fail-closed for x32 syscall numbers
+        filter.push(bpf_stmt(
+            BPF_RET | BPF_K,
+            SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_X32,
+        ));
+    }
 
     debug_assert_eq!(filter.len(), total);
     filter
@@ -283,14 +324,16 @@ fn build_filter() -> Vec<SockFilterInst> {
 mod tests {
     use super::*;
 
+    fn trap_nrs() -> Vec<i64> {
+        native_trap_nrs().to_vec()
+    }
+
     #[test]
     fn filter_has_correct_length() {
         let filter = build_filter();
-        let seccomp_count = SECURITY_RELEVANT
-            .iter()
-            .filter(|nr| !PTRACE_EVENT_HANDLED.contains(nr))
-            .count();
-        let expected = 2 + 2 + seccomp_count + 4;
+        let head = if NATIVE_HAS_X32 { 4 } else { 3 };
+        let returns = if NATIVE_HAS_X32 { 4 } else { 3 };
+        let expected = head + trap_nrs().len() + returns;
         assert_eq!(filter.len(), expected);
     }
 
@@ -300,11 +343,14 @@ mod tests {
         // First instruction: load arch
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+        // Second: compare against the native audit arch.
+        assert_eq!(filter[1].code, BPF_JMP | BPF_JEQ | BPF_K);
+        assert_eq!(filter[1].k, arch::NATIVE_AUDIT_ARCH);
     }
 
     #[test]
     fn filter_ends_with_return_block() {
-        let filter = build_filter();
+        let filter = build_filter_for(arch::NATIVE_AUDIT_ARCH, &trap_nrs(), true);
         let n = filter.len();
         // Return block layout: ALLOW, TRACE, TRACE|foreign, TRACE|x32.
         assert_eq!(filter[n - 4].code, BPF_RET | BPF_K);
@@ -321,13 +367,33 @@ mod tests {
     }
 
     #[test]
-    fn filter_jump_offsets_are_valid() {
-        let filter = build_filter();
+    fn no_x32_filter_ends_with_three_returns_and_no_x32_instructions() {
+        let nrs = trap_nrs();
+        let filter = build_filter_for(AUDIT_ARCH_AARCH64, &nrs, false);
         let n = filter.len();
-        let num_relevant = SECURITY_RELEVANT
-            .iter()
-            .filter(|nr| !PTRACE_EVENT_HANDLED.contains(nr))
-            .count();
+        assert_eq!(n, 3 + nrs.len() + 3);
+        assert_eq!(filter[n - 3].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[n - 2].k, SECCOMP_RET_TRACE);
+        assert_eq!(
+            filter[n - 1].k,
+            SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_FOREIGN_ARCH
+        );
+        // No instruction references the x32 marker bit or the x32 return.
+        for inst in &filter {
+            assert_ne!(inst.k, X32_SYSCALL_BIT, "x32 JGE must not be emitted");
+            assert_ne!(
+                inst.k,
+                SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_X32,
+                "x32 return must not be emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_jump_offsets_are_valid() {
+        let filter = build_filter_for(arch::NATIVE_AUDIT_ARCH, &trap_nrs(), true);
+        let n = filter.len();
+        let num_relevant = trap_nrs().len();
 
         // Arch check: jf must reach TRACE|foreign (index n-2), never ALLOW.
         let arch_jf = filter[1].jf as usize;
@@ -356,14 +422,37 @@ mod tests {
     }
 
     #[test]
+    fn no_x32_filter_jump_offsets_are_valid() {
+        let nrs = trap_nrs();
+        let filter = build_filter_for(AUDIT_ARCH_AARCH64, &nrs, false);
+        let n = filter.len();
+
+        // Arch check: jf must reach TRACE|foreign (index n-1), never ALLOW.
+        let arch_jf = filter[1].jf as usize;
+        assert_eq!(
+            1 + 1 + arch_jf,
+            n - 1,
+            "arch check jf should reach TRACE|foreign-arch"
+        );
+
+        // Each JEQ: jt should reach TRACE (index n-2).
+        for i in 0..nrs.len() {
+            let inst_idx = 3 + i;
+            let jt = filter[inst_idx].jt as usize;
+            assert_eq!(
+                inst_idx + 1 + jt,
+                n - 2,
+                "JEQ at index {inst_idx} jt should reach TRACE"
+            );
+        }
+    }
+
+    #[test]
     fn filter_covers_seccomp_syscalls() {
         let filter = build_filter();
-        let seccomp_syscalls: Vec<i64> = SECURITY_RELEVANT
-            .iter()
-            .copied()
-            .filter(|nr| !PTRACE_EVENT_HANDLED.contains(nr))
-            .collect();
-        let jeq_nrs: Vec<u32> = filter[4..4 + seccomp_syscalls.len()]
+        let seccomp_syscalls = trap_nrs();
+        let head = if NATIVE_HAS_X32 { 4 } else { 3 };
+        let jeq_nrs: Vec<u32> = filter[head..head + seccomp_syscalls.len()]
             .iter()
             .map(|inst| inst.k)
             .collect();
@@ -383,7 +472,7 @@ mod tests {
             .filter(|inst| inst.code == BPF_JMP | BPF_JEQ | BPF_K)
             .map(|inst| inst.k)
             .collect();
-        for &nr in PTRACE_EVENT_HANDLED {
+        for &nr in arch::ptrace_event_handled_nrs() {
             assert!(
                 !jeq_nrs.contains(&(nr as u32)),
                 "syscall {nr} should NOT be in BPF filter (handled by ptrace events)"
@@ -392,10 +481,12 @@ mod tests {
     }
 
     // ── BPF simulator: fail-closed regression suite (go-live review B1) ──
-    // Executes the real `build_filter()` output against synthetic
+    // Executes the real `build_filter_for()` output against synthetic
     // `seccomp_data` and returns the SECCOMP_RET_* value the kernel would
     // apply. Permanent: any layout change that silently turns a fail-closed
-    // TRACE into ALLOW fails here.
+    // TRACE into ALLOW fails here. Runs against BOTH parameter shapes (with
+    // and without the x32 branch) so the aarch64 filter is exercised on
+    // x86 hosts.
     fn simulate(filter: &[SockFilterInst], arch: u32, nr: u32) -> u32 {
         let mut acc: u32 = 0;
         let mut pc: usize = 0;
@@ -431,56 +522,77 @@ mod tests {
 
     const AUDIT_ARCH_I386: u32 = 0x4000_0003;
     const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
-    const OPENAT_NR: u32 = crate::platform::linux::syscall_nr::OPENAT as u32;
+    const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
+
+    fn openat_nr() -> u32 {
+        arch::nr_of(arch::SysId::Openat).expect("openat exists on every arch") as u32
+    }
 
     #[test]
-    fn baseline_x86_64_openat_is_traced() {
+    fn baseline_native_openat_is_traced() {
         let f = build_filter();
         assert_eq!(
-            simulate(&f, AUDIT_ARCH_X86_64, OPENAT_NR),
+            simulate(&f, arch::NATIVE_AUDIT_ARCH, openat_nr()),
             SECCOMP_RET_TRACE,
-            "control: openat on x86_64 must reach plain TRACE"
+            "control: openat on the native arch must reach plain TRACE"
         );
     }
 
     #[test]
     fn foreign_arch_never_reaches_allow() {
-        let f = build_filter();
         // Boundary/representative syscall numbers: the full 0..=512 range,
-        // every security-relevant number, and the x32-bit edges. Under a
-        // foreign arch every one of them must return TRACE|foreign — the
-        // number belongs to a foreign table and must not be interpreted.
+        // every trapped number, and the x32-bit edges. Under a foreign arch
+        // every one of them must return TRACE|foreign — the number belongs
+        // to a foreign table and must not be interpreted. Exercised for both
+        // builder shapes.
         let mut nrs: Vec<u32> = (0..=512).collect();
-        nrs.extend(SECURITY_RELEVANT.iter().map(|&n| n as u32));
+        nrs.extend(trap_nrs().iter().map(|&n| n as u32));
         nrs.extend([
             0x3fff_ffff,
             X32_SYSCALL_BIT,
-            X32_SYSCALL_BIT | OPENAT_NR,
+            X32_SYSCALL_BIT | openat_nr(),
             u32::MAX,
         ]);
-        for arch in [AUDIT_ARCH_I386, AUDIT_ARCH_AARCH64, 0] {
-            for &nr in &nrs {
-                assert_eq!(
-                    simulate(&f, arch, nr),
-                    SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_FOREIGN_ARCH,
-                    "arch {arch:#x} nr {nr} must fail closed as foreign-arch"
-                );
+        let shapes = [
+            (
+                build_filter_for(arch::NATIVE_AUDIT_ARCH, &trap_nrs(), true),
+                arch::NATIVE_AUDIT_ARCH,
+            ),
+            (
+                build_filter_for(AUDIT_ARCH_AARCH64, &trap_nrs(), false),
+                AUDIT_ARCH_AARCH64,
+            ),
+        ];
+        for (f, native) in &shapes {
+            for foreign in [
+                AUDIT_ARCH_I386,
+                AUDIT_ARCH_AARCH64,
+                AUDIT_ARCH_ARM,
+                0,
+                0xc000_003e,
+            ] {
+                if foreign == *native {
+                    continue;
+                }
+                for &nr in &nrs {
+                    assert_eq!(
+                        simulate(f, foreign, nr),
+                        SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_FOREIGN_ARCH,
+                        "arch {foreign:#x} nr {nr} must fail closed as foreign-arch (native {native:#x})"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn x32_numbers_never_reach_allow() {
-        let f = build_filter();
+        let f = build_filter_for(arch::NATIVE_AUDIT_ARCH, &trap_nrs(), true);
         let mut nrs: Vec<u32> = vec![X32_SYSCALL_BIT, u32::MAX, X32_SYSCALL_BIT | 5];
-        nrs.extend(
-            SECURITY_RELEVANT
-                .iter()
-                .map(|&n| n as u32 | X32_SYSCALL_BIT),
-        );
+        nrs.extend(trap_nrs().iter().map(|&n| n as u32 | X32_SYSCALL_BIT));
         for &nr in &nrs {
             assert_eq!(
-                simulate(&f, AUDIT_ARCH_X86_64, nr),
+                simulate(&f, arch::NATIVE_AUDIT_ARCH, nr),
                 SECCOMP_RET_TRACE | SECCOMP_TRACE_DATA_X32,
                 "x32 nr {nr:#x} must fail closed as x32"
             );
@@ -488,35 +600,53 @@ mod tests {
     }
 
     #[test]
-    fn x86_64_non_relevant_syscalls_still_allowed() {
-        let f = build_filter();
+    fn native_non_relevant_syscalls_still_allowed() {
         // Noise syscalls (read/write/close on ordinary fds are the hot
         // path) must keep flowing without a ptrace stop; ptrace-event
         // handled syscalls are ALLOW at the filter and trapped via
-        // PTRACE_EVENT_* instead.
-        for nr in (0u32..=512).filter(|&nr| {
-            !SECURITY_RELEVANT.contains(&(nr as i64)) || PTRACE_EVENT_HANDLED.contains(&(nr as i64))
-        }) {
-            assert_eq!(
-                simulate(&f, AUDIT_ARCH_X86_64, nr),
-                SECCOMP_RET_ALLOW,
-                "non-relevant x86_64 nr {nr} should stay ALLOW"
-            );
+        // PTRACE_EVENT_* instead. Both builder shapes.
+        let shapes = [
+            (
+                build_filter_for(arch::NATIVE_AUDIT_ARCH, &trap_nrs(), true),
+                arch::NATIVE_AUDIT_ARCH,
+            ),
+            (
+                build_filter_for(AUDIT_ARCH_AARCH64, &trap_nrs(), false),
+                AUDIT_ARCH_AARCH64,
+            ),
+        ];
+        let trapped = trap_nrs();
+        for (f, native) in &shapes {
+            for nr in (0u32..=512).filter(|&nr| !trapped.contains(&(nr as i64))) {
+                assert_eq!(
+                    simulate(f, *native, nr),
+                    SECCOMP_RET_ALLOW,
+                    "non-relevant nr {nr} should stay ALLOW (native {native:#x})"
+                );
+            }
         }
     }
 
     #[test]
-    fn x86_64_relevant_syscalls_all_trace() {
-        let f = build_filter();
-        for &nr in SECURITY_RELEVANT
-            .iter()
-            .filter(|nr| !PTRACE_EVENT_HANDLED.contains(nr))
-        {
-            assert_eq!(
-                simulate(&f, AUDIT_ARCH_X86_64, nr as u32),
-                SECCOMP_RET_TRACE,
-                "relevant x86_64 nr {nr} should TRACE"
-            );
+    fn native_relevant_syscalls_all_trace() {
+        let shapes = [
+            (
+                build_filter_for(arch::NATIVE_AUDIT_ARCH, &trap_nrs(), true),
+                arch::NATIVE_AUDIT_ARCH,
+            ),
+            (
+                build_filter_for(AUDIT_ARCH_AARCH64, &trap_nrs(), false),
+                AUDIT_ARCH_AARCH64,
+            ),
+        ];
+        for (f, native) in &shapes {
+            for &nr in &trap_nrs() {
+                assert_eq!(
+                    simulate(f, *native, nr as u32),
+                    SECCOMP_RET_TRACE,
+                    "relevant nr {nr} should TRACE (native {native:#x})"
+                );
+            }
         }
     }
 }

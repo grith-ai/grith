@@ -296,6 +296,7 @@ pub fn dashboard_write_routes() -> Router<AppState> {
         .route("/canaries/:id/rotate", post(canary::rotate_canary))
         .route("/config", put(config::update_config))
         .route("/onboarding/dismiss", post(onboarding::dismiss_onboarding))
+        .route("/onboarding/intro-seen", post(onboarding::mark_intro_seen))
         .route(
             "/notifications/test/:channel",
             post(notifications::test_notification),
@@ -1213,6 +1214,51 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["tier"], "enterprise");
+        assert!(json["upgrade_url"].is_null());
+        assert!(!json["remediation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "upgrade"));
+    }
+
+    // Pro is a paid tier, so — like Enterprise — hitting its (generous) session
+    // cap offers no upgrade nudge: no upgrade would raise it, and the only
+    // remedy is to close a session.
+    #[tokio::test]
+    async fn test_pro_429_has_no_upgrade_url() {
+        let state = make_pro_state();
+        {
+            let mut reg = state.supervisor_registry.lock().unwrap();
+            reg.set_max_sessions(1);
+        }
+        let router = ipc_routes().with_state(state.clone());
+        let live_pid = std::process::id();
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "claude", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = router
+            .oneshot(
+                Request::post("/ipc/sessions")
+                    .header("content-type", "application/json")
+                    .body(register_body(uuid::Uuid::new_v4(), "codex", live_pid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["tier"], "pro");
         assert!(json["upgrade_url"].is_null());
         assert!(!json["remediation"]
             .as_array()

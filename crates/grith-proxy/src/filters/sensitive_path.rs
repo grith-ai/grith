@@ -259,6 +259,19 @@ impl SecurityFilter for SensitivePathHeuristicFilter {
         // making a link the cheap way to plant one.
         // This filter deliberately covers a narrower set of call types than
         // the rule-driven one; anything outside it is left alone.
+        // A FilesystemMutation (mount/move_mount/...) only reaches the proxy
+        // when the supervisor's `category2_proxy` coverage flag is enabled
+        // (default OFF; event_handler's PR-6 category gate allow+returns it
+        // otherwise). Under that opt-in, score the mount SOURCE through the
+        // same rules a direct read would hit, so a bind whose source is a
+        // credential directory (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/grith)
+        // escalates regardless of the benign target basename — closing the
+        // bind-mount path-aliasing hole where later reads land on the
+        // un-sensitive target path.
+        if let ToolCallType::FilesystemMutation { source, target, .. } = &ctx.call_type {
+            return Ok(self.evaluate_filesystem_mutation(source.as_deref(), target));
+        }
+
         let handled = operation_for_call_type(&ctx.call_type).is_some()
             || matches!(ctx.call_type, ToolCallType::FileLink { .. });
         if !handled {
@@ -627,6 +640,43 @@ impl SensitivePathHeuristicFilter {
             best.message,
         )
     }
+
+    /// Score a `FilesystemMutation` by its SOURCE (a bind re-exposes the source
+    /// under the target) and its TARGET (a mount over a persistence/control
+    /// path is itself suspicious). Worst verdict wins, mirroring `evaluate`'s
+    /// multi-path handling.
+    ///
+    /// The source is judged twice: as written (so a file source like
+    /// `~/.aws/credentials` trips the filename/key rules) and with a trailing
+    /// `/` (so a *directory* source like `~/.ssh` — the usual bind shape, which
+    /// canonicalises WITHOUT a trailing slash — matches the credential-DIRECTORY
+    /// markers that key on `"/.ssh/"`). Appending the slash only for the mount
+    /// source keeps this directory-aware match scoped to FilesystemMutation, so
+    /// ordinary FileRead/DirList of a bare `~/.ssh` directory (default-path
+    /// traffic) is UNAFFECTED.
+    fn evaluate_filesystem_mutation(&self, source: Option<&str>, target: &str) -> FilterResult {
+        let mut candidates: Vec<(String, &'static str)> = Vec::new();
+        if let Some(src) = source {
+            candidates.push((src.to_string(), "read"));
+            if !src.ends_with('/') {
+                candidates.push((format!("{src}/"), "read"));
+            }
+        }
+        candidates.push((target.to_string(), "write"));
+
+        let mut worst: Option<FilterResult> = None;
+        for (path, op) in candidates {
+            let result = self.evaluate_path(&path, op);
+            let better = match &worst {
+                Some(current) => result.score > current.score,
+                None => true,
+            };
+            if result.matched && better {
+                worst = Some(result);
+            }
+        }
+        worst.unwrap_or_else(|| FilterResult::no_match(self.name()))
+    }
 }
 
 fn normalize_path_for_match(path: &str) -> String {
@@ -673,16 +723,26 @@ fn normalized_file_name(path_lc: &str) -> String {
 
 /// Every (path, operation) pair a call subjects to path policy.
 ///
-/// Most calls have exactly one. Link creation has two, and they are different
-/// operations: the **target** becomes readable through a new name, and a new
-/// entry is **written** at the link path. Both must be judged — scoring only
-/// the target would let `ln -s ./mine ~/.ssh/authorized_keys` slip in under
-/// the price of writing that file (go-live review B2).
+/// Most calls have exactly one. Two calls create a NEW entry at a
+/// destination and so must judge both ends, or the destination slips in
+/// under the price of the (often benign) source:
+///
+/// - **Link creation** — the `target` becomes readable through a new name,
+///   and a new entry is `written` at the `link_path`. Scoring only the
+///   target would let `ln -s ./mine ~/.ssh/authorized_keys` through
+///   (go-live review B2).
+/// - **Rename** — the same shape via `rename(2)`: `mv ./mine
+///   ~/.ssh/authorized_keys` plants a file at a sensitive destination while
+///   the scored `old_path` is a harmless project file. Score the
+///   destination as a write too.
 pub(crate) fn path_operations(call_type: &ToolCallType) -> Vec<(&str, &'static str)> {
     match call_type {
         ToolCallType::FileLink {
             target, link_path, ..
         } => vec![(target.as_str(), "read"), (link_path.as_str(), "write")],
+        ToolCallType::FileRename { old_path, new_path } => {
+            vec![(old_path.as_str(), "write"), (new_path.as_str(), "write")]
+        }
         other => match path_of(other) {
             Some(path) => vec![(
                 path,
@@ -731,6 +791,69 @@ mod tests {
 
     fn make_ctx(call_type: ToolCallType) -> ToolCallContext {
         ToolCallContext::new("test", call_type, Uuid::new_v4())
+    }
+
+    fn mount(source: Option<&str>, target: &str, fstype: Option<&str>) -> ToolCallType {
+        ToolCallType::FilesystemMutation {
+            op: "mount".into(),
+            source: source.map(str::to_string),
+            target: target.to_string(),
+            fstype: fstype.map(str::to_string),
+        }
+    }
+
+    /// fix #6: a bind of a bare ~/.ssh directory (canonicalises WITHOUT a
+    /// trailing slash) over a benign target escalates via the trailing-slash
+    /// source candidate — the credential-directory rule keys on "/.ssh/".
+    #[tokio::test]
+    async fn bind_mount_credential_dir_source_escalates() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let result = filter
+            .evaluate(&make_ctx(mount(Some("/home/dev/.ssh"), "/tmp/x", None)))
+            .await
+            .unwrap();
+        assert!(result.matched, "credential-dir bind source should match");
+        assert!(
+            result.score >= 4.0,
+            "score {} must be elevated",
+            result.score
+        );
+    }
+
+    /// A file-shaped credential source is scored via the as-written candidate.
+    #[tokio::test]
+    async fn bind_mount_credential_file_source_matches() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let result = filter
+            .evaluate(&make_ctx(mount(
+                Some("/home/dev/.aws/credentials"),
+                "/mnt/x",
+                None,
+            )))
+            .await
+            .unwrap();
+        assert!(result.matched);
+    }
+
+    /// A benign source and a source-less tmpfs mount add nothing (stay at
+    /// operation_risk's flat +5.0) — no NEW false positive in the opt-in path.
+    #[tokio::test]
+    async fn benign_mount_source_and_tmpfs_do_not_match() {
+        let filter = SensitivePathHeuristicFilter::new();
+        assert!(
+            !filter
+                .evaluate(&make_ctx(mount(Some("/data/project"), "/mnt/x", None)))
+                .await
+                .unwrap()
+                .matched
+        );
+        assert!(
+            !filter
+                .evaluate(&make_ctx(mount(None, "/tmp/build", Some("tmpfs"))))
+                .await
+                .unwrap()
+                .matched
+        );
     }
 
     // FP §5.6: two-tier /etc. A generic world-readable app-config READ is a
@@ -811,6 +934,42 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert!(result.score >= 4.0);
+    }
+
+    /// A rename must judge its DESTINATION, not only the source: `mv
+    /// ./benign ~/.ssh/authorized_keys` plants an SSH key while `old_path`
+    /// is a harmless project file. The rename twin of the `ln -s ... ~/.ssh`
+    /// hole (work/80 scenario D, surfaced on a real box).
+    #[tokio::test]
+    async fn test_rename_into_credential_dir_scores_destination() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let ctx = make_ctx(ToolCallType::FileRename {
+            old_path: "/home/dev/project/payload".into(),
+            new_path: "/home/dev/.ssh/authorized_keys".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            result.matched && result.score >= 3.0,
+            "rename into ~/.ssh must escalate on the destination (score {}, rule {})",
+            result.score,
+            result.rule_id
+        );
+    }
+
+    /// The control: an ordinary rename between two benign paths stays quiet.
+    #[tokio::test]
+    async fn test_rename_between_benign_paths_no_match() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let ctx = make_ctx(ToolCallType::FileRename {
+            old_path: "/home/dev/project/a.txt".into(),
+            new_path: "/home/dev/project/b.txt".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(
+            !result.matched,
+            "benign rename must not flag (rule {})",
+            result.rule_id
+        );
     }
 
     #[tokio::test]

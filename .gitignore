@@ -37,3 +37,4 @@ Thumbs.db
 
 qa-runs/
 local-notes.txt
+arm64-smoke-results-grith-arm64-*

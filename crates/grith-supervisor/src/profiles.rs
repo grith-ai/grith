@@ -609,10 +609,6 @@ impl SupervisorProfile {
     /// - `exec-prefix:<root/>` for trusted executable root directories
     /// - `net:<domain>` for routine destinations and listen addresses
     pub fn build_session_allowlist(&self) -> std::collections::HashSet<String> {
-        use std::collections::HashSet;
-
-        let mut allowed = HashSet::<String>::new();
-
         // Canonicalise the two stable roots — and ONLY these — so a profile
         // prefix written against a symlinked `${HOME}` (common) or a
         // container-mounted `${PROJECT_DIR}` still matches the resolved paths
@@ -623,24 +619,58 @@ impl SupervisorProfile {
         // filesystem for the session. Resolving only the roots keeps the FP
         // fix without that escape; a symlinked leaf simply sends its accesses
         // to the proxy (fail-safe) rather than silently trusting them.
-        let canon_root = |raw: String| -> String {
-            std::fs::canonicalize(&raw)
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or(raw)
-        };
-        let home = canon_root(std::env::var("HOME").unwrap_or_default());
-        let project_dir = canon_root(
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_default(),
-        );
+        let (home, project_dir) = resolved_home_and_project_dir();
+        self.build_session_allowlist_with_roots(&home, &project_dir)
+    }
+
+    /// The env-independent core of [`build_session_allowlist`], split out so
+    /// tests can drive `home`/`project_dir` without touching process state.
+    pub(crate) fn build_session_allowlist_with_roots(
+        &self,
+        home: &str,
+        project_dir: &str,
+    ) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+
+        let mut allowed = HashSet::<String>::new();
+
+        // work/80: `${PROJECT_DIR}` is the LAUNCH CWD, not a curated path.
+        // Expanded at `/`, `$HOME`, or an ancestor of `$HOME`, it would
+        // session-trust the entire tree — every credential directory
+        // included — so those roots get no project-derived trust at all.
+        // Surviving project-derived path prefixes are additionally recorded
+        // as inert `projdir:` markers, letting the allow gates refuse to
+        // let launch-derived trust cover credential stores
+        // (`syscall_map::is_credential_store_path`).
+        let dangerous_project_root = project_dir == "/"
+            || (!home.is_empty()
+                && (project_dir == home || home.starts_with(&format!("{project_dir}/"))));
+        if dangerous_project_root
+            && (self
+                .routine_paths
+                .iter()
+                .chain(self.routine_exec_roots.iter())
+                .chain(self.readonly_paths.iter())
+                .chain(self.readonly_path_patterns.iter())
+                .any(|p| p.contains("${PROJECT_DIR}")))
+        {
+            tracing::warn!(
+                project_dir,
+                "launch directory is / or the home directory: project-directory trust is \
+                 disabled for this session — run the tool from a project subdirectory to \
+                 restore routine-path trust"
+            );
+        }
+        let project_entry_usable =
+            |pattern: &str| !(dangerous_project_root && pattern.contains("${PROJECT_DIR}"));
 
         for pattern in &self.routine_paths {
+            if !project_entry_usable(pattern) {
+                continue;
+            }
             let expanded = pattern
-                .replace("${HOME}", &home)
-                .replace("${PROJECT_DIR}", &project_dir)
+                .replace("${HOME}", home)
+                .replace("${PROJECT_DIR}", project_dir)
                 .trim_end_matches("/**")
                 .trim_end_matches("/*")
                 .trim_end_matches('*')
@@ -651,6 +681,9 @@ impl SupervisorProfile {
                 // without following any tool-writable leaf symlink. See the
                 // `canon_root` note above for why the full path is NOT
                 // canonicalised here.
+                if pattern.contains("${PROJECT_DIR}") {
+                    allowed.insert(format!("projdir:{expanded}"));
+                }
                 allowed.insert(expanded);
             }
         }
@@ -682,9 +715,12 @@ impl SupervisorProfile {
         // Read-only trusted paths — auto-allow FileRead only, not writes.
         // Uses `ro:` namespace with exact match (no prefix matching).
         for path in &self.readonly_paths {
+            if !project_entry_usable(path) {
+                continue;
+            }
             let expanded = path
-                .replace("${HOME}", &home)
-                .replace("${PROJECT_DIR}", &project_dir);
+                .replace("${HOME}", home)
+                .replace("${PROJECT_DIR}", project_dir);
             if let Some(canonical) = canonicalize_readonly_path(&expanded) {
                 allowed.insert(format!("ro:{canonical}"));
             }
@@ -693,9 +729,12 @@ impl SupervisorProfile {
         // Read-only glob patterns — auto-allow FileRead for files matching
         // these patterns. Uses `ro-glob:` namespace with simple glob matching.
         for pattern in &self.readonly_path_patterns {
+            if !project_entry_usable(pattern) {
+                continue;
+            }
             let expanded = pattern
-                .replace("${HOME}", &home)
-                .replace("${PROJECT_DIR}", &project_dir);
+                .replace("${HOME}", home)
+                .replace("${PROJECT_DIR}", project_dir);
             if !expanded.is_empty() {
                 allowed.insert(format!("ro-glob:{expanded}"));
             }
@@ -713,7 +752,12 @@ impl SupervisorProfile {
         // substitute-and-trailing-slash path so existing profiles keep
         // working even if a directory is not yet present on disk.
         for root in &self.routine_exec_roots {
-            let substituted = substitute_path_vars(root, &home, &project_dir);
+            // work/80: an exec root derived from a dangerous launch cwd
+            // would grant spawn trust to every binary under `/` or `$HOME`.
+            if !project_entry_usable(root) {
+                continue;
+            }
+            let substituted = substitute_path_vars(root, home, project_dir);
             if substituted.is_empty() {
                 continue;
             }
@@ -801,14 +845,24 @@ impl SupervisorProfile {
     pub fn expand_routine_exec_roots(&self) -> Vec<String> {
         use std::collections::BTreeSet;
 
-        let home = std::env::var("HOME").unwrap_or_default();
-        let project_dir = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_default();
+        // work/80: same CANONICALISED roots as build_session_allowlist —
+        // with a symlinked $HOME (`/home/u` -> `/mnt/data/u`), raw env
+        // strings would make `project_dir == home` miss and the
+        // dangerous-root drop silently never fire (review catch).
+        let (home, project_dir) = resolved_home_and_project_dir();
+
+        // A `${PROJECT_DIR}` exec root expanded at `/`, `$HOME`, or an
+        // ancestor of `$HOME` would extend routine-spawn provenance trust
+        // to every binary under that tree.
+        let dangerous_project_root = project_dir == "/"
+            || (!home.is_empty()
+                && (project_dir == home || home.starts_with(&format!("{project_dir}/"))));
 
         let mut out = BTreeSet::<String>::new();
         for root in &self.routine_exec_roots {
+            if dangerous_project_root && root.contains("${PROJECT_DIR}") {
+                continue;
+            }
             let substituted = substitute_path_vars(root, &home, &project_dir);
             if substituted.is_empty() {
                 continue;
@@ -865,6 +919,28 @@ impl SupervisorProfile {
         }
         out.into_iter().collect()
     }
+}
+
+/// The canonicalised `$HOME` and launch-cwd roots shared by
+/// `build_session_allowlist` and `expand_routine_exec_roots` (work/80: both
+/// must agree, or the dangerous-root drop can silently miss under a
+/// symlinked `$HOME`). Only the ROOTS are canonicalised — see the
+/// build_session_allowlist comment for why full paths never are.
+fn resolved_home_and_project_dir() -> (String, String) {
+    let canon_root = |raw: String| -> String {
+        std::fs::canonicalize(&raw)
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or(raw)
+    };
+    let home = canon_root(std::env::var("HOME").unwrap_or_default());
+    let project_dir = canon_root(
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default(),
+    );
+    (home, project_dir)
 }
 
 /// PR 4 Phase B: substitute `${HOME}`, `${PROJECT_DIR}`, and a leading
@@ -1417,6 +1493,84 @@ mod tests {
         assert!(claude.routine_commands.contains(&"git".into()));
         assert!(claude.routine_commands.contains(&"cargo".into()));
         assert!(claude.routine_commands.contains(&"node".into()));
+    }
+
+    /// work/80: `${PROJECT_DIR}` trust is dropped at dangerous launch
+    /// roots and marked with an inert `projdir:` twin elsewhere.
+    #[test]
+    fn project_dir_trust_dropped_at_dangerous_roots() {
+        let profile = SupervisorProfile {
+            name: "work80".into(),
+            display_name: "work80".into(),
+            rationale: None,
+            extends: None,
+            routine_paths: vec![
+                "${PROJECT_DIR}/**".into(),
+                "${HOME}/.cache/claude/**".into(),
+            ],
+            routine_commands: Vec::new(),
+            routine_destinations: Vec::new(),
+            routine_listen_addresses: Vec::new(),
+            routine_exec_roots: vec!["${PROJECT_DIR}/node_modules/.bin".into()],
+            scratch_roots: Vec::new(),
+            readonly_paths: Vec::new(),
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
+        };
+        let home = "/home/user";
+
+        // Launching from `/`, `$HOME`, or an ancestor of `$HOME`: no
+        // project-derived entries at all — the explicit HOME literal stays.
+        for dangerous in ["/", "/home/user", "/home"] {
+            let allowed = profile.build_session_allowlist_with_roots(home, dangerous);
+            assert!(
+                !allowed.contains(dangerous),
+                "launch cwd {dangerous} must not become a trusted prefix"
+            );
+            assert!(
+                !allowed.iter().any(|e| e.starts_with("projdir:")),
+                "no projdir markers at dangerous root {dangerous}"
+            );
+            assert!(
+                !allowed
+                    .iter()
+                    .any(|e| e.starts_with("exec-prefix:") && e.contains("node_modules")),
+                "no project exec roots at dangerous root {dangerous}"
+            );
+            assert!(
+                allowed.contains("/home/user/.cache/claude"),
+                "curated HOME literal survives at {dangerous}"
+            );
+        }
+
+        // A genuine project subdirectory keeps trust, plus the marker twin.
+        let allowed = profile.build_session_allowlist_with_roots(home, "/home/user/proj");
+        assert!(allowed.contains("/home/user/proj"));
+        assert!(
+            allowed.contains("projdir:/home/user/proj"),
+            "project-derived prefix must carry its projdir marker"
+        );
+        assert!(
+            !allowed.contains("projdir:/home/user/.cache/claude"),
+            "curated HOME literal must NOT be marked project-derived"
+        );
+
+        // Review defect 3: the dangerous-root test is on the CANONICAL
+        // roots, so a launch cwd equal to the canonicalised home (even if
+        // the raw env strings differed via a symlink) still drops project
+        // exec roots. Driving _with_roots with project_dir == home models
+        // the post-canonicalisation state both call paths now share.
+        let allowed = profile.build_session_allowlist_with_roots("/mnt/data/u", "/mnt/data/u");
+        assert!(
+            !allowed
+                .iter()
+                .any(|e| e.starts_with("exec-prefix:") && e.contains("node_modules")),
+            "project exec roots must drop when canonical project_dir == canonical home"
+        );
     }
 
     #[test]

@@ -551,6 +551,11 @@ pub struct SupervisorCoreConfig {
     /// Seconds an operator's approval keeps auto-allowing identical retries
     /// without a fresh prompt. `0` disables replay.
     pub approve_replay_seconds: u64,
+    /// Local safety valve for concurrent supervised sessions. The daemon
+    /// enforces the *lower* of this and the license entitlement (Community 2,
+    /// paid 64), so it only tightens the cap. Defaults to the paid cap (64) so
+    /// it does not silently clamp a paid entitlement; lower it for a hard local
+    /// ceiling.
     pub max_concurrent_sessions: usize,
     pub pty_forwarding: bool,
     /// Linux attach mechanism (`traceme` | `seize`). See [`AttachMode`].
@@ -1108,7 +1113,7 @@ impl Default for SupervisorCoreConfig {
             freeze_timeout_seconds: 300,
             deny_replay_seconds: 60,
             approve_replay_seconds: 60,
-            max_concurrent_sessions: 4,
+            max_concurrent_sessions: 64,
             pty_forwarding: true,
             attach_mode: AttachMode::default(),
             require_sandbox: false,
@@ -1479,6 +1484,7 @@ impl GrithConfig {
             parse("float")  "proxy.auto_deny_threshold"         => proxy.auto_deny_threshold;
             parse("u64")    "proxy.review_timeout_seconds"      => proxy.review_timeout_seconds;
             parse("bool")   "server.enabled"                    => server.enabled;
+            parse("bool")   "server.auto_open_dashboard"        => server.auto_open_dashboard;
             parse("port")   "server.port"                       => server.port;
             parse("bool")   "supervisor.enabled"                => supervisor.enabled;
             parse("u64")    "supervisor.freeze_timeout_seconds" => supervisor.freeze_timeout_seconds;

@@ -37,6 +37,21 @@ cargo fmt -- --check                           # Format check
 | API routes | `kebab-case` | `/api/digest` |
 | Env vars | `GRITH_UPPER_SNAKE` | `GRITH_LOG_LEVEL` |
 
-## Licence
+## How contributions land
 
-By contributing, you agree that your contributions will be licensed under MPL-2.0.
+grith is developed in a private monorepo and exported to the public
+repository per release, which is why the public history is squashed. Pull
+requests are welcome on the public repository: they are reviewed on GitHub,
+applied to the internal tree, and credited with Co-authored-by trailers and
+in the CHANGELOG.
+
+## Contributor License Agreement
+
+Before a first pull request can be accepted, we ask contributors to sign the
+[Contributor License Agreement](CLA.md). Signing is electronic: the CLA bot
+prompts on your first PR, and you sign by posting the comment it asks for.
+
+The short version: you keep the copyright to your contribution, you grant
+Field Logic Ltd a licence broad enough to ship grith both under MPL-2.0 and
+under commercial licence terms from one codebase, and you confirm the work is
+yours to contribute. The public repository is licensed under MPL-2.0.

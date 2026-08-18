@@ -149,10 +149,11 @@ pub fn create_interceptor() -> Result<Box<dyn SyscallInterceptor>> {
 /// - **Linux + ptrace**: yes. The seccomp-BPF path stops on entry as
 ///   `PTRACE_EVENT_SECCOMP`. After the supervisor allows the syscall,
 ///   resuming with `PTRACE_SYSCALL` instead of `PTRACE_CONT` causes the
-///   kernel to deliver a second stop at syscall exit, where RAX holds
-///   the return value. The fallback `PTRACE_SYSCALL` path already
-///   delivers entry+exit stops natively. Either way the return value
-///   is readable via `read_registers`. See
+///   kernel to deliver a second stop at syscall exit, where the
+///   return-value register holds the result. The fallback
+///   `PTRACE_SYSCALL` path already delivers entry+exit stops natively.
+///   Either way the return value is readable via
+///   `arch::read_return_value`. See
 ///   `crates/grith-supervisor/src/platform/linux/events.rs` for the
 ///   existing entry-stop machinery; the exit-stop wiring lands in
 ///   PR 3 Phase B/C.

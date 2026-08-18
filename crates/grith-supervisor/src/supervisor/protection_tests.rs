@@ -61,6 +61,7 @@ struct RecordedState {
     allow_pids: Vec<u32>,
     deny_pids: Vec<u32>,
     freeze_pids: Vec<u32>,
+    kill_pids: Vec<u32>,
 }
 
 struct RecordingInterceptor {
@@ -101,6 +102,11 @@ impl SyscallInterceptor for RecordingInterceptor {
 
     async fn deny(&mut self, pid: u32) -> crate::error::Result<()> {
         self.state.lock().unwrap().deny_pids.push(pid);
+        Ok(())
+    }
+
+    async fn kill(&mut self, pid: u32) -> crate::error::Result<()> {
+        self.state.lock().unwrap().kill_pids.push(pid);
         Ok(())
     }
 
@@ -168,6 +174,7 @@ struct Recorded {
     allow_pids: Vec<u32>,
     deny_pids: Vec<u32>,
     freeze_pids: Vec<u32>,
+    kill_pids: Vec<u32>,
     total_allowed: u64,
     total_queued: u64,
     total_denied: u64,
@@ -179,6 +186,9 @@ impl Recorded {
     }
     fn allowed(&self, pid: u32) -> bool {
         self.allow_pids.contains(&pid)
+    }
+    fn killed(&self, pid: u32) -> bool {
+        self.kill_pids.contains(&pid)
     }
 }
 
@@ -198,6 +208,8 @@ struct Harness {
     yama_ptrace_scope: Option<u8>,
     reviewer: Arc<dyn QueueReviewer>,
     containment: bool,
+    permit_authority_delegating: Vec<String>,
+    reputation_table: Option<Arc<Mutex<grith_proxy::reputation::ReputationTable>>>,
 }
 
 impl Default for Harness {
@@ -220,6 +232,8 @@ impl Default for Harness {
             yama_ptrace_scope: None,
             reviewer: Arc::new(DenyReviewer),
             containment: false,
+            permit_authority_delegating: Vec::new(),
+            reputation_table: None,
         }
     }
 }
@@ -297,6 +311,40 @@ impl Harness {
         self
     }
 
+    /// Enable authority-delegating-spawn enforcement (the escalation +
+    /// kill-on-deny path). Off by default, mirroring the shipped config.
+    fn with_enforce_authority_delegating_spawn(mut self, on: bool) -> Self {
+        self.config.enforce_authority_delegating_spawn = on;
+        self
+    }
+
+    /// Seed the profile's `permit_authority_delegating` basenames (operators
+    /// authorising a delegating binary for routine use).
+    fn with_permit_authority_delegating(mut self, permit: Vec<String>) -> Self {
+        self.permit_authority_delegating = permit;
+        self
+    }
+
+    /// Override the interactive queue action (Freeze / Log / Deny).
+    fn with_interactive_queue_action(
+        mut self,
+        action: crate::config::InteractiveQueueAction,
+    ) -> Self {
+        self.config.interactive_queue_action = action;
+        self
+    }
+
+    /// Share a reputation table across runs so trust seeded by one run (via
+    /// approved reviews) is visible to a later run — used to exercise the
+    /// reputation auto-allow bypass.
+    fn with_reputation_table(
+        mut self,
+        table: Arc<Mutex<grith_proxy::reputation::ReputationTable>>,
+    ) -> Self {
+        self.reputation_table = Some(table);
+        self
+    }
+
     /// Set the session working root. Deletes/renames under it are in-tree and
     /// excluded from the mass-destruction signal — used to isolate a test from
     /// that signal so it asserts ONLY the behaviour under test.
@@ -351,7 +399,9 @@ impl Harness {
             dns_forward_confirm: None,
             syscall_log: None,
             forensics_trace: None,
-            reputation_table: Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new())),
+            reputation_table: self.reputation_table.clone().unwrap_or_else(|| {
+                Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new()))
+            }),
             reputation_config: grith_proxy::reputation::ReputationConfig::default(),
             daemon_proxy_url: None,
             daemon_proxy_token: None,
@@ -361,8 +411,10 @@ impl Harness {
             scratch_roots: self.scratch_roots.clone(),
             local_listener_policy: Vec::new(),
             namespace_users: self.namespace_users.clone(),
-            permit_authority_delegating: Vec::new(),
+            permit_authority_delegating: self.permit_authority_delegating.clone(),
             permit_control_sockets: Vec::new(),
+            authority_delegating_hashes: std::collections::HashSet::new(),
+            authority_delegating_sizes: std::collections::HashSet::new(),
             working_root: self.working_root.clone(),
             mass_destruction: Mutex::new(
                 super::mass_destruction::MassDestructionTracker::with_defaults(),
@@ -396,6 +448,7 @@ impl Harness {
             allow_pids: s.allow_pids.clone(),
             deny_pids: s.deny_pids.clone(),
             freeze_pids: s.freeze_pids.clone(),
+            kill_pids: s.kill_pids.clone(),
             total_allowed: session.stats.total_allowed,
             total_queued: session.stats.total_queued,
             total_denied: session.stats.total_denied,
@@ -432,7 +485,11 @@ fn event_with_tid(pid: u32, tid: u32, raw_syscall_nr: i64, kind: SyscallKind) ->
 }
 
 // Syscall numbers (x86-64) for events whose handler keys off raw_syscall_nr.
-use crate::platform::linux::syscall_nr;
+// Sample-event raw syscall numbers: forensic-only decor on the events the
+// suite fabricates, never classified. Pinned to the x86_64 table so the
+// suite is identical on every host arch (the aarch64 backend never
+// consults raw numbers outside arch/).
+use crate::platform::linux::arch::x86_64::syscall_nr;
 
 // ===========================================================================
 // Phase 1 — raw-socket creation is hard-denied before proxy evaluation
@@ -1523,5 +1580,378 @@ async fn protection_namespace_carveout_fails_safe_outside_routine_root() {
     assert!(
         r.deny_pids.contains(&pid),
         "a namespace_user outside every routine root must NOT be carved out (fail-safe): {r:?}"
+    );
+}
+
+// ===========================================================================
+// Denied authority-delegating spawn is SIGKILLed, not no-op denied
+//
+// A `ProcessSpawn` is intercepted at `PTRACE_EVENT_EXEC` — after execve has
+// returned into the new program image — so `deny_syscall` has no in-flight
+// syscall to convert to EPERM and is a silent no-op: the delegating binary
+// would run and hand its work to an untraced peer (the `systemd-run` escape
+// class). An enforced authority-delegating spawn must therefore be killed on a
+// deny outcome. These tests assert the kill fires on both the reviewer-deny
+// (Freeze) and the non-interactive auto-deny paths, and that the escalation
+// is correctly scoped so ordinary spawns, permitted binaries, and the
+// flag-off case are untouched.
+// ===========================================================================
+
+/// An executable whose *basename* is a real authority-delegating binary name
+/// (e.g. `systemd-run`), at an absolute path that exists — so the spawn is
+/// classified delegating by name AND is not suppressed as a failed exec (the
+/// target must `stat`). Returns `(dir, path)`; the caller removes `dir`.
+fn tmp_delegating_executable(basename: &str, tag: &str) -> (String, String) {
+    let dir = format!("/tmp/grith-kill-test-{}-{tag}", std::process::id());
+    std::fs::create_dir_all(&dir).expect("mkdir delegating test dir");
+    let path = format!("{dir}/{basename}");
+    std::fs::write(&path, "#!/bin/sh\n").expect("write delegating executable");
+    let mut perms = std::fs::metadata(&path)
+        .expect("stat delegating executable")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod delegating executable");
+    (dir, path)
+}
+
+// The core fix: a reviewer-denied authority-delegating spawn is SIGKILLed
+// (not the no-op `deny_syscall`) so `systemd-run` is stopped at the exec stop,
+// before it can connect to the untraced session manager and delegate.
+#[tokio::test]
+async fn protection_authority_delegating_spawn_deny_kills_tracee() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "deny-kills");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.killed(pid),
+        "a denied authority-delegating spawn must be SIGKILLed — deny_syscall is a no-op at \
+         PTRACE_EVENT_EXEC: {r:?}"
+    );
+    assert!(
+        !r.denied(pid),
+        "the spawn must be stopped by kill, not the no-op deny: {r:?}"
+    );
+}
+
+// The non-interactive (headless) auto-deny path must also kill: a CI/piped
+// session with no reviewer fails closed on a delegating spawn by SIGKILL, not
+// the no-op deny that would let it escape.
+#[tokio::test]
+async fn protection_authority_delegating_spawn_noninteractive_deny_kills() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "noninteractive");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_interactive_queue_action(crate::config::InteractiveQueueAction::Deny)
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.killed(pid),
+        "non-interactive auto-deny of a delegating spawn must SIGKILL: {r:?}"
+    );
+    assert!(
+        !r.denied(pid),
+        "must be stopped by kill, not the no-op deny: {r:?}"
+    );
+}
+
+// Scope guard 1: an operator-permitted delegating binary is neither escalated
+// nor killed — it is allowed, exactly as before.
+#[tokio::test]
+async fn protection_authority_delegating_spawn_permitted_not_killed() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "permitted");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_permit_authority_delegating(vec!["systemd-run".to_string()])
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.allowed(pid),
+        "a permitted delegating spawn must be allowed: {r:?}"
+    );
+    assert!(
+        !r.killed(pid),
+        "a permitted delegating spawn must NOT be killed: {r:?}"
+    );
+}
+
+// Scope guard 2 (blast radius): an ordinary, non-delegating spawn that is
+// denied still takes the plain `deny` path — the kill escalation is confined
+// to authority-delegating spawns and does not turn every denied spawn into a
+// SIGKILL.
+#[tokio::test]
+async fn protection_non_delegating_spawn_deny_not_killed() {
+    let pid = std::process::id();
+    let target = tmp_executable("non-deleg-deny");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_proxy(spawn_queues_proxy())
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_file(&target).ok();
+    assert!(
+        r.denied(pid),
+        "a denied ordinary spawn still uses the plain deny path: {r:?}"
+    );
+    assert!(
+        !r.killed(pid),
+        "an ordinary spawn deny must NOT be escalated to SIGKILL: {r:?}"
+    );
+}
+
+// Scope guard 3 (flag gating): with enforcement off, a delegating spawn is
+// neither escalated nor killed — the fix is inert unless the operator opts in.
+#[tokio::test]
+async fn protection_authority_delegating_spawn_flag_off_not_killed() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "flag-off");
+    let r = Harness::new()
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        !r.killed(pid),
+        "with enforcement off a delegating spawn must not be killed: {r:?}"
+    );
+    assert!(
+        r.allowed(pid),
+        "with enforcement off the spawn is allowed (empty proxy): {r:?}"
+    );
+}
+
+// Permit is not immunity: an operator-PERMITTED delegating binary is exempt
+// from the delegation escalation, but NOT from an INDEPENDENT deny (a reviewer
+// deny of an independently-queued spawn, a secret in argv, a taint data-flow).
+// Such a deny must still SIGKILL — otherwise the permitted binary escapes via
+// the no-op deny at PTRACE_EVENT_EXEC (kill_on_deny is permit-independent).
+#[tokio::test]
+async fn protection_permitted_delegating_spawn_independent_deny_kills() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "permit-deny-kills");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_permit_authority_delegating(vec!["systemd-run".to_string()])
+        // Independent (non-delegation) score puts the spawn in the queue band;
+        // escalation is suppressed by the permit, but the reviewer still denies.
+        .with_proxy(spawn_queues_proxy())
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.killed(pid),
+        "a permitted delegating binary that is INDEPENDENTLY denied must still be killed — \
+         the permit suppresses escalation, not other filters' verdicts: {r:?}"
+    );
+    assert!(
+        !r.denied(pid),
+        "must be stopped by kill, not the no-op deny: {r:?}"
+    );
+}
+
+// Reputation must not auto-allow an enforced delegating spawn whose BASE score
+// was already Queue (so escalation — which only rewrites Allow — never fired
+// and never set its reputation guard). `delegation_would_enforce` is the
+// permit-aware guard that closes this. Self-validating: the CONTROL (enforce
+// off) proves the seed is strong enough to auto-allow, so the enforced
+// assertion cannot false-pass on a weak seed.
+#[tokio::test]
+async fn protection_unpermitted_delegating_base_queue_not_reputation_auto_allowed() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "rep-bypass");
+    let shared = Arc::new(Mutex::new(grith_proxy::reputation::ReputationTable::new()));
+
+    // Seed heavy trust for this exact spawn key via approved reviews.
+    // enforcement OFF (nothing escalates/kills); approve-replay OFF so every
+    // retry re-reviews and records a fresh reputation observation.
+    let seed: Vec<_> = (0..120).map(|_| spawn_event(pid, &target)).collect();
+    Harness::new()
+        .with_reputation_table(shared.clone())
+        .with_proxy(spawn_queues_proxy())
+        .with_reviewer(Arc::new(ApproveReviewer))
+        .with_approve_replay_seconds(0)
+        .run(seed)
+        .await;
+
+    // CONTROL: with enforcement OFF, the seeded trust auto-ALLOWS the delegating
+    // spawn even under a DenyReviewer — proving the seed is strong enough (else
+    // the enforced assertion below could false-pass on a weak seed).
+    let control = Harness::new()
+        .with_reputation_table(shared.clone())
+        .with_proxy(spawn_queues_proxy())
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    assert!(
+        control.allowed(pid) && !control.killed(pid),
+        "seed precondition: with enforcement OFF the delegating spawn must be \
+         reputation-auto-allowed (seed too weak otherwise): {control:?}"
+    );
+
+    // FIX: with enforcement ON, the SAME high-trust delegating spawn must NOT be
+    // reputation-auto-allowed — it reaches review and is killed.
+    let r = Harness::new()
+        .with_reputation_table(shared.clone())
+        .with_enforce_authority_delegating_spawn(true)
+        .with_proxy(spawn_queues_proxy())
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.killed(pid),
+        "an enforced delegating spawn must bypass reputation auto-allow and reach \
+         review/kill even with high accrued trust: {r:?}"
+    );
+    assert!(
+        !r.allowed(pid),
+        "must not be reputation-auto-allowed: {r:?}"
+    );
+}
+
+/// A `ProcessExec` event with an explicit argv (incl. argv[0]), as the
+/// supervisor carries it from `/proc/<pid>/cmdline`.
+fn spawn_event_with_args(pid: u32, target: &str, argv: &[&str]) -> SyscallEvent {
+    event(
+        pid,
+        syscall_nr::EXECVE,
+        SyscallKind::ProcessExec {
+            path: target.to_string(),
+            args: argv.iter().map(|s| (*s).to_string()).collect(),
+        },
+    )
+}
+
+// Read-only subcommand filter (end-to-end): `flatpak --installations` is a
+// read-only query that delegates nothing, so even with enforcement ON and a
+// DenyReviewer it must be ALLOWED — never escalated, queued, or killed. This is
+// the exact false positive the user reported.
+#[tokio::test]
+async fn protection_read_only_delegating_spawn_is_not_escalated() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("flatpak", "readonly");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event_with_args(
+            pid,
+            &target,
+            &["flatpak", "--installations"],
+        )])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.allowed(pid),
+        "a read-only `flatpak --installations` must be allowed, not escalated: {r:?}"
+    );
+    assert!(
+        !r.killed(pid) && !r.denied(pid),
+        "a read-only query must never be killed or denied: {r:?}"
+    );
+    assert_eq!(r.total_queued, 0, "a read-only query must not queue: {r:?}");
+}
+
+// A genuinely-delegating subcommand of the SAME binary still escalates (and,
+// reviewer-denied, is killed) — proving the exemption is scoped to queries.
+#[tokio::test]
+async fn protection_delegating_subcommand_of_exempt_binary_still_escalates() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("flatpak", "run");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_reviewer(Arc::new(DenyReviewer))
+        .run(vec![spawn_event_with_args(
+            pid,
+            &target,
+            &["flatpak", "run", "org.foo.Bar"],
+        )])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        r.killed(pid),
+        "`flatpak run` delegates to the flatpak sandbox and must still escalate+kill: {r:?}"
+    );
+}
+
+// Exact-command approval sticks for the session: after the operator approves a
+// delegating spawn once, the IDENTICAL command auto-allows on recurrence
+// instead of re-escalating (the user's "the same command should have been
+// allowed"). The first spawn queues; the second does not.
+#[tokio::test]
+async fn protection_approved_delegating_spawn_sticks_for_session() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "approval-sticks");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_reviewer(Arc::new(ApproveReviewer))
+        .run(vec![spawn_event(pid, &target), spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        r.allow_pids.iter().filter(|p| **p == pid).count(),
+        2,
+        "both identical delegating spawns must end up allowed: {r:?}"
+    );
+    assert_eq!(
+        r.total_queued, 1,
+        "only the FIRST delegating spawn queues; the approved identical recurrence \
+         auto-allows without re-escalating: {r:?}"
+    );
+    assert!(
+        !r.killed(pid),
+        "an approved-then-repeated command must never be killed: {r:?}"
+    );
+}
+
+// The exact-command approval is keyed on command + args: approving one command
+// must NOT auto-allow a DIFFERENT delegating command of the same binary.
+#[tokio::test]
+async fn protection_delegating_approval_is_keyed_on_exact_command() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "approval-exact");
+    let first = spawn_event_with_args(pid, &target, &[&target, "--user", "cmd-a"]);
+    let second = spawn_event_with_args(pid, &target, &[&target, "--user", "cmd-b"]);
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_reviewer(Arc::new(ApproveReviewer))
+        .run(vec![first, second])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        r.total_queued, 2,
+        "a different delegating command must be reviewed on its own, not covered \
+         by the first approval: {r:?}"
+    );
+}
+
+// Under containment the exact-command approval is disabled: the session's taint
+// can change between identical runs, so a previously-approved delegating command
+// must be re-reviewed (mirrors approve-replay being disabled under containment).
+#[tokio::test]
+async fn protection_delegating_approval_re_reviews_under_containment() {
+    let pid = std::process::id();
+    let (dir, target) = tmp_delegating_executable("systemd-run", "approval-containment");
+    let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(true)
+        .with_reviewer(Arc::new(ApproveReviewer))
+        .with_containment_active()
+        .run(vec![spawn_event(pid, &target), spawn_event(pid, &target)])
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        r.total_queued, 2,
+        "under containment a previously-approved delegating command must be \
+         re-reviewed, not auto-allowed: {r:?}"
     );
 }

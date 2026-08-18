@@ -272,6 +272,9 @@ pub(crate) struct ConfigUpdateRequest {
     /// Optional threshold updates.
     #[serde(default)]
     proxy: Option<ProxyUpdate>,
+    /// Optional server/dashboard behaviour updates (e.g. auto-open browser).
+    #[serde(default)]
+    server: Option<ServerUpdate>,
 }
 
 #[derive(Deserialize)]
@@ -286,12 +289,20 @@ struct ProxyUpdate {
     auto_deny_threshold: Option<f64>,
 }
 
+#[derive(Deserialize, Default)]
+struct ServerUpdate {
+    /// Whether grith opens the dashboard in a browser when it starts. Written to
+    /// `server.auto_open_dashboard`, which the CLI reads at its next launch.
+    auto_open_dashboard: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct ConfigUpdateResponse {
     status: String,
     scope: ConfigScope,
     filters_updated: usize,
     proxy_updated: bool,
+    server_updated: bool,
     message: String,
 }
 
@@ -388,6 +399,19 @@ pub(crate) async fn update_config(
         }
     }
 
+    let mut server_updated = false;
+    if let Some(server) = body.server {
+        if let Some(auto_open) = server.auto_open_dashboard {
+            let root = table_mut(&mut target_cfg);
+            let server_table = child_table_mut(root, "server");
+            server_table.insert(
+                "auto_open_dashboard".to_string(),
+                toml::Value::Boolean(auto_open),
+            );
+            server_updated = true;
+        }
+    }
+
     if let Err(e) = write_toml(&path, &target_cfg, scope_label) {
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "CONFIG_SAVE_ERROR")
             .into_response();
@@ -399,6 +423,7 @@ pub(crate) async fn update_config(
         config_path = %path.display(),
         filters_updated = updated,
         proxy_updated,
+        server_updated,
         "saved dashboard config to file"
     );
 
@@ -407,6 +432,7 @@ pub(crate) async fn update_config(
         scope: body.scope,
         filters_updated: updated,
         proxy_updated,
+        server_updated,
         message:
             "Configuration saved. Team config is shared baseline; local config overrides it. Proxy threshold changes apply after daemon restart.".into(),
     })

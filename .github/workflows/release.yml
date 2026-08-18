@@ -28,17 +28,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v0.1.x is Linux x86_64 only. The supervisor uses ptrace+seccomp
-        # which is Linux-specific (macOS via Endpoint Security and
-        # Windows via ETW are v2.0 — work/31, work/32). Within Linux,
-        # the supervisor's syscall-arg extraction hard-codes x86_64
-        # register names (orig_rax, rdi, rsi, r10, ...) and uses
-        # ptrace::getregs/setregs which exist on x86_64 but not aarch64.
-        # Add aarch64-unknown-linux-musl back when the supervisor's
-        # arch backend ports are in (separate work item).
+        # Linux x86_64 + aarch64 (static musl binaries via cross; the
+        # supervisor's arch backends live in platform/linux/arch/ —
+        # work/78). macOS via Endpoint Security and Windows via ETW are
+        # v2.0 — work/31, work/32.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            ext: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
             ext: ""
     steps:
       - uses: actions/checkout@v4
@@ -207,10 +206,41 @@ jobs:
             ${{ env.ARCHIVE_NAME }}.intoto.bundle
           if-no-files-found: error
 
+  # Boot the aarch64 release artifact on a real arm64 kernel before the
+  # release is cut: unpack the exact tarball users will download and prove
+  # the static binary executes there. Full interception smoke (deny-errno,
+  # queue/freeze/thaw, clamp) runs per-commit in the test-arm64 CI job and
+  # on the work/78 §5 validation VMs — this gate is about the artifact.
+  smoke-arm64:
+    name: Release smoke (arm64)
+    runs-on: ubuntu-24.04-arm
+    # If the arm64 runner label ever fails to resolve, fail the release
+    # loudly instead of queueing for 24h with no release cut.
+    timeout-minutes: 15
+    needs: build
+    steps:
+      - name: Set release version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Download aarch64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grith-aarch64-unknown-linux-musl
+
+      - name: Unpack and run the release binary
+        run: |
+          tar xzf "grith-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+          FILE_OUT=$(file ./grith) || { echo "file(1) failed"; exit 1; }
+          echo "${FILE_OUT}"
+          echo "${FILE_OUT}" | grep -q 'ARM aarch64' || { echo "not an aarch64 binary"; exit 1; }
+          ./grith --version
+          ./grith --help > /dev/null
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, smoke-arm64]
     steps:
       - uses: actions/checkout@v4
 

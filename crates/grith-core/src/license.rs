@@ -1658,24 +1658,21 @@ mod tests {
 
     #[test]
     fn test_max_sessions_by_tier() {
-        // Community
+        // Community: a hard cap of 2 (the free-tier lever).
         let gate = feature_gate_from_status(&LicenseStatus::NotFound);
         assert_eq!(gate.max_sessions(), 2);
 
-        // Pro with 1 seat
-        let lic = make_license("pro", 1);
-        let gate = feature_gate_from_status(&LicenseStatus::Valid(lic));
-        assert_eq!(gate.max_sessions(), 4);
-
-        // Pro with 3 seats
-        let lic = make_license("pro", 3);
-        let gate = feature_gate_from_status(&LicenseStatus::Valid(lic));
-        assert_eq!(gate.max_sessions(), 12);
-
-        // Enterprise with 2 seats
-        let lic = make_license("enterprise", 2);
-        let gate = feature_gate_from_status(&LicenseStatus::Valid(lic));
-        assert_eq!(gate.max_sessions(), 16);
+        // Paid tiers get a flat, generous 64 regardless of seats — local
+        // session concurrency is not a per-seat monetisation axis.
+        for (tier, seats) in [("pro", 1), ("pro", 3), ("enterprise", 1), ("enterprise", 2)] {
+            let lic = make_license(tier, seats);
+            let gate = feature_gate_from_status(&LicenseStatus::Valid(lic));
+            assert_eq!(
+                gate.max_sessions(),
+                64,
+                "{tier} with {seats} seat(s) should get the flat paid cap"
+            );
+        }
     }
 
     #[test]
