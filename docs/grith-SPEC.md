@@ -671,10 +671,10 @@ Profiles translate to allowlist entries in the proxy, giving score reductions fo
 
 | Platform | Mechanism | Status | Notes |
 |----------|-----------|--------|-------|
-| Linux x86-64 | ptrace + seccomp-BPF | v1.5 | Primary implementation |
-| Linux ARM64 | ptrace + seccomp-BPF | v1.5 | asm-generic syscall table (no legacy non-`at` calls), regset-based register access (`NT_PRSTATUS`/`NT_ARM_SYSTEM_CALL`), compat-ARM foreign-ABI surface, kernel 5.3+ (`PTRACE_GET_SYSCALL_INFO`) — see work/78 |
-| macOS (Apple Silicon) | Endpoint Security framework | v1.5 | Requires entitlement |
-| macOS (Intel) | Endpoint Security framework | v1.5 | Same as Apple Silicon |
+| Linux x86-64 | ptrace + seccomp-BPF | Shipped (v0.1.0) | Primary implementation |
+| Linux ARM64 | ptrace + seccomp-BPF | Shipped (v0.2.4) | asm-generic syscall table (no legacy non-`at` calls), regset-based register access (`NT_PRSTATUS`/`NT_ARM_SYSTEM_CALL`), compat-ARM foreign-ABI surface, kernel 5.3+ (`PTRACE_GET_SYSCALL_INFO`) |
+| macOS (Apple Silicon) | Endpoint Security framework | v2.0 | Requires entitlement |
+| macOS (Intel) | Endpoint Security framework | v2.0 | Same as Apple Silicon |
 | Windows x86-64 | Minifilter + ETW | v2.0 | Requires driver signing |
 
 ### 7.13 Resource Constraints
