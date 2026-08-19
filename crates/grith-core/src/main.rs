@@ -352,8 +352,19 @@ enum ReputationAction {
     },
 }
 
+/// Commands that can host the interactive upgrade prompt: it reads stdin and
+/// exits the process on accept, so it only belongs where the user is sitting
+/// at a prompt and re-running is one keystroke.
 fn command_supports_update_check(command: Option<&Command>) -> bool {
     matches!(command, None | Some(Command::Run { .. }))
+}
+
+/// Commands that get the non-interactive notice instead. `exec` hands stdin to
+/// the supervised tool and must go on to actually launch it, so it cannot take
+/// the prompt — but its users are the ones least likely to open a REPL and see
+/// one, so silence would leave them on an old binary indefinitely.
+fn command_supports_update_notice(command: Option<&Command>) -> bool {
+    matches!(command, Some(Command::Exec { .. }))
 }
 
 fn command_supports_profile_refresh(command: Option<&Command>) -> bool {
@@ -431,6 +442,22 @@ fn should_refresh_profiles(
     env_disabled: bool,
 ) -> bool {
     profile_update_check_enabled && !env_disabled && command_supports_profile_refresh(command)
+}
+
+/// Gating for the notice. Deliberately not the same set as
+/// [`should_check_updates`]: there is no stdin requirement because nothing is
+/// read from it. stderr must still be a terminal, so redirected logs and CI
+/// output stay clean.
+fn should_notify_update(
+    command: Option<&Command>,
+    stderr_is_tty: bool,
+    update_check_enabled: bool,
+    env_disabled: bool,
+) -> bool {
+    update_check_enabled
+        && stderr_is_tty
+        && !env_disabled
+        && command_supports_update_notice(command)
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -531,6 +558,17 @@ fn main() -> anyhow::Result<()> {
     ) && update_check::check_and_prompt(enable_color)?
     {
         return Ok(()); // user upgraded — exit so they re-run with new binary
+    }
+
+    // Supervised launches get the same news without the prompt: one line from
+    // a cached answer, then straight on to the tool.
+    if should_notify_update(
+        cli.command.as_ref(),
+        stderr_is_tty,
+        cfg.general.update_check,
+        std::env::var_os("GRITH_NO_UPDATE_CHECK").is_some(),
+    ) {
+        update_check::maybe_notify(enable_color);
     }
 
     // Check for remote profile overlay updates (silent, TTL-gated).
@@ -1429,6 +1467,60 @@ mod session_summary_tests {
         assert!(super::command_supports_update_check(Some(&run)));
         assert!(!super::command_supports_update_check(Some(&exec)));
         assert!(!super::command_supports_update_check(Some(&config)));
+    }
+
+    #[test]
+    fn update_notice_only_runs_for_exec() {
+        let run = super::Command::Run {
+            task: "hello".to_string(),
+        };
+        let exec = super::Command::Exec {
+            profile: None,
+            attach: None,
+            syscall_log: None,
+            trace_syscalls_jsonl: None,
+            allow_queued: false,
+            command: vec!["echo".to_string(), "hi".to_string()],
+        };
+        let config = super::Command::Config { action: None };
+
+        assert!(super::command_supports_update_notice(Some(&exec)));
+
+        // The REPL and `run` take the interactive prompt instead — offering
+        // both would print the notice and then ask the same question.
+        assert!(!super::command_supports_update_notice(None));
+        assert!(!super::command_supports_update_notice(Some(&run)));
+        assert!(!super::command_supports_update_notice(Some(&config)));
+    }
+
+    #[test]
+    fn update_notice_requires_tty_config_and_env_gate() {
+        let exec = super::Command::Exec {
+            profile: None,
+            attach: None,
+            syscall_log: None,
+            trace_syscalls_jsonl: None,
+            allow_queued: false,
+            command: vec!["echo".to_string(), "hi".to_string()],
+        };
+
+        assert!(super::should_notify_update(Some(&exec), true, true, false));
+        // stderr not a terminal — redirected logs and CI output stay clean.
+        assert!(!super::should_notify_update(
+            Some(&exec),
+            false,
+            true,
+            false
+        ));
+        // disabled in config
+        assert!(!super::should_notify_update(
+            Some(&exec),
+            true,
+            false,
+            false
+        ));
+        // GRITH_NO_UPDATE_CHECK set
+        assert!(!super::should_notify_update(Some(&exec), true, true, true));
     }
 
     #[test]

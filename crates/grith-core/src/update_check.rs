@@ -3,11 +3,20 @@
 
 //! Startup update checker.
 //!
-//! On each launch, queries the GitHub Releases API for the latest version.
-//! If a newer version is available, prompts the user to upgrade via the
-//! install script. Fails silently on network errors so offline usage is
-//! never blocked.
+//! Two launch paths, because they can afford different things:
+//!
+//! * [`check_and_prompt`] — the interactive path (REPL / `grith run`). Queries
+//!   the GitHub Releases API inline and offers to upgrade, exiting the process
+//!   if the user accepts.
+//! * [`maybe_notify`] — the non-interactive path (`grith exec`). Prints a
+//!   one-line notice from a cached answer and returns. It never reads stdin
+//!   (which belongs to the supervised tool), never exits (which would swallow
+//!   the launch), and never waits on the network.
+//!
+//! Both fail silently on network errors so offline usage is never blocked.
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +31,12 @@ const INSTALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const INSTALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Where `install.sh --global` writes the binary.
 const GLOBAL_INSTALL_DIR: &str = "/usr/local/bin";
+/// Where the background refresh records what the release feed last reported.
+const NOTICE_CACHE_FILE: &str = "update-check.json";
+/// How long a recorded answer is served before a refresh is due. The notice
+/// itself is printed from whatever is cached, however old — a release that
+/// exists does not stop existing because the record of it went stale.
+const NOTICE_REFRESH_TTL_SECS: i64 = 24 * 3600;
 
 /// Check GitHub for a newer release and prompt the user to upgrade.
 ///
@@ -36,6 +51,10 @@ pub fn check_and_prompt(enable_color: bool) -> anyhow::Result<bool> {
             return Ok(false);
         }
     };
+
+    // Seed the cache the non-interactive notice reads, so REPL and `run`
+    // launches keep it warm for supervised sessions on the same machine.
+    write_cache(&latest);
 
     if !is_newer(&latest, CURRENT_VERSION) {
         tracing::debug!(current = CURRENT_VERSION, latest = %latest, "up to date");
@@ -89,6 +108,168 @@ pub fn check_and_prompt(enable_color: bool) -> anyhow::Result<bool> {
 
     eprintln!();
     run_upgrade(install_flag)
+}
+
+/// Print a one-line "update available" notice, without prompting or blocking.
+///
+/// This is the launch path for supervised sessions (`grith exec`), where
+/// [`check_and_prompt`] cannot be used: it reads a `y/N` answer from stdin,
+/// which the supervised tool owns, and on accept returns a value that makes
+/// `main` exit — so the launch the user actually asked for would never run.
+///
+/// The notice is printed from the cached answer, so it costs no network time
+/// on a path that runs before every supervised tool. When that answer is older
+/// than [`NOTICE_REFRESH_TTL_SECS`] a refresh runs on a detached background
+/// thread and lands in time for the next launch.
+pub fn maybe_notify(enable_color: bool) {
+    let cached = read_cache();
+
+    if let Some(entry) = &cached {
+        if is_newer(&entry.latest_version, CURRENT_VERSION) {
+            eprintln!("{}", notice_line(&entry.latest_version, enable_color));
+        }
+    }
+
+    if refresh_due(
+        cached.as_ref().and_then(UpdateCheckCache::checked_at),
+        Utc::now(),
+    ) {
+        spawn_cache_refresh(cached.map(|c| c.latest_version));
+    }
+}
+
+/// The notice itself. One line: this prints ahead of a supervised tool taking
+/// over the terminal, so it has to be readable in the moment before that and
+/// in the scrollback afterwards, without pushing anything off screen.
+fn notice_line(latest: &str, enable_color: bool) -> String {
+    let (bold, cyan, reset) = if enable_color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
+    format!(
+        "  {bold}Update available:{reset} {cyan}{CURRENT_VERSION}{reset} \u{2192} \
+{cyan}{latest}{reset} \u{b7} install with {cyan}curl -fsSL {INSTALL_URL} | sh{reset}"
+    )
+}
+
+/// Whether the cached answer is old enough to refresh.
+///
+/// A timestamp in the future (a clock that moved backwards, a cache copied
+/// from another machine) counts as due — otherwise the check would be stuck
+/// until real time caught up with it.
+fn refresh_due(checked_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    let Some(checked_at) = checked_at else {
+        return true;
+    };
+    let elapsed = now.signed_duration_since(checked_at).num_seconds();
+    !(0..NOTICE_REFRESH_TTL_SECS).contains(&elapsed)
+}
+
+/// Refresh the cached answer on a detached background thread.
+///
+/// Never joined: the launch path must not wait on the network. If the process
+/// exits before the fetch finishes, nothing is written and the next launch
+/// tries again. `previous` is carried in so a failed fetch can re-record the
+/// last known answer rather than discarding it.
+fn spawn_cache_refresh(previous: Option<String>) {
+    let spawned = std::thread::Builder::new()
+        .name("grith-update-check".to_string())
+        .spawn(move || refresh_cache(&cache_dir(), previous, fetch_latest_version));
+
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "update notice refresh not started");
+    }
+}
+
+/// Body of the refresh, split out from the thread so it can be driven with a
+/// stub fetcher in tests.
+///
+/// A failed fetch still writes: the timestamp is what makes the next launch
+/// wait out the TTL instead of retrying immediately, and `previous` is carried
+/// forward so a machine that goes offline does not forget a release it had
+/// already been told about.
+fn refresh_cache<F>(dir: &Path, previous: Option<String>, fetch: F)
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    match fetch() {
+        Ok(latest) => write_cache_to(dir, &latest),
+        Err(e) => {
+            tracing::debug!(error = %e, "update notice refresh failed");
+            write_cache_to(dir, previous.as_deref().unwrap_or(CURRENT_VERSION));
+        }
+    }
+}
+
+/// The last answer the release feed gave, and when it gave it.
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdateCheckCache {
+    /// Newest version reported at `checked_at`.
+    latest_version: String,
+    /// RFC3339 timestamp of the last completed attempt, successful or not.
+    checked_at: String,
+}
+
+impl UpdateCheckCache {
+    fn checked_at(&self) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(&self.checked_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+}
+
+fn cache_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("grith")
+}
+
+fn read_cache() -> Option<UpdateCheckCache> {
+    read_cache_from(&cache_dir())
+}
+
+fn write_cache(latest: &str) {
+    write_cache_to(&cache_dir(), latest);
+}
+
+/// Read the cached answer. Any failure — missing, unreadable, written by a
+/// different schema — reads as "nothing cached", which suppresses the notice
+/// and schedules a refresh.
+fn read_cache_from(dir: &Path) -> Option<UpdateCheckCache> {
+    let bytes = std::fs::read(dir.join(NOTICE_CACHE_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Record `latest` against the current time, replacing any previous answer.
+///
+/// Staged through a pid-suffixed temporary file in the same directory and
+/// renamed into place, so a launch reading the cache while another writes it
+/// sees the old entry or the new one, never a half-written file.
+fn write_cache_to(dir: &Path, latest: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::debug!(error = %e, "update notice cache dir unavailable");
+        return;
+    }
+
+    let entry = UpdateCheckCache {
+        latest_version: latest.to_string(),
+        checked_at: Utc::now().to_rfc3339(),
+    };
+    let Ok(json) = serde_json::to_string_pretty(&entry) else {
+        return;
+    };
+
+    let tmp = dir.join(format!("{NOTICE_CACHE_FILE}.{}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, json) {
+        tracing::debug!(error = %e, "update notice cache write failed");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, dir.join(NOTICE_CACHE_FILE)) {
+        tracing::debug!(error = %e, "update notice cache rename failed");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Which install directory, if any, owns the running binary.
@@ -310,6 +491,170 @@ mod tests {
         assert!(!is_newer("abc", "0.1.0"));
         assert!(!is_newer("0.1.0", "xyz"));
         assert!(!is_newer("1.0", "0.1.0"));
+    }
+
+    #[test]
+    fn refresh_due_when_nothing_cached() {
+        assert!(refresh_due(None, Utc::now()));
+    }
+
+    #[test]
+    fn fresh_cache_does_not_refresh() {
+        let now = Utc::now();
+        let checked = now - chrono::Duration::seconds(NOTICE_REFRESH_TTL_SECS - 60);
+        assert!(!refresh_due(Some(checked), now));
+    }
+
+    #[test]
+    fn stale_cache_refreshes() {
+        let now = Utc::now();
+        let checked = now - chrono::Duration::seconds(NOTICE_REFRESH_TTL_SECS + 1);
+        assert!(refresh_due(Some(checked), now));
+    }
+
+    /// A cache stamped in the future must not pin the check shut until the
+    /// clock catches up with it.
+    #[test]
+    fn future_cache_refreshes() {
+        let now = Utc::now();
+        assert!(refresh_due(Some(now + chrono::Duration::hours(72)), now));
+    }
+
+    #[test]
+    fn notice_names_both_versions_and_the_install_command() {
+        let line = notice_line("9.9.9", false);
+        assert!(line.contains(CURRENT_VERSION), "missing current: {line}");
+        assert!(line.contains("9.9.9"), "missing latest: {line}");
+        assert!(line.contains(INSTALL_URL), "missing installer: {line}");
+    }
+
+    /// The notice prints straight ahead of a supervised tool taking the
+    /// terminal, so it stays a single line whatever the version strings are.
+    #[test]
+    fn notice_is_one_line() {
+        assert!(!notice_line("10.20.30", true).contains('\n'));
+    }
+
+    #[test]
+    fn notice_honours_no_color() {
+        assert!(!notice_line("9.9.9", false).contains('\x1b'));
+        assert!(notice_line("9.9.9", true).contains('\x1b'));
+    }
+
+    #[test]
+    fn cache_survives_a_write_read_cycle_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            read_cache_from(dir.path()).is_none(),
+            "empty dir has no cache"
+        );
+
+        write_cache_to(dir.path(), "1.2.3");
+        let entry = read_cache_from(dir.path()).expect("cache written");
+        assert_eq!(entry.latest_version, "1.2.3");
+        assert!(!refresh_due(entry.checked_at(), Utc::now()), "just written");
+
+        // A second write replaces the answer rather than accumulating files.
+        write_cache_to(dir.path(), "4.5.6");
+        assert_eq!(
+            read_cache_from(dir.path())
+                .expect("cache rewritten")
+                .latest_version,
+            "4.5.6"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_records_what_the_feed_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        refresh_cache(dir.path(), None, || Ok("7.8.9".to_string()));
+        assert_eq!(
+            read_cache_from(dir.path()).expect("cache").latest_version,
+            "7.8.9"
+        );
+    }
+
+    /// Going offline must not lose a release the machine already knew about,
+    /// and must not retry on every launch either.
+    #[test]
+    fn failed_refresh_keeps_the_previous_answer_and_stamps_the_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        refresh_cache(dir.path(), Some("7.8.9".to_string()), || {
+            Err("offline".to_string())
+        });
+
+        let entry = read_cache_from(dir.path()).expect("cache");
+        assert_eq!(entry.latest_version, "7.8.9");
+        assert!(!refresh_due(entry.checked_at(), Utc::now()));
+    }
+
+    /// With nothing known and no answer, the recorded version is our own — so
+    /// no notice is printed on the strength of a failed check.
+    #[test]
+    fn failed_first_refresh_records_current_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        refresh_cache(dir.path(), None, || Err("offline".to_string()));
+
+        let entry = read_cache_from(dir.path()).expect("cache");
+        assert_eq!(entry.latest_version, CURRENT_VERSION);
+        assert!(!is_newer(&entry.latest_version, CURRENT_VERSION));
+    }
+
+    /// Garbage in the cache must not surface as a notice — it reads as
+    /// "nothing known", which is the same as a first run.
+    #[test]
+    fn corrupt_cache_reads_as_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(NOTICE_CACHE_FILE), b"{ not json").expect("write");
+        assert!(read_cache_from(dir.path()).is_none());
+    }
+
+    /// The cache directory is created on demand: a fresh install has a config
+    /// dir only once something writes to it.
+    #[test]
+    fn write_creates_missing_cache_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let nested = root.path().join("grith");
+        write_cache_to(&nested, "1.2.3");
+        assert_eq!(
+            read_cache_from(&nested)
+                .expect("cache written")
+                .latest_version,
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn cache_round_trips() {
+        let entry = UpdateCheckCache {
+            latest_version: "1.2.3".to_string(),
+            checked_at: Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: UpdateCheckCache = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.latest_version, "1.2.3");
+        assert!(back.checked_at().is_some());
+    }
+
+    /// An unparseable timestamp must read as "no idea when", which schedules a
+    /// refresh rather than trusting the entry forever.
+    #[test]
+    fn unparseable_timestamp_refreshes() {
+        let entry = UpdateCheckCache {
+            latest_version: "1.2.3".to_string(),
+            checked_at: "not-a-timestamp".to_string(),
+        };
+        assert!(entry.checked_at().is_none());
+        assert!(refresh_due(entry.checked_at(), Utc::now()));
     }
 
     #[test]

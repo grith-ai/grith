@@ -132,6 +132,10 @@ pub struct GeneralConfig {
     /// Plan tier: "community", "pro", or "enterprise".
     pub plan_tier: String,
     /// Check for new releases on startup. Defaults to `true`.
+    ///
+    /// Governs both forms: the interactive upgrade prompt on the REPL and
+    /// `grith run`, and the one-line notice on `grith exec`. Setting it to
+    /// `false` (or `GRITH_NO_UPDATE_CHECK=1`) silences both.
     pub update_check: bool,
     /// Sync audit records to the grith cloud API. Defaults to `true`.
     /// Set to `false` to keep audit records local-only. This does not disable

@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and
 will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
+## [Unreleased]
+
+### Added
+
+- **`grith exec` now tells you when a new version is out.** The update
+  prompt only ever ran on the REPL and `grith run`, because it reads a
+  `y/N` from stdin and exits the process on accept - neither of which
+  `exec` can do: stdin belongs to the supervised tool, and exiting would
+  swallow the launch you asked for. So the people who live in
+  `grith exec` were the least likely to ever hear about a release.
+  Supervised launches now print a single line instead, ahead of the tool
+  starting:
+
+  ```
+    Update available: 0.2.5 -> 0.2.6 - install with curl -fsSL https://grith.ai/install | sh
+  ```
+
+  It reads a cached answer, so it adds no network wait to a path that
+  runs before every supervised tool; the answer is refreshed on a
+  background thread at most once every 24 hours and is never waited on.
+  A failed refresh keeps the last known answer rather than forgetting it.
+  Same off switches as the prompt: `[general] update_check = false` or
+  `GRITH_NO_UPDATE_CHECK=1`. Nothing prints when stderr is not a
+  terminal, so redirected logs and CI output stay clean.
+
 ## [0.2.5] - 2026-08-19
 
 ### Changed
