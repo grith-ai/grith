@@ -278,16 +278,30 @@ download_and_install() {
         exit 1
     fi
 
-    # Install binary
+    # Install binary.
+    #
+    # Stage inside the destination directory and rename into place rather than
+    # writing over the target: replacing a file that is currently executing
+    # fails with ETXTBSY ("Text file busy"), which is exactly what a running
+    # grith updating itself would hit. rename(2) swaps the directory entry and
+    # leaves the running process on its now-unlinked inode. Staging in the
+    # destination (rather than in ${tmpdir}) keeps both paths on one
+    # filesystem, so the rename cannot degrade into a copy.
     mkdir -p "${install_dir}"
 
+    local staged="${install_dir}/.${BINARY_NAME}.new.$$"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${tmpdir}'; rm -f '${staged}' 2>/dev/null || true" EXIT
+
     if [ -w "${install_dir}" ]; then
-        cp "${tmpdir}/${BINARY_NAME}" "${install_dir}/${BINARY_NAME}"
-        chmod +x "${install_dir}/${BINARY_NAME}"
+        cp "${tmpdir}/${BINARY_NAME}" "${staged}"
+        chmod +x "${staged}"
+        mv -f "${staged}" "${install_dir}/${BINARY_NAME}"
     else
         info "Elevated permissions required to install to ${install_dir}"
-        sudo cp "${tmpdir}/${BINARY_NAME}" "${install_dir}/${BINARY_NAME}"
-        sudo chmod +x "${install_dir}/${BINARY_NAME}"
+        sudo cp "${tmpdir}/${BINARY_NAME}" "${staged}"
+        sudo chmod +x "${staged}"
+        sudo mv -f "${staged}" "${install_dir}/${BINARY_NAME}"
     fi
 
     ok "Installed grith to ${install_dir}/${BINARY_NAME}"

@@ -36,7 +36,7 @@
 //! [`spawn_should_escalate_full`], which also fires on the **canonical**
 //! (symlink-resolved) basename — defeating `run0`→`systemd-run` and
 //! `ln -s systemd-run x` — and on a **content SHA-256** match against the
-//! session-start-pinned set of the listed binaries ([`build_pinned_authority_metadata`])
+//! session-start-pinned set of the listed binaries ([`AuthorityDelegatingPins`])
 //! — defeating an unmodified `cp /usr/bin/systemd-run /tmp/x && /tmp/x`. A
 //! hash-only match is deliberately NOT basename-permittable.
 //!
@@ -49,7 +49,7 @@
 //! a renamed `ssh` copy evades it; (4) a from-scratch reimplementation under a
 //! novel name; (5) proxy-side scoring covering the built-in-agent (Path 1)
 //! path. Multicall dispatchers (busybox/toybox) are deliberately NOT pinned —
-//! see [`build_pinned_authority_metadata`].
+//! see [`AuthorityDelegatingPins`].
 
 use grith_proxy::types::{ProxyAction, ProxyDecision, QueuePriority};
 use std::collections::HashSet;
@@ -92,8 +92,8 @@ pub(super) fn is_control_injection_socket(address: &str) -> bool {
 }
 
 /// Curated authority-delegating binary basenames. A `const` slice (rather than
-/// the old inline `matches!`) so [`build_pinned_authority_metadata`] can resolve
-/// and hash each one on `$PATH` at session start. Security-relevant — see the
+/// the old inline `matches!`) so [`AuthorityDelegatingPins`] can resolve each
+/// one on `$PATH` at session start (and hash it on first need). Security-relevant — see the
 /// module curation policy. `run0` is systemd's `systemd-run`-equivalent
 /// (pkexec-style peer exec); `qdbus*` drive an *existing* session bus like
 /// `dbus-send`/`gdbus`/`busctl`. NB: `dbus-launch`/`dbus-run-session` are
@@ -168,15 +168,22 @@ fn basename(command: &str) -> &str {
 /// set dedups. A binary not installed at session start is simply absent — you
 /// cannot copy what is not present. Symlinks are resolved so the pinned hash is
 /// the real target's.
-pub(super) fn build_pinned_authority_metadata() -> (HashSet<String>, HashSet<u64>) {
-    build_pinned_from_path(&std::env::var_os("PATH").unwrap_or_default())
+#[cfg(test)]
+pub(super) fn build_pinned_from_path(
+    path_var: &std::ffi::OsStr,
+) -> (HashSet<String>, HashSet<u64>) {
+    let candidates = candidates_from_path(path_var);
+    let sizes = candidates.iter().map(|(_, len)| *len).collect();
+    (hash_candidates(&candidates), sizes)
 }
 
-/// Core of [`build_pinned_authority_metadata`], parameterised on the search
-/// path so it is testable without mutating the process-global `PATH`.
-fn build_pinned_from_path(path_var: &std::ffi::OsStr) -> (HashSet<String>, HashSet<u64>) {
-    let mut hashes = HashSet::new();
-    let mut sizes = HashSet::new();
+/// Cheap half of the pin: resolve every curated delegating binary on the
+/// search path to its canonical file and size. Canonicalise + stat only, no
+/// file reads, so this is safe to run at session start now that enforcement
+/// is on by default (v0.2.5). Parameterised on the search path so it is
+/// testable without mutating the process-global `PATH`.
+fn candidates_from_path(path_var: &std::ffi::OsStr) -> Vec<(std::path::PathBuf, u64)> {
+    let mut candidates = Vec::new();
     let mut seen_canonical: HashSet<String> = HashSet::new();
     for name in AUTHORITY_DELEGATING_BINARIES {
         for dir in std::env::split_paths(path_var) {
@@ -208,13 +215,140 @@ fn build_pinned_from_path(path_var: &std::ffi::OsStr) -> (HashSet<String>, HashS
             if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
                 continue;
             }
-            if let Ok(sha) = crate::provenance::sha256_file(&canonical) {
-                hashes.insert(sha);
-                sizes.insert(meta.len());
-            }
+            candidates.push((canonical, meta.len()));
         }
     }
-    (hashes, sizes)
+    candidates
+}
+
+/// Expensive half of the pin: SHA-256 the resolved candidates. Deferred
+/// behind [`AuthorityDelegatingPins`] - a docker or kubectl binary is tens of
+/// megabytes, and the overwhelming majority of sessions never spawn a
+/// delegating binary at all.
+fn hash_candidates(candidates: &[(std::path::PathBuf, u64)]) -> HashSet<String> {
+    candidates
+        .iter()
+        .filter_map(|(path, _)| crate::provenance::sha256_file(path).ok())
+        .collect()
+}
+
+/// The empty hash set handed to identity checks that provably cannot match.
+/// The pinned set is only ever consulted as `contains(spawn_sha256)`, so an
+/// empty set yields the same verdict as the full one whenever no pinned
+/// binary shares the spawn target's size - and costs no hashing.
+pub(super) fn empty_pinned_hashes() -> &'static HashSet<String> {
+    static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashSet::new)
+}
+
+/// Session-scoped identity pins for the curated authority-delegating binaries.
+///
+/// Sizes resolve at session start (stat only, cheap). Content hashes are
+/// built at most once per session, and only when a spawn actually needs
+/// identity matching: a by-name delegating spawn, or a target whose size
+/// collides with a pinned binary. Building them eagerly would tax every
+/// `grith exec` launch with a full read of every docker-class binary on
+/// `$PATH`, which is what turning enforcement on by default first exposed.
+pub(super) struct AuthorityDelegatingPins {
+    /// Sizes of the pinned binaries, resolved at session start (stat only).
+    sizes: HashSet<u64>,
+    /// Their content hashes. Computed off-thread starting at session start,
+    /// so the pin still describes session-start content - hashing on first
+    /// use instead would pin whatever the file holds later, and a mid-session
+    /// upgrade of a pinned binary would silently desync it from `sizes`.
+    hashes: std::sync::OnceLock<HashSet<String>>,
+    /// The in-flight hashing job, joined by the first caller that needs it.
+    pending: std::sync::Mutex<Option<std::thread::JoinHandle<HashSet<String>>>>,
+}
+
+impl AuthorityDelegatingPins {
+    /// Resolve candidates when `enabled`; no pins at all otherwise.
+    pub(super) fn resolve(enabled: bool) -> Self {
+        let candidates = if enabled {
+            candidates_from_path(&std::env::var_os("PATH").unwrap_or_default())
+        } else {
+            Vec::new()
+        };
+        let sizes = candidates.iter().map(|(_, len)| *len).collect();
+        // Hash off-thread. The reads start at session start, so the pin stays
+        // a session-start snapshot, but launch never waits on tens of
+        // megabytes of docker/kubectl.
+        let pending = if candidates.is_empty() {
+            None
+        } else {
+            Some(std::thread::spawn(move || hash_candidates(&candidates)))
+        };
+        Self {
+            sizes,
+            hashes: std::sync::OnceLock::new(),
+            pending: std::sync::Mutex::new(pending),
+        }
+    }
+
+    /// No pins. Production reaches the same state through `resolve(false)`
+    /// when enforcement is off; this is the fixture constructor.
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self::resolve(false)
+    }
+
+    /// True when nothing was pinned, so identity matching can be skipped.
+    pub(super) fn is_empty(&self) -> bool {
+        self.sizes.is_empty()
+    }
+
+    /// Cheap prefilter: the sizes of the pinned binaries.
+    pub(super) fn sizes(&self) -> &HashSet<u64> {
+        &self.sizes
+    }
+
+    /// The pinned content hashes, joining the session-start hashing job on
+    /// first use and reused thereafter. Call only once a cheaper check has
+    /// shown the hashes can actually matter.
+    pub(super) fn hashes(&self) -> &HashSet<String> {
+        self.hashes.get_or_init(|| {
+            let handle = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            handle.map_or_else(HashSet::new, |h| h.join().unwrap_or_default())
+        })
+    }
+
+    /// The hash set to hand an identity check for a spawn of `canonical_path`
+    /// with content hash `sha256`, materialising it only when it could change
+    /// the verdict: there are pins, the spawn has a hash to compare, and its
+    /// size matches a pinned binary. Otherwise the (verdict-equivalent) empty
+    /// set, which is the common case for every ordinary spawn.
+    pub(super) fn hashes_for(
+        &self,
+        command: &str,
+        canonical_path: Option<&str>,
+        sha256: Option<&str>,
+    ) -> &HashSet<String> {
+        if self.sizes.is_empty() || sha256.is_none() {
+            return empty_pinned_hashes();
+        }
+        // Every consumer matches the name first and returns before reaching
+        // the hash arm, so for a by-name delegating spawn the set cannot
+        // change the verdict - and waiting on it here would stall the syscall
+        // handler on the hashing job for a result that is then discarded.
+        if matched_delegating_name(command, canonical_path).is_some() {
+            return empty_pinned_hashes();
+        }
+        // A byte-copy of a delegating binary has that binary's size, so a
+        // size miss proves no hash can match. A stat failure or an unresolved
+        // path falls through and materialises: fail towards checking.
+        if let Some(path) = canonical_path {
+            if let Ok(meta) = std::fs::metadata(path) {
+                if !self.sizes.contains(&meta.len()) {
+                    return empty_pinned_hashes();
+                }
+            }
+        }
+        self.hashes()
+    }
 }
 
 /// Parse an env override with the same semantics as the routine-signal
@@ -1388,6 +1522,63 @@ mod tests {
             &permit,
             &pinned,
         ));
+    }
+
+    /// Disabled pins resolve to nothing and never consult the filesystem.
+    #[test]
+    fn pins_disabled_are_empty_and_never_match() {
+        let pins = AuthorityDelegatingPins::resolve(false);
+        assert!(pins.is_empty());
+        assert!(pins.sizes().is_empty());
+        assert!(pins.hashes().is_empty());
+        assert!(pins
+            .hashes_for("/tmp/whatever", Some("/tmp/whatever"), Some("deadbeef"))
+            .is_empty());
+    }
+
+    /// `hashes_for` returns the empty set for the cases where the pinned
+    /// hashes provably cannot change the verdict - no spawn hash to compare,
+    /// and a by-name delegating spawn (which short-circuits before the hash
+    /// arm in every consumer, so waiting on the hashing job there would stall
+    /// the syscall handler for a discarded result).
+    #[test]
+    fn hashes_for_skips_when_hashes_cannot_matter() {
+        let pins = AuthorityDelegatingPins::resolve(false);
+        assert!(pins
+            .hashes_for("/usr/bin/systemd-run", None, None)
+            .is_empty());
+
+        // A by-name match short-circuits regardless of the spawn hash.
+        assert!(pins
+            .hashes_for(
+                "/usr/bin/systemd-run",
+                Some("/usr/bin/systemd-run"),
+                Some("abc")
+            )
+            .is_empty());
+        assert!(matched_delegating_name("/usr/bin/systemd-run", None).is_some());
+    }
+
+    /// The size prefilter and the hash set describe the same files: anything
+    /// hashed has its size pinned, so a size miss cannot hide a hash match.
+    #[test]
+    fn pinned_sizes_cover_every_pinned_hash() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("systemd-run");
+        let mut f = std::fs::File::create(&bin).unwrap();
+        f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(f);
+
+        let (hashes, sizes) = build_pinned_from_path(dir.path().as_os_str());
+        assert!(!hashes.is_empty(), "fixture should pin at least one binary");
+        let len = std::fs::metadata(&bin).unwrap().len();
+        assert!(
+            sizes.contains(&len),
+            "every hashed binary's size must be in the prefilter set"
+        );
     }
 
     /// build_pinned_from_path hashes a fake delegating binary placed on a temp

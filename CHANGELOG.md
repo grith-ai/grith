@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and
 will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
+## [0.2.5] - 2026-08-19
+
+### Changed
+
+- **Supervision-escape enforcement is now ON by default.**
+  `supervisor.enforce_authority_delegating_spawn` and
+  `supervisor.enforce_control_socket_connect` both default to `true`. A
+  security supervisor whose sharpest protections ship disabled is not one
+  we would run, and the queue-noise groundwork landed first: a denied
+  authority-delegating spawn is SIGKILLed rather than silently allowed
+  (0.2.4), read-only subcommands (`docker ps`, `systemctl status`,
+  `kubectl get`, ...) never prompt, and an exact-command approval sticks
+  for the session (0.2.4). Enforcement escalates Allow→QUEUE, so
+  interactive sessions see a prompt, not a breakage.
+
+  **Behaviour change for non-interactive sessions:** a headless or CI
+  session that legitimately delegates (e.g. `docker build` in a script
+  under `grith exec`) now fails safe and DENIES instead of allowing.
+  Opt-outs, most-targeted first: add the binary to the profile's
+  `permit_authority_delegating` / `permit_control_sockets` list, set the
+  config keys to `false`, or set `GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN=0`
+  / `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT=0`.
+
+### Fixed
+
+- **`grith update` now replaces the binary you are actually running.** The
+  updater ran the install script blindly, and the installer writes to its
+  own destination - so a copy running from anywhere else got a *second*
+  install elsewhere on `$PATH` while every launch kept starting the old
+  binary and re-offering the same update. The updater now classifies the
+  running binary's directory: `~/.local/bin` updates in place,
+  `/usr/local/bin` passes `--global`, and anywhere else (a cargo build, a
+  system package, a hand-placed copy) refuses with instructions instead of
+  pretending to succeed. The install script is also fetched in-process with
+  connect and read timeouts rather than through an unbounded `curl | sh`,
+  so a stalled or failed download is detected instead of hanging.
+
+- **Spawn-enforcement no longer hashes every delegating binary at session
+  start.** Pinning the identity of the curated authority-delegating binaries
+  read and SHA-256'd each match on `$PATH` before the event loop began -
+  docker and kubectl are tens of megabytes each, so every supervised launch
+  paid for them. Sizes (a stat) still resolve at session start; the content
+  hashes are now built at most once per session and only when a spawn
+  actually needs identity matching (a by-name delegating spawn, or a target
+  whose size collides with a pinned binary). Verdicts are unchanged: the
+  pinned set is only ever consulted as `contains(spawn_sha256)`, and a
+  size miss already proves no hash can match. This affected anyone who had
+  opted into `enforce_authority_delegating_spawn` before now; turning it on
+  by default is what surfaced it.
+
+  **Known gap, stated plainly:** control-socket enforcement does not yet
+  match abstract-namespace unix sockets (`sun_path[0] == '\0'`), which
+  standard X11 client libraries try first - a pathname-socket connect is
+  enforced, an abstract one is not. The sockaddr rendering fix is tracked
+  separately; the basename-keyed binary classifier caveat from 0.2.3 also
+  still applies.
+
 ## [0.2.4] - 2026-08-18
 
 ### Security

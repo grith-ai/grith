@@ -579,19 +579,21 @@ pub struct SupervisorCoreConfig {
     pub pty_ownership_enforce: bool,
     /// Enforce the authority-delegating-binary-spawn detection (`systemd-run`
     /// / `at` / `docker` / `systemctl` / `dbus-send` / …). When `false`
-    /// (default) such a spawn is audit-only; when `true` it is escalated
+    /// such a spawn is audit-only; when `true` (the default since v0.2.5)
+    /// it is escalated
     /// Allow→QUEUE unless the profile's `permit_authority_delegating` list
     /// authorises the binary. Closes the `systemd-run --user` supervision
     /// escape. Env override `GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN`.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enforce_authority_delegating_spawn: bool,
     /// Enforce the control-injection-IPC-socket-connect detection (session
-    /// D-Bus / tmux / screen / X11). When `false` (default) such a connect is
-    /// audit-only; when `true` it is routed to the proxy and escalated
+    /// D-Bus / tmux / screen / X11). When `false` such a connect is
+    /// audit-only; when `true` (the default since v0.2.5) it is routed to
+    /// the proxy and escalated
     /// Allow→QUEUE unless the profile's `permit_control_sockets` list
     /// authorises it. Independent knob (higher FP surface than the spawn
     /// flag). Env override `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enforce_control_socket_connect: bool,
     /// Seconds to keep running after the daemon stops accounting for this
     /// session before terminating it automatically. `0` (the default) means
@@ -1122,11 +1124,18 @@ impl Default for SupervisorCoreConfig {
             dns_inspection: SupervisorDnsInspectionConfig::default(),
             coverage: CoverageConfig::default(),
             pty_ownership_enforce: false,
-            enforce_authority_delegating_spawn: false,
-            enforce_control_socket_connect: false,
+            enforce_authority_delegating_spawn: true,
+            enforce_control_socket_connect: true,
             authority_lost_terminate_after_seconds: 0,
         }
     }
+}
+
+/// Serde default for the supervision-escape enforcement flags - on by
+/// default since v0.2.5. A config file or `GRITH_ENFORCE_*=0` env override
+/// can still turn them off.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for SupervisorPlatformConfig {

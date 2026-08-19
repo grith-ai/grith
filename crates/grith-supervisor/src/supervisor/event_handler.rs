@@ -490,17 +490,13 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// may connect to without the enforcement QUEUE (consulted only when
     /// `config.enforce_control_socket_connect` is on). Empty permits none.
     pub(super) permit_control_sockets: Vec<String>,
-    /// Session-start-pinned SHA-256 hex of every curated authority-delegating
-    /// binary resolved on `$PATH`. A ProcessSpawn whose canonical bytes hash
-    /// into this set is a copy/hardlink of a delegating binary regardless of
-    /// its name. Empty unless `enforce_authority_delegating_spawn` was on at
-    /// session start.
-    pub(super) authority_delegating_hashes: std::collections::HashSet<String>,
-    /// Cheap prefilter paired with `authority_delegating_hashes`: the file
-    /// sizes of the pinned binaries. A spawn target whose size is absent here
-    /// can never be a byte-copy of a delegating binary, so the gate skips
-    /// hashing it (keeps routine build spawns to a single stat).
-    pub(super) authority_delegating_sizes: std::collections::HashSet<u64>,
+    /// Session identity pins for the curated authority-delegating binaries on
+    /// `$PATH`. A ProcessSpawn whose canonical bytes hash into the pinned set
+    /// is a copy/hardlink of a delegating binary regardless of its name. Sizes
+    /// resolve at session start; hashes are built lazily on first real need,
+    /// so an ordinary session never reads a docker-class binary. Empty unless
+    /// `enforce_authority_delegating_spawn` was on at session start.
+    pub(super) authority_delegating_pins: authority_delegation::AuthorityDelegatingPins,
     /// Session working root — the supervisor's cwd at session start, which the
     /// supervised tool inherits, i.e. the project the tool was pointed at. The
     /// mass-destruction signal uses it to classify deletes as in-tree (the
@@ -2600,13 +2596,21 @@ pub(super) async fn handle_syscall_event(
             // signal, not out of every other filter's verdict — so a deny of a
             // permitted delegating spawn must still SIGKILL, or it escapes via
             // the no-op deny at PTRACE_EVENT_EXEC.
+            // Resolved once and shared: two independent lookups could stat the
+            // target either side of a rename and disagree, escalating to QUEUE
+            // while kill_on_deny stayed false - exactly the no-op deny the
+            // comment above guards against.
+            let pinned_hashes =
+                loop_ctx
+                    .authority_delegating_pins
+                    .hashes_for(command, prov_canonical, prov_sha256);
             kill_on_deny =
                 authority_delegation::spawn_targets_delegating_binary(
                     command,
                     args,
                     prov_canonical,
                     prov_sha256,
-                    &loop_ctx.authority_delegating_hashes,
+                    pinned_hashes,
                 ) || authority_delegation::ssh_family_loopback_destination(command, args);
             if !already_user_approved_delegation
                 && authority_delegation::maybe_escalate_spawn_full(
@@ -2616,7 +2620,7 @@ pub(super) async fn handle_syscall_event(
                     prov_canonical,
                     prov_sha256,
                     &loop_ctx.permit_authority_delegating,
-                    &loop_ctx.authority_delegating_hashes,
+                    pinned_hashes,
                 )
             {
                 authority_delegation_escalated = true;
@@ -5101,11 +5105,17 @@ fn spawn_delegation_would_enforce(
     args: &[String],
 ) -> bool {
     let permit = &loop_ctx.permit_authority_delegating;
-    let hashes = &loop_ctx.authority_delegating_hashes;
-    // (1) raw basename — no I/O.
+    let pins = &loop_ctx.authority_delegating_pins;
+    // (1) raw basename — no I/O. A name match short-circuits before the hash
+    // fallback is consulted, so the empty set is verdict-identical here.
     if authority_delegation::is_authority_delegating_binary(command) {
         return authority_delegation::spawn_should_escalate_full(
-            command, args, None, None, permit, hashes,
+            command,
+            args,
+            None,
+            None,
+            permit,
+            authority_delegation::empty_pinned_hashes(),
         );
     }
     // (2) canonical basename — one path resolution, catches run0/symlink-copy.
@@ -5120,29 +5130,30 @@ fn spawn_delegation_would_enforce(
             Some(&canonical_str),
             None,
             permit,
-            hashes,
+            authority_delegation::empty_pinned_hashes(),
         );
     }
     // (3) byte-copy — size prefilter, then hash only on a size collision.
-    if hashes.is_empty() {
+    if pins.is_empty() {
         return false; // enforcement was off at session start: no pin to match
     }
     let Ok(meta) = std::fs::metadata(&canonical) else {
         return false;
     };
-    if !loop_ctx.authority_delegating_sizes.contains(&meta.len()) {
+    if !pins.sizes().contains(&meta.len()) {
         return false;
     }
     let Ok(sha) = crate::provenance::sha256_file(&canonical) else {
         return false;
     };
+    // Size collision: only now is the pinned hash set worth building.
     authority_delegation::spawn_should_escalate_full(
         command,
         args,
         Some(&canonical_str),
         Some(&sha),
         permit,
-        hashes,
+        pins.hashes(),
     )
 }
 
@@ -7395,8 +7406,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -7476,8 +7486,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -7645,8 +7654,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -7899,8 +7907,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -9201,8 +9208,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating,
             permit_control_sockets,
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -9523,8 +9529,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
@@ -9639,8 +9644,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,

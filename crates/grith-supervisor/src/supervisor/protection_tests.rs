@@ -413,8 +413,8 @@ impl Harness {
             namespace_users: self.namespace_users.clone(),
             permit_authority_delegating: self.permit_authority_delegating.clone(),
             permit_control_sockets: Vec::new(),
-            authority_delegating_hashes: std::collections::HashSet::new(),
-            authority_delegating_sizes: std::collections::HashSet::new(),
+            authority_delegating_pins:
+                crate::supervisor::authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: self.working_root.clone(),
             mass_destruction: Mutex::new(
                 super::mass_destruction::MassDestructionTracker::with_defaults(),
@@ -1715,7 +1715,10 @@ async fn protection_non_delegating_spawn_deny_not_killed() {
 async fn protection_authority_delegating_spawn_flag_off_not_killed() {
     let pid = std::process::id();
     let (dir, target) = tmp_delegating_executable("systemd-run", "flag-off");
+    // Explicit: enforcement is ON by default since v0.2.5, and this test is
+    // the one that pins the opted-out behaviour.
     let r = Harness::new()
+        .with_enforce_authority_delegating_spawn(false)
         .with_reviewer(Arc::new(DenyReviewer))
         .run(vec![spawn_event(pid, &target)])
         .await;
@@ -1777,6 +1780,7 @@ async fn protection_unpermitted_delegating_base_queue_not_reputation_auto_allowe
     // retry re-reviews and records a fresh reputation observation.
     let seed: Vec<_> = (0..120).map(|_| spawn_event(pid, &target)).collect();
     Harness::new()
+        .with_enforce_authority_delegating_spawn(false)
         .with_reputation_table(shared.clone())
         .with_proxy(spawn_queues_proxy())
         .with_reviewer(Arc::new(ApproveReviewer))
@@ -1788,6 +1792,7 @@ async fn protection_unpermitted_delegating_base_queue_not_reputation_auto_allowe
     // spawn even under a DenyReviewer — proving the seed is strong enough (else
     // the enforced assertion below could false-pass on a weak seed).
     let control = Harness::new()
+        .with_enforce_authority_delegating_spawn(false)
         .with_reputation_table(shared.clone())
         .with_proxy(spawn_queues_proxy())
         .with_reviewer(Arc::new(DenyReviewer))

@@ -185,22 +185,32 @@ pub struct SupervisorConfig {
     /// (audit-only). When `true`, such a spawn is escalated Allow→QUEUE unless
     /// the profile's `permit_authority_delegating` list authorises the binary
     /// — closing the `systemd-run --user … -- <cmd>` supervision-escape class.
-    /// Off by default until the FP budget is measured. Env override:
+    /// On by default since v0.2.5 - the queue-noise budget was tuned first:
+    /// read-only subcommands are exempt and an exact-command approval sticks
+    /// for the session. Env override:
     /// `GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN`.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enforce_authority_delegating_spawn: bool,
 
     /// Enforce the control-injection-IPC-socket-connect detection. When
-    /// `false` (default) a connect to the session D-Bus / tmux / screen / X11
+    /// `false` a connect to the session D-Bus / tmux / screen / X11
     /// socket is forensically logged but auto-allowed as local IPC. When
-    /// `true`, such a connect is routed to the proxy and escalated
-    /// Allow→QUEUE unless the profile's `permit_control_sockets` list
-    /// authorises it. Higher false-positive surface than the spawn flag
-    /// (desktop tooling touches the session bus routinely), so it is an
-    /// independent knob. Env override:
-    /// `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`.
-    #[serde(default)]
+    /// `true` (the default since v0.2.5), such a connect is routed to the
+    /// proxy and escalated Allow→QUEUE unless the profile's
+    /// `permit_control_sockets` list authorises it. Higher false-positive
+    /// surface than the spawn flag (desktop tooling touches the session bus
+    /// routinely), so it stays an independent knob. Known gap, documented
+    /// in the CHANGELOG: abstract-namespace sockets are not yet matched.
+    /// Env override: `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`.
+    #[serde(default = "default_true")]
     pub enforce_control_socket_connect: bool,
+}
+
+/// Serde default for the supervision-escape enforcement flags - on by
+/// default since v0.2.5. A config file or `GRITH_ENFORCE_*=0` env override
+/// can still turn them off.
+fn default_true() -> bool {
+    true
 }
 
 /// Linux attach mechanism (supervisor-local mirror of
@@ -343,8 +353,8 @@ impl Default for SupervisorConfig {
             coverage: CoverageConfig::default(),
             audit_completeness: AuditCompletenessLevel::default(),
             pty_ownership_enforce: false,
-            enforce_authority_delegating_spawn: false,
-            enforce_control_socket_connect: false,
+            enforce_authority_delegating_spawn: true,
+            enforce_control_socket_connect: true,
         }
     }
 }
