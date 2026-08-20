@@ -92,7 +92,12 @@ impl SecurityFilter for ArgumentFilter {
             ToolCallType::OwnershipChange { target, .. } => self.check_path(target),
             ToolCallType::FilesystemMutation { target, .. } => self.check_path(target),
             ToolCallType::CrossProcessAccess { .. } => Ok(FilterResult::no_match("argument")),
-            ToolCallType::NamespaceOp { .. } => Ok(FilterResult::no_match("argument")),
+            // Argument-structure analysis is for shell/exec argv. A D-Bus
+            // call has no argv; its shape is judged by the supervisor's
+            // curated allowlist before it ever reaches the proxy.
+            ToolCallType::NamespaceOp { .. } | ToolCallType::DbusMethodCall { .. } => {
+                Ok(FilterResult::no_match("argument"))
+            }
         }
     }
 }

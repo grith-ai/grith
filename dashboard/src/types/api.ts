@@ -481,34 +481,6 @@ export type NotificationEvent =
   | NotificationEventInteractiveResponse;
 
 // ---------------------------------------------------------------------------
-// Adaptive Scoring
-// ---------------------------------------------------------------------------
-
-export interface CategoryStats {
-  approved: number;
-  denied: number;
-  approval_rate: number;
-}
-
-export interface AdaptiveStatsResponse {
-  enabled: boolean;
-  total_observations: number;
-  categories: Record<string, CategoryStats>;
-}
-
-export interface AdaptiveFeedbackRequest {
-  tool_type_category: string;
-  matched_filters: string[];
-  original_score: number;
-  outcome: "approved" | "denied";
-}
-
-export interface AdaptiveFeedbackResponse {
-  status: string;
-  total_observations: number;
-}
-
-// ---------------------------------------------------------------------------
 // Analytics (Pro)
 // ---------------------------------------------------------------------------
 

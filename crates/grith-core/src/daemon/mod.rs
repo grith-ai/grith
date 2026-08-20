@@ -994,7 +994,37 @@ impl Daemon {
             )));
 
             let routing = if config.notifications.routing.severity_routes.is_empty() {
-                RoutingEngine::default()
+                // No explicit routing configured: notify every ENABLED channel
+                // for every severity, so turning a channel on is enough to
+                // receive notifications (previously this defaulted to only
+                // websocket/desktop, so e.g. an enabled telegram channel was
+                // never routed to). The dispatch path still tier-gates each
+                // channel, and websocket (the dashboard) is always available
+                // while the server runs.
+                let n = &config.notifications;
+                let mut enabled: Vec<String> = vec!["websocket".to_string()];
+                for (on, id) in [
+                    (n.desktop.enabled, "desktop"),
+                    (n.email.enabled, "email"),
+                    (n.slack.enabled, "slack"),
+                    (n.telegram.enabled, "telegram"),
+                    (n.discord.enabled, "discord"),
+                    (n.webhook.enabled, "webhook"),
+                    (n.pagerduty.enabled, "pagerduty"),
+                    (n.opsgenie.enabled, "opsgenie"),
+                    (n.teams.enabled, "teams"),
+                    (n.whatsapp.enabled, "whatsapp"),
+                ] {
+                    if on {
+                        enabled.push(id.to_string());
+                    }
+                }
+                let mut routes: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for sev in ["low", "medium", "high", "critical"] {
+                    routes.insert(sev.to_string(), enabled.clone());
+                }
+                RoutingEngine::from_config(routes, enabled, std::collections::HashMap::new())
             } else {
                 RoutingEngine::from_config(
                     config.notifications.routing.severity_routes.clone(),
@@ -1005,6 +1035,11 @@ impl Daemon {
                     config.notifications.routing.canonical_filter_overrides(),
                 )
             };
+            tracing::info!(
+                low = ?routing.resolve(grith_digest::types::ScoreSeverity::Low, &[]),
+                critical = ?routing.resolve(grith_digest::types::ScoreSeverity::Critical, &[]),
+                "notification routing resolved"
+            );
 
             let mut rate_limiter = grith_notify::rate_limiter::RateLimiter::new(
                 config.notifications.rate_limits.max_per_window,
@@ -1058,7 +1093,10 @@ impl Daemon {
                 batcher,
                 auto_escalate_timeout,
                 auto_escalate_min_severity,
-            );
+            )
+            .with_remote_delay(std::time::Duration::from_secs(
+                config.notifications.escalation.remote_delay_seconds,
+            ));
             Arc::new(dispatcher)
         };
         if config.notifications.enabled {

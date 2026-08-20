@@ -599,6 +599,16 @@ pub struct SupervisorCoreConfig {
     /// flag). Env override `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`.
     #[serde(default = "default_true")]
     pub enforce_control_socket_connect: bool,
+    /// Decide D-Bus control-socket access per method call rather than per
+    /// connection. When `true` (the default), a connect to a D-Bus endpoint
+    /// arms message inspection instead of prompting: the messages the tool
+    /// sends are decoded and only calls that are not on a curated
+    /// non-delegating allowlist are escalated Allow→QUEUE. Anything the
+    /// supervisor cannot read or decode falls back to escalating the
+    /// connection. X11 / tmux / screen are unaffected — they carry no
+    /// per-message destination. Env override `GRITH_DBUS_MESSAGE_INSPECTION`.
+    #[serde(default = "default_true")]
+    pub dbus_message_inspection: bool,
     /// Seconds to keep running after the daemon stops accounting for this
     /// session before terminating it automatically. `0` (the default) means
     /// never — the session keeps running with a loud warning and the operator
@@ -912,7 +922,14 @@ pub struct WebhookNotifyConfig {
 }
 
 /// Severity-based routing rules for notification delivery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Routing policy for notifications.
+///
+/// The default is intentionally EMPTY. When no `[notifications.routing]` is
+/// configured, the daemon (daemon/mod.rs) detects the empty `severity_routes`
+/// and routes every severity to every ENABLED channel — so turning a channel
+/// on is enough. Pre-populating this with websocket/desktop meant an enabled
+/// telegram/slack channel was silently never routed to.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyRoutingConfig {
     /// Severity → list of channel IDs.
@@ -967,6 +984,12 @@ pub struct EscalationConfig {
     pub batch_window_seconds: u64,
     /// Max items per batch before force-flushing.
     pub max_batch_size: usize,
+    /// Grace period before a pending permission request is sent to the
+    /// notification channels (Telegram, Slack, desktop, ...). A prompt
+    /// approved or denied at the local TUI within this window is never
+    /// pushed to a remote channel — avoiding a redundant phone alert (and a
+    /// stale one that has to be expired). Set to 0 to notify immediately.
+    pub remote_delay_seconds: u64,
 }
 
 // --- Defaults ---
@@ -1130,6 +1153,7 @@ impl Default for SupervisorCoreConfig {
             pty_ownership_enforce: false,
             enforce_authority_delegating_spawn: true,
             enforce_control_socket_connect: true,
+            dbus_message_inspection: true,
             authority_lost_terminate_after_seconds: 0,
         }
     }
@@ -1311,24 +1335,6 @@ impl Default for WebhookNotifyConfig {
     }
 }
 
-impl Default for NotifyRoutingConfig {
-    fn default() -> Self {
-        let mut severity_routes = std::collections::HashMap::new();
-        severity_routes.insert("low".into(), vec!["websocket".into()]);
-        severity_routes.insert("medium".into(), vec!["websocket".into(), "desktop".into()]);
-        severity_routes.insert("high".into(), vec!["websocket".into(), "desktop".into()]);
-        severity_routes.insert(
-            "critical".into(),
-            vec!["websocket".into(), "desktop".into()],
-        );
-        Self {
-            severity_routes,
-            escalation_channels: vec!["websocket".into(), "desktop".into()],
-            filter_overrides: std::collections::HashMap::new(),
-        }
-    }
-}
-
 impl Default for NotifyRateLimitConfig {
     fn default() -> Self {
         Self {
@@ -1347,6 +1353,7 @@ impl Default for EscalationConfig {
             auto_escalate_min_severity: "high".into(),
             batch_window_seconds: 300,
             max_batch_size: 10,
+            remote_delay_seconds: 15,
         }
     }
 }

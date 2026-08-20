@@ -79,6 +79,10 @@ impl CapabilityFilter {
             ToolCallType::FilesystemMutation { .. } => "fs:mount",
             ToolCallType::CrossProcessAccess { .. } => "process:ptrace",
             ToolCallType::NamespaceOp { .. } => "process:namespace",
+            // Its own capability string so a profile can declare "this tool
+            // legitimately drives the session bus" without also granting
+            // every other IPC operation under `net:*`.
+            ToolCallType::DbusMethodCall { .. } => "ipc:dbus",
         }
     }
 }

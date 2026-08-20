@@ -4,7 +4,7 @@
 //! Egress rate limiting filter for outbound data volume control.
 
 use crate::filters::{FilterPhase, SecurityFilter};
-use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType};
+use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType, UnixSocketClass};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 // NOTE(M-4): std::sync::Mutex is intentionally used here instead of
@@ -175,7 +175,7 @@ impl EgressRateFilter {
     /// destination — a routine/allowlisted host that must not count toward the
     /// volumetric anomaly signals (burst / rate / spread).
     fn is_routine_destination(&self, ctx: &ToolCallContext) -> bool {
-        let Some(host) = Self::extract_destination_host(&ctx.call_type) else {
+        let Some(host) = Self::extract_destination_host(ctx) else {
             return false;
         };
         if host_in_domain_set(&self.trusted_domains, &host) {
@@ -187,12 +187,25 @@ impl EgressRateFilter {
             .is_some_and(|set| host_in_domain_set(set, &host))
     }
 
-    /// Check whether a call type is an outbound egress call.
-    fn is_egress(call_type: &ToolCallType) -> bool {
-        matches!(
-            call_type,
-            ToolCallType::HttpRequest { .. } | ToolCallType::NetConnect { .. }
-        )
+    /// Check whether a call is an outbound egress call.
+    ///
+    /// Takes the full context (not just the call type) so the supervisor's
+    /// unix-socket classification is visible: a `Control`-labelled connect
+    /// (session D-Bus, X11, tmux/screen) is desktop control-injection IPC,
+    /// not data egress — in the v0.2.5 FP regression `gh auth token` (keyring
+    /// lookup over the session bus) and `xclip` (X11) scored as unknown
+    /// outbound destinations and queued/denied. `Privileged` (docker.sock,
+    /// systemd private) and unlabelled unix connects remain egress: excluding
+    /// all unix sockets would strip docker.sock of the read-then-send +5.0
+    /// correlation.
+    fn is_egress(ctx: &ToolCallContext) -> bool {
+        match &ctx.call_type {
+            ToolCallType::HttpRequest { .. } => true,
+            ToolCallType::NetConnect { .. } => {
+                !matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control))
+            }
+            _ => false,
+        }
     }
 
     /// Check whether a call type is a source read.
@@ -200,9 +213,11 @@ impl EgressRateFilter {
         matches!(call_type, ToolCallType::FileRead { .. })
     }
 
-    /// Extract the destination host from a tool call, if applicable.
-    fn extract_destination_host(call_type: &ToolCallType) -> Option<String> {
-        match call_type {
+    /// Extract the destination host from a tool call, if applicable. Takes the
+    /// context for signature parity with [`Self::is_egress`]; extraction
+    /// itself is label-independent.
+    fn extract_destination_host(ctx: &ToolCallContext) -> Option<String> {
+        match &ctx.call_type {
             ToolCallType::HttpRequest { url, .. } => {
                 // Extract host from URL: scheme://[user@]host[:port]/...
                 let rest = url.split("://").nth(1)?;
@@ -403,7 +418,7 @@ impl EgressRateFilter {
         ctx: &ToolCallContext,
         now: Instant,
     ) -> crate::error::Result<FilterResult> {
-        let is_egress = Self::is_egress(&ctx.call_type);
+        let is_egress = Self::is_egress(ctx);
         let is_read = Self::is_source_read(&ctx.call_type);
 
         // Only track egress and read calls.
@@ -442,7 +457,7 @@ impl EgressRateFilter {
         // flag. Non-routine egress is counted and its host/port recorded.
         if !routine {
             state.counted_egress_timestamps.push(now);
-            if let Some(host) = Self::extract_destination_host(&ctx.call_type) {
+            if let Some(host) = Self::extract_destination_host(ctx) {
                 state.destinations.push((host, now));
             }
             if let Some(port) = Self::extract_destination_port(&ctx.call_type) {
@@ -559,7 +574,7 @@ mod tests {
             url: "https://api.example.com/v1/data".into(),
         };
         assert_eq!(
-            EgressRateFilter::extract_destination_host(&ct),
+            EgressRateFilter::extract_destination_host(&make_ctx(ct, Uuid::new_v4())),
             Some("api.example.com".into())
         );
     }
@@ -571,7 +586,7 @@ mod tests {
             url: "https://api.example.com:8443/v1/data".into(),
         };
         assert_eq!(
-            EgressRateFilter::extract_destination_host(&ct),
+            EgressRateFilter::extract_destination_host(&make_ctx(ct, Uuid::new_v4())),
             Some("api.example.com".into())
         );
     }
@@ -583,7 +598,7 @@ mod tests {
             port: 443,
         };
         assert_eq!(
-            EgressRateFilter::extract_destination_host(&ct),
+            EgressRateFilter::extract_destination_host(&make_ctx(ct, Uuid::new_v4())),
             Some("10.0.0.1".into())
         );
     }
@@ -620,32 +635,128 @@ mod tests {
         let ct = ToolCallType::FileRead {
             path: "/etc/passwd".into(),
         };
-        assert_eq!(EgressRateFilter::extract_destination_host(&ct), None);
+        assert_eq!(
+            EgressRateFilter::extract_destination_host(&make_ctx(ct, Uuid::new_v4())),
+            None
+        );
     }
 
     // ── Classification ──────────────────────────────────────────────
 
+    /// Build a NetConnect ctx carrying the supervisor's unix-socket class
+    /// label (`None` = unlabelled, as the LLM path or a pre-label
+    /// supervisor would produce).
+    fn unix_connect_ctx(address: &str, class: Option<&str>) -> ToolCallContext {
+        let mut ctx = make_ctx(
+            ToolCallType::NetConnect {
+                address: address.into(),
+                port: 0,
+            },
+            Uuid::new_v4(),
+        );
+        if let Some(class) = class {
+            ctx.arguments = serde_json::json!({ UnixSocketClass::KEY: class });
+        }
+        ctx
+    }
+
     #[test]
     fn is_egress_for_network_calls() {
-        assert!(EgressRateFilter::is_egress(&ToolCallType::HttpRequest {
-            method: "GET".into(),
-            url: "https://x.com".into(),
-        }));
-        assert!(EgressRateFilter::is_egress(&ToolCallType::NetConnect {
-            address: "1.2.3.4".into(),
-            port: 443,
-        }));
+        assert!(EgressRateFilter::is_egress(&make_ctx(
+            ToolCallType::HttpRequest {
+                method: "GET".into(),
+                url: "https://x.com".into(),
+            },
+            Uuid::new_v4()
+        )));
+        assert!(EgressRateFilter::is_egress(&make_ctx(
+            ToolCallType::NetConnect {
+                address: "1.2.3.4".into(),
+                port: 443,
+            },
+            Uuid::new_v4()
+        )));
     }
 
     #[test]
     fn is_egress_false_for_file_ops() {
-        assert!(!EgressRateFilter::is_egress(&ToolCallType::FileRead {
-            path: "/tmp/x".into(),
-        }));
-        assert!(!EgressRateFilter::is_egress(&ToolCallType::ShellExec {
-            command: "ls".into(),
-            args: vec![],
-        }));
+        assert!(!EgressRateFilter::is_egress(&make_ctx(
+            ToolCallType::FileRead {
+                path: "/tmp/x".into(),
+            },
+            Uuid::new_v4()
+        )));
+        assert!(!EgressRateFilter::is_egress(&make_ctx(
+            ToolCallType::ShellExec {
+                command: "ls".into(),
+                args: vec![],
+            },
+            Uuid::new_v4()
+        )));
+    }
+
+    /// Control-class unix connects (session D-Bus, X11) are desktop IPC,
+    /// not data egress; Privileged (docker.sock) and unlabelled unix
+    /// connects MUST stay egress so the read-then-send correlation keeps
+    /// covering them.
+    #[test]
+    fn is_egress_respects_unix_socket_class() {
+        assert!(!EgressRateFilter::is_egress(&unix_connect_ctx(
+            "unix:/run/user/1000/bus",
+            Some("control")
+        )));
+        assert!(EgressRateFilter::is_egress(&unix_connect_ctx(
+            "unix:/var/run/docker.sock",
+            Some("privileged")
+        )));
+        assert!(EgressRateFilter::is_egress(&unix_connect_ctx(
+            "unix:/tmp/app.sock",
+            None
+        )));
+    }
+
+    /// End-to-end correlation gate: a read spike followed by Control-class
+    /// connects must not fire read-then-send (desktop IPC is not egress);
+    /// the identical spike followed by Privileged connects still does.
+    /// Recipe mirrors `read_then_send_spike_detected`.
+    #[tokio::test]
+    async fn read_then_send_correlation_ignores_control_class() {
+        let run = |address: &str, class: &str| {
+            let filter = EgressRateFilter::from_config(small_limit_config());
+            let session = Uuid::new_v4();
+            let now = Instant::now();
+            for i in 0..3 {
+                let ctx = make_ctx(
+                    ToolCallType::FileRead {
+                        path: format!("/secrets/key_{i}.pem"),
+                    },
+                    session,
+                );
+                let _ = filter.evaluate_at(&ctx, now + Duration::from_secs(i));
+            }
+            let mut first = unix_connect_ctx(address, Some(class));
+            first.session_id = session;
+            let _ = filter.evaluate_at(&first, now + Duration::from_secs(5));
+            let mut second = unix_connect_ctx(address, Some(class));
+            second.session_id = session;
+            filter
+                .evaluate_at(&second, now + Duration::from_secs(6))
+                .unwrap()
+        };
+
+        let control = run("unix:/run/user/1000/bus", "control");
+        assert!(
+            !control.matched,
+            "control-class IPC must not correlate as egress: {}",
+            control.message
+        );
+
+        let privileged = run("unix:/var/run/docker.sock", "privileged");
+        assert!(
+            privileged.matched,
+            "privileged daemon socket must keep the read-then-send correlation"
+        );
+        assert_eq!(privileged.rule_id, "read-then-send-spike");
     }
 
     #[test]

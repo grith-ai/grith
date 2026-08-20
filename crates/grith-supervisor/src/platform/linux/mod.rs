@@ -117,6 +117,11 @@ pub(crate) const CLONE_NEW_NS_MASK: u64 = 0x0000_0000_7E02_0000;
 /// // sup.spawn_supervised("/usr/bin/ls", &["-la".into()], &[]).await?;
 /// // loop { let event = sup.next_event().await?; /* ... */ }
 /// ```
+// Each bool is an independent, orthogonal session capability (seccomp vs
+// attach mode, DNS response observation, TCP-DNS blocking, D-Bus inspection);
+// collapsing them into a state enum would assert a mutual exclusion that does
+// not exist.
+#[allow(clippy::struct_excessive_bools)]
 pub struct PtraceSupervisor {
     /// Set of all PIDs/TIDs currently being traced. This includes both
     /// process PIDs and thread TIDs; use `thread_tids` to distinguish.
@@ -286,6 +291,46 @@ pub struct PtraceSupervisor {
     /// Session-local connected UDP DNS data-plane control. `None` retains the
     /// current in-line-only behaviour.
     pub(crate) connected_dns_proxy: Option<crate::connected_dns_proxy::ConnectedDnsProxyControl>,
+
+    /// Per-connection D-Bus decode state for sockets whose access is being
+    /// decided per method call rather than per connect. Empty (and every hook
+    /// short-circuits) when inspection is off.
+    pub(crate) dbus_channels: crate::dbus::DbusChannelTracker,
+
+    /// Whether a D-Bus connect arms message inspection instead of being
+    /// escalated at connect time. Resolved once per session from
+    /// `supervisor.dbus_message_inspection` and its env override.
+    pub(crate) dbus_inspection: bool,
+
+    /// Per-tid decoded method call awaiting the event handler's decision,
+    /// consumed via `take_dbus_method_call`. Mirrors `pending_dns_query`:
+    /// the syscall stays stopped until the call is allowed or denied.
+    pub(crate) pending_dbus_call: HashMap<u32, PendingDbusCall>,
+
+    /// Per-tid payload of a D-Bus write decoded at its entry stop, awaiting the
+    /// exit stop that reports how much of it the kernel accepted.
+    pub(crate) pending_dbus_write: HashMap<u32, PendingDbusWrite>,
+}
+
+/// A D-Bus write whose bytes have been judged but not yet committed to the
+/// channel's stream position.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDbusWrite {
+    pub tgid: u32,
+    pub fd: i32,
+    pub payload: Vec<u8>,
+}
+
+/// The D-Bus method calls a stopped write carried that the policy layer
+/// refused, awaiting the event handler's decision.
+///
+/// Every one of them, not just the one named in the event: a client may batch
+/// several messages into a single `write(2)`, and the decision is on the write,
+/// so approving the call in the prompt also sends whatever rode along with it.
+/// The handler records the full list on the audit context.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDbusCall {
+    pub escalated: Vec<crate::dbus::wire::DbusMessage>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,6 +365,10 @@ pub(crate) enum FdLifecyclePending {
     Dup {
         tgid: u32,
         source_socket: Option<dns_socket_tracker::SocketId>,
+        /// The descriptor being duplicated. The DNS tracker resolves aliases
+        /// through `source_socket`, but D-Bus channels are keyed by descriptor
+        /// and need the number itself to find the channel being aliased.
+        source_fd: i32,
     },
 }
 
@@ -402,6 +451,16 @@ pub(crate) struct ConnectedDgramStepping {
     /// the entry but keeps stepping, because a thread that has tried to reach
     /// a rejected destination will try again.
     pub awaiting: HashMap<u32, i32>,
+    /// D-Bus channels being inspected per message ([`crate::dbus`]).
+    ///
+    /// A separate set because the two windows close on opposite events: a
+    /// connected-datagram fd stops being stepped at its first *allowed* write,
+    /// whereas a D-Bus channel must stay stepped for the life of the
+    /// connection — every method call is a new decision, and the one after the
+    /// approved one is exactly where `StartTransientUnit` would hide. Keeping
+    /// them in `fds` would let `settle_stepping_decision` retire a bus channel
+    /// on its first `Hello`.
+    pub dbus_fds: HashSet<i32>,
 }
 
 impl PtraceSupervisor {
@@ -436,7 +495,27 @@ impl PtraceSupervisor {
             pending_tcp_dns_deny: HashSet::new(),
             block_tcp_dns: false,
             connected_dns_proxy: None,
+            dbus_channels: crate::dbus::DbusChannelTracker::new(),
+            dbus_inspection: false,
+            pending_dbus_call: HashMap::new(),
+            pending_dbus_write: HashMap::new(),
         }
+    }
+
+    /// Decide D-Bus control-socket access per method call for this session.
+    /// Called by the supervisor wiring before the loop starts, only when
+    /// control-socket enforcement is itself on — inspection narrows that
+    /// enforcement and is meaningless without it.
+    ///
+    /// Returns whether it armed. Only a seccomp session can: reading what a
+    /// tracee is about to write needs the stepped-write path
+    /// (`tid_is_stepping`), which the attach-mode fallback does not have —
+    /// there, `write`/`writev` reach `classify_syscall`, which returns
+    /// `Ok(None)` for them, so a bus write would pass unseen. Reporting `false`
+    /// keeps such a session enforcing at the connect, exactly as before.
+    pub(crate) fn enable_dbus_inspection(&mut self) -> bool {
+        self.dbus_inspection = self.seccomp_session;
+        self.dbus_inspection
     }
 
     /// Enable in-line DNS inspection with the shared cache. Called by the

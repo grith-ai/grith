@@ -261,6 +261,48 @@ impl PtraceSupervisor {
         }
     }
 
+    /// Begin stepping `tgid` so writes to a D-Bus channel on `fd` are decoded
+    /// before the kernel sends them.
+    ///
+    /// Unlike the connected-datagram window this one closes only when the
+    /// channel does (close, exec, exit) — see `ConnectedDgramStepping::dbus_fds`.
+    pub(super) fn promote_dbus_stepping(&mut self, tgid: u32, fd: i32, address: &str) {
+        let state = self.stepping.entry(tgid).or_default();
+        if state.dbus_fds.insert(fd) {
+            debug!(
+                tgid,
+                fd,
+                address,
+                tracked_fds = state.dbus_fds.len(),
+                event = "dbus_stepping_promoted",
+                "stepping process so D-Bus method calls are decoded before they are sent"
+            );
+        }
+    }
+
+    /// Stop stepping a D-Bus channel. Mirrors [`Self::demote_stepping_fd`]:
+    /// the process keeps being stepped while it holds any other tracked fd.
+    pub(super) fn demote_dbus_stepping(&mut self, tgid: u32, fd: i32, reason: &'static str) {
+        let Some(state) = self.stepping.get_mut(&tgid) else {
+            return;
+        };
+        if !state.dbus_fds.remove(&fd) {
+            return;
+        }
+        let remaining = state.dbus_fds.len() + state.fds.len();
+        if remaining == 0 {
+            self.stepping.remove(&tgid);
+        }
+        debug!(
+            tgid,
+            fd,
+            reason,
+            remaining,
+            event = "dbus_stepping_demoted",
+            "stopped inspecting a D-Bus channel"
+        );
+    }
+
     /// Stop tracking one fd. Stepping ends only when the process has no
     /// tracked fds left — a process may hold several connected sockets at
     /// once, and forgetting one must not un-cover the others.
@@ -271,7 +313,9 @@ impl PtraceSupervisor {
         if !state.fds.remove(&fd) {
             return;
         }
-        let remaining = state.fds.len();
+        // A D-Bus channel keeps the process stepped even with no datagram fds
+        // left: its window closes on the connection, not on a write decision.
+        let remaining = state.fds.len() + state.dbus_fds.len();
         if remaining == 0 {
             self.stepping.remove(&tgid);
         }
@@ -450,6 +494,218 @@ impl PtraceSupervisor {
                 address: destination.ip().to_string(),
                 port: destination.port(),
                 protocol: crate::interceptor::NetProtocol::Udp,
+            },
+            raw_syscall_nr: nr,
+        }
+    }
+
+    // -- D-Bus message inspection -------------------------------------------
+
+    /// Read the payload one outbound syscall is about to write.
+    ///
+    /// `None` means the payload could not be read out of tracee memory, which
+    /// the caller must treat as a decode failure (poison → escalate), never as
+    /// "nothing was sent".
+    fn read_outbound_payload(
+        &self,
+        pid: Pid,
+        nr: i64,
+        regs: &super::arch::SyscallRegs,
+    ) -> Option<Vec<u8>> {
+        let limit = crate::dbus::wire::MAX_MESSAGE_LEN;
+        match super::arch::sys_id(nr) {
+            // write(fd, buf, count) / send(fd, buf, len, flags)
+            Some(SysId::Write) | Some(SysId::Sendto) => {
+                let len = (regs.args[2] as usize).min(limit);
+                self.read_tracee_bytes(pid, regs.args[1], len).ok()
+            }
+            // writev(fd, iov, iovcnt)
+            Some(SysId::Writev) => {
+                self.read_iovecs(pid, regs.args[1], regs.args[2] as usize, limit)
+            }
+            // sendmsg(fd, msghdr, flags) — the payload is the iovec array at
+            // offset 16 of the header. `msg_name` is meaningless on a
+            // connected stream socket and is ignored.
+            Some(SysId::Sendmsg) => {
+                let iov_ptr = self.read_tracee_u64(pid, regs.args[1] + 16)?;
+                let iovlen = self.read_tracee_u64(pid, regs.args[1] + 24)? as usize;
+                self.read_iovecs(pid, iov_ptr, iovlen, limit)
+            }
+            // sendmmsg batches: the messages are contiguous on the wire, so
+            // concatenating them in order reconstructs the byte stream. A
+            // batch too large to walk is refused rather than partially read —
+            // a valid prefix must not vouch for an uninspected suffix.
+            Some(SysId::Sendmmsg) => {
+                let vlen = regs.args[2] as usize;
+                if vlen == 0 || vlen > crate::dbus::wire::MAX_MESSAGES_PER_CALL {
+                    return None;
+                }
+                let mut out = Vec::new();
+                for index in 0..vlen {
+                    let header = regs.args[1].checked_add((index as u64) * MMSGHDR_SIZE)?;
+                    let iov_ptr = self.read_tracee_u64(pid, header + 16)?;
+                    let iovlen = self.read_tracee_u64(pid, header + 24)? as usize;
+                    let remaining = limit.checked_sub(out.len())?;
+                    out.extend(self.read_iovecs(pid, iov_ptr, iovlen, remaining)?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Decode what a tracee is about to write to a D-Bus channel and decide
+    /// whether any of it needs a human.
+    ///
+    /// Returns `Some(event)` when at least one message must be scored — the
+    /// caller stops the syscall and routes the event through the ordinary
+    /// proxy path. `None` means every message on this write is curated as
+    /// non-delegating (or the write carried only handshake bytes or a partial
+    /// message), and the syscall proceeds with no prompt and no proxy round
+    /// trip.
+    ///
+    /// A channel that cannot be decoded is poisoned and escalated. That is the
+    /// same outcome `enforce_control_socket_connect` produced for the whole
+    /// connection before inspection existed, so every failure path here is a
+    /// fallback to the previous behaviour rather than a new hole.
+    fn inspect_dbus_write(
+        &mut self,
+        pid: Pid,
+        tgid: u32,
+        tid: u32,
+        fd: i32,
+        nr: i64,
+        regs: &super::arch::SyscallRegs,
+    ) -> Option<SyscallEvent> {
+        let socket = self.dbus_channels.address(tgid, fd)?.to_string();
+
+        // An already-poisoned channel escalates every write without re-reading
+        // tracee memory.
+        if self.dbus_channels.is_poisoned(tgid, fd) {
+            return Some(
+                self.dbus_escalation_event(
+                    tgid,
+                    tid,
+                    fd,
+                    nr,
+                    &socket,
+                    Vec::new(),
+                    self.dbus_channels
+                        .poison_tag_for(tgid, fd)
+                        .unwrap_or("poisoned"),
+                ),
+            );
+        }
+
+        let Some(payload) = self.read_outbound_payload(pid, nr, regs) else {
+            self.dbus_channels.poison(tgid, fd, "payload-unreadable");
+            return Some(self.dbus_escalation_event(
+                tgid,
+                tid,
+                fd,
+                nr,
+                &socket,
+                Vec::new(),
+                "payload-unreadable",
+            ));
+        };
+
+        // Decoded but not committed: the kernel has not accepted these bytes
+        // yet, and may accept only some of them. The exit stop commits exactly
+        // what went out — see `commit_dbus_write`.
+        let outcome = self.dbus_channels.peek(tgid, fd, &payload);
+        self.pending_dbus_write.insert(
+            tid,
+            super::PendingDbusWrite {
+                tgid,
+                fd,
+                payload: payload.clone(),
+            },
+        );
+
+        match outcome {
+            crate::dbus::Feed::NotTracked => None,
+            crate::dbus::Feed::Poisoned(tag) => {
+                Some(self.dbus_escalation_event(tgid, tid, fd, nr, &socket, Vec::new(), tag))
+            }
+            crate::dbus::Feed::Messages(messages) => {
+                let escalated: Vec<_> = messages
+                    .into_iter()
+                    .filter(|message| {
+                        matches!(
+                            crate::dbus::classify(message),
+                            crate::dbus::Verdict::Escalate { .. }
+                        )
+                    })
+                    .collect();
+                if escalated.is_empty() {
+                    return None;
+                }
+                Some(self.dbus_escalation_event(tgid, tid, fd, nr, &socket, escalated, "policy"))
+            }
+        }
+    }
+
+    /// Advance a D-Bus channel by the bytes its write actually delivered.
+    ///
+    /// Called at the syscall-exit stop, which a stepped process reaches for
+    /// free. A negative return means the write failed and nothing reached the
+    /// socket; a short count means the client will re-send the remainder.
+    /// Either way the decoder must end up exactly where the socket is.
+    fn commit_dbus_write(&mut self, tid: u32, result: i64) {
+        let Some(pending) = self.pending_dbus_write.remove(&tid) else {
+            return;
+        };
+        let accepted = usize::try_from(result).unwrap_or(0);
+        self.dbus_channels
+            .commit(pending.tgid, pending.fd, &pending.payload, accepted);
+    }
+
+    /// Build the event for a D-Bus write that needs a decision, and stage the
+    /// pending record the event handler consumes.
+    ///
+    /// `escalated` is every message on this write the policy layer refused —
+    /// possibly none, when the channel itself became undecodable. The operator
+    /// is asked about the first; the rest ride along so one approval cannot
+    /// cover a second call batched into the same syscall.
+    fn dbus_escalation_event(
+        &mut self,
+        tgid: u32,
+        tid: u32,
+        fd: i32,
+        nr: i64,
+        socket: &str,
+        escalated: Vec<crate::dbus::wire::DbusMessage>,
+        reason: &'static str,
+    ) -> SyscallEvent {
+        let first = escalated.first().cloned().unwrap_or_default();
+        warn!(
+            tid,
+            tgid,
+            fd,
+            socket,
+            reason,
+            call = %first.describe(),
+            batched = escalated.len(),
+            event = "dbus_method_call_escalated",
+            "D-Bus method call surfaced for review"
+        );
+        self.pending_dbus_call.insert(
+            tid,
+            super::PendingDbusCall {
+                escalated: escalated.clone(),
+            },
+        );
+        SyscallEvent {
+            pid: tgid,
+            tid,
+            timestamp: Utc::now(),
+            kind: crate::interceptor::SyscallKind::DbusMethodCall {
+                socket: socket.to_string(),
+                destination: first.destination,
+                interface: first.interface,
+                member: first.member,
+                path: first.path,
             },
             raw_syscall_nr: nr,
         }
@@ -1027,6 +1283,25 @@ impl PtraceSupervisor {
                     );
                 }
             }
+
+            // The child inherits the parent's bus descriptors too. They are
+            // copied poisoned — parent and child now share one open file
+            // description, so their writes interleave and neither side's
+            // reassembly can be trusted — and stepped, so the child's writes
+            // are seen and escalate rather than vanishing.
+            let inherited = self.dbus_channels.inherit_process(parent_tgid, child_tgid);
+            if !inherited.is_empty() {
+                debug!(
+                    parent_tgid,
+                    child_tgid,
+                    fds = inherited.len(),
+                    event = "dbus_channel_inherited",
+                    "fork child inherits D-Bus channels, poisoned"
+                );
+                for fd in inherited {
+                    self.promote_dbus_stepping(child_tgid, fd, "inherited across fork");
+                }
+            }
         }
 
         // The kernel may report a clone child's initial stop before the
@@ -1458,6 +1733,10 @@ impl SyscallInterceptor for PtraceSupervisor {
         self.enable_dns_inspection(cache, observe_responses, block_tcp_dns);
     }
 
+    fn set_dbus_inspection(&mut self) -> bool {
+        self.enable_dbus_inspection()
+    }
+
     fn set_connected_dns_proxy(
         &mut self,
         control: crate::connected_dns_proxy::ConnectedDnsProxyControl,
@@ -1503,6 +1782,26 @@ impl SyscallInterceptor for PtraceSupervisor {
 
     fn take_dns_query(&mut self, tid: u32) -> Option<crate::interceptor::DnsQueryInspection> {
         self.pending_dns_query.remove(&tid)
+    }
+
+    fn take_dbus_method_calls(&mut self, tid: u32) -> Vec<crate::interceptor::DbusCallSummary> {
+        // Peeked, not removed: `allow`/`deny` consume the entry, and they need
+        // it to decide whether an approved write may proceed as-is.
+        self.pending_dbus_call
+            .get(&tid)
+            .map(|pending| {
+                pending
+                    .escalated
+                    .iter()
+                    .map(|message| crate::interceptor::DbusCallSummary {
+                        description: message.describe(),
+                        destination: message.destination.clone(),
+                        interface: message.interface.clone(),
+                        member: message.member.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn finish_dns_query(&mut self, tid: u32, allowed: bool) {
@@ -1832,8 +2131,14 @@ impl SyscallInterceptor for PtraceSupervisor {
                             // `classify_syscall`, which returns `Ok(None)` for
                             // CLOSE (see classify.rs) -> allowed. Behaviourally
                             // equivalent; validated by the fd-lifecycle repro.
+                            // A tracked D-Bus channel joins the same gate: its
+                            // exit handler is not a no-op (the channel must be
+                            // forgotten and stepping demoted), and leaving it
+                            // registered would keep the process stepped for an
+                            // fd that no longer exists.
                             Some(SysId::Close)
-                                if self.dns_tracker.socket_type(tgid, fd).is_some() =>
+                                if self.dns_tracker.socket_type(tgid, fd).is_some()
+                                    || self.dbus_channels.is_tracked(tgid, fd) =>
                             {
                                 Some(super::FdLifecyclePending::Close { tgid, fd })
                             }
@@ -1865,6 +2170,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 Some(super::FdLifecyclePending::Dup {
                                     tgid,
                                     source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                                    source_fd: fd,
                                 })
                             }
                             Some(SysId::Fcntl)
@@ -1876,6 +2182,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 Some(super::FdLifecyclePending::Dup {
                                     tgid,
                                     source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                                    source_fd: fd,
                                 })
                             }
                             _ => None,
@@ -2004,6 +2311,28 @@ impl SyscallInterceptor for PtraceSupervisor {
                             self.resume_to_next_syscall(pid, None)?;
                             continue;
                         }
+                        // A send on a D-Bus channel is inspected per message.
+                        // These syscalls ARE in the seccomp trap set, so this
+                        // arm catches the client libraries that use sendmsg
+                        // (GDBus, sd-bus, libdbus when passing fds); the
+                        // write/writev shapes are caught by the stepped path.
+                        if self.dbus_channels.is_tracked(tgid, fd)
+                            && matches!(
+                                sid,
+                                Some(SysId::Sendto) | Some(SysId::Sendmsg) | Some(SysId::Sendmmsg)
+                            )
+                        {
+                            if let Some(event) =
+                                self.inspect_dbus_write(pid, tgid, tid, fd, nr, &regs)
+                            {
+                                record_event(self, tid, "dbus-send");
+                                return Ok(Some(event));
+                            }
+                            record_event(self, tid, "dbus-send-allowed");
+                            self.resume_tracee(pid, None)?;
+                            continue;
+                        }
+
                         // Discover DNS from either a prior connect or the
                         // syscall's explicit destination, then strictly inspect
                         // every message in the send before allowing it.
@@ -2269,6 +2598,31 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 } = &kind
                                 {
                                     let fd = regs.args[0] as i32;
+
+                                    // A connect to a D-Bus endpoint arms
+                                    // message inspection instead of being the
+                                    // decision itself. The connect still flows
+                                    // through the proxy below — it is scored
+                                    // as the local IPC it is — but the event
+                                    // handler will not escalate it, because
+                                    // the authority it might carry is now
+                                    // judged per method call.
+                                    //
+                                    // Registered at the entry stop rather than
+                                    // on a promoted exit: a failed connect
+                                    // leaves a channel on an fd that cannot be
+                                    // written to, which costs nothing and
+                                    // escalates if it somehow is, whereas a
+                                    // second ptrace stop per bus connect is
+                                    // the wedge-sensitive dance we keep rare.
+                                    if self.dbus_inspection
+                                        && *protocol == crate::interceptor::NetProtocol::Unix
+                                        && crate::dbus::is_dbus_socket(address)
+                                    {
+                                        self.dbus_channels.register(tgid, fd, address.clone());
+                                        self.promote_dbus_stepping(tgid, fd, address);
+                                    }
+
                                     let mut known_type = self.dns_tracker.socket_type(tgid, fd);
                                     if known_type.is_none()
                                         && matches!(
@@ -2410,6 +2764,17 @@ impl SyscallInterceptor for PtraceSupervisor {
                             // for an already-connected socket, so this is the only
                             // place stepping can be re-armed across exec.
                             self.resync_stepping_after_exec(tgid);
+                            // Same survival question for D-Bus channels, with a
+                            // different answer: a surviving bus fd is kept and
+                            // poisoned (the new image inherits a socket
+                            // mid-stream that cannot be framed), and stepping
+                            // is re-armed for it so its writes are still seen
+                            // and escalate. `resync_stepping_after_exec` just
+                            // cleared the whole stepping entry, so this must
+                            // run after it.
+                            for fd in self.dbus_channels.retain_and_poison(tgid, &live_fds) {
+                                self.promote_dbus_stepping(tgid, fd, "survived exec");
+                            }
                         }
                         let (path, args) = Self::read_exec_info(pid_u32);
                         let kind = crate::interceptor::SyscallKind::ProcessExec { path, args };
@@ -2784,6 +3149,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             super::FdLifecyclePending::Dup {
                                 tgid,
                                 source_socket,
+                                ..
                             } if result >= 0 => match source_socket {
                                 Some(socket_id) => self.dns_tracker.duplicate_socket(
                                     tgid,
@@ -2850,6 +3216,56 @@ impl SyscallInterceptor for PtraceSupervisor {
                             // tracker, so nothing to add or remove here.
                             super::FdLifecyclePending::Dup { .. } => {}
                         }
+                        // D-Bus channels track by descriptor, so each of these
+                        // needs its own reconciliation. A dup'd bus fd is
+                        // tracked-but-poisoned rather than ignored: writes
+                        // through the alias stay visible and escalate.
+                        match pending {
+                            super::FdLifecyclePending::Close { tgid, fd } => {
+                                self.dbus_channels.close(tgid, fd);
+                                self.demote_dbus_stepping(tgid, fd, "bus fd closed");
+                            }
+                            super::FdLifecyclePending::CloseRange { tgid, first, last }
+                                if result >= 0 =>
+                            {
+                                for fd in self.dbus_channels.tracked_fds(tgid) {
+                                    if fd >= 0 && (fd as u32) >= first && (fd as u32) <= last {
+                                        self.demote_dbus_stepping(
+                                            tgid,
+                                            fd,
+                                            "bus fd closed by close_range",
+                                        );
+                                    }
+                                }
+                                self.dbus_channels.close_range(tgid, first, last);
+                            }
+                            super::FdLifecyclePending::Dup {
+                                tgid, source_fd, ..
+                            } if result >= 0 => {
+                                let new_fd = result as i32;
+                                // dup2/dup3 silently close an already-open
+                                // target, so a channel on the target number is
+                                // gone whatever the source was.
+                                if new_fd != source_fd {
+                                    self.dbus_channels.close(tgid, new_fd);
+                                    self.demote_dbus_stepping(
+                                        tgid,
+                                        new_fd,
+                                        "bus fd closed by dup2 target reuse",
+                                    );
+                                }
+                                if self.dbus_channels.is_tracked(tgid, source_fd) {
+                                    self.dbus_channels.alias(tgid, source_fd, new_fd);
+                                    self.promote_dbus_stepping(
+                                        tgid,
+                                        new_fd,
+                                        "duplicated bus descriptor",
+                                    );
+                                }
+                            }
+                            super::FdLifecyclePending::CloseRange { .. }
+                            | super::FdLifecyclePending::Dup { .. } => {}
+                        }
                         self.resume_tracee(pid, None)?;
                         continue;
                     }
@@ -2899,7 +3315,29 @@ impl SyscallInterceptor for PtraceSupervisor {
                         };
                         if !at_entry {
                             // Exit stop — the write already ran (or was
-                            // cancelled by deny). Nothing to do.
+                            // cancelled by deny). This is where a D-Bus
+                            // channel learns how many of the bytes it judged
+                            // at entry the kernel actually accepted, so its
+                            // decoder stays level with the socket. A denied
+                            // write reports -EPERM and commits nothing.
+                            if let Some(retval) = super::arch::read_return_value(pid)
+                                .ok()
+                                .flatten()
+                                .or(regs.retval_hint)
+                            {
+                                self.commit_dbus_write(pid_u32, retval);
+                            } else {
+                                // Without a return value we cannot know the
+                                // stream position; the channel must stop
+                                // claiming to.
+                                if let Some(pending) = self.pending_dbus_write.remove(&pid_u32) {
+                                    self.dbus_channels.poison(
+                                        pending.tgid,
+                                        pending.fd,
+                                        "write-result-unreadable",
+                                    );
+                                }
+                            }
                             self.resume_tracee(pid, None)?;
                             continue;
                         }
@@ -2914,6 +3352,25 @@ impl SyscallInterceptor for PtraceSupervisor {
 
                         let tgid = Self::resolve_tgid(pid_u32).unwrap_or(pid_u32);
                         let write_fd = regs.args[0] as i32;
+
+                        // A D-Bus channel is checked first: it is not a
+                        // connected datagram socket, so the egress-target
+                        // check below would not recognise it and would demote
+                        // the stepping this inspection depends on.
+                        if self.dbus_channels.is_tracked(tgid, write_fd) {
+                            if let Some(event) =
+                                self.inspect_dbus_write(pid, tgid, pid_u32, write_fd, nr, &regs)
+                            {
+                                record_event(self, pid_u32, "dbus-write-step");
+                                return Ok(Some(event));
+                            }
+                            // Curated as non-delegating: send it without a
+                            // proxy round trip. This is the path that makes
+                            // `gh auth token` stop prompting.
+                            self.resume_to_next_syscall(pid, None)?;
+                            continue;
+                        }
+
                         let Some(destination) = self.connected_dgram_egress_target(tgid, write_fd)
                         else {
                             // Not egress: an ordinary file, the PTY, or a
@@ -3048,6 +3505,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             Some(super::FdLifecyclePending::Dup {
                                 tgid,
                                 source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                                source_fd: fd,
                             })
                         }
                         Some(SysId::Fcntl)
@@ -3059,6 +3517,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             Some(super::FdLifecyclePending::Dup {
                                 tgid,
                                 source_socket: self.dns_tracker.hold_socket_identity(tgid, fd),
+                                source_fd: fd,
                             })
                         }
                         _ => None,
@@ -3487,6 +3946,9 @@ impl SyscallInterceptor for PtraceSupervisor {
                     // The thread group is gone only when its leader exits.
                     if exited_tgid == pid_u32 {
                         self.demote_stepping_tgid(pid_u32, "process exited");
+                        self.pending_dbus_call.remove(&pid_u32);
+                        self.pending_dbus_write.remove(&pid_u32);
+                        self.dbus_channels.remove_process(pid_u32);
                     }
                     self.last_event_at.remove(&pid_u32);
                     self.last_event_kind.remove(&pid_u32);
@@ -3571,6 +4033,9 @@ impl SyscallInterceptor for PtraceSupervisor {
                     // The thread group is gone only when its leader exits.
                     if exited_tgid == pid_u32 {
                         self.demote_stepping_tgid(pid_u32, "process exited");
+                        self.pending_dbus_call.remove(&pid_u32);
+                        self.pending_dbus_write.remove(&pid_u32);
+                        self.dbus_channels.remove_process(pid_u32);
                     }
                     self.last_event_at.remove(&pid_u32);
                     self.last_event_kind.remove(&pid_u32);
@@ -3679,6 +4144,11 @@ impl SyscallInterceptor for PtraceSupervisor {
         // would only re-derive the same answer — stop paying two ptrace stops
         // per syscall for it.
         self.settle_stepping_decision(pid, true);
+        // A D-Bus channel is NOT settled by an allow: the next method call on
+        // the same connection is a fresh decision, and it is exactly where a
+        // second, less benign call would hide. `pending_dbus_write` survives
+        // to the exit stop, which commits the bytes the kernel accepted.
+        self.pending_dbus_call.remove(&pid);
         // Route through resume_tracee so the resume primitive is recorded for
         // wedge forensics (and the CONT/SYSCALL selection stays in one place).
         self.resume_tracee(nix_pid, None)
@@ -3698,6 +4168,7 @@ impl SyscallInterceptor for PtraceSupervisor {
         // unrelated allowed syscall on this thread would be mistaken for the
         // decision and end stepping silently.
         self.settle_stepping_decision(pid, false);
+        self.pending_dbus_call.remove(&pid);
 
         // Replace the syscall with an invalid number so the kernel skips
         // execution, and pre-seed the return register with -EPERM so the
@@ -4119,6 +4590,148 @@ mod tests {
         // The seccomp-event + clone-tracing options the supervisor depends on.
         assert!(trace_options().contains(nix::sys::ptrace::Options::PTRACE_O_TRACESECCOMP));
         assert!(trace_options().contains(nix::sys::ptrace::Options::PTRACE_O_TRACECLONE));
+    }
+
+    /// An attach-mode session has no stepped-write path — `write`/`writev`
+    /// reach `classify_syscall`, which returns `Ok(None)` for them — so a bus
+    /// write would pass unseen. Arming inspection there would suppress the
+    /// connect-time prompt while nothing downstream watched, turning "decide
+    /// per message" into "decide never". The backend must report that it
+    /// cannot, so the caller keeps enforcing at the connect.
+    #[test]
+    fn dbus_inspection_arms_only_for_a_seccomp_session() {
+        let mut attach = PtraceSupervisor::new();
+        assert!(!attach.seccomp_session);
+        assert!(
+            !attach.enable_dbus_inspection(),
+            "an attach-mode session cannot see bus writes and must say so"
+        );
+        assert!(!attach.dbus_inspection);
+
+        let mut spawned = PtraceSupervisor::new();
+        spawned.seccomp_session = true;
+        assert!(spawned.enable_dbus_inspection());
+        assert!(spawned.dbus_inspection);
+    }
+
+    // -- D-Bus message inspection: stepping lifetime -------------------------
+    //
+    // Inspection is only as good as the window in which writes are visible. A
+    // bus channel that stops being stepped is not "allowed", it is *invisible*
+    // — the method calls on it stop reaching any decision at all. These tests
+    // pin the window against the events that could close it early.
+
+    /// A D-Bus channel's window closes on the *connection*, not on a write
+    /// decision. Sharing `ConnectedDgramStepping::fds` with the datagram path
+    /// would let `settle_stepping_decision` retire a bus channel the moment its
+    /// first `Hello` was allowed — after which `StartTransientUnit` on the same
+    /// connection would never be seen.
+    #[test]
+    fn allowing_a_dbus_write_does_not_end_stepping() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(70, 70);
+        sup.dbus_channels
+            .register(70, 5, "unix:/run/user/1000/bus".into());
+        sup.promote_dbus_stepping(70, 5, "unix:/run/user/1000/bus");
+        assert!(sup.tid_is_stepping(70));
+
+        // An allowed write settles the datagram decision for this tid...
+        sup.settle_stepping_decision(70, true);
+
+        assert!(
+            sup.tid_is_stepping(70),
+            "the bus channel must stay stepped so the NEXT method call is judged"
+        );
+    }
+
+    /// The mirror for the datagram path: a process holding both kinds keeps
+    /// being stepped after its datagram fd retires, and only stops when both
+    /// are gone. Getting this wrong would silently un-cover one or the other.
+    #[test]
+    fn stepping_ends_only_when_both_kinds_are_gone() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(71, 71);
+        sup.promote_stepping(71, 3, addr("1.2.3.4:9999"));
+        sup.dbus_channels
+            .register(71, 5, "unix:/run/user/1000/bus".into());
+        sup.promote_dbus_stepping(71, 5, "unix:/run/user/1000/bus");
+
+        sup.demote_stepping_fd(71, 3, "datagram write allowed");
+        assert!(
+            sup.tid_is_stepping(71),
+            "the surviving bus channel must keep the process stepped"
+        );
+
+        sup.demote_dbus_stepping(71, 5, "bus fd closed");
+        assert!(
+            !sup.tid_is_stepping(71),
+            "with neither kind left the process returns to PTRACE_CONT"
+        );
+    }
+
+    /// A bus fd that survives `execve` (non-CLOEXEC) must stay *visible*. The
+    /// new image inherits a socket mid-stream that cannot be framed, so the
+    /// channel is poisoned rather than trusted — but forgetting it entirely
+    /// would make its writes invisible, which is the worse failure.
+    #[test]
+    fn dbus_channel_surviving_exec_is_poisoned_and_still_stepped() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(72, 72);
+        sup.dbus_channels
+            .register(72, 5, "unix:/run/user/1000/bus".into());
+        sup.dbus_channels
+            .register(72, 6, "unix:/run/user/1000/bus".into());
+        sup.promote_dbus_stepping(72, 5, "unix:/run/user/1000/bus");
+        sup.promote_dbus_stepping(72, 6, "unix:/run/user/1000/bus");
+
+        // fd 5 survived exec; fd 6 was FD_CLOEXEC.
+        let live: std::collections::HashSet<i32> = [5].into_iter().collect();
+        sup.demote_stepping_tgid(72, "exec");
+        for fd in sup.dbus_channels.retain_and_poison(72, &live) {
+            sup.promote_dbus_stepping(72, fd, "survived exec");
+        }
+
+        assert!(sup.dbus_channels.is_tracked(72, 5));
+        assert!(
+            sup.dbus_channels.is_poisoned(72, 5),
+            "an inherited mid-stream connection cannot be framed"
+        );
+        assert!(
+            !sup.dbus_channels.is_tracked(72, 6),
+            "a CLOEXEC'd bus fd is gone, not poisoned"
+        );
+        assert!(
+            sup.tid_is_stepping(72),
+            "the survivor must stay stepped so its writes still escalate"
+        );
+    }
+
+    /// A fork child shares the parent's open file description, so both sides'
+    /// writes interleave on the wire. Neither decoder can be trusted, but the
+    /// child's writes must still be seen — poisoned and stepped, not dropped.
+    #[test]
+    fn forked_dbus_channel_is_inherited_poisoned_and_stepped() {
+        let mut sup = PtraceSupervisor::new();
+        sup.seccomp_session = true;
+        sup.tid_tgids.insert(73, 73);
+        sup.tid_tgids.insert(74, 74);
+        sup.dbus_channels
+            .register(73, 5, "unix:/run/user/1000/bus".into());
+        sup.promote_dbus_stepping(73, 5, "unix:/run/user/1000/bus");
+
+        for fd in sup.dbus_channels.inherit_process(73, 74) {
+            sup.promote_dbus_stepping(74, fd, "inherited across fork");
+        }
+
+        assert!(sup.dbus_channels.is_poisoned(74, 5));
+        assert!(sup.tid_is_stepping(74), "the child must be stepped too");
+        assert!(
+            !sup.dbus_channels.is_poisoned(73, 5),
+            "the parent's own channel is untouched by the copy"
+        );
     }
 
     // -- B13: connected-datagram write stepping -----------------------------

@@ -146,6 +146,7 @@ fn session_registry_view(session: &SupervisorSession) -> SupervisorSession {
         controlling_pts: std::sync::OnceLock::new(),
         recent_denials: std::collections::HashMap::new(),
         recent_approvals: std::collections::HashMap::new(),
+        control_socket_answers: std::collections::HashMap::new(),
     }
 }
 
@@ -515,10 +516,10 @@ async fn create_session(
     }
 
     if let Some(pid) = body.root_pid {
-        if pid == 0 {
+        if !root_pid_is_signalable(pid) {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "root_pid must be a positive integer",
+                "root_pid must be a positive integer within the process-id range",
                 "INVALID_REQUEST",
             )
             .into_response();
@@ -749,6 +750,23 @@ async fn terminate_session(
     terminate_session_by_id(state, &id).await
 }
 
+/// Whether `root_pid` names a process the daemon could later signal.
+///
+/// `kill(2)` overloads non-positive pids: `0` signals **every process in the
+/// caller's process group**, `-1` signals **every process the caller may
+/// signal**, and any other negative value signals a process group. `root_pid`
+/// arrives as a `u32` on the register endpoint and reaches `kill` through
+/// `as libc::pid_t`, which wraps — `4294967295` becomes `-1`, and
+/// `4294962296` becomes `-5000`.
+///
+/// Rejecting `0` alone (which is all the register endpoint used to do) leaves
+/// the whole upper half of the `u32` range mapping onto those broadcast forms,
+/// so "terminate this session" could be turned into "SIGTERM everything this
+/// uid owns" by anyone able to reach the IPC socket.
+fn root_pid_is_signalable(root_pid: u32) -> bool {
+    root_pid != 0 && i32::try_from(root_pid).is_ok()
+}
+
 /// POST /api/supervisor/sessions/:id/kill
 ///
 /// Terminate and remove a supervised session. Kept for compatibility with
@@ -798,15 +816,31 @@ pub(crate) async fn terminate_session_by_id(state: AppState, id: &str) -> axum::
             if !stopped {
                 #[cfg(unix)]
                 {
-                    let ret = unsafe { libc::kill(session.root_pid as libc::pid_t, libc::SIGTERM) };
-                    if ret != 0 {
-                        let err = std::io::Error::last_os_error();
-                        tracing::warn!(
-                            session_id = %session.id,
-                            pid = session.root_pid,
-                            error = %err,
-                            "failed to send SIGTERM to externally registered session"
-                        );
+                    // Re-checked here rather than trusted from registration:
+                    // this is the line that actually signals, and a pid that
+                    // does not convert cleanly would be a broadcast, not a
+                    // no-op. Never `as`-cast into `kill`.
+                    match i32::try_from(session.root_pid) {
+                        Ok(pid) if pid > 0 => {
+                            let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                            if ret != 0 {
+                                let err = std::io::Error::last_os_error();
+                                tracing::warn!(
+                                    session_id = %session.id,
+                                    pid = session.root_pid,
+                                    error = %err,
+                                    "failed to send SIGTERM to externally registered session"
+                                );
+                            }
+                        }
+                        _ => {
+                            tracing::error!(
+                                session_id = %session.id,
+                                pid = session.root_pid,
+                                "refusing to signal a session whose root_pid is not a valid \
+                                 process id — signalling it would target a process group"
+                            );
+                        }
                     }
                 }
                 #[cfg(not(unix))]
@@ -1335,20 +1369,106 @@ mod tests {
         assert!(get_json["stats"].is_object());
     }
 
+    #[test]
+    fn root_pid_is_signalable_rejects_broadcast_forms() {
+        assert!(root_pid_is_signalable(1));
+        assert!(root_pid_is_signalable(5555));
+        assert!(root_pid_is_signalable(i32::MAX as u32));
+
+        // 0 -> kill(0) signals the caller's whole process group.
+        assert!(!root_pid_is_signalable(0));
+        // 4294967295 as i32 == -1 -> kill(-1) signals every process this uid
+        // may signal.
+        assert!(!root_pid_is_signalable(u32::MAX));
+        // 4294962296 as i32 == -5000 -> kill(-5000) signals process group 5000.
+        assert!(!root_pid_is_signalable(4_294_962_296));
+        // The entire upper half of the u32 range wraps negative.
+        assert!(!root_pid_is_signalable(i32::MAX as u32 + 1));
+    }
+
+    /// The register endpoint is the door these values come through, so it has
+    /// to reject the whole wrapping range — not just 0, which is all it
+    /// checked before.
+    #[tokio::test]
+    async fn register_rejects_root_pid_outside_the_pid_range() {
+        let state = make_state();
+        let router = supervisor_router().with_state(state.clone());
+
+        for bad in ["0", "4294967295", "4294962296", "2147483648"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::post("/sessions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"tool_name": "codex", "root_pid": {bad}, "start_interception": false}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "root_pid {bad} must be refused: signalling it would hit a process group"
+            );
+        }
+    }
+
+    /// A live process this test owns, for tests that reach the SIGTERM path.
+    ///
+    /// The terminate handler signals `root_pid` for real. These tests used to
+    /// register a hardcoded 5555, so on any machine where 5555 happened to be
+    /// live — a CI runner, a developer laptop — the suite SIGTERMed a stranger.
+    /// It killed the arm64 test harness itself often enough to look like a
+    /// flaky test. Owning the target makes the signal both harmless and
+    /// meaningful: it lands on a process that was actually there.
+    #[cfg(unix)]
+    struct DoomedChild(std::process::Child);
+
+    #[cfg(unix)]
+    impl DoomedChild {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("300")
+                    .spawn()
+                    .expect("spawn sleep"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DoomedChild {
+        fn drop(&mut self) {
+            // SIGTERM may already have landed; kill+wait regardless so the
+            // child is reaped and never outlives the test.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[tokio::test]
     async fn test_terminate_session() {
         let state = make_state();
         let router = supervisor_router().with_state(state.clone());
 
-        // Create a session.
+        // Create a session against a process this test owns — terminate
+        // signals root_pid for real.
+        let doomed = DoomedChild::spawn();
         let create_resp = router
             .clone()
             .oneshot(
                 Request::post("/sessions")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"tool_name": "codex", "root_pid": 5555, "start_interception": false}"#,
-                    ))
+                    .body(Body::from(format!(
+                        r#"{{"tool_name": "codex", "root_pid": {}, "start_interception": false}}"#,
+                        doomed.pid()
+                    )))
                     .unwrap(),
             )
             .await
@@ -1394,14 +1514,16 @@ mod tests {
         let state = make_state();
         let router = supervisor_router().with_state(state.clone());
 
+        let doomed = DoomedChild::spawn();
         let create_resp = router
             .clone()
             .oneshot(
                 Request::post("/sessions")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"tool_name": "codex", "root_pid": 5555, "start_interception": false}"#,
-                    ))
+                    .body(Body::from(format!(
+                        r#"{{"tool_name": "codex", "root_pid": {}, "start_interception": false}}"#,
+                        doomed.pid()
+                    )))
                     .unwrap(),
             )
             .await

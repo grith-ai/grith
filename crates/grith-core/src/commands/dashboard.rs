@@ -150,7 +150,15 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
 
     let addr = server.address();
 
-    daemon.register_notification_channels(Some(server.ws_sender()));
+    {
+        // The telegram channel starts its callback poller with `tokio::spawn`,
+        // which panics ("no reactor running") unless a runtime context is
+        // active. This call is before `runtime.block_on` below, so enter the
+        // runtime for it. Without this, enabling telegram crashes the daemon at
+        // startup and takes every supervised session down with it.
+        let _enter = runtime.enter();
+        daemon.register_notification_channels(Some(server.ws_sender()));
+    }
 
     let pid = std::process::id();
     if let Err(e) = daemon::write_dashboard_pid(pid, port) {

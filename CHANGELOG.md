@@ -8,6 +8,47 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **D-Bus access is now decided per method call, not per connection.** Every
+  supervised session opened with a permission prompt: `gh auth token` reads
+  your GitHub token from the keyring over the session D-Bus, and
+  `enforce_control_socket_connect` (on by default since 0.2.5) escalates any
+  connect to a control-injection socket regardless of score. The prompt read
+  `composite score 0.5 → QUEUED`, which looked like a bug and was not — the
+  escalation fires on identity, because at `connect(2)` a socket path is all
+  there is to judge. "Read the keyring" and "ask systemd to run this command
+  outside supervision" are byte-identical syscalls.
+
+  grith now reads the D-Bus messages the tool is about to send, and decides on
+  those instead. A curated allowlist covers the calls that cannot delegate
+  authority — joining the bus, and the Secret Service API every credential
+  helper uses — and they proceed with no prompt and no proxy round trip.
+  Everything else still QUEUEs, and now names itself:
+
+  ```
+    D-BUS CALL  StartTransientUnit
+       service  org.freedesktop.systemd1
+        method  org.freedesktop.systemd1.Manager.StartTransientUnit
+           bus  unix:/run/user/1000/bus
+  ```
+
+  The connect is still scored and audited exactly as before; what changed is
+  that it no longer prompts. Every uncertainty falls back to escalating the
+  connection — an unreadable payload, a stream that stops framing, a method
+  that is not on the list — so a decoder bug or a curation gap costs the prompt
+  you already had, never a silent allow. The allowlist is deliberately small:
+  a tool that prompts on some other bus service needs a reviewed addition, not
+  a wildcard.
+
+  Only D-Bus is affected. X11, tmux and screen carry no per-message
+  destination, so they keep connect-time enforcement — X11's real threat
+  (XTEST input injection) is already handled at the spawn level.
+
+  Off switch: `[supervisor] dbus_message_inspection = false`, or
+  `GRITH_DBUS_MESSAGE_INSPECTION=0`, which restores the previous behaviour
+  exactly.
+
 ### Added
 
 - **`grith exec` now tells you when a new version is out.** The update

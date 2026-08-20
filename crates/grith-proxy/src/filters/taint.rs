@@ -20,7 +20,9 @@
 
 use crate::filters::{FilterPhase, SecurityFilter};
 use crate::session_state::{ContainmentReason, SessionStateRegistry};
-use crate::types::{FilterResult, Severity, TaintLevel, ToolCallContext, ToolCallType};
+use crate::types::{
+    FilterResult, Severity, TaintLevel, ToolCallContext, ToolCallType, UnixSocketClass,
+};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -1340,22 +1342,52 @@ impl SecurityFilter for TaintFilter {
             // Network connect is a network sink, similar to HttpRequest.
             ToolCallType::NetConnect { address, port } => {
                 let effective_taint = self.get_effective_taint(ctx);
-                let mut result = match effective_taint {
-                    TaintLevel::High => FilterResult::matched(
-                        "taint",
-                        "high-taint-network-sink",
-                        5.0,
-                        Severity::Critical,
-                        format!("Highly tainted data flowing to network sink: {address}:{port}"),
-                    ),
-                    TaintLevel::Medium | TaintLevel::Low => FilterResult::matched(
-                        "taint",
-                        "tainted-network-sink",
-                        3.0,
-                        Severity::Warning,
-                        format!("Tainted data flowing to network sink: {address}:{port}"),
-                    ),
-                    TaintLevel::None => FilterResult::no_match("taint"),
+                // Control-class sockets (session D-Bus, X11, tmux/screen)
+                // are local desktop IPC, not a direct exfil channel: the
+                // session-level sink tiers here turned `gh auth token`'s
+                // keyring read and `xclip` into silent 9.0+ denies the
+                // moment anything ELSE in the session was tainted. For
+                // Control the sink requires actual data flow — the
+                // CONNECTING pid must have read tainted data (the same
+                // per-pid gate the spawn rule uses) — and caps at 3.0
+                // (a human decision, never an auto-deny contribution).
+                // Privileged and unlabelled sockets keep the full
+                // session-level tiers below.
+                let control_class =
+                    matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control));
+                let mut result = if control_class {
+                    match Self::pid_taint_level(&self.tainted_pids, ctx) {
+                        Some(level) if level != TaintLevel::None => FilterResult::matched(
+                            "taint",
+                            "tainted-local-ipc-sink",
+                            3.0,
+                            Severity::Warning,
+                            format!(
+                                "Tainted data flowing to local control-injection socket: {address}"
+                            ),
+                        ),
+                        _ => FilterResult::no_match("taint"),
+                    }
+                } else {
+                    match effective_taint {
+                        TaintLevel::High => FilterResult::matched(
+                            "taint",
+                            "high-taint-network-sink",
+                            5.0,
+                            Severity::Critical,
+                            format!(
+                                "Highly tainted data flowing to network sink: {address}:{port}"
+                            ),
+                        ),
+                        TaintLevel::Medium | TaintLevel::Low => FilterResult::matched(
+                            "taint",
+                            "tainted-network-sink",
+                            3.0,
+                            Severity::Warning,
+                            format!("Tainted data flowing to network sink: {address}:{port}"),
+                        ),
+                        TaintLevel::None => FilterResult::no_match("taint"),
+                    }
                 };
                 if result.matched {
                     let cats = self.active_source_categories(ctx);
@@ -1549,6 +1581,147 @@ mod tests {
         assert!(result.matched);
         assert_eq!(result.score, 5.0);
         assert_eq!(result.rule_id, "high-taint-network-sink");
+    }
+
+    /// Build a NetConnect ctx in `session` carrying the supervisor's
+    /// unix-socket class label and the connecting `pid`.
+    fn unix_connect_ctx(
+        session: Uuid,
+        address: &str,
+        class: Option<&str>,
+        pid: u64,
+    ) -> ToolCallContext {
+        let mut ctx = make_ctx_in_session(
+            ToolCallType::NetConnect {
+                address: address.into(),
+                port: 0,
+            },
+            session,
+        );
+        let mut args = serde_json::Map::new();
+        args.insert("pid".into(), serde_json::json!(pid));
+        if let Some(class) = class {
+            args.insert(UnixSocketClass::KEY.into(), serde_json::json!(class));
+        }
+        ctx.arguments = serde_json::Value::Object(args);
+        ctx
+    }
+
+    /// Read a high-taint file in `session` attributed to `pid` (marks both
+    /// the session scope and the pid tainted).
+    async fn taint_session_via_pid(filter: &TaintFilter, session: Uuid, pid: u64) {
+        let mut read_ctx = make_ctx_in_session(
+            ToolCallType::FileRead {
+                path: "/home/user/.ssh/id_rsa".into(),
+            },
+            session,
+        );
+        read_ctx.arguments = serde_json::json!({ "pid": pid });
+        let _ = filter.evaluate(&read_ctx).await.unwrap();
+    }
+
+    /// Control-class sink requires per-pid data flow: session taint from
+    /// ANOTHER pid must not fire the sink (this session shape — one tool
+    /// reads a secret, an unrelated `gh` child later opens the session
+    /// bus — is exactly the v0.2.5 silent-deny regression).
+    #[tokio::test]
+    async fn control_class_sink_requires_connecting_pid_taint() {
+        let filter = TaintFilter::with_defaults();
+        let session = Uuid::new_v4();
+        taint_session_via_pid(&filter, session, 100).await;
+
+        let result = filter
+            .evaluate(&unix_connect_ctx(
+                session,
+                "unix:/run/user/1000/bus",
+                Some("control"),
+                200,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !result.matched,
+            "untainted pid to a control socket must not sink-score: {}",
+            result.message
+        );
+    }
+
+    /// Control-class sink caps at 3.0 even when the connecting pid carries
+    /// high taint — never the 5.0 auto-deny-feeding tier.
+    #[tokio::test]
+    async fn control_class_sink_caps_at_three() {
+        let filter = TaintFilter::with_defaults();
+        let session = Uuid::new_v4();
+        taint_session_via_pid(&filter, session, 100).await;
+
+        let result = filter
+            .evaluate(&unix_connect_ctx(
+                session,
+                "unix:/run/user/1000/bus",
+                Some("control"),
+                100,
+            ))
+            .await
+            .unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "tainted-local-ipc-sink");
+        assert_eq!(result.score, 3.0);
+        assert_eq!(result.severity, Severity::Warning);
+    }
+
+    /// Regression guards: Privileged and unlabelled sockets keep the
+    /// session-level 5.0 high-taint sink tier byte-for-byte.
+    #[tokio::test]
+    async fn privileged_and_unlabelled_keep_session_level_sink() {
+        for (address, class) in [
+            ("unix:/var/run/docker.sock", Some("privileged")),
+            ("unix:/tmp/whatever.sock", None),
+        ] {
+            let filter = TaintFilter::with_defaults();
+            let session = Uuid::new_v4();
+            taint_session_via_pid(&filter, session, 100).await;
+
+            let result = filter
+                .evaluate(&unix_connect_ctx(session, address, class, 200))
+                .await
+                .unwrap();
+            assert!(result.matched, "{address} must keep the session-level sink");
+            assert_eq!(result.rule_id, "high-taint-network-sink");
+            assert_eq!(result.score, 5.0);
+        }
+    }
+
+    /// The proximity signal is not pid-gated and must keep firing for
+    /// Control-class connects (an early no_match return for Control would
+    /// silently delete it — caught in adversarial review).
+    #[tokio::test]
+    async fn control_class_keeps_proximity_signal() {
+        let mut filter = TaintFilter::with_defaults();
+        filter.taint_ttl = Duration::from_secs(0);
+        let session = Uuid::new_v4();
+
+        let read_ctx = make_ctx_in_session(
+            ToolCallType::FileRead {
+                path: "/home/user/.ssh/id_rsa".into(),
+            },
+            session,
+        );
+        let _ = filter.evaluate(&read_ctx).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(filter.tainted_path_count(), 0);
+
+        let result = filter
+            .evaluate(&unix_connect_ctx(
+                session,
+                "unix:/run/user/1000/bus",
+                Some("control"),
+                300,
+            ))
+            .await
+            .unwrap();
+        assert!(result.matched, "proximity must still fire for Control");
+        assert_eq!(result.rule_id, "proximity-sensitive-read");
+        assert_eq!(result.score, 1.5);
     }
 
     #[tokio::test]

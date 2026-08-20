@@ -1211,6 +1211,24 @@ impl PtraceSupervisor {
                     // Pathname socket, or an unnamed/autobind abstract socket
                     // (addrlen <= 3) -> renders "unix:" unchanged, still local.
                     let path = self.read_tracee_string(pid, addr + SUN_PATH_OFF, 108)?;
+                    // A pathname `sun_path` resolves like any other path
+                    // argument: relative to the tracee's cwd, following
+                    // symlinks. Every socket classifier downstream
+                    // (`is_sensitive_unix_socket`, `is_control_injection_socket`,
+                    // profile permit lists, `net:unix:` session grants) is a
+                    // string match on this render, so an uncanonicalised path
+                    // is a laundering hole: `chdir("/var/run"); connect("docker.sock")`
+                    // or `ln -s /var/run/docker.sock /tmp/x` would classify
+                    // benign and auto-allow as local IPC. Resolution fails
+                    // safe — `resolve_follow` returns the input unchanged when
+                    // nothing resolves. The empty render (unnamed/autobind) is
+                    // left alone: it is not a filesystem path, and absolutising
+                    // it would rewrite `unix:` to the tracee's cwd.
+                    let path = if path.is_empty() {
+                        path
+                    } else {
+                        Self::canonicalize_for_tracee(pid.as_raw() as u32, &path)
+                    };
                     Ok(Some((format!("unix:{path}"), 0, NetProtocol::Unix)))
                 }
             }

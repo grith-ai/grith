@@ -47,6 +47,10 @@ pub struct NotificationDispatcher {
     digest_queue: Arc<DigestQueue>,
     auto_escalate_timeout: Duration,
     auto_escalate_min_severity: ScoreSeverity,
+    /// Grace period before a pending permission request is pushed to the
+    /// notification channels. A prompt resolved at the local TUI within this
+    /// window is never sent remotely. See `with_remote_delay`.
+    remote_delay: Duration,
 }
 
 impl NotificationDispatcher {
@@ -73,7 +77,18 @@ impl NotificationDispatcher {
             digest_queue,
             auto_escalate_timeout,
             auto_escalate_min_severity,
+            remote_delay: Duration::from_secs(15),
         }
+    }
+
+    /// Set the grace period before a pending permission request is pushed to
+    /// the notification channels. A prompt resolved at the local TUI within
+    /// this window is never sent remotely (no redundant/stale phone alert).
+    /// `Duration::ZERO` restores immediate delivery.
+    #[must_use]
+    pub fn with_remote_delay(mut self, delay: Duration) -> Self {
+        self.remote_delay = delay;
+        self
     }
 
     fn current_plan_tier(&self) -> PlanTier {
@@ -478,7 +493,7 @@ impl NotificationDispatcher {
     /// Spawn background tasks (nonce cleanup, auto-escalation, batcher flush).
     /// Returns join handles for the spawned tasks.
     pub fn spawn_background_tasks(
-        &self,
+        self: &Arc<Self>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
@@ -486,6 +501,105 @@ impl NotificationDispatcher {
         // Create resubscriptions before moving shutdown_rx
         let mut escalation_shutdown_rx = shutdown_rx.resubscribe();
         let mut batcher_shutdown_rx = shutdown_rx.resubscribe();
+        let mut notify_scan_shutdown_rx = shutdown_rx.resubscribe();
+
+        // New-pending notify loop. The daemon is the single owner of the
+        // registered channels and the notification config, so it — not the
+        // caller that queued the item — watches the shared digest queue and
+        // sends the initial permission-request notification for any pending
+        // item that has not been notified yet. This is what makes BOTH paths
+        // notify: the built-in agent (`grith run`) AND the CLI supervisor
+        // (`grith exec`), which both enqueue to the same digest DB but only the
+        // agent used to call `notify_permission_request` directly. Dedup is a
+        // per-run in-memory set (pruned to still-pending ids) plus the delivery
+        // tracker, so an item is announced once; a daemon restart re-announces
+        // items still pending, which is the desired "you have N waiting" nudge.
+        let scan_dispatcher = Arc::clone(self);
+        handles.push(tokio::spawn(async move {
+            use std::collections::HashSet;
+            let mut announced: HashSet<uuid::Uuid> = HashSet::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(3));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let pending = match scan_dispatcher.digest_queue.get_pending(200, 0) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!("notify scan: get_pending failed: {e}");
+                                continue;
+                            }
+                        };
+                        let pending_ids: HashSet<uuid::Uuid> =
+                            pending.iter().map(|i| i.id).collect();
+
+                        // Expire remote prompts resolved out-of-band. Any item
+                        // we announced that is no longer pending was
+                        // approved/denied somewhere else (the local TUI, the
+                        // dashboard) — broadcast the resolution so channels
+                        // that carry buttons (Telegram, ...) drop them and
+                        // show the outcome instead of a stale, tappable prompt.
+                        let resolved: Vec<uuid::Uuid> = announced
+                            .iter()
+                            .filter(|id| !pending_ids.contains(id))
+                            .copied()
+                            .collect();
+                        for id in resolved {
+                            if let Ok(item) = scan_dispatcher.digest_queue.get_by_id(&id) {
+                                if let Err(e) = scan_dispatcher.notify_resolution(&item).await {
+                                    debug!(item_id = %id, error = %e,
+                                        "notify scan: resolution broadcast failed");
+                                }
+                            }
+                            announced.remove(&id);
+                        }
+
+                        let now = chrono::Utc::now();
+                        let remote_delay = chrono::Duration::from_std(scan_dispatcher.remote_delay)
+                            .unwrap_or_else(|_| chrono::Duration::zero());
+                        for item in &pending {
+                            if item.informational_only || announced.contains(&item.id) {
+                                continue;
+                            }
+                            if !scan_dispatcher.tracker.sent_channels(item.id).is_empty() {
+                                announced.insert(item.id);
+                                continue;
+                            }
+                            // Grace period: hold the item back from the
+                            // notification channels until it has been pending
+                            // for `remote_delay`. A prompt answered at the
+                            // local TUI within the window is resolved (and so
+                            // leaves `pending`) before it is ever sent — no
+                            // redundant phone alert, no stale prompt to expire.
+                            // It is picked up on a later tick once it ages past
+                            // the window.
+                            if now.signed_duration_since(item.created_at) < remote_delay {
+                                continue;
+                            }
+                            // Dispatch immediately (not via the batcher): a
+                            // permission prompt is time-sensitive — you need it
+                            // to approve/deny remotely, not 5 minutes later.
+                            match scan_dispatcher.dispatch_permission_request_now(item).await {
+                                Ok(()) => {
+                                    announced.insert(item.id);
+                                }
+                                Err(e) => {
+                                    error!(item_id = %item.id, error = %e,
+                                        "notify scan: permission-request dispatch failed");
+                                }
+                            }
+                        }
+                        // Bound memory: drop any remaining ids that are no
+                        // longer pending (e.g. announced this run then resolved,
+                        // or an item whose get_by_id failed above).
+                        announced.retain(|id| pending_ids.contains(id));
+                    }
+                    _ = notify_scan_shutdown_rx.recv() => {
+                        debug!("notify scan loop shutting down");
+                        break;
+                    }
+                }
+            }
+        }));
 
         // Nonce cleanup loop
         let nonce_store = Arc::clone(&self.nonce_store);

@@ -277,6 +277,7 @@ pub fn action_name(call_type: &ToolCallType) -> &'static str {
         ToolCallType::FilesystemMutation { .. } => "FilesystemMutation",
         ToolCallType::CrossProcessAccess { .. } => "CrossProcessAccess",
         ToolCallType::NamespaceOp { .. } => "NamespaceOp",
+        ToolCallType::DbusMethodCall { .. } => "DbusMethodCall",
     }
 }
 

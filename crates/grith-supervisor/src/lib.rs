@@ -54,6 +54,7 @@ pub mod audit_sink;
 pub mod cdp;
 pub mod config;
 pub mod connected_dns_proxy;
+pub(crate) mod dbus;
 pub mod dns_cache;
 pub mod dns_proxy;
 pub mod error;

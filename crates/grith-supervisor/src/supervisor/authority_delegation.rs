@@ -59,6 +59,9 @@ use std::os::unix::fs::PermissionsExt;
 const SPAWN_ENV: &str = "GRITH_ENFORCE_AUTHORITY_DELEGATING_SPAWN";
 /// Emergency env kill-switch for control-socket enforcement.
 const CONTROL_SOCKET_ENV: &str = "GRITH_ENFORCE_CONTROL_SOCKET_CONNECT";
+/// Emergency env kill-switch for per-method D-Bus inspection. Turning it off
+/// restores connect-time escalation for D-Bus sockets.
+const DBUS_INSPECTION_ENV: &str = "GRITH_DBUS_MESSAGE_INSPECTION";
 
 /// Control-injection IPC sockets — a connect here drives a more-privileged
 /// peer that can run commands on the tool's behalf (tmux/screen pane
@@ -75,7 +78,7 @@ const CONTROL_SOCKET_ENV: &str = "GRITH_ENFORCE_CONTROL_SOCKET_CONNECT";
 /// session-bus check robust to an abstract bus too. Rendering fidelity depends
 /// on the tracee-supplied `addrlen`, but grith reads the same length the kernel
 /// uses, so it matches what the kernel actually binds/connects to.
-pub(super) fn is_control_injection_socket(address: &str) -> bool {
+pub(crate) fn is_control_injection_socket(address: &str) -> bool {
     let path = address
         .strip_prefix("unix:")
         .unwrap_or(address)
@@ -376,6 +379,15 @@ pub(super) fn control_socket_enforcement_enabled(config_flag: bool) -> bool {
     env_override(CONTROL_SOCKET_ENV).unwrap_or(config_flag)
 }
 
+/// Effective D-Bus-message-inspection state: env override wins over config.
+///
+/// Inspection only ever *narrows* what connect-time enforcement escalates, so
+/// it is meaningless when that enforcement is off — the caller must already
+/// have established `control_socket_enforcement_enabled`.
+pub(crate) fn dbus_inspection_enabled(config_flag: bool) -> bool {
+    env_override(DBUS_INSPECTION_ENV).unwrap_or(config_flag)
+}
+
 /// True when the profile's `permit_authority_delegating` list authorises this
 /// binary (basename match — an operator writes `"systemd-run"`).
 fn spawn_permitted(command: &str, permit: &[String]) -> bool {
@@ -392,16 +404,44 @@ fn spawn_permitted_full(command: &str, canonical_path: Option<&str>, permit: &[S
 }
 
 /// True when the profile's `permit_control_sockets` list authorises this
-/// socket. Each entry is a substring of the (case-insensitive) socket path,
-/// so `"/run/user/1000/bus"` or a broader `"/tmux-"` both work.
+/// socket.
+///
+/// An entry matches the socket path exactly, or names one of its ancestor
+/// directories — both anchored on `/` boundaries, both case-insensitive.
+///
+/// Unanchored substring matching was deliberately dropped. It let an entry
+/// match mid-component (`"bus"` permitting `/run/user/1000/dbus-1/socket`,
+/// which is a different peer entirely) and it let the natural shorthand for
+/// "the session bus" — `"/run/user/"` — silently permit the tmux and X11
+/// sockets that live under the same runtime directory. A permit list is a
+/// security control: it has to grant what the operator wrote and nothing
+/// adjacent to it.
+///
+/// Abstract-namespace sockets (`unix:@name`) have no filesystem path and so
+/// no ancestors; they match only exactly. A bare `"/"` entry matches nothing
+/// rather than everything.
 fn control_socket_permitted(address: &str, permit: &[String]) -> bool {
     let path = address
         .strip_prefix("unix:")
         .unwrap_or(address)
         .to_ascii_lowercase();
-    permit
-        .iter()
-        .any(|p| !p.is_empty() && path.contains(&p.to_ascii_lowercase()))
+
+    permit.iter().any(|entry| {
+        let entry = entry.trim_end_matches('/').to_ascii_lowercase();
+        if entry.is_empty() {
+            return false;
+        }
+        if path == entry {
+            return true;
+        }
+        // Ancestor directory: `entry` must be followed by a separator in
+        // `path`, so `/run/user/1000` covers `/run/user/1000/bus` but not
+        // `/run/user/10000/bus`.
+        !path.starts_with('@')
+            && !entry.starts_with('@')
+            && path.starts_with(&entry)
+            && path.as_bytes().get(entry.len()) == Some(&b'/')
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,14 +1149,125 @@ pub(super) fn maybe_escalate_ssh_loopback_spawn(
     true
 }
 
-/// Escalate an `Allow` decision for a control-injection socket connect to
-/// `Queue { High }`. Returns `true` if it escalated.
-pub(super) fn maybe_escalate_control_socket(
-    decision: &mut ProxyDecision,
-    address: &str,
+// ---------------------------------------------------------------------------
+// Desktop input injection
+// ---------------------------------------------------------------------------
+//
+// CURATION POLICY: security-relevant. Changes gated on security-team review,
+// same as the delegating-binary registry above.
+//
+// Connecting to X11 or a Wayland compositor is now scored as local IPC
+// (`UnixSocketClass::Control`) rather than as an unknown network destination,
+// because routine desktop tooling touches those sockets constantly. That
+// de-scoring is only defensible if the operations that turn desktop access
+// into *control of the operator's session* are still surfaced.
+//
+// Synthesising input is that operation. A tool that can type into the focused
+// window can drive a terminal, a password manager, or a browser already logged
+// into everything — all outside supervision, because the keystrokes are
+// executed by whatever application receives them, not by a supervised process.
+//
+// Keyed on binary + argv shape, because these tools are also used read-only:
+// `xdotool getactivewindow` and `xdotool search` inspect the desktop and inject
+// nothing, and prompting on them would be exactly the false-positive friction
+// the read-only subcommand exemption exists to avoid.
+const INPUT_INJECTION_BINARIES: &[(&str, &[&str])] = &[
+    // X11. `key`/`keydown`/`keyup`/`type` synthesise keystrokes; the mouse and
+    // window verbs drive clicks and focus, which is how injected input is
+    // aimed at a chosen target.
+    (
+        "xdotool",
+        &[
+            "key",
+            "keydown",
+            "keyup",
+            "type",
+            "click",
+            "mousedown",
+            "mouseup",
+            "mousemove",
+            "mousemove_relative",
+            "windowactivate",
+            "windowfocus",
+        ],
+    ),
+    // X11 test extension: `xte 'key a'` / `'str hello'` / `'mouseclick 1'`.
+    ("xte", &["key", "keydown", "keyup", "str", "mouseclick"]),
+    // uinput-based, works under both X11 and Wayland.
+    (
+        "ydotool",
+        &["key", "type", "click", "mousemove", "mousedown", "mouseup"],
+    ),
+    ("dotool", &[]),
+    // Wayland virtual-keyboard protocol: every invocation types.
+    ("wtype", &[]),
+];
+
+/// True when `command` is a curated input-injection tool AND its argv actually
+/// injects.
+///
+/// An empty verb list means the binary only ever injects, so any invocation
+/// counts. Otherwise an injecting verb must appear among the positional
+/// arguments: `xdotool getactivewindow` reads the desktop and is left alone,
+/// `xdotool type "rm -rf ~"` is not.
+///
+/// Scans **every** positional token rather than just the first, because these
+/// tools chain commands in one invocation — `xdotool search --name x
+/// windowactivate key ctrl+l` opens with a read-only verb and injects at the
+/// end. Taking only the leading subcommand (as the read-only exemption does for
+/// `docker`/`kubectl`) would read that as a search and wave it through.
+///
+/// `args` is the full argv including argv[0], per the convention documented on
+/// [`subcommand`].
+pub(super) fn is_input_injection_spawn(command: &str, args: &[String]) -> bool {
+    let name = basename(command);
+    let Some((_, verbs)) = INPUT_INJECTION_BINARIES.iter().find(|(b, _)| *b == name) else {
+        return false;
+    };
+    if verbs.is_empty() {
+        return true;
+    }
+    args.iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .any(|a| {
+            // `xte` carries its verb inside a single quoted argument
+            // ("key a", "str hello"); every other tool passes the verb as its
+            // own token, so an exact match keeps a quoted payload that merely
+            // contains a verb word — `xdotool search --name "click me"` —
+            // from reading as an injection.
+            if name == "xte" {
+                verbs.contains(&a.split_whitespace().next().unwrap_or(a))
+            } else {
+                verbs.contains(&a.as_str())
+            }
+        })
+}
+
+/// Whether an input-injection spawn should be escalated: it injects, and the
+/// profile has not permitted the binary.
+///
+/// Shares `permit_authority_delegating` rather than adding a list: an operator
+/// running an automation tool under supervision permits the binary once and
+/// means it for every reason that binary would otherwise prompt.
+pub(super) fn input_injection_should_escalate(
+    command: &str,
+    args: &[String],
     permit: &[String],
 ) -> bool {
-    if !control_socket_should_escalate(address, permit) {
+    is_input_injection_spawn(command, args) && !spawn_permitted(command, permit)
+}
+
+/// Escalate an `Allow` decision for a desktop input-injection spawn to
+/// `Queue { High }`. Returns `true` if it escalated. Mirrors
+/// [`maybe_escalate_ssh_loopback_spawn`]: only touches `Allow` decisions.
+pub(super) fn maybe_escalate_input_injection_spawn(
+    decision: &mut ProxyDecision,
+    command: &str,
+    args: &[String],
+    permit: &[String],
+) -> bool {
+    if !input_injection_should_escalate(command, args, permit) {
         return false;
     }
     if !matches!(decision.action, ProxyAction::Allow) {
@@ -1126,10 +1277,65 @@ pub(super) fn maybe_escalate_control_socket(
         priority: QueuePriority::High,
     };
     decision.decision_reason = format!(
+        "desktop input-injection spawn queued for review: `{}` synthesises keyboard or mouse          input into the operator's session, which executes outside supervision",
+        basename(command)
+    );
+    true
+}
+
+/// Escalate an `Allow` decision for a control-injection socket connect to
+/// `Queue { High }`. Returns `true` if it escalated.
+/// Outcome of [`maybe_escalate_control_socket`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlSocketEscalation {
+    /// Not an unpermitted control socket, or the base decision was Deny
+    /// (a Deny is never rewritten in either direction).
+    None,
+    /// The base decision was already Queue: only `decision_reason` was
+    /// rewritten so the prompt says what the call actually is; action and
+    /// score are untouched. The caller must NOT treat this as an
+    /// Allow→Queue escalation.
+    Annotated,
+    /// Base Allow rewritten to Queue{High}.
+    Escalated,
+}
+
+pub(super) fn maybe_escalate_control_socket(
+    decision: &mut ProxyDecision,
+    address: &str,
+    permit: &[String],
+) -> ControlSocketEscalation {
+    if !control_socket_should_escalate(address, permit) {
+        return ControlSocketEscalation::None;
+    }
+    let reason = format!(
         "control-injection IPC socket connect queued for review: `{address}` can drive a \
          more-privileged peer that runs commands on the tool's behalf"
     );
-    true
+    match decision.action {
+        ProxyAction::Allow => {
+            decision.action = ProxyAction::Queue {
+                priority: QueuePriority::High,
+            };
+            decision.decision_reason = reason;
+            ControlSocketEscalation::Escalated
+        }
+        // Already queueing on score. The action stands, but the operator
+        // must still be told WHAT this is — an Allow-only rewrite left a
+        // score-driven queue reading "unknown-destination … Score 4.0 in
+        // escalation zone" for a keyring read over the session bus. The
+        // score-derived reason is kept in parentheses for context.
+        ProxyAction::Queue { .. } => {
+            let prior = std::mem::take(&mut decision.decision_reason);
+            decision.decision_reason = if prior.is_empty() {
+                reason
+            } else {
+                format!("{reason} ({prior})")
+            };
+            ControlSocketEscalation::Annotated
+        }
+        ProxyAction::Deny { .. } => ControlSocketEscalation::None,
+    }
 }
 
 #[cfg(test)]
@@ -1783,20 +1989,278 @@ mod tests {
     #[test]
     fn control_socket_escalates_and_permit_suppresses() {
         let mut d = allow_decision();
-        assert!(maybe_escalate_control_socket(
-            &mut d,
-            "unix:/run/user/1000/bus",
-            &[]
-        ));
+        assert_eq!(
+            maybe_escalate_control_socket(&mut d, "unix:/run/user/1000/bus", &[]),
+            ControlSocketEscalation::Escalated
+        );
         assert!(matches!(d.action, ProxyAction::Queue { .. }));
+        assert!(d.decision_reason.contains("control-injection"));
 
         let mut d2 = allow_decision();
         let permit = vec!["/run/user/1000/bus".to_string()];
-        assert!(!maybe_escalate_control_socket(
-            &mut d2,
-            "unix:/run/user/1000/bus",
+        assert_eq!(
+            maybe_escalate_control_socket(&mut d2, "unix:/run/user/1000/bus", &permit),
+            ControlSocketEscalation::None
+        );
+        assert!(matches!(d2.action, ProxyAction::Allow));
+    }
+
+    /// Ordering guarantee that keeps the daemon's reputation auto-allow from
+    /// undoing a control-socket escalation.
+    ///
+    /// `grith exec` routes evaluation through the daemon, and the daemon runs
+    /// its own reputation auto-allow with no delegation awareness — so a
+    /// score-queued control-socket connect can come back from the IPC hop as a
+    /// bare `Allow`. That is safe only because the supervisor escalates
+    /// *after* `evaluate_proxy` returns: the auto-allowed decision is rewritten
+    /// straight back to `Queue`. The in-process path is protected the other way
+    /// round (it escalates first, then guards the reputation block on
+    /// `delegation_would_enforce`), so this test pins the half that has no
+    /// guard of its own. If escalation ever moves ahead of `evaluate_proxy`,
+    /// this fails and the daemon path needs an explicit guard.
+    #[test]
+    fn daemon_reputation_auto_allow_is_re_escalated() {
+        let mut d = allow_decision();
+        // Shaped exactly like a decision returned from the daemon's
+        // maybe_apply_reputation_auto_allow.
+        d.action = ProxyAction::Allow;
+        d.decision_reason = "daemon reputation auto-allow: trust sufficient".to_string();
+
+        assert_eq!(
+            maybe_escalate_control_socket(&mut d, "unix:/run/user/1000/bus", &[]),
+            ControlSocketEscalation::Escalated
+        );
+        assert!(
+            matches!(d.action, ProxyAction::Queue { .. }),
+            "a reputation-auto-allowed control-socket connect must be re-queued"
+        );
+        assert!(d.decision_reason.contains("control-injection"));
+    }
+
+    /// Injecting verbs escalate; the same binaries used read-only do not.
+    #[test]
+    fn input_injection_keys_on_verb_not_just_binary() {
+        assert!(is_input_injection_spawn(
+            "/usr/bin/xdotool",
+            &argv(&["xdotool", "type", "rm -rf ~"])
+        ));
+        assert!(is_input_injection_spawn(
+            "xdotool",
+            &argv(&["xdotool", "key", "ctrl+l"])
+        ));
+
+        // Read-only desktop inspection injects nothing.
+        assert!(!is_input_injection_spawn(
+            "xdotool",
+            &argv(&["xdotool", "getactivewindow"])
+        ));
+        assert!(!is_input_injection_spawn(
+            "xdotool",
+            &argv(&["xdotool", "search", "--name", "Firefox"])
+        ));
+
+        // A quoted payload that merely contains a verb word is not a verb.
+        assert!(!is_input_injection_spawn(
+            "xdotool",
+            &argv(&["xdotool", "search", "--name", "click me"])
+        ));
+    }
+
+    /// These tools chain commands, so an injection after a read-only verb
+    /// still counts — this is the evasion a first-token-only scan would miss.
+    #[test]
+    fn input_injection_sees_chained_commands() {
+        assert!(is_input_injection_spawn(
+            "xdotool",
+            &argv(&[
+                "xdotool",
+                "search",
+                "--name",
+                "Terminal",
+                "windowactivate",
+                "key",
+                "ctrl+l"
+            ])
+        ));
+    }
+
+    /// Binaries that only ever inject need no verb.
+    #[test]
+    fn input_injection_covers_verbless_tools() {
+        assert!(is_input_injection_spawn(
+            "wtype",
+            &argv(&["wtype", "hello"])
+        ));
+        assert!(is_input_injection_spawn(
+            "/usr/bin/ydotool",
+            &argv(&["ydotool", "key", "29:1", "46:1"])
+        ));
+        // xte takes its verb inside one quoted argument.
+        assert!(is_input_injection_spawn("xte", &argv(&["xte", "key a"])));
+        assert!(is_input_injection_spawn(
+            "xte",
+            &argv(&["xte", "str hello world"])
+        ));
+        assert!(!is_input_injection_spawn(
+            "xte",
+            &argv(&["xte", "-x", "--version"])
+        ));
+    }
+
+    /// Nothing outside the curated list is affected.
+    #[test]
+    fn input_injection_ignores_unrelated_binaries() {
+        assert!(!is_input_injection_spawn("curl", &argv(&["curl", "type"])));
+        assert!(!is_input_injection_spawn("xclip", &argv(&["xclip", "-o"])));
+    }
+
+    #[test]
+    fn input_injection_escalates_allow_and_permit_suppresses() {
+        let mut d = allow_decision();
+        assert!(maybe_escalate_input_injection_spawn(
+            &mut d,
+            "xdotool",
+            &argv(&["xdotool", "type", "secret"]),
+            &[]
+        ));
+        assert!(matches!(d.action, ProxyAction::Queue { .. }));
+        assert!(d.decision_reason.contains("input-injection"));
+
+        let permit = vec!["xdotool".to_string()];
+        let mut permitted = allow_decision();
+        assert!(!maybe_escalate_input_injection_spawn(
+            &mut permitted,
+            "xdotool",
+            &argv(&["xdotool", "type", "secret"]),
             &permit
         ));
-        assert!(matches!(d2.action, ProxyAction::Allow));
+        assert!(matches!(permitted.action, ProxyAction::Allow));
+    }
+
+    /// Like every other spawn escalator, only `Allow` is rewritten — a Deny
+    /// stays denied and an existing Queue keeps its own reason.
+    #[test]
+    fn input_injection_only_rewrites_allow() {
+        let mut denied = allow_decision();
+        denied.action = ProxyAction::Deny {
+            reason: "score".to_string(),
+        };
+        assert!(!maybe_escalate_input_injection_spawn(
+            &mut denied,
+            "xdotool",
+            &argv(&["xdotool", "key", "a"]),
+            &[]
+        ));
+        assert!(matches!(denied.action, ProxyAction::Deny { .. }));
+    }
+
+    /// A permit entry grants the exact socket and anything beneath it, and
+    /// nothing else. The substring form this replaced meant `"/run/user/"` —
+    /// the obvious shorthand for "the session bus" — also permitted the tmux
+    /// and X11 sockets sharing that runtime directory.
+    #[test]
+    fn control_socket_permit_is_anchored_not_substring() {
+        let bus = "unix:/run/user/1000/bus";
+        let tmux = "unix:/run/user/1000/tmux-1000/default";
+
+        // Exact path.
+        assert!(control_socket_permitted(
+            bus,
+            &["/run/user/1000/bus".into()]
+        ));
+        assert!(!control_socket_permitted(
+            tmux,
+            &["/run/user/1000/bus".into()]
+        ));
+
+        // Ancestor directory, with and without a trailing slash.
+        assert!(control_socket_permitted(bus, &["/run/user/1000".into()]));
+        assert!(control_socket_permitted(bus, &["/run/user/1000/".into()]));
+
+        // A directory prefix covers everything under it — explicit, and the
+        // operator wrote the directory.
+        assert!(control_socket_permitted(tmux, &["/run/user/1000".into()]));
+
+        // Mid-component matches are gone: "bus" must not permit "dbus-1",
+        // and a component prefix is not a component.
+        assert!(!control_socket_permitted(
+            "unix:/run/user/1000/dbus-1/socket",
+            &["bus".into()]
+        ));
+        assert!(!control_socket_permitted(tmux, &["/tmux-".into()]));
+
+        // Boundary: the entry must end on a separator, so 1000 does not
+        // reach into 10000.
+        assert!(!control_socket_permitted(
+            "unix:/run/user/10000/bus",
+            &["/run/user/1000".into()]
+        ));
+    }
+
+    /// Neither an empty entry nor a bare root may act as "permit everything".
+    #[test]
+    fn control_socket_permit_rejects_catch_all_entries() {
+        let bus = "unix:/run/user/1000/bus";
+        assert!(!control_socket_permitted(bus, &[String::new()]));
+        assert!(!control_socket_permitted(bus, &["/".into()]));
+        assert!(!control_socket_permitted(bus, &["   ".into()]));
+    }
+
+    /// Abstract-namespace sockets have no filesystem path, so they match
+    /// exactly and are never covered by a directory entry.
+    #[test]
+    fn control_socket_permit_handles_abstract_sockets() {
+        let abstract_x11 = "unix:@/tmp/.X11-unix/X1";
+        assert!(control_socket_permitted(
+            abstract_x11,
+            &["@/tmp/.X11-unix/X1".into()]
+        ));
+        assert!(!control_socket_permitted(
+            abstract_x11,
+            &["/tmp/.X11-unix".into()]
+        ));
+        // ... and a filesystem socket is not covered by an abstract entry.
+        assert!(!control_socket_permitted(
+            "unix:/tmp/.X11-unix/X1",
+            &["@/tmp/.X11-unix".into()]
+        ));
+    }
+
+    /// A score-driven Queue keeps its action but gains the control-socket
+    /// explanation (with the score reason preserved in parentheses); a Deny
+    /// is never touched.
+    #[test]
+    fn control_socket_annotates_queue_and_leaves_deny() {
+        let mut queued = allow_decision();
+        queued.action = ProxyAction::Queue {
+            priority: QueuePriority::Medium,
+        };
+        queued.decision_reason = "Score 4.0 in escalation zone".to_string();
+        assert_eq!(
+            maybe_escalate_control_socket(&mut queued, "unix:/run/user/1000/bus", &[]),
+            ControlSocketEscalation::Annotated
+        );
+        assert!(matches!(
+            queued.action,
+            ProxyAction::Queue {
+                priority: QueuePriority::Medium
+            }
+        ));
+        assert!(queued.decision_reason.contains("control-injection"));
+        assert!(queued
+            .decision_reason
+            .contains("Score 4.0 in escalation zone"));
+
+        let mut denied = allow_decision();
+        denied.action = ProxyAction::Deny {
+            reason: "denied".to_string(),
+        };
+        denied.decision_reason = "denied".to_string();
+        assert_eq!(
+            maybe_escalate_control_socket(&mut denied, "unix:/run/user/1000/bus", &[]),
+            ControlSocketEscalation::None
+        );
+        assert!(matches!(denied.action, ProxyAction::Deny { .. }));
+        assert_eq!(denied.decision_reason, "denied");
     }
 }

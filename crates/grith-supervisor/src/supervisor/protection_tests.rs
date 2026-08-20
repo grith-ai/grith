@@ -413,6 +413,7 @@ impl Harness {
             namespace_users: self.namespace_users.clone(),
             permit_authority_delegating: self.permit_authority_delegating.clone(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins:
                 crate::supervisor::authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: self.working_root.clone(),

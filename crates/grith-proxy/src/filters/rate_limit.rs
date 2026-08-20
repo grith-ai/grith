@@ -183,6 +183,7 @@ impl RateLimitFilter {
             ToolCallType::FilesystemMutation { .. } => "filesystem_mutation".to_string(),
             ToolCallType::CrossProcessAccess { .. } => "cross_process_access".to_string(),
             ToolCallType::NamespaceOp { .. } => "namespace_op".to_string(),
+            ToolCallType::DbusMethodCall { .. } => "dbus_method_call".to_string(),
         }
     }
 

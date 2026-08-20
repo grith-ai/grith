@@ -51,36 +51,21 @@ impl NotificationChannel for DesktopChannel {
             item.tool_call_type, item.composite_score, item.arguments_summary, self.dashboard_url,
         );
 
-        // notify-rust is sync, run in blocking task
+        // Detached, not awaited: on Linux we wait for the click before opening
+        // the dashboard, and that wait blocks until the notification is
+        // dismissed (up to the timeout). Blocking the dispatch loop here would
+        // stall every channel routed after desktop, so we fire-and-forget and
+        // report delivered optimistically — matching the previous best-effort
+        // show (which ignored the show Result).
         let dashboard_url = self.dashboard_url.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = notify_rust::Notification::new()
-                    .summary(&title)
-                    .body(&body)
-                    .icon("dialog-warning")
-                    .timeout(notify_rust::Timeout::Milliseconds(10000))
-                    .show();
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let _ = notify_rust::Notification::new()
-                    .summary(&title)
-                    .body(&body)
-                    .show();
-            }
-            let _ = open::that(&dashboard_url);
-        })
-        .await;
+        tokio::task::spawn_blocking(move || {
+            show_permission_request(&title, &body, &dashboard_url);
+        });
 
-        match result {
-            Ok(()) => Ok(NotifyResult {
-                external_id: None,
-                delivered: true,
-            }),
-            Err(e) => Err(Error::DeliveryFailed("desktop".into(), e.to_string())),
-        }
+        Ok(NotifyResult {
+            external_id: None,
+            delivered: true,
+        })
     }
 
     async fn notify_resolution(&self, item: &DigestItem) -> Result<(), Error> {
@@ -147,6 +132,51 @@ impl NotificationChannel for DesktopChannel {
             },
         })
     }
+}
+
+/// Show a permission-request desktop notification, opening the dashboard only
+/// when the notification is *clicked*.
+///
+/// The previous implementation called `open::that(dashboard_url)`
+/// unconditionally right after `show()`, so every notification spawned a fresh
+/// browser tab — stacking tabs on a machine that already had the dashboard
+/// open. On Linux we now register the freedesktop `"default"` action (invoked
+/// when the notification body is clicked) and open the dashboard from its
+/// handler. This call blocks until the notification is dismissed, so the
+/// caller runs it on a detached blocking task.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn show_permission_request(title: &str, body: &str, dashboard_url: &str) {
+    if let Ok(handle) = notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .icon("dialog-warning")
+        // "default" is the special freedesktop action key fired when the
+        // notification body itself is clicked.
+        .action("default", "Open dashboard")
+        .timeout(notify_rust::Timeout::Milliseconds(10000))
+        .show()
+    {
+        let url = dashboard_url.to_string();
+        handle.wait_for_action(|action| {
+            if action == "default" {
+                let _ = open::that(&url);
+            }
+        });
+    }
+}
+
+/// macOS/Windows fall back to a plain notification (their notify-rust backends
+/// do not expose the freedesktop click-action model). No auto-open — the
+/// dashboard URL is in the body.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn show_permission_request(title: &str, body: &str, _dashboard_url: &str) {
+    let mut builder = notify_rust::Notification::new();
+    builder.summary(title).body(body);
+    #[cfg(target_os = "macos")]
+    builder
+        .icon("dialog-warning")
+        .timeout(notify_rust::Timeout::Milliseconds(10000));
+    let _ = builder.show();
 }
 
 /// Check whether a display server is available on the current platform.

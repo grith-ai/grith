@@ -176,6 +176,18 @@ pub struct SupervisorSession {
     /// Entries expire by timestamp (`approve_replay_seconds`); expired
     /// entries are purged on insert. Cleared with the session.
     pub recent_approvals: std::collections::HashMap<String, Instant>,
+    /// Session-lifetime answers to Control-class control-socket prompts
+    /// (session D-Bus, X11, tmux/screen connects), keyed by exact call
+    /// identity. Unlike the windowed replay maps above, entries never
+    /// expire and ARE consulted under containment: every call still
+    /// re-scores through the full pipeline (an auto-deny never reaches
+    /// `queue_and_wait`), so the only thing suppressed is re-asking a
+    /// question a human already answered this session — the fix for the
+    /// contained-session prompt storm where every xclip invocation opened
+    /// its own freeze dialog. `true` = approved, `false` = explicitly
+    /// denied; timeouts deliberately record nothing (not a human answer).
+    /// Cleared with the session.
+    pub control_socket_answers: std::collections::HashMap<String, bool>,
 }
 
 impl SupervisorSession {
@@ -205,6 +217,7 @@ impl SupervisorSession {
             controlling_pts: std::sync::OnceLock::new(),
             recent_denials: std::collections::HashMap::new(),
             recent_approvals: std::collections::HashMap::new(),
+            control_socket_answers: std::collections::HashMap::new(),
         }
     }
 

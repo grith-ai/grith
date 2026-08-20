@@ -490,6 +490,17 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// may connect to without the enforcement QUEUE (consulted only when
     /// `config.enforce_control_socket_connect` is on). Empty permits none.
     pub(super) permit_control_sockets: Vec<String>,
+    /// Whether D-Bus control-socket access is actually being decided per method
+    /// call for this session — the interceptor confirmed it can see the writes,
+    /// not merely that the config asked for it.
+    ///
+    /// Load-bearing distinction: an attach-mode session has no stepped-write
+    /// path, so its bus writes are invisible. Suppressing the connect-time
+    /// escalation on the strength of the config alone would turn "decide per
+    /// message" into "decide never" there. Set at session start from
+    /// `SyscallInterceptor::set_dbus_inspection`, which reports what the
+    /// backend can really do.
+    pub(super) dbus_inspection_armed: bool,
     /// Session identity pins for the curated authority-delegating binaries on
     /// `$PATH`. A ProcessSpawn whose canonical bytes hash into the pinned set
     /// is a copy/hardlink of a delegating binary regardless of its name. Sizes
@@ -1938,6 +1949,18 @@ pub(super) async fn handle_syscall_event(
             }
             _ => false,
         };
+        // Whether the *connect* is still the enforcement point. For a D-Bus
+        // endpoint under message inspection it is not: the connection carries
+        // no authority on its own, and each method call written to it is
+        // judged separately (see `crate::dbus`). The connect is still kept
+        // out of the local-IPC auto-allow above, so it is scored and audited
+        // exactly as before — it just no longer prompts.
+        let control_socket_escalates = control_socket_enforce
+            && !matches!(
+                &call_type,
+                grith_proxy::types::ToolCallType::NetConnect { address, .. }
+                    if dbus_inspection_covers(loop_ctx, address)
+            );
         let is_local = match &call_type {
             grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
                 // A control-injection socket we are enforcing must NOT be
@@ -1972,6 +1995,22 @@ pub(super) async fn handle_syscall_event(
         // evaluation.
         if let grith_proxy::types::ToolCallType::NetConnect { address, .. } = &call_type {
             if authority_delegation::is_control_injection_socket(address) {
+                // Distinguish an enforcement candidate that a durable
+                // exe-bound grant will allow from one that will actually
+                // queue — "enforce-queue" on a call the grant then allows
+                // would be a lying forensics record. Same predicate the
+                // escalation guard uses downstream.
+                let grant_covers = control_socket_escalates
+                    && !SessionStateRegistry::global()
+                        .is_containment_active(SessionScopeKey::from_session_id(session.id))
+                    && ipc_socket_grant_key_parts(address, u64::from(event.pid)).is_some_and(
+                        |key| {
+                            loop_ctx
+                                .session_allowed
+                                .lock()
+                                .is_ok_and(|s| s.contains(&key))
+                        },
+                    );
                 write_forensics_stage(
                     loop_ctx,
                     trace_event_id,
@@ -1979,8 +2018,15 @@ pub(super) async fn handle_syscall_event(
                     event.pid,
                     Some(&call_type),
                     "control_socket_connect",
-                    Some(if control_socket_enforce {
+                    Some(if grant_covers {
+                        "grant-allow"
+                    } else if control_socket_escalates {
                         "enforce-queue"
+                    } else if control_socket_enforce {
+                        // D-Bus under message inspection: the connect is
+                        // scored and recorded, and the decision it used to
+                        // carry now belongs to the method calls written to it.
+                        "dbus-inspection-armed"
                     } else {
                         "audit-only-allow"
                     }),
@@ -1991,6 +2037,7 @@ pub(super) async fn handle_syscall_event(
                     address = %address,
                     tid,
                     control_socket_enforce,
+                    control_socket_escalates,
                     "control-injection IPC socket connect"
                 );
             }
@@ -2368,15 +2415,21 @@ pub(super) async fn handle_syscall_event(
                         command,
                         args,
                         &loop_ctx.permit_authority_delegating,
+                    )
+                    || authority_delegation::input_injection_should_escalate(
+                        command,
+                        args,
+                        &loop_ctx.permit_authority_delegating,
                     ))
             }
             grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
                 authority_delegation::control_socket_enforcement_enabled(
                     loop_ctx.config.enforce_control_socket_connect,
-                ) && authority_delegation::control_socket_should_escalate(
-                    address,
-                    &loop_ctx.permit_control_sockets,
-                )
+                ) && !dbus_inspection_covers(loop_ctx, address)
+                    && authority_delegation::control_socket_should_escalate(
+                        address,
+                        &loop_ctx.permit_control_sockets,
+                    )
             }
             _ => false,
         };
@@ -2434,6 +2487,29 @@ pub(super) async fn handle_syscall_event(
     ctx.profile_name = session.profile_name.clone();
     ctx.task_context = session.project_name.clone();
     ctx.arguments = supervisor_event_arguments(session, event.pid, &ctx.call_type);
+
+    // A client may batch several messages into one write. The decision is on
+    // the *write*, so approving the call named in the prompt also sends
+    // anything else that rode along — record every escalated message so the
+    // audit shows what an approval actually covered, and flag the batch so the
+    // reason line can say so rather than naming one call and sending two.
+    if matches!(
+        ctx.call_type,
+        grith_proxy::types::ToolCallType::DbusMethodCall { .. }
+    ) {
+        let batched = interceptor.take_dbus_method_calls(tid);
+        if batched.len() > 1 {
+            if let Some(obj) = ctx.arguments.as_object_mut() {
+                obj.insert(
+                    "dbus_batched_calls".into(),
+                    serde_json::json!(batched
+                        .iter()
+                        .map(|c| c.description.clone())
+                        .collect::<Vec<_>>()),
+                );
+            }
+        }
+    }
 
     // (The `scratch_root_match` proxy-argument flag that used to be set here was
     // retired with the rate_limit scratch/`.git`/`~/.cache` burst exemptions —
@@ -2669,36 +2745,133 @@ pub(super) async fn handle_syscall_event(
                     tid,
                     "ssh-family loopback spawn: escalating Allow→QUEUE"
                 );
+            } else if !already_user_approved_delegation
+                && authority_delegation::maybe_escalate_input_injection_spawn(
+                    &mut decision,
+                    command,
+                    args,
+                    &loop_ctx.permit_authority_delegating,
+                )
+            {
+                // Compensating control for scoring X11 / Wayland sockets as
+                // local IPC: desktop access is cheap now, so the spawns that
+                // turn it into control of the operator's session are what
+                // carries the review pressure. Neither of the arms above
+                // matches these binaries, so control only reaches here — no
+                // double-escalation.
+                authority_delegation_escalated = true;
+                write_forensics_stage(
+                    loop_ctx,
+                    trace_event_id,
+                    session,
+                    event.pid,
+                    Some(&ctx.call_type),
+                    "input_injection_escalation",
+                    Some("queue"),
+                    Some(decision.composite_score),
+                    Some("desktop input-injection spawn escalated Allow→QUEUE"),
+                );
+                tracing::warn!(
+                    command = %command,
+                    tid,
+                    "desktop input-injection spawn: escalating Allow→QUEUE"
+                );
             }
         }
     } else if let grith_proxy::types::ToolCallType::NetConnect { address, .. } = &ctx.call_type {
-        if !already_user_approved_delegation
-            && authority_delegation::control_socket_enforcement_enabled(
-                loop_ctx.config.enforce_control_socket_connect,
-            )
-            && authority_delegation::maybe_escalate_control_socket(
-                &mut decision,
-                address,
-                &loop_ctx.permit_control_sockets,
-            )
-        {
-            authority_delegation_escalated = true;
+        // Durable exe-bound IPC grant: a prior [a]/[l] approval of this
+        // control socket minted `ipc-socket:<address>|<client exe>` (the [l]
+        // form persists across sessions via learned rules). A match guards
+        // the escalation only — the call has still been fully proxy-scored
+        // and audit-recorded, and a Queue produced by the SCORE (containment,
+        // taint) is deliberately not downgraded: the grant answers the
+        // delegation question, not whatever else flagged the call. Checked
+        // post-proxy rather than at the session-allowlist short-circuit so
+        // the exe identity is enforced (the broad `net:unix:` entry the same
+        // approval inserts is exe-blind, and the enforcement path skips it).
+        // Suspended under containment like every other approval memory.
+        let ipc_grant_matches = !containment_active
+            && ipc_socket_grant_key_for_ctx(&ctx).is_some_and(|key| {
+                loop_ctx
+                    .session_allowed
+                    .lock()
+                    .is_ok_and(|s| s.contains(&key))
+            });
+        if ipc_grant_matches {
             write_forensics_stage(
                 loop_ctx,
                 trace_event_id,
                 session,
                 event.pid,
                 Some(&ctx.call_type),
-                "control_socket_escalation",
-                Some("queue"),
+                "control_socket_grant",
+                Some("grant-allow"),
                 Some(decision.composite_score),
-                Some("control-injection socket connect escalated Allow→QUEUE"),
+                Some("durable exe-bound ipc-socket grant covers this connect"),
             );
-            tracing::warn!(
+            tracing::info!(
                 address = %address,
                 tid,
-                "control-injection socket connect: escalating Allow→QUEUE"
+                "control-socket connect covered by durable ipc-socket grant"
             );
+        }
+        if !already_user_approved_delegation
+            && !ipc_grant_matches
+            && !dbus_inspection_covers(loop_ctx, address)
+            && authority_delegation::control_socket_enforcement_enabled(
+                loop_ctx.config.enforce_control_socket_connect,
+            )
+        {
+            match authority_delegation::maybe_escalate_control_socket(
+                &mut decision,
+                address,
+                &loop_ctx.permit_control_sockets,
+            ) {
+                authority_delegation::ControlSocketEscalation::Escalated => {
+                    authority_delegation_escalated = true;
+                    write_forensics_stage(
+                        loop_ctx,
+                        trace_event_id,
+                        session,
+                        event.pid,
+                        Some(&ctx.call_type),
+                        "control_socket_escalation",
+                        Some("queue"),
+                        Some(decision.composite_score),
+                        Some("control-injection socket connect escalated Allow→QUEUE"),
+                    );
+                    tracing::warn!(
+                        address = %address,
+                        tid,
+                        "control-injection socket connect: escalating Allow→QUEUE"
+                    );
+                }
+                // Score-driven Queue on a control socket: the action stands
+                // and only the reason was rewritten for the prompt.
+                // `authority_delegation_escalated` stays false — its contract
+                // (relied on by the reputation bypass below) is "a base Allow
+                // was rewritten"; the base-Queue case is held out of the
+                // reputation auto-allow by `delegation_would_enforce` instead.
+                authority_delegation::ControlSocketEscalation::Annotated => {
+                    write_forensics_stage(
+                        loop_ctx,
+                        trace_event_id,
+                        session,
+                        event.pid,
+                        Some(&ctx.call_type),
+                        "control_socket_escalation",
+                        Some("queue-annotated"),
+                        Some(decision.composite_score),
+                        Some("control-injection socket connect already queued on score; reason annotated"),
+                    );
+                    tracing::info!(
+                        address = %address,
+                        tid,
+                        "control-injection socket connect: already queued on score, reason annotated"
+                    );
+                }
+                authority_delegation::ControlSocketEscalation::None => {}
+            }
         }
     }
 
@@ -3225,8 +3398,17 @@ async fn enforce_decision(
             // In "log" mode, allow the syscall and log it as informational
             // instead of freezing the process tree for a blocking dialog.
             // This keeps interactive TUI tools running uninterrupted.
+            //
+            // Not when containment or taint put the call in the queue band.
+            // `--allow-queued` is a throughput concession for a headless
+            // session whose queued calls are ordinary friction; it was never
+            // meant to wave through the two signals that specifically mean
+            // "this session has already touched something sensitive". Those
+            // fall through to the deny branch below — the same fail-closed
+            // outcome the flag's absence would produce.
             if loop_ctx.config.interactive_queue_action
                 == crate::config::InteractiveQueueAction::Log
+                && !contamination_signalled(decision)
             {
                 write_forensics_stage(
                     loop_ctx,
@@ -3424,15 +3606,21 @@ fn session_scope_now_covers(
                         command,
                         args,
                         &loop_ctx.permit_authority_delegating,
+                    )
+                    || authority_delegation::input_injection_should_escalate(
+                        command,
+                        args,
+                        &loop_ctx.permit_authority_delegating,
                     ))
             }
             grith_proxy::types::ToolCallType::NetConnect { address, .. } => {
                 authority_delegation::control_socket_enforcement_enabled(
                     loop_ctx.config.enforce_control_socket_connect,
-                ) && authority_delegation::control_socket_should_escalate(
-                    address,
-                    &loop_ctx.permit_control_sockets,
-                )
+                ) && !dbus_inspection_covers(loop_ctx, address)
+                    && authority_delegation::control_socket_should_escalate(
+                        address,
+                        &loop_ctx.permit_control_sockets,
+                    )
             }
             _ => false,
         };
@@ -3527,6 +3715,79 @@ async fn queue_and_wait(
         thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
         session.stats.total_denied += 1;
         return Ok(());
+    }
+
+    // Control-socket answer replay: a session-lifetime memory for
+    // Control-class connects only (session D-Bus, X11, tmux/screen).
+    // The windowed approve-replay below is deliberately disabled under
+    // containment, and every other approval memory is containment-gated
+    // too — which meant a contained session opened a fresh freeze dialog
+    // for EVERY control-socket connect (observed: four X11 prompts in one
+    // run, two of them 2ms apart). Replaying here is sound even under
+    // containment because the call has already re-scored through the full
+    // pipeline this time (an auto-deny never reaches queue_and_wait); the
+    // only thing suppressed is re-asking a question a human answered this
+    // session. Checked after deny-replay so a recent explicit deny still
+    // wins its window.
+    if is_control_class_connect(ctx) {
+        if let Some(approved) = session.control_socket_answers.get(&replay_key).copied() {
+            let (stage, decision_str, note) = if approved {
+                (
+                    "control_socket_answer_replayed",
+                    "auto-allow",
+                    "control-socket prompt answered approve earlier this session",
+                )
+            } else {
+                (
+                    "control_socket_answer_replayed",
+                    "auto-deny",
+                    "control-socket prompt answered deny earlier this session",
+                )
+            };
+            write_forensics_stage(
+                loop_ctx,
+                trace_event_id,
+                session,
+                event_pid,
+                Some(&ctx.call_type),
+                stage,
+                Some(decision_str),
+                Some(decision.composite_score),
+                Some(note),
+            );
+            write_syscall_log(
+                loop_ctx,
+                session.root_pid,
+                &ctx.call_type,
+                decision.composite_score,
+                "control-socket-answer",
+                note,
+            );
+            tracing::info!(
+                event = "control_socket_answer_replayed",
+                session_id = %session.id,
+                tid,
+                call = %replay_key,
+                approved,
+                "control-socket prompt already answered this session — replaying without a prompt"
+            );
+            if approved {
+                thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
+                session.stats.total_allowed += 1;
+            } else {
+                record_reputation_observation(
+                    loop_ctx,
+                    session,
+                    &ctx.call_type,
+                    grith_proxy::reputation::ReputationOutcome::Denied(implicit_deny_weight(
+                        &loop_ctx.reputation_config,
+                    )),
+                );
+                thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
+                session.stats.total_denied += 1;
+            }
+            return Ok(());
+        }
     }
 
     // Approve-replay: a request identical to one the operator approved
@@ -3642,6 +3903,53 @@ async fn queue_and_wait(
                         }
                         loop_ctx.reviewer.cancel_review(digest_id).await;
                         break (ReviewOutcome::Approved, true);
+                    }
+                    // Remote resolution: a notification channel (Telegram,
+                    // Slack, the dashboard, ...) approved or denied this item
+                    // out-of-band while the local TUI dialog is still on
+                    // screen. The reviewer future only wakes on a LOCAL
+                    // answer, so without this poll a remote approval would
+                    // leave the syscall frozen until the freeze timeout.
+                    // Honour the persisted status and drop the now-stale
+                    // local dialog (cancel_review). drained = false: a remote
+                    // human answer earns the same side effects as a local one
+                    // (reputation, approve-replay, session allowlist), and the
+                    // downstream re-fetch of review_action preserves a scoped
+                    // approval if the channel supplied one.
+                    match loop_ctx.digest_store.get(digest_id).await {
+                        Ok(Some(item)) => match item.status {
+                            grith_digest::types::DigestStatus::Approved => {
+                                tracing::info!(
+                                    event = "remote_review_resolved",
+                                    item_id = %digest_id,
+                                    action = "approve",
+                                    "review resolved out-of-band by a notification channel"
+                                );
+                                loop_ctx.reviewer.cancel_review(digest_id).await;
+                                break (ReviewOutcome::Approved, false);
+                            }
+                            grith_digest::types::DigestStatus::Denied
+                            | grith_digest::types::DigestStatus::Expired => {
+                                tracing::info!(
+                                    event = "remote_review_resolved",
+                                    item_id = %digest_id,
+                                    action = "deny",
+                                    "review resolved out-of-band by a notification channel"
+                                );
+                                loop_ctx.reviewer.cancel_review(digest_id).await;
+                                break (ReviewOutcome::Denied, false);
+                            }
+                            // Pending/Escalated: still awaiting a decision.
+                            _ => {}
+                        },
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                item_id = %digest_id,
+                                "failed to poll digest status for remote resolution"
+                            );
+                        }
                     }
                 }
             }
@@ -3865,6 +4173,25 @@ async fn queue_and_wait(
                             allowed.insert(key.clone());
                         }
 
+                        // Approving a Control-class IPC socket additionally
+                        // mints the exe-bound `ipc-socket:` grant consumed by
+                        // the control-socket escalation guard (the broad
+                        // `net:` entry above is deliberately ignored by that
+                        // path — it is exe-blind). Not minted under
+                        // containment: post-contamination approvals must not
+                        // create durable artifacts.
+                        if !SessionStateRegistry::global()
+                            .is_containment_active(SessionScopeKey::from_session_id(ctx.session_id))
+                        {
+                            if let Some(grant) = ipc_socket_grant_key_for_ctx(ctx) {
+                                tracing::info!(
+                                    key = grant,
+                                    "session allowlist: exe-bound ipc-socket grant minted"
+                                );
+                                allowed.insert(grant);
+                            }
+                        }
+
                         // /tmp self-created subtree auto-allow: when the
                         // approved op is a top-level `/tmp/<name>` dir create
                         // (or file write/rename), also register a bare-path
@@ -3926,7 +4253,12 @@ async fn queue_and_wait(
                 session
                     .recent_approvals
                     .retain(|_, at| now.duration_since(*at) < window);
-                session.recent_approvals.insert(replay_key, now);
+                session.recent_approvals.insert(replay_key.clone(), now);
+            }
+            // Session-lifetime answer for Control-class connects — replayed
+            // by queue_and_wait even under containment (see the field doc).
+            if is_control_class_connect(ctx) {
+                session.control_socket_answers.insert(replay_key, true);
             }
             thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
         }
@@ -3983,7 +4315,13 @@ async fn queue_and_wait(
                 session
                     .recent_denials
                     .retain(|_, at| now.duration_since(*at) < window);
-                session.recent_denials.insert(replay_key, now);
+                session.recent_denials.insert(replay_key.clone(), now);
+            }
+            // Session-lifetime answer for Control-class connects. Only an
+            // EXPLICIT deny records — a timeout is not a human answer and
+            // must re-prompt next time.
+            if matches!(outcome, ReviewOutcome::Denied) && is_control_class_connect(ctx) {
+                session.control_socket_answers.insert(replay_key, false);
             }
             thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
             session.stats.total_denied += 1;
@@ -4031,7 +4369,22 @@ fn dispatch_supervisor_review_side_effects(
                     })
                     .unwrap_or_default();
 
-                for entry in approved_session_allowlist_entries(&ctx.call_type) {
+                // A Control-class IPC socket approval also persists the
+                // exe-bound `ipc-socket:` grant, so the [l] answer holds
+                // across sessions (the session-scoped `delegating-approved:`
+                // key cannot be persisted, and the `net:` entry is skipped by
+                // the enforcement path). Not minted under containment.
+                let ipc_grant = if SessionStateRegistry::global()
+                    .is_containment_active(SessionScopeKey::from_session_id(ctx.session_id))
+                {
+                    None
+                } else {
+                    ipc_socket_grant_key_for_ctx(ctx)
+                };
+                for entry in approved_session_allowlist_entries(&ctx.call_type)
+                    .into_iter()
+                    .chain(ipc_grant)
+                {
                     if crate::learned_rules::validate_persisted_rule(&entry).is_err() {
                         continue;
                     }
@@ -4693,9 +5046,121 @@ fn is_foreign_pts_write(call_type: &ToolCallType, path: &str, own_pts: Option<&s
 // the `authority_delegation` module, which owns their curated lists and the
 // enforcement escalation built on them.
 
+/// Classify a `NetConnect`/`NetListen` address for the proxy's
+/// [`UnixSocketClass`](grith_proxy::types::UnixSocketClass) label.
+///
+/// `Privileged` wins over `Control` (checked first): a daemon control
+/// socket must keep full network-grade scoring even if a marker ever
+/// overlaps. A leading `@` (abstract-namespace render) is stripped before
+/// the sensitive check so an abstract name mimicking a sensitive path
+/// classifies as `Privileged` — over-scoring an impostor is the fail-safe
+/// direction. Non-`unix:` addresses and the empty render
+/// (unnamed/autobind) carry no label.
+fn classify_unix_socket(address: &str) -> Option<grith_proxy::types::UnixSocketClass> {
+    let path = address.strip_prefix("unix:")?;
+    let bare = path.strip_prefix('@').unwrap_or(path);
+    if bare.is_empty() {
+        return None;
+    }
+    if is_sensitive_unix_socket(bare) {
+        return Some(grith_proxy::types::UnixSocketClass::Privileged);
+    }
+    if authority_delegation::is_control_injection_socket(address) {
+        return Some(grith_proxy::types::UnixSocketClass::Control);
+    }
+    None
+}
+
+/// Durable, client-bound grant key for a Control-class IPC socket connect:
+/// `ipc-socket:<rendered address>|<canonical client exe>`.
+///
+/// Binding to the connecting binary's `/proc/<pid>/exe` is what makes the
+/// grant strictly narrower than the session-scoped `delegating-approved:`
+/// key it complements: approving `gh`'s session-bus keyring read must not
+/// cover an in-process D-Bus payload inside `node` — same socket, different
+/// client. Returns `None` (→ no grant, always prompt) for anything that is
+/// not an unpermitted control socket, for Privileged daemon sockets
+/// (deliberately un-grantable), and whenever the client exe cannot be
+/// resolved — including a deleted/replaced binary, whose readlink renders
+/// with a ` (deleted)` suffix.
+fn ipc_socket_grant_key_parts(address: &str, pid: u64) -> Option<String> {
+    let path = address.strip_prefix("unix:")?;
+    let bare = path.strip_prefix('@').unwrap_or(path);
+    if bare.is_empty() || is_sensitive_unix_socket(bare) {
+        return None;
+    }
+    if !authority_delegation::is_control_injection_socket(address) {
+        return None;
+    }
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let exe = exe.to_str()?;
+    if exe.ends_with(" (deleted)") {
+        return None;
+    }
+    Some(format!("ipc-socket:{address}|{exe}"))
+}
+
+/// True when a connect to `address` is covered by D-Bus message inspection,
+/// so the *connection* is no longer the enforcement point.
+///
+/// The connect is still scored and audited; what changes is that it is not
+/// escalated to a prompt, because the authority it might carry is decided per
+/// method call instead (see [`crate::dbus`]). Only D-Bus endpoints qualify —
+/// X11, tmux and screen carry no per-message destination and keep
+/// connect-time enforcement.
+///
+/// Deliberately does not consult the profile permit list: an address the
+/// operator already permitted is not escalated anyway, and adding the check
+/// here would only duplicate it.
+fn dbus_inspection_covers(loop_ctx: &SupervisorLoopContext, address: &str) -> bool {
+    // `dbus_inspection_armed`, not the config flag: the interceptor confirmed
+    // at session start that it can see this session's bus writes. Trusting the
+    // config alone would suppress the connect-time prompt in a session where
+    // nothing downstream is watching.
+    loop_ctx.dbus_inspection_armed && crate::dbus::is_dbus_socket(address)
+}
+
+/// True when `ctx` is a `NetConnect` the supervisor labelled Control-class
+/// (session D-Bus, X11, tmux/screen) — the calls covered by the
+/// session-lifetime `control_socket_answers` replay.
+fn is_control_class_connect(ctx: &ToolCallContext) -> bool {
+    matches!(
+        ctx.call_type,
+        grith_proxy::types::ToolCallType::NetConnect { .. }
+    ) && matches!(
+        ctx.unix_socket_class(),
+        Some(grith_proxy::types::UnixSocketClass::Control)
+    )
+}
+
+/// True when the taint or session-containment filter contributed to this
+/// decision.
+///
+/// Consumed by the `--allow-queued` (`InteractiveQueueAction::Log`) branch,
+/// which auto-allows queued calls in a headless session. Those two filters do
+/// not report ordinary policy friction — they report that this session has
+/// already read something sensitive or been contained — so a blanket
+/// throughput flag must not clear them.
+fn contamination_signalled(decision: &grith_proxy::types::ProxyDecision) -> bool {
+    decision
+        .filter_results
+        .iter()
+        .any(|r| r.matched && matches!(r.filter_name.as_str(), "taint" | "session-containment"))
+}
+
+/// [`ipc_socket_grant_key_parts`] for a built proxy context (the connect's
+/// `pid` is stamped into `ctx.arguments` by `supervisor_event_arguments`).
+fn ipc_socket_grant_key_for_ctx(ctx: &ToolCallContext) -> Option<String> {
+    let grith_proxy::types::ToolCallType::NetConnect { address, .. } = &ctx.call_type else {
+        return None;
+    };
+    let pid = ctx.arguments.get("pid")?.as_u64()?;
+    ipc_socket_grant_key_parts(address, pid)
+}
+
 /// Returns `true` if `path` is a sensitive Unix socket that grants container
 /// runtime control and must not be silently allowed.
-fn is_sensitive_unix_socket(path: &str) -> bool {
+pub(crate) fn is_sensitive_unix_socket(path: &str) -> bool {
     if SENSITIVE_UNIX_SOCKETS.contains(&path) {
         return true;
     }
@@ -5850,6 +6315,12 @@ fn supervisor_event_arguments(
         ToolCallType::NetListen { address, port } | ToolCallType::NetConnect { address, port } => {
             obj.insert("address".into(), serde_json::json!(address));
             obj.insert("port".into(), serde_json::json!(port));
+            if let Some(class) = classify_unix_socket(address) {
+                obj.insert(
+                    grith_proxy::types::UnixSocketClass::KEY.into(),
+                    serde_json::json!(class.as_str()),
+                );
+            }
         }
         ToolCallType::ProcessSpawn { command, args } => {
             obj.insert("command".into(), serde_json::json!(command));
@@ -5929,6 +6400,23 @@ fn supervisor_event_arguments(
         ToolCallType::NamespaceOp { syscall, flags } => {
             obj.insert("ns_syscall".into(), serde_json::json!(syscall));
             obj.insert("ns_flags".into(), serde_json::json!(format!("{flags:#x}")));
+        }
+        ToolCallType::DbusMethodCall {
+            socket,
+            destination,
+            interface,
+            member,
+        } => {
+            obj.insert("address".into(), serde_json::json!(socket));
+            if let Some(d) = destination {
+                obj.insert("dbus_destination".into(), serde_json::json!(d));
+            }
+            if let Some(i) = interface {
+                obj.insert("dbus_interface".into(), serde_json::json!(i));
+            }
+            if let Some(m) = member {
+                obj.insert("dbus_member".into(), serde_json::json!(m));
+            }
         }
     }
 
@@ -6967,6 +7455,83 @@ mod tests {
     }
 
     #[test]
+    fn classify_unix_socket_two_class_whitelist() {
+        use grith_proxy::types::UnixSocketClass::{Control, Privileged};
+        // Privileged: daemon control sockets, pathname and abstract render.
+        // An abstract name mimicking a sensitive path classifies Privileged
+        // (over-scoring an impostor is the fail-safe direction).
+        assert_eq!(
+            classify_unix_socket("unix:/var/run/docker.sock"),
+            Some(Privileged)
+        );
+        assert_eq!(
+            classify_unix_socket("unix:@/var/run/docker.sock"),
+            Some(Privileged)
+        );
+        assert_eq!(
+            classify_unix_socket("unix:/run/user/1000/systemd/private"),
+            Some(Privileged)
+        );
+        // Control: desktop control-injection IPC.
+        assert_eq!(
+            classify_unix_socket("unix:/run/user/1000/bus"),
+            Some(Control)
+        );
+        assert_eq!(
+            classify_unix_socket("unix:@/tmp/.X11-unix/X1"),
+            Some(Control)
+        );
+        assert_eq!(
+            classify_unix_socket("unix:/tmp/tmux-1000/default"),
+            Some(Control)
+        );
+        // Whitelist: anything else — plain unix sockets, the empty
+        // unnamed/autobind render, non-unix addresses — carries no label
+        // and keeps pre-classification scoring.
+        assert_eq!(classify_unix_socket("unix:/run/user/1000/app.sock"), None);
+        assert_eq!(classify_unix_socket("unix:"), None);
+        assert_eq!(classify_unix_socket("unix:@"), None);
+        assert_eq!(classify_unix_socket("192.0.2.1"), None);
+        assert_eq!(classify_unix_socket("example.com"), None);
+    }
+
+    /// The grant key binds (socket address, client exe). Own pid resolves
+    /// the test binary's exe; control sockets mint, privileged and
+    /// unclassified sockets and dead pids never do.
+    #[test]
+    fn ipc_socket_grant_key_binds_socket_and_exe() {
+        let pid = u64::from(std::process::id());
+        let own_exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let own_exe = own_exe.to_str().unwrap();
+
+        let key = ipc_socket_grant_key_parts("unix:/run/user/1000/bus", pid)
+            .expect("control socket + live pid must mint");
+        assert_eq!(key, format!("ipc-socket:unix:/run/user/1000/bus|{own_exe}"));
+
+        let abstract_key = ipc_socket_grant_key_parts("unix:@/tmp/.X11-unix/X1", pid)
+            .expect("abstract control socket must mint");
+        assert!(abstract_key.starts_with("ipc-socket:unix:@/tmp/.X11-unix/X1|"));
+
+        // Privileged, unclassified, and non-unix addresses never mint.
+        assert_eq!(
+            ipc_socket_grant_key_parts("unix:/var/run/docker.sock", pid),
+            None
+        );
+        assert_eq!(
+            ipc_socket_grant_key_parts("unix:/run/user/1000/systemd/private", pid),
+            None
+        );
+        assert_eq!(ipc_socket_grant_key_parts("unix:/tmp/app.sock", pid), None);
+        assert_eq!(ipc_socket_grant_key_parts("192.0.2.1", pid), None);
+
+        // A pid whose /proc entry cannot be read fails toward no grant.
+        assert_eq!(
+            ipc_socket_grant_key_parts("unix:/run/user/1000/bus", u64::MAX),
+            None
+        );
+    }
+
+    #[test]
     fn sensitive_unix_socket_helper_matches_all_known_paths() {
         // Direct unit test of the helper independent of the address format.
         assert!(is_sensitive_unix_socket("/var/run/docker.sock"));
@@ -7406,6 +7971,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
@@ -7486,6 +8052,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
@@ -7654,6 +8221,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
@@ -7907,6 +8475,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
@@ -9141,9 +9710,76 @@ mod tests {
     }
 
     /// Drive a single event through `handle_syscall_event` in Log queue-mode
+    fn decision_with_filters(filters: &[(&str, bool)]) -> grith_proxy::types::ProxyDecision {
+        let mut d = grith_proxy::types::ProxyDecision {
+            action: grith_proxy::types::ProxyAction::Queue {
+                priority: grith_proxy::types::QueuePriority::Medium,
+            },
+            composite_score: 4.0,
+            filter_results: Vec::new(),
+            decision_reason: "test".to_string(),
+            evaluation_time: Duration::from_millis(0),
+        };
+        for (name, matched) in filters {
+            d.filter_results.push(grith_proxy::types::FilterResult {
+                filter_name: (*name).to_string(),
+                matched: *matched,
+                score: if *matched { 3.0 } else { 0.0 },
+                rule_id: "test-rule".to_string(),
+                severity: grith_proxy::types::Severity::Warning,
+                message: String::new(),
+                metadata: std::collections::HashMap::new(),
+            });
+        }
+        d
+    }
+
+    /// `--allow-queued` trades safety for throughput on ordinary queued calls.
+    /// Taint and containment are not ordinary: they mean the session has
+    /// already touched something sensitive, so they must not be waved through.
+    #[test]
+    fn contamination_signalled_detects_taint_and_containment() {
+        assert!(contamination_signalled(&decision_with_filters(&[(
+            "taint", true
+        )])));
+        assert!(contamination_signalled(&decision_with_filters(&[(
+            "session-containment",
+            true
+        )])));
+        // Mixed: one ordinary filter alongside a contamination signal.
+        assert!(contamination_signalled(&decision_with_filters(&[
+            ("egress-policy", true),
+            ("taint", true),
+        ])));
+    }
+
+    /// Ordinary policy friction is exactly what the flag is for.
+    #[test]
+    fn contamination_signalled_ignores_ordinary_filters() {
+        assert!(!contamination_signalled(&decision_with_filters(&[
+            ("egress-policy", true),
+            ("operation-risk", true),
+        ])));
+        assert!(!contamination_signalled(&decision_with_filters(&[])));
+    }
+
+    /// A filter that ran but did not match contributed nothing and must not
+    /// suppress the flag — every filter appears in `filter_results`.
+    #[test]
+    fn contamination_signalled_requires_an_actual_match() {
+        assert!(!contamination_signalled(&decision_with_filters(&[
+            ("taint", false),
+            ("session-containment", false),
+        ])));
+    }
+
     /// (so a QUEUE escalation is allowed-and-counted rather than freezing on
     /// the `PanicReviewer`) with an all-allow proxy, so the ONLY thing that can
     /// produce a QUEUE is the supervisor-side authority-delegation escalation.
+    /// Run one event through the delegation path with D-Bus message inspection
+    /// **off**, so the case under test is connect-time enforcement itself.
+    /// D-Bus cases that need the shipped default use
+    /// [`run_delegation_event_with_dbus_inspection`].
     async fn run_delegation_event(
         event: SyscallEvent,
         enforce_spawn: bool,
@@ -9152,11 +9788,66 @@ mod tests {
         permit_control_sockets: Vec<String>,
         session_allowed_seed: Vec<String>,
     ) -> DelegationOutcome {
+        run_delegation_event_with_dbus_inspection(
+            event,
+            enforce_spawn,
+            enforce_control_socket,
+            permit_authority_delegating,
+            permit_control_sockets,
+            session_allowed_seed,
+            false,
+        )
+        .await
+    }
+
+    /// Run one event with a caller-supplied proxy, so a case can assert a
+    /// score-driven decision rather than an escalation. Everything else in the
+    /// harness is unchanged.
+    async fn run_delegation_event_with_proxy(
+        event: SyscallEvent,
+        proxy: Arc<SecurityProxy>,
+    ) -> DelegationOutcome {
+        run_delegation_event_inner(event, false, true, vec![], vec![], vec![], true, proxy).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_delegation_event_with_dbus_inspection(
+        event: SyscallEvent,
+        enforce_spawn: bool,
+        enforce_control_socket: bool,
+        permit_authority_delegating: Vec<String>,
+        permit_control_sockets: Vec<String>,
+        session_allowed_seed: Vec<String>,
+        dbus_message_inspection: bool,
+    ) -> DelegationOutcome {
+        run_delegation_event_inner(
+            event,
+            enforce_spawn,
+            enforce_control_socket,
+            permit_authority_delegating,
+            permit_control_sockets,
+            session_allowed_seed,
+            dbus_message_inspection,
+            allow_only_proxy(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_delegation_event_inner(
+        event: SyscallEvent,
+        enforce_spawn: bool,
+        enforce_control_socket: bool,
+        permit_authority_delegating: Vec<String>,
+        permit_control_sockets: Vec<String>,
+        session_allowed_seed: Vec<String>,
+        dbus_message_inspection: bool,
+        proxy: Arc<SecurityProxy>,
+    ) -> DelegationOutcome {
         let pid = event.pid;
         let (mock, state) = MockInterceptor::new(vec![event.clone()]);
         let mut interceptor: Box<dyn SyscallInterceptor> = Box::new(mock);
         let mut session = SupervisorSession::new("mock-tool", pid);
-        let proxy = allow_only_proxy();
         let audit_storage = Arc::new(Mutex::new(
             grith_audit::AuditStorage::open_in_memory().unwrap(),
         ));
@@ -9176,6 +9867,7 @@ mod tests {
         config.interactive_queue_action = crate::config::InteractiveQueueAction::Log;
         config.enforce_authority_delegating_spawn = enforce_spawn;
         config.enforce_control_socket_connect = enforce_control_socket;
+        config.dbus_message_inspection = dbus_message_inspection;
         let loop_ctx = SupervisorLoopContext {
             proxy: &proxy,
             audit_sink,
@@ -9208,6 +9900,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating,
             permit_control_sockets,
+            dbus_inspection_armed: dbus_message_inspection,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
@@ -9250,6 +9943,67 @@ mod tests {
                 ],
             },
         )
+    }
+
+    fn dbus_method_call_event(pid: u32, member: &str) -> SyscallEvent {
+        sample_phase_a_event(
+            pid,
+            crate::platform::linux::syscall_nr::WRITE,
+            SyscallKind::DbusMethodCall {
+                socket: "unix:/run/user/1000/bus".into(),
+                destination: Some("org.freedesktop.systemd1".into()),
+                interface: Some("org.freedesktop.systemd1.Manager".into()),
+                member: Some(member.into()),
+                path: Some("/org/freedesktop/systemd1".into()),
+            },
+        )
+    }
+
+    /// The end-to-end assertion for the moved enforcement point: an escalated
+    /// D-Bus method call must reach the proxy, be scored by `operation-risk`,
+    /// and land in the QUEUE band. Every other piece of this feature is worth
+    /// nothing if the call the supervisor refuses gets auto-allowed here — and
+    /// `to_tool_call_type`'s catch-all makes that the default failure mode.
+    ///
+    /// Uses a registry with the real `operation-risk` filter rather than the
+    /// empty `allow_only_proxy`, because the QUEUE has to come from the score,
+    /// not from an escalation.
+    #[tokio::test]
+    async fn escalated_dbus_method_call_queues_through_the_proxy() {
+        let mut registry = FilterRegistry::new();
+        registry.register(Box::new(
+            grith_proxy::filters::operation_risk::OperationRiskFilter::new(),
+        ));
+        let proxy = Arc::new(SecurityProxy::new(
+            registry,
+            ScoringConfig::default(),
+            MetaRuleEngine::new(vec![]),
+        ));
+        let out = run_delegation_event_with_proxy(
+            dbus_method_call_event(9120, "StartTransientUnit"),
+            proxy,
+        )
+        .await;
+        assert_eq!(
+            out.total_filtered_noise, 0,
+            "a decoded method call is never noise"
+        );
+        assert_eq!(
+            out.total_queued, 1,
+            "an undeclared D-Bus method call must QUEUE for review"
+        );
+
+        // Negative control, so the assertion above cannot pass vacuously: with
+        // no filters registered the same event is allowed. The QUEUE therefore
+        // came from `operation-risk` scoring the mapped `ToolCallType`, which
+        // is exactly the link that would break if the variant ever fell into
+        // `to_tool_call_type`'s auto-allow catch-all.
+        let unscored = run_delegation_event_with_proxy(
+            dbus_method_call_event(9121, "StartTransientUnit"),
+            allow_only_proxy(),
+        )
+        .await;
+        assert_eq!(unscored.total_queued, 0);
     }
 
     fn connect_event(pid: u32, address: &str) -> SyscallEvent {
@@ -9333,8 +10087,12 @@ mod tests {
         // The load-bearing assertion: the connect must NOT be swallowed by the
         // local-IPC noise auto-allow (total_filtered_noise stays 0) and must
         // instead reach the proxy and QUEUE.
+        //
+        // X11 rather than the session bus: X11 carries no per-message
+        // destination, so the connect stays the enforcement point for it under
+        // every configuration. The D-Bus behaviour is covered separately below.
         let out = run_delegation_event(
-            connect_event(9105, "unix:/run/user/1000/bus"),
+            connect_event(9105, "unix:/tmp/.X11-unix/X0"),
             false,
             true,
             vec![],
@@ -9348,6 +10106,84 @@ mod tests {
         );
         assert_eq!(out.total_queued, 1, "control socket connect must QUEUE");
         assert_eq!(out.allow_pids, vec![9105]);
+    }
+
+    #[tokio::test]
+    async fn dbus_connect_still_queues_with_inspection_disabled() {
+        // Turning message inspection off must restore the pre-inspection
+        // behaviour exactly — this is the emergency-rollback contract.
+        let out = run_delegation_event(
+            connect_event(9115, "unix:/run/user/1000/bus"),
+            false,
+            true,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(out.total_filtered_noise, 0);
+        assert_eq!(out.total_queued, 1, "session bus connect must QUEUE");
+        assert_eq!(out.allow_pids, vec![9115]);
+    }
+
+    #[tokio::test]
+    async fn dbus_connect_is_scored_but_not_queued_when_inspection_armed() {
+        // The fix for the `gh auth token` prompt. Under the shipped default the
+        // connect is still kept out of the local-IPC auto-allow — so it is
+        // scored and audited exactly as before — but it no longer escalates,
+        // because the authority it might carry is judged per method call.
+        let out = run_delegation_event_with_dbus_inspection(
+            connect_event(9116, "unix:/run/user/1000/bus"),
+            false,
+            true,
+            vec![],
+            vec![],
+            vec![],
+            true,
+        )
+        .await;
+        assert_eq!(
+            out.total_filtered_noise, 0,
+            "the connect must still reach the proxy so it is scored and audited"
+        );
+        assert_eq!(
+            out.total_queued, 0,
+            "an inspected D-Bus connect must not prompt"
+        );
+        assert_eq!(out.allow_pids, vec![9116]);
+    }
+
+    #[tokio::test]
+    async fn x11_still_queues_while_dbus_inspection_is_armed() {
+        // Inspection must narrow only what it can actually decode. An X11
+        // connect has no per-message destination, so it keeps connect-time
+        // enforcement even with the D-Bus flag on.
+        let out = run_delegation_event_with_dbus_inspection(
+            connect_event(9117, "unix:/tmp/.X11-unix/X0"),
+            false,
+            true,
+            vec![],
+            vec![],
+            vec![],
+            true,
+        )
+        .await;
+        assert_eq!(out.total_queued, 1, "X11 connect must still QUEUE");
+    }
+
+    #[tokio::test]
+    async fn tmux_still_queues_while_dbus_inspection_is_armed() {
+        let out = run_delegation_event_with_dbus_inspection(
+            connect_event(9118, "unix:/tmp/tmux-1000/default"),
+            false,
+            true,
+            vec![],
+            vec![],
+            vec![],
+            true,
+        )
+        .await;
+        assert_eq!(out.total_queued, 1, "tmux connect must still QUEUE");
     }
 
     #[tokio::test]
@@ -9529,6 +10365,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
@@ -9644,6 +10481,7 @@ mod tests {
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
             permit_control_sockets: Vec::new(),
+            dbus_inspection_armed: false,
             authority_delegating_pins: authority_delegation::AuthorityDelegatingPins::empty(),
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),

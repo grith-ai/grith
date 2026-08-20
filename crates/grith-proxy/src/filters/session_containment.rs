@@ -5,7 +5,7 @@
 
 use crate::filters::{FilterPhase, SecurityFilter};
 use crate::scoring::severity_for;
-use crate::types::{FilterResult, TaintLevel, ToolCallContext, ToolCallType};
+use crate::types::{FilterResult, TaintLevel, ToolCallContext, ToolCallType, UnixSocketClass};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -262,6 +262,25 @@ impl SessionContainmentFilter {
         };
 
         let result = match &ctx.call_type {
+            // Control-class unix sockets (session D-Bus, X11, tmux/screen)
+            // under containment: local IPC, not the egress channel this
+            // filter exists to slow down. The full network_score stacked
+            // with the taint sink to push `gh`'s keyring read and xclip
+            // past auto-deny in contained sessions (the v0.2.5 silent-deny
+            // regression). 2.0 keeps the access visible and review-worthy
+            // in aggregate without ever feeding an auto-deny — the same
+            // reasoning as the routine-spawn carveout below.
+            ToolCallType::NetConnect { .. }
+                if matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control)) =>
+            {
+                FilterResult::matched(
+                    "session-containment",
+                    "contained-local-ipc-egress",
+                    2.0,
+                    severity_for(2.0),
+                    mk_message("local control-injection IPC"),
+                )
+            }
             ToolCallType::HttpRequest { .. } | ToolCallType::NetConnect { .. } => {
                 let severity = severity_for(self.network_score);
                 FilterResult::matched(
@@ -378,6 +397,79 @@ mod tests {
             matched_routine_root: None,
             is_outbound_capable,
         }
+    }
+
+    /// Build a NetConnect ctx over a unix socket, optionally class-labelled.
+    fn unix_connect(session: Uuid, address: &str, class: Option<&str>) -> ToolCallContext {
+        let mut ctx = make_ctx(
+            session,
+            ToolCallType::NetConnect {
+                address: address.into(),
+                port: 0,
+            },
+        );
+        if let Some(class) = class {
+            ctx.arguments = serde_json::json!({ UnixSocketClass::KEY: class });
+        }
+        ctx
+    }
+
+    /// Arm containment, then: a Control-class connect takes the 2.0 local-IPC
+    /// carveout; Privileged and unlabelled unix connects keep the full
+    /// network_score (regression guards).
+    #[tokio::test]
+    async fn contained_control_socket_takes_local_ipc_carveout() {
+        let (filter, _t) = SessionContainmentFilter::with_defaults();
+        let sid = Uuid::new_v4();
+        let now = Instant::now();
+        let _ = filter
+            .evaluate_at(
+                &make_ctx(
+                    sid,
+                    ToolCallType::FileRead {
+                        path: "/home/u/.ssh/id_rsa".into(),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+
+        let control = filter
+            .evaluate_at(
+                &unix_connect(sid, "unix:/run/user/1000/bus", Some("control")),
+                later,
+            )
+            .unwrap();
+        assert!(control.matched);
+        assert_eq!(control.rule_id, "contained-local-ipc-egress");
+        assert_eq!(control.score, 2.0);
+
+        for (address, class) in [
+            ("unix:/var/run/docker.sock", Some("privileged")),
+            ("unix:/tmp/whatever.sock", None),
+        ] {
+            let result = filter
+                .evaluate_at(&unix_connect(sid, address, class), later)
+                .unwrap();
+            assert!(result.matched, "{address} must stay contained");
+            assert_eq!(result.rule_id, "contained-network-egress");
+            assert_eq!(result.score, 4.5, "{address} must keep network_score");
+        }
+    }
+
+    /// Without containment armed, the Control carveout contributes nothing.
+    #[tokio::test]
+    async fn control_socket_no_match_without_containment() {
+        let (filter, _t) = SessionContainmentFilter::with_defaults();
+        let sid = Uuid::new_v4();
+        let result = filter
+            .evaluate_at(
+                &unix_connect(sid, "unix:/run/user/1000/bus", Some("control")),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(!result.matched);
     }
 
     // Arm containment, then assert ProcessSpawn is penalised ONLY when the

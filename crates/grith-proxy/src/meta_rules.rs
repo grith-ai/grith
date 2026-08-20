@@ -127,6 +127,7 @@ impl MetaRuleEngine {
                 ToolCallType::FilesystemMutation { .. } => "FilesystemMutation",
                 ToolCallType::CrossProcessAccess { .. } => "CrossProcessAccess",
                 ToolCallType::NamespaceOp { .. } => "NamespaceOp",
+                ToolCallType::DbusMethodCall { .. } => "DbusMethodCall",
             };
             if actual_type != expected_type {
                 return false;

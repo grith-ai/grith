@@ -28,13 +28,11 @@ const FEATURE_MATRIX: FeatureRow[] = [
   { name: "Digest Review", key: "digest", community: true, pro: true, enterprise: true },
   { name: "Dashboard", key: "dashboard", community: true, pro: true, enterprise: true },
   { name: "Supervisor", key: "supervisor", community: true, pro: true, enterprise: true },
-  { name: "Adaptive Scoring", key: "adaptive_scoring", community: false, pro: true, enterprise: true },
   { name: "Notification Channels", key: "notification_channels", community: false, pro: true, enterprise: true },
   { name: "Usage Analytics", key: "usage_analytics", community: false, pro: true, enterprise: true },
   { name: "Cloud Sync", key: "cloud_sync", community: false, pro: true, enterprise: true },
   { name: "Policy Editor", key: "policy_editor", community: false, pro: true, enterprise: true },
   { name: "PagerDuty", key: "pagerduty", community: false, pro: false, enterprise: true },
-  { name: "Team Scope", key: "team_scope", community: false, pro: false, enterprise: true },
 ];
 
 export function BillingPage() {

@@ -332,13 +332,12 @@ async fn handle_queued_call(
         );
     }
 
-    // Fire notification on configured channels
-    if let Err(e) = notification_dispatcher
-        .notify_permission_request(&digest_item)
-        .await
-    {
-        tracing::warn!(error = %e, "failed to send permission request notification");
-    }
+    // The daemon's notification scan (NotificationDispatcher::spawn_background_tasks)
+    // is the single owner of channel delivery: it watches the shared digest queue
+    // and sends the permission-request notification for every pending item, from
+    // BOTH the built-in agent and the CLI supervisor. Notifying here as well would
+    // double-fire (and only ever covered the agent path), so it is intentionally
+    // not done inline.
 
     // Interactive inline review (shows detail + key prompt in terminal)
     let outcome = grith_cli::run_inline_review(digest_queue, &digest_item, review_timeout).await;
@@ -996,6 +995,12 @@ pub async fn execute_operation(
         | grith_proxy::types::ToolCallType::CrossProcessAccess { .. }
         | grith_proxy::types::ToolCallType::NamespaceOp { .. } => {
             "PR 6 syscall-interception shape not executable from the agent path".into()
+        }
+        // Decoded from a supervised tool's write to a D-Bus socket. Like the
+        // shapes above it only exists on the interception path — the built-in
+        // agent has no bus connection to write to.
+        grith_proxy::types::ToolCallType::DbusMethodCall { .. } => {
+            "D-Bus method call not executable from the agent path".into()
         }
     }
 }

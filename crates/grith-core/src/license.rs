@@ -1626,7 +1626,7 @@ mod tests {
         assert_eq!(gate.tier, PlanTier::Community);
         assert!(gate.allows("proxy"));
         assert!(gate.allows("dashboard"));
-        assert!(!gate.allows("adaptive_scoring"));
+        assert!(!gate.allows("notification_channels"));
         assert!(!gate.allows("policy_editor"));
         assert!(!gate.allows("unknown_feature"));
     }
@@ -1637,9 +1637,9 @@ mod tests {
         let gate = feature_gate_from_status(&LicenseStatus::Valid(lic));
         assert_eq!(gate.tier, PlanTier::Pro);
         assert!(gate.allows("proxy"));
-        assert!(gate.allows("adaptive_scoring"));
         assert!(gate.allows("notification_channels"));
         assert!(gate.allows("usage_analytics"));
+        assert!(gate.allows("cloud_sync"));
         assert!(gate.allows("policy_editor"));
         assert!(!gate.allows("pagerduty"));
     }
@@ -1650,10 +1650,9 @@ mod tests {
         let gate = feature_gate_from_status(&LicenseStatus::Valid(lic));
         assert_eq!(gate.tier, PlanTier::Enterprise);
         assert!(gate.allows("proxy"));
-        assert!(gate.allows("adaptive_scoring"));
         assert!(gate.allows("policy_editor"));
         assert!(gate.allows("pagerduty"));
-        assert!(gate.allows("team_scope"));
+        assert!(gate.allows("opsgenie"));
     }
 
     #[test]
@@ -1705,8 +1704,8 @@ mod tests {
         let gate = feature_gate_from_status(&LicenseStatus::NotFound);
         let list = gate.feature_list();
         assert!(
-            list.len() >= 18,
-            "expected at least 18 features, got {}",
+            list.len() >= 13,
+            "expected at least 13 features, got {}",
             list.len()
         );
         // All core features should be enabled for community
@@ -1716,8 +1715,18 @@ mod tests {
             .collect();
         assert!(core_enabled.iter().all(|(_, enabled)| *enabled));
         // Pro features should be disabled for community
-        let adaptive = list.iter().find(|(f, _)| *f == "adaptive_scoring").unwrap();
-        assert!(!adaptive.1);
+        let pro_feature = list
+            .iter()
+            .find(|(f, _)| *f == "notification_channels")
+            .unwrap();
+        assert!(!pro_feature.1);
+        // Retired/unbuilt features must not be advertised any more.
+        for retired in ["adaptive_scoring", "extended_retention", "sso"] {
+            assert!(
+                !list.iter().any(|(f, _)| *f == retired),
+                "{retired} should no longer appear in the feature list"
+            );
+        }
     }
 
     // --- Provider key encryption tests ---

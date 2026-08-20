@@ -5,7 +5,7 @@
 
 use crate::filters::{FilterPhase, SecurityFilter};
 use crate::scoring::severity_for;
-use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType};
+use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType, UnixSocketClass};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -833,6 +833,30 @@ impl SecurityFilter for EgressPolicyFilter {
                         format!("Raw socket ({address}): can exfiltrate data bypassing IP stack"),
                     ));
                 }
+                // Control-class unix sockets (session D-Bus, X11, tmux/screen)
+                // are desktop IPC, not network egress: `gh auth token` reads
+                // the keyring over /run/user/<uid>/bus and xclip talks to X11,
+                // and scoring their socket paths as unknown outbound hostnames
+                // produced the v0.2.5 QUEUE/DENY regression. Review pressure
+                // for these sockets is owned by the supervisor's control-socket
+                // escalation, which can see the connecting binary; this filter
+                // contributes 0.0 — visible in the audit trail, never in the
+                // score. The message renders the original-case address (the
+                // destination parser below lowercases, which is how operators
+                // ended up reading `unix:@/tmp/.x11-unix/x1`). Deliberately an
+                // explicit `Control` match: Privileged daemon sockets
+                // (docker.sock, systemd/private) and unlabelled unix paths keep
+                // the full destination scoring below, so a labelling bug fails
+                // toward review.
+                if matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control)) {
+                    return Ok(FilterResult::matched(
+                        "egress-policy",
+                        "local-ipc-socket",
+                        0.0,
+                        Severity::Notice,
+                        format!("Local IPC socket (desktop control class): {address}"),
+                    ));
+                }
                 // Ambiguous shared-IP DNS attribution renders the address as
                 // a JSON hostname array (`["a.example","b.example"]`): the IP
                 // is shared CDN infrastructure and the tenant actually reached
@@ -892,6 +916,22 @@ impl SecurityFilter for EgressPolicyFilter {
                 //
                 // The OpenClaw-specific arm was a precursor to this matrix;
                 // we now apply the same gating across every profile.
+                // Control-class unix binds mirror the NetConnect carveout
+                // above. Today these never reach the proxy (the supervisor
+                // auto-allows non-sensitive unix binds as local IPC), so this
+                // is defensive: if a future supervisor change routes them
+                // here, a control-socket bind must not score +5.0 as a
+                // "specific non-loopback interface". Explicit `Control` match
+                // — a Privileged unix bind keeps the full path below.
+                if matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control)) {
+                    return Ok(FilterResult::matched(
+                        "egress-policy",
+                        "local-ipc-listen",
+                        0.0,
+                        Severity::Notice,
+                        format!("Local IPC listener (desktop control class): {address}"),
+                    ));
+                }
                 let is_loopback = is_loopback_bind_address(address);
                 let is_wildcard = is_wildcard_bind_address(address);
                 if !is_loopback {
@@ -1590,6 +1630,109 @@ mod tests {
             "crates.io".into(),
         ];
         EgressPolicyFilter::from_config(cfg)
+    }
+
+    /// Helper: a NetConnect/NetListen ctx over a unix socket, optionally
+    /// carrying the supervisor's class label.
+    fn unix_ctx(call_type: ToolCallType, class: Option<&str>) -> ToolCallContext {
+        let mut ctx = make_ctx(call_type);
+        if let Some(class) = class {
+            ctx.arguments = serde_json::json!({ UnixSocketClass::KEY: class });
+        }
+        ctx
+    }
+
+    /// Control-class sockets contribute 0.0 under a dedicated rule id, and
+    /// the message preserves the original-case address (the destination
+    /// parser lowercases, which is how operators used to read
+    /// `unix:@/tmp/.x11-unix/x1`).
+    #[tokio::test]
+    async fn control_class_connect_scores_zero_local_ipc() {
+        let filter = filter_with_trusted();
+        let result = filter
+            .evaluate(&unix_ctx(
+                ToolCallType::NetConnect {
+                    address: "unix:@/tmp/.X11-unix/X1".into(),
+                    port: 0,
+                },
+                Some("control"),
+            ))
+            .await
+            .unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "local-ipc-socket");
+        assert_eq!(result.score, 0.0);
+        assert!(
+            result.message.contains("unix:@/tmp/.X11-unix/X1"),
+            "message must preserve original case: {}",
+            result.message
+        );
+    }
+
+    /// Regression guards: Privileged daemon sockets and UNLABELLED unix
+    /// paths keep unknown-destination scoring — an absent or buggy label
+    /// must fail toward review, never toward a silent allow. This pair is
+    /// the test whose absence let socket paths score as hostnames
+    /// unnoticed.
+    #[tokio::test]
+    async fn privileged_and_unlabelled_connects_keep_unknown_destination() {
+        let filter = filter_with_trusted();
+        for (address, class) in [
+            ("unix:/var/run/docker.sock", Some("privileged")),
+            ("unix:/run/user/1000/systemd/private", Some("privileged")),
+            ("unix:/tmp/whatever.sock", None),
+        ] {
+            let result = filter
+                .evaluate(&unix_ctx(
+                    ToolCallType::NetConnect {
+                        address: address.into(),
+                        port: 0,
+                    },
+                    class,
+                ))
+                .await
+                .unwrap();
+            assert!(result.matched, "{address} must still match");
+            assert_eq!(
+                result.rule_id, "unknown-destination",
+                "{address} must keep unknown-destination"
+            );
+            assert_eq!(result.score, 3.5, "{address} must keep the review score");
+        }
+    }
+
+    /// Control-class listens take the defensive 0.0 rule; a Privileged unix
+    /// listen keeps today's bind-shape scoring (specific-iface-bind 5.0).
+    #[tokio::test]
+    async fn listen_arm_respects_unix_socket_class() {
+        let filter = filter_with_trusted();
+        let control = filter
+            .evaluate(&unix_ctx(
+                ToolCallType::NetListen {
+                    address: "unix:/run/user/1000/bus".into(),
+                    port: 0,
+                },
+                Some("control"),
+            ))
+            .await
+            .unwrap();
+        assert!(control.matched);
+        assert_eq!(control.rule_id, "local-ipc-listen");
+        assert_eq!(control.score, 0.0);
+
+        let privileged = filter
+            .evaluate(&unix_ctx(
+                ToolCallType::NetListen {
+                    address: "unix:/var/run/docker.sock".into(),
+                    port: 0,
+                },
+                Some("privileged"),
+            ))
+            .await
+            .unwrap();
+        assert!(privileged.matched);
+        assert_eq!(privileged.rule_id, "specific-iface-bind");
+        assert_eq!(privileged.score, 5.0);
     }
 
     /// Regression: rustc invocations contain `incremental` (substring `nc`),

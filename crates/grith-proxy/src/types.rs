@@ -114,6 +114,60 @@ pub struct ListenerPolicyMatch {
     pub desc: String,
 }
 
+/// Classification of a unix-domain socket target, stamped by the
+/// supervisor into `ToolCallContext.arguments["unix_socket_class"]`
+/// (via [`UnixSocketClass::KEY`]) and consumed by the filters through
+/// [`ToolCallContext::unix_socket_class`].
+///
+/// Deliberately a **whitelist**: an address that matches neither
+/// classifier carries no key, the accessor returns `None`, and every
+/// filter falls through to its pre-existing (network-shaped) scoring.
+/// A labelling bug therefore fails toward over-scoring, never toward a
+/// silent allow. Only [`Control`](UnixSocketClass::Control) de-scores;
+/// [`Privileged`](UnixSocketClass::Privileged) exists so filters can be
+/// explicit that daemon control sockets keep full network-grade
+/// scrutiny (an accidental `!= Privileged` guard would silently cover
+/// the unlabelled case too).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnixSocketClass {
+    /// Root/host-daemon control socket (docker.sock, containerd, libvirt,
+    /// `systemd/private`, ...): RCE-equivalent control of a privileged
+    /// daemon whose work runs outside the supervised tree. Scored like a
+    /// network destination — review-worthy on every unknown access.
+    Privileged,
+    /// Desktop control-injection IPC socket (session D-Bus, X11, tmux,
+    /// screen): local IPC that routine desktop tooling touches constantly
+    /// (keyring reads, clipboard, notifications) but that can also drive a
+    /// more-privileged peer. Scored as local IPC by the generic filters;
+    /// review pressure comes from the supervisor's dedicated
+    /// control-socket escalation, not from hostname-shaped scoring.
+    Control,
+}
+
+impl UnixSocketClass {
+    /// The `ToolCallContext.arguments` key carrying the classification.
+    pub const KEY: &'static str = "unix_socket_class";
+
+    /// Stable string value stored under [`Self::KEY`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnixSocketClass::Privileged => "privileged",
+            UnixSocketClass::Control => "control",
+        }
+    }
+
+    /// Parse the stored string value; unknown values are `None` (treated
+    /// as unlabelled — the fail-safe direction).
+    pub fn from_str_value(value: &str) -> Option<Self> {
+        match value {
+            "privileged" => Some(UnixSocketClass::Privileged),
+            "control" => Some(UnixSocketClass::Control),
+            _ => None,
+        }
+    }
+}
+
 /// PR 4: structured provenance metadata for a `ProcessSpawn`, computed
 /// by the supervisor and consumed by `operation_risk.rs` to decide
 /// whether the spawn earns the +0.5 routine signal.
@@ -295,6 +349,23 @@ pub enum ToolCallType {
         /// `CLONE_NEW*` flag bitmap (unshare) or `nstype` (setns).
         flags: u64,
     },
+    /// A D-Bus method call the supervisor decoded from a write to a control
+    /// socket, and which its curated allowlist does not vouch for.
+    ///
+    /// Only calls that reach a prompt arrive here: an allowlisted call is
+    /// resumed in the interceptor without a proxy round trip. `+5.0` baseline,
+    /// the same weight as the other authority-delegating operations, so an
+    /// undeclared bus method QUEUEs for review.
+    DbusMethodCall {
+        /// Rendered bus socket, e.g. `unix:/run/user/1000/bus`.
+        socket: String,
+        /// Bus name being addressed, e.g. `org.freedesktop.systemd1`.
+        destination: Option<String>,
+        /// Interface, e.g. `org.freedesktop.systemd1.Manager`.
+        interface: Option<String>,
+        /// Method name, e.g. `StartTransientUnit`.
+        member: Option<String>,
+    },
 }
 
 /// Result from a single security filter evaluation.
@@ -401,6 +472,21 @@ impl ToolCallContext {
     pub fn with_profile(mut self, name: impl Into<String>) -> Self {
         self.profile_name = Some(name.into());
         self
+    }
+
+    /// The supervisor's unix-socket classification for this call, if any.
+    ///
+    /// Reads `arguments[UnixSocketClass::KEY]` (stamped by the supervisor's
+    /// event handler for `NetConnect`/`NetListen` on `unix:` addresses; the
+    /// key rides `arguments` so it survives the daemon IPC round-trip like
+    /// the supervisor `pid` key does). `None` — no key, or an unknown
+    /// value — means unlabelled: filters must score exactly as they did
+    /// before the classification existed.
+    pub fn unix_socket_class(&self) -> Option<UnixSocketClass> {
+        self.arguments
+            .get(UnixSocketClass::KEY)?
+            .as_str()
+            .and_then(UnixSocketClass::from_str_value)
     }
 
     /// Override the session scope. Use when the calling layer has a finer-grained
@@ -787,6 +873,17 @@ impl std::fmt::Display for ToolCallType {
             }
             Self::NamespaceOp { syscall, flags } => {
                 write!(f, "NamespaceOp({syscall} flags={flags:#x})")
+            }
+            Self::DbusMethodCall {
+                socket,
+                destination,
+                interface,
+                member,
+            } => {
+                let dest = destination.as_deref().unwrap_or("?");
+                let iface = interface.as_deref().unwrap_or("?");
+                let member = member.as_deref().unwrap_or("?");
+                write!(f, "DbusMethodCall({socket} {dest} {iface}.{member})")
             }
         }
     }

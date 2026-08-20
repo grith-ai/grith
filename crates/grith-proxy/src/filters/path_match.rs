@@ -76,6 +76,7 @@ pub(crate) fn operation_for_call_type(call_type: &ToolCallType) -> &'static str 
             ToolCallType::FilesystemMutation { .. } => "write",
             ToolCallType::CrossProcessAccess { .. } => "process",
             ToolCallType::NamespaceOp { .. } => "namespace",
+            ToolCallType::DbusMethodCall { .. } => "dbus",
         }
     }
 }

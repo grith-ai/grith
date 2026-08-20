@@ -333,12 +333,32 @@ impl SecurityFilter for OperationRiskFilter {
                     )
                 }
             }
-            ToolCallType::NetConnect { address, port } => (
-                0.5,
-                "net-connect-baseline",
-                Severity::Notice,
-                format!("Network connection: {address}:{port}"),
-            ),
+            ToolCallType::NetConnect { address, port } => {
+                // Unix-domain sockets get their own rule id so the audit
+                // trail and dashboard can distinguish local IPC from real
+                // network egress (the v0.2.5 D-Bus/X11 FP triage kept
+                // conflating the two under `net-connect-baseline`). The
+                // message drops the `:{port}` suffix — classify.rs
+                // hardcodes port 0 for unix sockets, so
+                // "unix:/run/user/1000/bus:0" is noise. Score and severity
+                // are identical to the network baseline: this branch is
+                // taxonomy and message hygiene only, never a risk change.
+                if address.starts_with("unix:") {
+                    (
+                        0.5,
+                        "unix-socket-connect-baseline",
+                        Severity::Notice,
+                        format!("Unix socket connection: {address}"),
+                    )
+                } else {
+                    (
+                        0.5,
+                        "net-connect-baseline",
+                        Severity::Notice,
+                        format!("Network connection: {address}:{port}"),
+                    )
+                }
+            }
 
             // Risky operations: shell execution, deletion, permission changes.
             ToolCallType::ShellExec { command, args } => {
@@ -469,6 +489,32 @@ impl SecurityFilter for OperationRiskFilter {
                 Severity::Warning,
                 format!("Namespace primitive: {syscall} flags={flags:#x}"),
             ),
+            // A D-Bus method call only reaches the proxy when the supervisor's
+            // curated allowlist did not vouch for it — an allowlisted call is
+            // resumed without a round trip. So this baseline is not "a bus
+            // method happened", it is "a bus method we do not recognise is
+            // about to run in a peer outside supervision", which is the same
+            // weight as the other authority-delegating operations.
+            ToolCallType::DbusMethodCall {
+                socket,
+                destination,
+                interface,
+                member,
+            } => {
+                let dest = destination.as_deref().unwrap_or("(no destination)");
+                let call = match (interface.as_deref(), member.as_deref()) {
+                    (Some(iface), Some(m)) => format!("{iface}.{m}"),
+                    (None, Some(m)) => m.to_string(),
+                    (Some(iface), None) => iface.to_string(),
+                    (None, None) => "(unnamed)".to_string(),
+                };
+                (
+                    5.0,
+                    "dbus-method-call-undeclared",
+                    Severity::Warning,
+                    format!("Undeclared D-Bus method call on {socket}: {dest} → {call}"),
+                )
+            }
         };
 
         Ok(FilterResult::matched(
@@ -597,6 +643,48 @@ mod tests {
         }
     }
 
+    /// Unix-domain socket connects get their own rule id and a message
+    /// without the `:{port}` suffix — classify.rs hardcodes port 0 for
+    /// unix sockets, so "unix:/run/user/1000/bus:0" is noise. Score and
+    /// severity stay identical to the network baseline (taxonomy only).
+    #[tokio::test]
+    async fn test_unix_socket_connect_baseline() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: "unix:/run/user/1000/bus".into(),
+            port: 0,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.rule_id, "unix-socket-connect-baseline");
+        assert_eq!(
+            result.message,
+            "Unix socket connection: unix:/run/user/1000/bus"
+        );
+        assert!(
+            !result.message.contains(":0"),
+            "message: {}",
+            result.message
+        );
+    }
+
+    /// Regression guard: TCP connects keep the legacy rule id, score,
+    /// and `{address}:{port}` message shape byte-for-byte.
+    #[tokio::test]
+    async fn test_tcp_net_connect_baseline_unchanged() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::NetConnect {
+            address: "203.0.113.7".into(),
+            port: 443,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.rule_id, "net-connect-baseline");
+        assert_eq!(result.message, "Network connection: 203.0.113.7:443");
+    }
+
     /// PR 69 Change 4: every NetListen — loopback, wildcard, or
     /// specific interface — gets the same low baseline here. Bind-shape
     /// exposure is owned by `egress-policy`.
@@ -720,6 +808,41 @@ mod tests {
         assert!(result.matched);
         assert_eq!(result.score, 5.0);
         assert_eq!(result.rule_id, "namespace-op-baseline");
+    }
+
+    #[tokio::test]
+    async fn dbus_method_call_scores_five_and_queues() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::DbusMethodCall {
+            socket: "unix:/run/user/1000/bus".into(),
+            destination: Some("org.freedesktop.systemd1".into()),
+            interface: Some("org.freedesktop.systemd1.Manager".into()),
+            member: Some("StartTransientUnit".into()),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert!(result.matched);
+        // Must land in the QUEUE band (3.0..8.0) so it prompts rather than
+        // being auto-allowed or hard-denied.
+        assert_eq!(result.score, 5.0);
+        assert_eq!(result.rule_id, "dbus-method-call-undeclared");
+        assert!(
+            result.message.contains("StartTransientUnit"),
+            "the operator must see which method: {}",
+            result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn dbus_method_call_without_header_fields_still_scores() {
+        let filter = OperationRiskFilter::new();
+        let ctx = make_ctx(ToolCallType::DbusMethodCall {
+            socket: "unix:/run/user/1000/bus".into(),
+            destination: None,
+            interface: None,
+            member: None,
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.score, 5.0);
     }
 
     // ---- PR 4 Phase D: routine spawn signal tests ----

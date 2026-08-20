@@ -15,6 +15,15 @@ mod authority_delegation;
 mod dns_decision;
 mod event_handler;
 mod mass_destruction;
+
+// Shared with `crate::learned_rules` so `ipc-socket:` grant validation
+// rejects privileged daemon sockets with the same curated predicate the
+// event handler enforces with.
+/// Exposed so `crate::dbus` can assert that every address it claims for message
+/// inspection is one connect-time enforcement would otherwise have escalated.
+#[cfg(test)]
+pub(crate) use authority_delegation::is_control_injection_socket as is_control_injection_socket_for_test;
+pub(crate) use event_handler::is_sensitive_unix_socket;
 #[cfg(test)]
 mod protection_tests;
 pub mod session_state;
@@ -448,6 +457,37 @@ pub async fn run_supervisor_loop(
     // - connected UDP/53 sockets can be redirected to a per-socket managed
     //   proxy route, preserving connected read/write semantics while allowing
     //   exact query inspection and response attribution.
+    // D-Bus message inspection narrows control-socket enforcement, so it is
+    // only meaningful while that enforcement is on: with the flag off there is
+    // nothing to move off the connect, and arming the decoder would pay
+    // per-message stepping for decisions nobody would act on.
+    let dbus_inspection_armed = if authority_delegation::control_socket_enforcement_enabled(
+        config.enforce_control_socket_connect,
+    ) && authority_delegation::dbus_inspection_enabled(
+        config.dbus_message_inspection,
+    ) {
+        // The interceptor gets the last word: it reports whether it can
+        // actually see what a tracee writes to a socket. A `false` here keeps
+        // the session enforcing at the connect — the same prompts as before,
+        // rather than a config flag quietly disabling enforcement.
+        let armed = interceptor.set_dbus_inspection();
+        if armed {
+            tracing::info!(
+                event = "dbus_message_inspection_active",
+                "D-Bus control-socket access decided per method call"
+            );
+        } else {
+            tracing::warn!(
+                event = "dbus_message_inspection_unavailable",
+                "D-Bus message inspection requested but unavailable for this session; \
+                 keeping connect-time control-socket enforcement"
+            );
+        }
+        armed
+    } else {
+        false
+    };
+
     let dns_inspection_enabled = cfg!(target_os = "linux") && config.dns_inspection.enabled;
     let mut connected_dns_proxy = None;
     let mut connected_dns_health = None;
@@ -703,6 +743,7 @@ pub async fn run_supervisor_loop(
         namespace_users: session_namespace_users,
         permit_authority_delegating: session_permit_authority_delegating,
         permit_control_sockets: session_permit_control_sockets,
+        dbus_inspection_armed,
         authority_delegating_pins,
         // The supervised tool is spawned as a child of this process and
         // inherits its cwd, so the supervisor's cwd at session start is the

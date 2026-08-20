@@ -1,6 +1,5 @@
 import { useState, useCallback } from "react";
 import { FilterConfig } from "@/components/FilterConfig";
-import { AdaptiveScoring } from "@/components/AdaptiveScoring";
 import { PolicyEditor, UsageAnalytics } from "@/components/ProStub";
 import { csrfHeaders } from "@/lib/csrf";
 
@@ -73,7 +72,6 @@ export function SettingsPage() {
           Pro Features
         </h2>
         <div className="space-y-4">
-          <AdaptiveScoring />
           <PolicyEditor />
           <UsageAnalytics />
         </div>

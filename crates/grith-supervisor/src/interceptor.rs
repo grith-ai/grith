@@ -191,6 +191,25 @@ pub enum SyscallKind {
         /// Protocol family.
         protocol: NetProtocol,
     },
+    /// A D-Bus method call the tracee is about to write to a control socket.
+    ///
+    /// Emitted instead of scoring the `connect(2)` when D-Bus message
+    /// inspection is armed for the channel: the connection is not the unit of
+    /// risk, the call is. Only calls the curated allowlist does not vouch for
+    /// reach the proxy — see [`crate::dbus`].
+    DbusMethodCall {
+        /// Rendered socket address of the bus, e.g. `unix:/run/user/1000/bus`.
+        socket: String,
+        /// Bus name being addressed (`org.freedesktop.systemd1`), when the
+        /// message carried a `DESTINATION` header field.
+        destination: Option<String>,
+        /// Interface (`org.freedesktop.systemd1.Manager`).
+        interface: Option<String>,
+        /// Method name (`StartTransientUnit`).
+        member: Option<String>,
+        /// Object path, for operator context.
+        path: Option<String>,
+    },
     /// `bind` — socket bind (server listen).
     NetBind {
         /// Local address being bound.
@@ -604,6 +623,20 @@ pub trait SyscallInterceptor: Send + Sync {
     ) {
     }
 
+    /// Decide D-Bus control-socket access per method call rather than per
+    /// connect. Called once after construction, before the loop, and only when
+    /// control-socket enforcement is itself on.
+    ///
+    /// Returns whether inspection is actually armed. This is a **capability
+    /// report, not an acknowledgement**: a backend that cannot see what a
+    /// tracee writes to a socket must return `false` so the caller keeps
+    /// enforcing at the connect. Silently accepting would convert "decide per
+    /// message" into "decide never". The default is `false` — only the Linux
+    /// ptrace backend can read tracee memory mid-syscall.
+    fn set_dbus_inspection(&mut self) -> bool {
+        false
+    }
+
     /// Install the session-local connected UDP DNS proxy control plane.
     ///
     /// The worker itself is owned and joined by the supervisor orchestrator.
@@ -641,6 +674,17 @@ pub trait SyscallInterceptor: Send + Sync {
     /// tracee's most recent DNS send for `tid`.
     fn take_dns_query(&mut self, _tid: u32) -> Option<DnsQueryInspection> {
         None
+    }
+
+    /// Take the D-Bus method calls escalated by `tid`'s stopped write.
+    ///
+    /// Returns every call on that write the policy layer refused, not only the
+    /// one named in the event: a client may batch several messages into one
+    /// syscall, and approving the first must not silently send the rest. Empty
+    /// when the escalation came from an undecodable channel rather than from a
+    /// specific call.
+    fn take_dbus_method_calls(&mut self, _tid: u32) -> Vec<DbusCallSummary> {
+        Vec::new()
     }
 
     /// Complete ownership of an in-line DNS inspection.
@@ -779,6 +823,17 @@ pub struct DnsQueryInspection {
     pub parse_error: Option<String>,
 }
 
+/// One escalated D-Bus method call, rendered for the audit record and the
+/// operator prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbusCallSummary {
+    /// `<destination> → <interface>.<member>`, with missing parts elided.
+    pub description: String,
+    pub destination: Option<String>,
+    pub interface: Option<String>,
+    pub member: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Display implementations
 // ---------------------------------------------------------------------------
@@ -826,6 +881,18 @@ impl std::fmt::Display for SyscallKind {
                 port,
                 protocol,
             } => write!(f, "NetConnect({protocol:?} {address}:{port})"),
+            Self::DbusMethodCall {
+                socket,
+                destination,
+                interface,
+                member,
+                ..
+            } => {
+                let dest = destination.as_deref().unwrap_or("?");
+                let iface = interface.as_deref().unwrap_or("?");
+                let member = member.as_deref().unwrap_or("?");
+                write!(f, "DbusMethodCall({socket} {dest} {iface}.{member})")
+            }
             Self::NetBind {
                 address,
                 port,

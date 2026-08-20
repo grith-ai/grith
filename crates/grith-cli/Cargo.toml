@@ -34,3 +34,7 @@ crossbeam-channel.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+# Timeline scripts for the demo_player / demo_timeline_gen examples.
+toml.workspace = true

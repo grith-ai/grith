@@ -205,8 +205,13 @@ pub enum ListenerFamily {
 /// Launch requirements enforced by `grith exec` before spawning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LaunchContract {
-    /// Args that must be present (as a contiguous sequence) or will be
-    /// auto-injected at the start of the arg list.
+    /// Args that must be present or will be auto-injected at the start of the
+    /// arg list.
+    ///
+    /// Split into groups: each element beginning with `-` starts a new group,
+    /// and a following non-flag element is its value. Each group is checked
+    /// and injected independently, so a contract may mix boolean flags with
+    /// flag/value pairs without re-injecting one the caller already passed.
     ///
     /// Example: `["--sandbox", "disabled"]` for Cursor CLI.
     #[serde(default)]
@@ -1100,7 +1105,35 @@ impl ProfileConfig {
     }
 }
 
+/// Split a launch contract's required args into independent groups.
+///
+/// A group starts at each element beginning with `-`; any immediately
+/// following non-flag element is that group's value. Leading non-flag
+/// elements (a malformed contract) are kept as one group so behaviour stays
+/// predictable rather than silently dropping them.
+fn split_required_arg_groups(required_args: &[String]) -> Vec<&[String]> {
+    let mut groups: Vec<&[String]> = Vec::new();
+    let mut start = 0usize;
+    for idx in 1..required_args.len() {
+        if required_args[idx].starts_with('-') {
+            groups.push(&required_args[start..idx]);
+            start = idx;
+        }
+    }
+    if start < required_args.len() {
+        groups.push(&required_args[start..]);
+    }
+    groups
+}
+
 fn validate_launch_contract_conflicts(args: &[String], required_args: &[String]) -> Result<()> {
+    for group in split_required_arg_groups(required_args) {
+        validate_launch_contract_group(args, group)?;
+    }
+    Ok(())
+}
+
+fn validate_launch_contract_group(args: &[String], required_args: &[String]) -> Result<()> {
     if required_args.len() != 2 {
         return Ok(());
     }
@@ -1144,20 +1177,22 @@ pub fn enforce_launch_contract(args: &mut Vec<String>, contract: &LaunchContract
     let req = &contract.required_args;
     validate_launch_contract_conflicts(args, req)?;
 
-    // Check if the required sequence already appears contiguously in args.
-    let found = args
-        .windows(req.len())
-        .any(|window| window == req.as_slice());
-
-    if found {
-        return Ok(false);
+    // Inject each group independently so a contract mixing a boolean flag
+    // with a flag/value pair does not re-inject the one already supplied.
+    let mut insert_at = 0usize;
+    let mut modified = false;
+    for group in split_required_arg_groups(req) {
+        let found = args.windows(group.len()).any(|window| window == group);
+        if found {
+            continue;
+        }
+        for (i, arg) in group.iter().enumerate() {
+            args.insert(insert_at + i, arg.clone());
+        }
+        insert_at += group.len();
+        modified = true;
     }
-
-    // Inject at the beginning of the arg list.
-    for (i, arg) in req.iter().enumerate() {
-        args.insert(i, arg.clone());
-    }
-    Ok(true)
+    Ok(modified)
 }
 
 /// Auto-detect the launcher environment from parent process and env vars.
@@ -2303,6 +2338,85 @@ routine_destinations = ["openai.com"]
         let modified = enforce_launch_contract(&mut args, &contract).unwrap();
         assert!(!modified);
         assert_eq!(args, vec!["--sandbox", "disabled", "task"]);
+    }
+
+    #[test]
+    fn enforce_launch_contract_injects_only_missing_group() {
+        // The shipped claude-code contract: a boolean flag plus a flag/value
+        // pair. A caller that already passed the boolean must not get it twice.
+        let contract = LaunchContract {
+            required_args: vec![
+                "--dangerously-skip-permissions".into(),
+                "--settings".into(),
+                "{\"sandbox\":{\"enabled\":false}}".into(),
+            ],
+        };
+        let mut args = vec!["--dangerously-skip-permissions".into()];
+        let modified = enforce_launch_contract(&mut args, &contract).unwrap();
+        assert!(modified);
+        assert_eq!(
+            args,
+            vec![
+                "--settings",
+                "{\"sandbox\":{\"enabled\":false}}",
+                "--dangerously-skip-permissions"
+            ]
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "--dangerously-skip-permissions")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn enforce_launch_contract_multi_group_all_missing() {
+        let contract = LaunchContract {
+            required_args: vec![
+                "--dangerously-skip-permissions".into(),
+                "--settings".into(),
+                "{}".into(),
+            ],
+        };
+        let mut args = vec!["task".into()];
+        assert!(enforce_launch_contract(&mut args, &contract).unwrap());
+        assert_eq!(
+            args,
+            vec!["--dangerously-skip-permissions", "--settings", "{}", "task"]
+        );
+    }
+
+    #[test]
+    fn enforce_launch_contract_multi_group_all_present_is_noop() {
+        let contract = LaunchContract {
+            required_args: vec![
+                "--dangerously-skip-permissions".into(),
+                "--settings".into(),
+                "{}".into(),
+            ],
+        };
+        let mut args = vec![
+            "--dangerously-skip-permissions".into(),
+            "--settings".into(),
+            "{}".into(),
+        ];
+        assert!(!enforce_launch_contract(&mut args, &contract).unwrap());
+    }
+
+    #[test]
+    fn enforce_launch_contract_detects_conflict_within_group() {
+        // Conflict detection must still work when the pair is one group of
+        // several, not just when it is the whole contract.
+        let contract = LaunchContract {
+            required_args: vec![
+                "--dangerously-skip-permissions".into(),
+                "--settings".into(),
+                "{}".into(),
+            ],
+        };
+        let mut args = vec!["--settings".into(), "/my/own.json".into()];
+        assert!(enforce_launch_contract(&mut args, &contract).is_err());
     }
 
     #[test]

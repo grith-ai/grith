@@ -199,11 +199,28 @@ pub struct SupervisorConfig {
     /// proxy and escalated Allow→QUEUE unless the profile's
     /// `permit_control_sockets` list authorises it. Higher false-positive
     /// surface than the spawn flag (desktop tooling touches the session bus
-    /// routinely), so it stays an independent knob. Known gap, documented
-    /// in the CHANGELOG: abstract-namespace sockets are not yet matched.
+    /// routinely), so it stays an independent knob. Abstract-namespace
+    /// sockets are matched too — they render as `unix:@<name>` and classify
+    /// like any other socket path.
     /// Env override: `GRITH_ENFORCE_CONTROL_SOCKET_CONNECT`.
     #[serde(default = "default_true")]
     pub enforce_control_socket_connect: bool,
+
+    /// Decide D-Bus control-socket access per *method call* instead of per
+    /// connection. When `true` (the default), a connect to a D-Bus endpoint
+    /// arms message inspection instead of escalating: the writing process is
+    /// stepped, the messages it sends are decoded, and only calls a curated
+    /// allowlist does not vouch for are escalated Allow→QUEUE. Every
+    /// uncertainty — an unreadable payload, an undecodable stream, an unlisted
+    /// method — falls back to escalating the connection, i.e. exactly the
+    /// behaviour of `enforce_control_socket_connect` alone.
+    ///
+    /// Only D-Bus sockets are affected. X11, tmux and screen keep connect-time
+    /// escalation: they carry no per-message destination to key a policy on.
+    /// Has no effect when `enforce_control_socket_connect` is `false` (nothing
+    /// to move). Env override: `GRITH_DBUS_MESSAGE_INSPECTION`.
+    #[serde(default = "default_true")]
+    pub dbus_message_inspection: bool,
 }
 
 /// Serde default for the supervision-escape enforcement flags - on by
@@ -355,6 +372,7 @@ impl Default for SupervisorConfig {
             pty_ownership_enforce: false,
             enforce_authority_delegating_spawn: true,
             enforce_control_socket_connect: true,
+            dbus_message_inspection: true,
         }
     }
 }
@@ -809,6 +827,7 @@ mod tests {
             pty_ownership_enforce: false,
             enforce_authority_delegating_spawn: false,
             enforce_control_socket_connect: false,
+            dbus_message_inspection: true,
         };
         let toml_str = toml::to_string(&original).unwrap();
         let parsed: SupervisorConfig = toml::from_str(&toml_str).unwrap();

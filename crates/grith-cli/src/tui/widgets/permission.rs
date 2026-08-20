@@ -702,6 +702,41 @@ fn call_summary(req: &PermissionRequest) -> CallSummary {
                 args: (!op.is_empty()).then(|| format!("via {op}")),
             }
         }
+        "DbusMethodCall" => {
+            // detail = "<socket> <destination> <interface>.<member>"
+            let mut parts = detail.splitn(3, ' ');
+            let socket = parts.next().unwrap_or_default();
+            let destination = parts.next().unwrap_or_default();
+            let call = parts.next().unwrap_or_default();
+            // The member is what the operator is actually deciding about, so
+            // it leads; the interface it hangs off is long, repetitive and
+            // reverse-DNS, and reads as noise in a headline.
+            let member = call.rsplit('.').next().unwrap_or(call);
+            let mut targets = Vec::new();
+            if !destination.is_empty() && destination != "?" {
+                targets.push(TargetRow {
+                    label: "service",
+                    value: destination.to_string(),
+                });
+            }
+            if !call.is_empty() && call != "?.?" {
+                targets.push(TargetRow {
+                    label: "method",
+                    value: call.to_string(),
+                });
+            }
+            targets.push(TargetRow {
+                label: "bus",
+                value: socket.to_string(),
+            });
+            CallSummary {
+                verb: "D-BUS CALL".to_string(),
+                role: VerbRole::Privileged,
+                headline: member.to_string(),
+                targets,
+                args: None,
+            }
+        }
         "NamespaceOp" => {
             // detail = "<syscall> flags=0x.."
             let (syscall, flags) = detail.split_once(" flags=").unwrap_or((detail, ""));
@@ -1792,6 +1827,38 @@ mod tests {
         req.call_type = call_type.to_string();
         req.args = args.to_string();
         call_summary(&req)
+    }
+
+    #[test]
+    fn call_summary_dbus_leads_with_the_method() {
+        let s = summary_for(
+            "DbusMethodCall(unix:/run/user/1000/bus org.freedesktop.systemd1 \
+             org.freedesktop.systemd1.Manager.StartTransientUnit)",
+            "DbusMethodCall",
+            "",
+        );
+        assert_eq!(s.verb, "D-BUS CALL");
+        // The member, not the reverse-DNS interface, is what is being decided.
+        assert_eq!(s.headline, "StartTransientUnit");
+        assert_eq!(s.targets[0].label, "service");
+        assert_eq!(s.targets[0].value, "org.freedesktop.systemd1");
+        assert_eq!(s.targets[1].label, "method");
+        assert_eq!(s.targets[2].label, "bus");
+        assert_eq!(s.targets[2].value, "unix:/run/user/1000/bus");
+    }
+
+    #[test]
+    fn call_summary_dbus_tolerates_unnamed_parts() {
+        // The decoder renders missing header fields as `?`; the prompt must
+        // still say something rather than showing a bare question mark row.
+        let s = summary_for(
+            "DbusMethodCall(unix:/run/user/1000/bus ? ?.?)",
+            "DbusMethodCall",
+            "",
+        );
+        assert_eq!(s.verb, "D-BUS CALL");
+        assert_eq!(s.targets.len(), 1);
+        assert_eq!(s.targets[0].label, "bus");
     }
 
     #[test]

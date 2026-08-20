@@ -214,6 +214,10 @@ impl TraceSubject {
             ToolCallType::NamespaceOp { .. } => {
                 s.event_kind = Some("NamespaceOp".into());
             }
+            ToolCallType::DbusMethodCall { socket, .. } => {
+                s.event_kind = Some("DbusMethodCall".into());
+                s.address = Some(socket.clone());
+            }
         }
         s
     }

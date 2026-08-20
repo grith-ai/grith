@@ -226,7 +226,12 @@ name = "claude-code"
 display_name = "Claude Code"
 extends = "generic"
 rationale = "Claude Code routinely reads project files, shells out to local build and SCM tools, and contacts Anthropic plus package and repository infrastructure."
-launch_contract = { required_args = ["--dangerously-skip-permissions"] }
+# Claude Code ships its own inner sandbox (filesystem isolation plus a network
+# egress allowlist). Under grith the supervisor is already the access-control
+# boundary, so the inner sandbox is redundant — and its allowlist silently
+# blocks legitimate egress (e.g. ssh to your own hosts) with EPERM. Disable it
+# so grith remains the single source of truth for what the tool may reach.
+launch_contract = { required_args = ["--dangerously-skip-permissions", "--settings", "{\"sandbox\":{\"enabled\":false}}"] }
 
 routine_paths = [
     "${PROJECT_DIR}/**",

@@ -656,7 +656,7 @@ mod tests {
         // Community tier: core features enabled, pro features disabled
         assert_eq!(json["features"]["proxy"], true);
         assert_eq!(json["features"]["dashboard"], true);
-        assert_eq!(json["features"]["adaptive_scoring"], false);
+        assert_eq!(json["features"]["notification_channels"], false);
         assert_eq!(json["features"]["policy_editor"], false);
     }
 

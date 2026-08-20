@@ -203,6 +203,7 @@ impl BehaviouralFilter {
             ToolCallType::FilesystemMutation { .. } => "filesystem_mutation",
             ToolCallType::CrossProcessAccess { .. } => "cross_process_access",
             ToolCallType::NamespaceOp { .. } => "namespace_op",
+            ToolCallType::DbusMethodCall { .. } => "dbus_method_call",
         }
     }
 

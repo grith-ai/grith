@@ -63,20 +63,22 @@ impl FeatureGate {
             // Core features available to all tiers
             "proxy" | "audit" | "digest" | "supervisor" | "filters" | "cli" | "dashboard" => true,
 
-            // Pro features
-            "adaptive_scoring"
-            | "notification_channels"
-            | "usage_analytics"
-            | "cloud_sync"
-            | "extended_retention"
-            | "policy_editor" => self.tier >= PlanTier::Pro,
-
-            // Enterprise features
-            "pagerduty" | "opsgenie" | "team_scope" | "sso" | "custom_filters" => {
-                self.tier >= PlanTier::Enterprise
+            // Pro features. Only features that are actually implemented AND
+            // enforced are listed — advertising a gate for a feature that isn't
+            // built (or isn't checked) is misleading. Add a name here the moment
+            // the feature lands, not before.
+            "notification_channels" | "usage_analytics" | "cloud_sync" | "policy_editor" => {
+                self.tier >= PlanTier::Pro
             }
 
-            // Unknown features are denied
+            // Enterprise features
+            "pagerduty" | "opsgenie" => self.tier >= PlanTier::Enterprise,
+
+            // Unknown features are denied. This also covers not-yet-built gates
+            // that were once advertised (adaptive_scoring — replaced by the
+            // reputation system; extended_retention, team_scope, sso,
+            // custom_filters — not implemented): they were removed so the
+            // feature list reflects reality.
             _ => false,
         }
     }
@@ -105,17 +107,12 @@ impl FeatureGate {
             "filters",
             "cli",
             "dashboard",
-            "adaptive_scoring",
             "notification_channels",
             "usage_analytics",
             "cloud_sync",
-            "extended_retention",
             "policy_editor",
             "pagerduty",
             "opsgenie",
-            "team_scope",
-            "sso",
-            "custom_filters",
         ];
         features.iter().map(|&f| (f, self.allows(f))).collect()
     }
@@ -316,7 +313,11 @@ impl CallbackNonceStore {
 
     /// Generate a nonce with a custom TTL.
     pub fn generate_with_ttl(&self, item_id: Uuid, channel_id: &str, ttl: Duration) -> String {
-        let nonce = Uuid::new_v4().to_string();
+        // Interactive channels embed this nonce in callback data with hard size
+        // limits (Telegram caps `callback_data` at 64 bytes; a full 36-char UUID
+        // nonce + the 36-char item id + action overflowed it -> BUTTON_DATA_INVALID).
+        // 16 hex chars (~60 random bits) is ample for a single-use, TTL'd nonce.
+        let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
         self.entries.insert(
             nonce.clone(),
             NonceEntry {

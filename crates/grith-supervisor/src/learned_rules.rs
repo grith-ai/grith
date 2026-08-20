@@ -87,7 +87,7 @@ pub fn validate_persisted_rule_with_scope(pattern: &str, scope: &str) -> Result<
     }
 
     // dns: rules are rejected — runtime matching only checks net: entries.
-    let valid_prefixes = ["ro:", "rw:", "exec:", "exec-prefix:", "net:"];
+    let valid_prefixes = ["ro:", "rw:", "exec:", "exec-prefix:", "net:", "ipc-socket:"];
     if !valid_prefixes.iter().any(|p| pattern.starts_with(p)) {
         return Err(Error::LearnedRuleError(format!(
             "pattern must start with one of: {}. Bare filesystem paths and dns: are not persistable.",
@@ -109,6 +109,47 @@ pub fn validate_persisted_rule_with_scope(pattern: &str, scope: &str) -> Result<
             return Err(Error::LearnedRuleError(
                 "exec-prefix: pattern must contain a non-empty absolute path (e.g., exec-prefix:/usr/lib/git-core/)"
                     .to_string(),
+            ));
+        }
+    }
+
+    // ipc-socket: is the durable exe-bound control-socket grant:
+    // `ipc-socket:<rendered socket address>|<absolute client exe>`. The
+    // address keeps the runtime `unix:` render (pathname `unix:/run/…` or
+    // abstract `unix:@/tmp/…`) because the grant is consumed by exact
+    // string equality against the same render. Privileged daemon sockets
+    // (docker.sock, systemd/private, …) are rejected here so a hand-edited
+    // rules file cannot grant what the [a]/[l] flow refuses to mint. The
+    // write-path validation covers the load path too — `load_learned_rules`
+    // re-validates every rule.
+    if let Some(suffix) = pattern.strip_prefix("ipc-socket:") {
+        let Some((socket, exe)) = suffix.split_once('|') else {
+            return Err(Error::LearnedRuleError(
+                "ipc-socket: pattern must be `ipc-socket:<socket address>|<client exe>`"
+                    .to_string(),
+            ));
+        };
+        let bare = socket
+            .strip_prefix("unix:")
+            .map(|p| p.strip_prefix('@').unwrap_or(p));
+        let Some(bare) = bare else {
+            return Err(Error::LearnedRuleError(
+                "ipc-socket: socket address must start with `unix:`".to_string(),
+            ));
+        };
+        if !bare.starts_with('/') {
+            return Err(Error::LearnedRuleError(
+                "ipc-socket: socket address must contain an absolute path".to_string(),
+            ));
+        }
+        if crate::supervisor::is_sensitive_unix_socket(bare) {
+            return Err(Error::LearnedRuleError(
+                "ipc-socket: privileged daemon sockets are not grantable".to_string(),
+            ));
+        }
+        if !exe.starts_with('/') {
+            return Err(Error::LearnedRuleError(
+                "ipc-socket: client exe must be an absolute path".to_string(),
             ));
         }
     }
@@ -610,6 +651,34 @@ mod tests {
     #[test]
     fn validate_accepts_ro_prefix() {
         assert!(validate_persisted_rule("ro:/home/dan/.ssh/config").is_ok());
+    }
+
+    /// The exe-bound control-socket grant: pathname and abstract renders
+    /// are persistable; privileged daemon sockets, malformed shapes, and
+    /// relative exes are not (a hand-edited rules file must not grant what
+    /// the [a]/[l] flow refuses to mint).
+    #[test]
+    fn validate_ipc_socket_grants() {
+        assert!(validate_persisted_rule("ipc-socket:unix:/run/user/1000/bus|/usr/bin/gh").is_ok());
+        assert!(
+            validate_persisted_rule("ipc-socket:unix:@/tmp/.X11-unix/X1|/usr/bin/xclip").is_ok()
+        );
+
+        for pat in [
+            // Privileged daemon sockets are un-grantable.
+            "ipc-socket:unix:/var/run/docker.sock|/usr/bin/docker",
+            "ipc-socket:unix:/run/user/1000/systemd/private|/usr/bin/systemd-run",
+            // Abstract render mimicking a privileged path: same rejection.
+            "ipc-socket:unix:@/var/run/docker.sock|/usr/bin/docker",
+            // Malformed: no exe separator, missing unix: render, relative
+            // socket path, relative exe.
+            "ipc-socket:unix:/run/user/1000/bus",
+            "ipc-socket:/run/user/1000/bus|/usr/bin/gh",
+            "ipc-socket:unix:bus|/usr/bin/gh",
+            "ipc-socket:unix:/run/user/1000/bus|gh",
+        ] {
+            assert!(validate_persisted_rule(pat).is_err(), "must reject {pat}");
+        }
     }
 
     // Protection suite (research doc §5.1 #6): a learned rule auto-allows

@@ -890,7 +890,14 @@ fn main() -> anyhow::Result<()> {
         // printed.
         let pair_code = server.mint_pair_code();
 
-        daemon.register_notification_channels(Some(ws_tx.clone()));
+        {
+            // Enter the runtime: the telegram channel's callback poller uses
+            // `tokio::spawn`, which needs an active runtime context. This call
+            // sits outside `runtime.block_on`/`spawn`, so without the guard it
+            // panics and crashes the daemon when telegram is enabled.
+            let _enter = runtime.enter();
+            daemon.register_notification_channels(Some(ws_tx.clone()));
+        }
 
         runtime.spawn(async move {
             if let Err(e) = server.start().await {
@@ -1396,6 +1403,7 @@ fn to_runtime_supervisor_config_with_audit(
         pty_ownership_enforce: core.pty_ownership_enforce,
         enforce_authority_delegating_spawn: core.enforce_authority_delegating_spawn,
         enforce_control_socket_connect: core.enforce_control_socket_connect,
+        dbus_message_inspection: core.dbus_message_inspection,
         authority_lost_terminate_after_seconds: core.authority_lost_terminate_after_seconds,
     }
 }

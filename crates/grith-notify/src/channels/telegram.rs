@@ -71,34 +71,48 @@ impl TelegramChannel {
         )
     }
 
+    /// Build a concise, phone-friendly permission prompt.
+    ///
+    /// The old format dumped the raw `ToolCallType` Display, the full argument
+    /// JSON, and every filter line — a wall of absolute paths that is unusable
+    /// on a phone. This shows only what a human needs to decide from their
+    /// pocket: which project and tool is asking, a plain-language action with a
+    /// shortened target, and the single strongest reason. Full detail lives one
+    /// tap away behind the Dashboard button.
     fn format_message(&self, item: &DigestItem) -> String {
-        let severity = match item.severity {
-            grith_digest::types::ScoreSeverity::Low => "🟡 Low",
-            grith_digest::types::ScoreSeverity::Medium => "🟠 Medium",
-            grith_digest::types::ScoreSeverity::High => "🔴 High",
-            grith_digest::types::ScoreSeverity::Critical => "🚨 CRITICAL",
+        let (emoji, severity_word) = match item.severity {
+            grith_digest::types::ScoreSeverity::Low => ("🟡", "Low"),
+            grith_digest::types::ScoreSeverity::Medium => ("🟠", "Medium"),
+            grith_digest::types::ScoreSeverity::High => ("🔴", "High"),
+            grith_digest::types::ScoreSeverity::Critical => ("🚨", "Critical"),
         };
 
+        let project = project_label(item);
+        let tool = tool_label(item);
+        let (op, inner) = split_call(&item.tool_call_type);
+        let friendly = friendly_operation(op);
+        let target = shorten_call_target(inner);
+
         let mut text = format!(
-            "<b>{severity} — grith Permission Request</b>\n\n\
-             <b>Tool:</b> <code>{}</code>\n\
-             <b>Score:</b> {:.1}\n\
-             <b>Args:</b> <code>{}</code>",
-            item.tool_call_type,
-            item.composite_score,
-            html_escape(&item.arguments_summary),
+            "{emoji} <b>{}</b> · {} needs approval\n\n<b>{}</b>",
+            html_escape(project),
+            html_escape(tool),
+            html_escape(&friendly),
         );
-
-        if !item.filter_breakdown.is_empty() {
-            text.push_str("\n\n<b>Filters:</b>");
-            for f in &item.filter_breakdown {
-                text.push_str(&format!(
-                    "\n• {} ({:.1}): {}",
-                    f.filter_name, f.score, f.message
-                ));
-            }
+        if !target.is_empty() {
+            text.push_str(&format!("\n<code>{}</code>", html_escape(&target)));
         }
-
+        match top_reason(item) {
+            Some(reason) => text.push_str(&format!(
+                "\n\n<i>{}</i> · score {:.1} ({severity_word})",
+                html_escape(&reason),
+                item.composite_score,
+            )),
+            None => text.push_str(&format!(
+                "\n\nscore {:.1} ({severity_word})",
+                item.composite_score
+            )),
+        }
         text
     }
 
@@ -107,11 +121,11 @@ impl TelegramChannel {
             "inline_keyboard": [[
                 {
                     "text": "✅ Approve",
-                    "callback_data": format!("approve:{}:{}", item.id, nonce),
+                    "callback_data": format!("approve:{}:{}", item.id.simple(), nonce),
                 },
                 {
                     "text": "❌ Deny",
-                    "callback_data": format!("deny:{}:{}", item.id, nonce),
+                    "callback_data": format!("deny:{}:{}", item.id.simple(), nonce),
                 },
                 {
                     "text": "🔗 Dashboard",
@@ -196,10 +210,16 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn notify_resolution(&self, item: &DigestItem) -> Result<(), Error> {
-        let record = self.messages.lock().ok().and_then(|msgs| {
-            msgs.get(&item.id)
-                .map(|r| (r.chat_id.clone(), r.message_id))
-        });
+        // Consume the record (remove, not get): resolution can be broadcast
+        // more than once for the same item — the interactive callback path and
+        // the daemon's out-of-band-resolution scan both fire — and the first
+        // call to reach here owns the edit. A second call finds no record and
+        // is a silent no-op, so buttons are removed and "Resolved" posted once.
+        let record = self
+            .messages
+            .lock()
+            .ok()
+            .and_then(|mut msgs| msgs.remove(&item.id).map(|r| (r.chat_id, r.message_id)));
 
         if let Some((chat_id, message_id)) = record {
             // Remove inline keyboard (buttons)
@@ -225,9 +245,16 @@ impl NotificationChannel for TelegramChannel {
 
             // Send follow-up with resolution
             let action = item.review_action.as_deref().unwrap_or("resolved");
+            let denied = action.starts_with("deny");
+            let (res_emoji, verb) = if denied {
+                ("🚫", "Denied")
+            } else {
+                ("✅", "Approved")
+            };
+            let (op, _) = split_call(&item.tool_call_type);
             let text = format!(
-                "✅ <b>Resolved:</b> <code>{}</code> — <b>{}</b>",
-                item.tool_call_type, action
+                "{res_emoji} <b>{verb}</b> — {}",
+                html_escape(&friendly_operation(op)),
             );
 
             let body = serde_json::json!({
@@ -256,11 +283,16 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn notify_escalation(&self, item: &DigestItem) -> Result<(), Error> {
+        let project = project_label(item);
+        let tool = tool_label(item);
+        let (op, inner) = split_call(&item.tool_call_type);
         let text = format!(
-            "🚨 <b>ESCALATED</b> — <code>{}</code> (score {:.1})\n\n{}\n\n<i>Immediate review required</i>",
-            item.tool_call_type,
+            "🚨 <b>ESCALATED</b> · <b>{}</b> · {}\n\n<b>{}</b>\n<code>{}</code>\n\nscore {:.1} — <i>immediate review required</i>",
+            html_escape(project),
+            html_escape(tool),
+            html_escape(&friendly_operation(op)),
+            html_escape(&shorten_call_target(inner)),
             item.composite_score,
-            html_escape(&item.arguments_summary),
         );
 
         let body = serde_json::json!({
@@ -338,6 +370,144 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// The project a digest item belongs to. The supervisor sets `task_context`
+/// to the session's project name (derived from the launch cwd); fall back to a
+/// generic label so the line is never blank.
+fn project_label(item: &DigestItem) -> &str {
+    item.task_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("grith")
+}
+
+/// The tool that made the call. Supervisor items carry `supervisor:<tool>`;
+/// the built-in agent carries its own plugin id.
+fn tool_label(item: &DigestItem) -> &str {
+    let tool = item
+        .plugin_id
+        .strip_prefix("supervisor:")
+        .unwrap_or(&item.plugin_id)
+        .trim();
+    if tool.is_empty() {
+        "grith"
+    } else {
+        tool
+    }
+}
+
+/// Split a `ToolCallType` Display string (`Op(inner...)`) into `(op, inner)`.
+/// A form without parentheses yields `(whole, "")`.
+fn split_call(tool_call_type: &str) -> (&str, &str) {
+    match tool_call_type.find('(') {
+        Some(open) => (
+            &tool_call_type[..open],
+            tool_call_type[open + 1..].trim_end_matches(')'),
+        ),
+        None => (tool_call_type, ""),
+    }
+}
+
+/// Plain-language verb for a `ToolCallType` discriminant. Falls back to the raw
+/// discriminant so a new variant still renders something sensible.
+fn friendly_operation(op: &str) -> String {
+    let label = match op {
+        "FileLink" => "Link file",
+        "FileWrite" => "Write file",
+        "FileAppend" => "Append to file",
+        "FileRead" => "Read file",
+        "FileDelete" => "Delete file",
+        "FileChmod" => "Change file permissions",
+        "FileChown" | "OwnershipChange" => "Change file owner",
+        "FileRename" | "FileMove" => "Rename file",
+        "DirCreate" => "Create directory",
+        "DirList" => "List directory",
+        "DirDelete" => "Delete directory",
+        "NetConnect" => "Network connection",
+        "NetListen" | "NetBind" => "Open network listener",
+        "DnsQuery" => "DNS lookup",
+        "ProcessSpawn" => "Run command",
+        "ProcessFork" => "Fork process",
+        "CrossProcessAccess" => "Access another process",
+        "NamespaceOp" => "Namespace operation",
+        "FilesystemMutation" => "Modify filesystem",
+        other => other,
+    };
+    label.to_string()
+}
+
+/// Shorten a call's argument text for a phone notification: absolute paths
+/// collapse to `…/basename`, the `->` link arrow becomes `→`, and the whole
+/// thing is capped so it never becomes a wall of text. Full detail stays
+/// available behind the Dashboard button.
+fn shorten_call_target(inner: &str) -> String {
+    const MAX_CHARS: usize = 90;
+    const MAX_COMPONENT: usize = 44;
+
+    let shortened: Vec<String> = inner
+        .split_whitespace()
+        .map(|tok| {
+            if tok == "->" {
+                return "→".to_string();
+            }
+            // A filesystem path (has a slash, not a URL). Keep the last
+            // component; a hugely long basename is itself truncated.
+            if tok.contains('/') && !tok.contains("://") {
+                let trimmed = tok.trim_end_matches([')', ',', ';']);
+                if let Some(base) = trimmed.rsplit('/').next() {
+                    if !base.is_empty() {
+                        let base = truncate_middle(base, MAX_COMPONENT);
+                        return format!("…/{base}");
+                    }
+                }
+            }
+            tok.to_string()
+        })
+        .collect();
+
+    let mut out = shortened.join(" ");
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect::<String>();
+        out.push('…');
+    }
+    out
+}
+
+/// Truncate a long token in the middle (`start…end`) so both the meaningful
+/// prefix and the distinguishing suffix survive.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    let head = max / 2;
+    let tail = max - head - 1;
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(len - tail).collect();
+    format!("{start}…{end}")
+}
+
+/// The single strongest reason the call was flagged: the highest-magnitude
+/// filter message, with any paths shortened. Falls back to the decision reason.
+fn top_reason(item: &DigestItem) -> Option<String> {
+    item.filter_breakdown
+        .iter()
+        .filter(|f| !f.message.trim().is_empty())
+        .max_by(|a, b| {
+            a.score
+                .abs()
+                .partial_cmp(&b.score.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|f| shorten_call_target(&f.message))
+        .or_else(|| {
+            item.decision_reason
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(shorten_call_target)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +789,134 @@ impl TelegramPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grith_digest::types::{DigestStatus, FilterBreakdown, ScoreSeverity};
+
+    /// A digest item shaped like the real screenshot: a hard-link create under
+    /// a Cargo target dir, with two filters, from the `grith` project /
+    /// `claude` tool.
+    fn filelink_item() -> DigestItem {
+        let long = "/home/dan/projects/PersonalProjects/Grith/grith/.claude/worktrees/\
+                    control-socket-unix-class/target/debug/deps/\
+                    fp_credential_then_tool-c44b1d25a0385cf5.4ylg70ch3j7spx06urf4o5id4.0c6r46d.rcgu.o";
+        let src = "/home/dan/projects/PersonalProjects/Grith/grith/.claude/worktrees/\
+                   control-socket-unix-class/target/debug/incremental/\
+                   fp_credential_then_tool-0lrjcx9q6lz73/s-hliigsc081-1jjrcc6-working/4ylg70ch3j7spx06urf4o5id4.o";
+        DigestItem {
+            id: Uuid::new_v4(),
+            created_at: chrono::Utc::now(),
+            session_id: Some(Uuid::new_v4()),
+            tool_call_type: format!("FileLink(hard {src} -> {long})"),
+            arguments_summary: "{\"link_symbolic\":false}".into(),
+            decision_reason: None,
+            composite_score: 3.3,
+            severity: ScoreSeverity::Low,
+            filter_breakdown: vec![
+                FilterBreakdown {
+                    filter_name: "operation-risk".into(),
+                    score: 0.5,
+                    rule_id: "op-risk".into(),
+                    message: format!("Hard link created: {src} -> {long}"),
+                },
+                FilterBreakdown {
+                    filter_name: "sensitive-path-heuristic".into(),
+                    score: 2.8,
+                    rule_id: "sph".into(),
+                    message: "read access to sensitive-looking filename".into(),
+                },
+            ],
+            task_context: Some("grith".into()),
+            plugin_id: "supervisor:claude".into(),
+            status: DigestStatus::Pending,
+            reviewed_at: None,
+            review_action: None,
+            reviewer_notes: None,
+            informational_only: false,
+            escalated_at: None,
+            escalated_by: None,
+        }
+    }
+
+    fn test_channel() -> TelegramChannel {
+        TelegramChannel::new(TelegramConfig {
+            bot_token: "t".into(),
+            chat_id: "1".into(),
+            dashboard_url: "http://localhost:3141".into(),
+            authorized_user_ids: vec![],
+            polling_interval_secs: 2,
+        })
+    }
+
+    #[test]
+    fn format_message_is_concise_and_names_the_project() {
+        let msg = test_channel().format_message(&filelink_item());
+
+        // Names the project and the tool.
+        assert!(msg.contains("grith"), "should name the project: {msg}");
+        assert!(msg.contains("claude"), "should name the tool: {msg}");
+        // Plain-language action, not the raw discriminant.
+        assert!(msg.contains("Link file"), "friendly op: {msg}");
+        // The strongest reason (2.8 > 0.5) is surfaced.
+        assert!(
+            msg.contains("sensitive-looking filename"),
+            "top reason: {msg}"
+        );
+        // Paths are shortened, never the full absolute path.
+        assert!(msg.contains("…/"), "paths shortened: {msg}");
+        assert!(
+            !msg.contains("/home/dan/projects/PersonalProjects"),
+            "must not dump full paths: {msg}"
+        );
+        // The link arrow is normalised.
+        assert!(msg.contains('→'), "arrow normalised: {msg}");
+        // Score is present.
+        assert!(msg.contains("3.3"), "score present: {msg}");
+        // The whole thing stays short enough for a phone.
+        assert!(
+            msg.chars().count() < 320,
+            "message too long ({} chars): {msg}",
+            msg.chars().count()
+        );
+    }
+
+    #[test]
+    fn helpers_extract_project_tool_and_op() {
+        let item = filelink_item();
+        assert_eq!(project_label(&item), "grith");
+        assert_eq!(tool_label(&item), "claude");
+        let (op, inner) = split_call(&item.tool_call_type);
+        assert_eq!(op, "FileLink");
+        assert!(inner.starts_with("hard /home/dan"));
+        assert_eq!(friendly_operation("NetConnect"), "Network connection");
+        assert_eq!(friendly_operation("TotallyNewOp"), "TotallyNewOp");
+    }
+
+    #[test]
+    fn tool_label_falls_back_for_agent_and_blank() {
+        let mut item = filelink_item();
+        item.plugin_id = "grith-agent".into();
+        assert_eq!(tool_label(&item), "grith-agent");
+        item.task_context = None;
+        assert_eq!(project_label(&item), "grith");
+    }
+
+    #[test]
+    fn shorten_keeps_last_component_and_caps_length() {
+        let s = shorten_call_target("hard /a/b/c/really.o -> /x/y/z/other.o");
+        assert!(s.contains("…/really.o"), "{s}");
+        assert!(s.contains("…/other.o"), "{s}");
+        assert!(s.contains('→'), "{s}");
+        // A non-path stays intact.
+        assert_eq!(shorten_call_target("example.com:22"), "example.com:22");
+    }
+
+    #[test]
+    fn truncate_middle_preserves_both_ends() {
+        let out = truncate_middle("abcdefghijklmnopqrstuvwxyz", 11);
+        assert!(out.starts_with("abc"), "{out}");
+        assert!(out.ends_with("xyz"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        assert_eq!(truncate_middle("short", 40), "short");
+    }
 
     #[test]
     fn parse_callback_data_approve() {

@@ -4,7 +4,7 @@
 //! Reputation-based scoring filter for known-risky patterns.
 
 use crate::filters::{FilterPhase, SecurityFilter};
-use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType};
+use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType, UnixSocketClass};
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -153,6 +153,21 @@ impl SecurityFilter for ReputationFilter {
                 }
             }
             ToolCallType::NetConnect { address, .. } => {
+                // Control-class unix sockets (session D-Bus, X11, tmux/screen)
+                // are desktop IPC, not outbound destinations — the dedicated
+                // control-socket enforcement path owns them. Feeding their
+                // paths through the domain scoring below caused the v0.2.5 FP
+                // regression (`gh auth token` reads the keyring via
+                // /run/user/<uid>/bus; xclip talks to X11), and the TLD-suffix
+                // check would flag paths like /run/user/1000/foo.info as a
+                // suspicious ".info" host. This filter records no reputation
+                // observations (the supervisor-side ReputationTable does), so
+                // no_match here also keeps a control-socket approval from
+                // building trust. Privileged and unlabelled sockets score
+                // exactly as before.
+                if matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control)) {
+                    return Ok(FilterResult::no_match("reputation"));
+                }
                 vec![address.to_lowercase()]
             }
             _ => return Ok(FilterResult::no_match("reputation")),
@@ -263,6 +278,59 @@ mod tests {
         assert!(result.matched);
         assert_eq!(result.score, 2.0);
         assert_eq!(result.rule_id, "suspicious-tld");
+    }
+
+    fn unix_connect_ctx(address: &str, class: Option<&str>) -> ToolCallContext {
+        let mut ctx = make_ctx(ToolCallType::NetConnect {
+            address: address.into(),
+            port: 0,
+        });
+        if let Some(class) = class {
+            ctx.arguments = serde_json::json!({ crate::types::UnixSocketClass::KEY: class });
+        }
+        ctx
+    }
+
+    /// A Control-class socket path never reaches domain scoring — even one
+    /// that would trip the TLD check (`.info` is in the suspicious list, so
+    /// a path like `.../foo.info` scored +2.0 before the class label).
+    #[tokio::test]
+    async fn test_control_class_socket_is_no_match() {
+        let filter = filter_with_malicious();
+        for address in [
+            "unix:/run/user/1000/bus",
+            "unix:@/tmp/.X11-unix/X1",
+            "unix:/run/user/1000/dbus/foo.info",
+        ] {
+            let result = filter
+                .evaluate(&unix_connect_ctx(address, Some("control")))
+                .await
+                .unwrap();
+            assert!(!result.matched, "{address} must be no_match");
+        }
+    }
+
+    /// Regression guards: Privileged and unlabelled sockets keep today's
+    /// scoring — docker.sock is an unknown domain (no_match), and an
+    /// unlabelled path with a suspicious TLD suffix still fires.
+    #[tokio::test]
+    async fn test_privileged_and_unlabelled_sockets_unchanged() {
+        let filter = filter_with_malicious();
+        let privileged = filter
+            .evaluate(&unix_connect_ctx(
+                "unix:/var/run/docker.sock",
+                Some("privileged"),
+            ))
+            .await
+            .unwrap();
+        assert!(!privileged.matched);
+
+        let unlabelled = filter
+            .evaluate(&unix_connect_ctx("unix:/tmp/payload.tk", None))
+            .await
+            .unwrap();
+        assert!(unlabelled.matched);
+        assert_eq!(unlabelled.rule_id, "suspicious-tld");
     }
 
     #[tokio::test]

@@ -196,11 +196,29 @@ enforce_authority_delegating_spawn = true
 # routed to the proxy and escalated
 # Allow→QUEUE unless the profile's permit_control_sockets list authorises it.
 # Independent knob — desktop tooling touches the session bus routinely, so this
-# has a higher false-positive surface than the spawn flag. Known gap: abstract-
-# namespace sockets (the kind X11 clients try first) are not yet matched — see
-# the CHANGELOG. Emergency override:
+# has a higher false-positive surface than the spawn flag. Abstract-namespace
+# sockets (the kind X11 clients try first) ARE matched — they render as
+# `unix:@<name>` and classify like any other path. Emergency override:
 # GRITH_ENFORCE_CONTROL_SOCKET_CONNECT=1 (or =0 to force off).
 enforce_control_socket_connect = true
+# Decide D-Bus control-socket access per *method call* instead of per
+# connection. At `connect(2)` there is nothing to judge but a socket path —
+# "read the keyring" and "ask systemd to run this command outside supervision"
+# are byte-identical syscalls — so enforcing there charges a prompt for every
+# credential-helper lookup. With this on (the default), a connect to a D-Bus
+# endpoint instead arms message inspection: grith decodes the calls the tool
+# writes to that socket and escalates only the ones a curated allowlist does
+# not vouch for. `gh auth token`'s keyring read stops prompting;
+# `org.freedesktop.systemd1.Manager.StartTransientUnit` still QUEUEs, and now
+# says so by name.
+#
+# Fails toward the old behaviour: an unreadable payload, an undecodable stream
+# or an unlisted method escalates the connection exactly as
+# enforce_control_socket_connect alone would. Only D-Bus is affected — X11,
+# tmux and screen carry no per-message destination and keep connect-time
+# enforcement. Has no effect when enforce_control_socket_connect is false.
+# Emergency override: GRITH_DBUS_MESSAGE_INSPECTION=0 (or =1 to force on).
+dbus_message_inspection = true
 # Seconds to keep running after the daemon stops accounting for this session
 # (it answered a heartbeat with "I am not tracking you" — usually because it
 # restarted while at its session cap). 0 = never terminate: the session keeps

@@ -38,3 +38,19 @@ Thumbs.db
 qa-runs/
 local-notes.txt
 arm64-smoke-results-grith-arm64-*
+
+# Demo takes (work/demos/player) — per-recording artifacts, not fixtures.
+# sample.cast is committed deliberately; real recordings are not.
+work/demos/player/*.cast
+!work/demos/player/sample.cast
+# summary.txt is a committed CURATED end-card (see timeline [summary]); a real
+# per-take capture would overwrite it, but the checked-in one keeps the demo
+# self-contained. Not ignored.
+work/demos/player/generated*.toml
+work/demos/player/__pycache__/
+pty*.log
+# Sink state — holds generated PRIVATE KEYS (ca.key/server.key) and captured
+# request bodies. Never commit.
+work/demos/player/.sink/
+work/demos/player/*-framed.gif
+work/demos/player/*-framed.mp4

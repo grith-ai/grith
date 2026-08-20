@@ -172,6 +172,23 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
             target: target.clone(),
             fstype: fstype.clone(),
         }),
+        // A decoded D-Bus method call the supervisor's allowlist refused.
+        // Mapped to its own variant rather than to `NetConnect`: the egress
+        // filter de-scores Control-class unix sockets to 0.0 (PR #126), so
+        // routing it there would score the call at 0.5 and auto-allow the
+        // exact operation this path exists to surface.
+        SyscallKind::DbusMethodCall {
+            socket,
+            destination,
+            interface,
+            member,
+            ..
+        } => Some(ToolCallType::DbusMethodCall {
+            socket: socket.clone(),
+            destination: destination.clone(),
+            interface: interface.clone(),
+            member: member.clone(),
+        }),
         SyscallKind::CrossProcessAccess { op, target_pid } => {
             Some(ToolCallType::CrossProcessAccess {
                 op: format!("{op:?}").to_ascii_lowercase(),
@@ -527,6 +544,52 @@ fn path_contains_node_modules(path_lc: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── D-Bus method calls ─────────────────────────────────────────
+
+    /// The regression guard that matters most for this variant: the `_ =>`
+    /// catch-all below the explicit arms means "not security-relevant", which
+    /// the event handler turns into a **silent allow**. A `DbusMethodCall` only
+    /// reaches the mapper when the supervisor's curated allowlist already
+    /// refused it, so falling through would auto-allow precisely the calls this
+    /// path exists to surface.
+    #[test]
+    fn dbus_method_call_never_falls_into_the_auto_allow_catch_all() {
+        let kind = SyscallKind::DbusMethodCall {
+            socket: "unix:/run/user/1000/bus".into(),
+            destination: Some("org.freedesktop.systemd1".into()),
+            interface: Some("org.freedesktop.systemd1.Manager".into()),
+            member: Some("StartTransientUnit".into()),
+            path: Some("/org/freedesktop/systemd1".into()),
+        };
+        assert_eq!(
+            to_tool_call_type(&kind),
+            Some(ToolCallType::DbusMethodCall {
+                socket: "unix:/run/user/1000/bus".into(),
+                destination: Some("org.freedesktop.systemd1".into()),
+                interface: Some("org.freedesktop.systemd1.Manager".into()),
+                member: Some("StartTransientUnit".into()),
+            })
+        );
+    }
+
+    /// A message missing header fields still maps — the decision is the
+    /// supervisor's, and an unnameable call must reach the proxy rather than
+    /// being dropped for want of a label.
+    #[test]
+    fn dbus_method_call_with_missing_header_fields_still_maps() {
+        let kind = SyscallKind::DbusMethodCall {
+            socket: "unix:/run/user/1000/bus".into(),
+            destination: None,
+            interface: None,
+            member: None,
+            path: None,
+        };
+        assert!(matches!(
+            to_tool_call_type(&kind),
+            Some(ToolCallType::DbusMethodCall { .. })
+        ));
+    }
 
     // ── FileOpen mappings ──────────────────────────────────────────
 
