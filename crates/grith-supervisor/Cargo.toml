@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 grith-proxy = { path = "../grith-proxy" }
 grith-audit = { path = "../grith-audit" }
+grith-analytics = { path = "../grith-analytics" }
 grith-digest = { path = "../grith-digest" }
 
 tokio.workspace = true

@@ -5,13 +5,41 @@
 
 use crate::tui::state::PermissionRequest;
 use crate::tui::theme::*;
-use grith_digest::{PermissionReviewAction, ScopedAllowRequest};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use grith_digest::{PermissionReviewAction, ScopedAllowRequest, ScopedDenyRequest};
+use grith_supervisor::scoped_permissions::ScopeMode;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
+
+/// What a keystroke did to the scope editor.
+///
+/// Both review hosts (`exec_tui.rs` and the REPL dialog in `tui/mod.rs`) used
+/// to carry their own copy of the key match, which is how they drifted apart.
+/// They now both call [`ScopeDialogState::handle_key`] and act on this.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScopeKeyOutcome {
+    /// Stay in the editor and redraw.
+    Continue,
+    /// Close the editor and go back to the request dialog.
+    Cancel,
+    /// The proposal validated; dismiss the review with this action.
+    Applied(PermissionReviewAction),
+}
+
+/// The next wider scope, or why there isn't one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WidenProbe {
+    /// Widening is allowed and would produce this directory.
+    Available(String),
+    /// The breadth floor refuses it. Carries a hint-sized reason so the
+    /// editor can grey the control and say why, rather than letting the
+    /// reviewer walk one component too far and discover it on Enter.
+    Blocked(String),
+}
 
 /// Mutable state for the second-step scoped permission editor.
 #[derive(Debug, Clone)]
@@ -21,32 +49,175 @@ pub struct ScopeDialogState {
     focus: usize,
     /// Inline validation error from the last apply attempt.
     pub error: Option<String>,
+    /// Caret position, as a char index into `request.directory`.
+    ///
+    /// The old field had none: it drew a caret glyph after a head-truncating
+    /// ellipsis while every edit landed in the invisible tail, so on a path
+    /// longer than the field the editor looked frozen.
+    cursor: usize,
+    /// Whether the directory row is a free-text field.
+    ///
+    /// Off by default. The primary interaction is walking whole path
+    /// components, which cannot land on the partial component that the
+    /// containment check rejects; free text is the escape hatch behind `[e]`.
+    editing: bool,
+    /// The reviewed target's own directory — the narrowest scope on offer,
+    /// and the anchor the "narrower" control walks back toward.
+    narrowest: String,
+    /// Whether `narrowest` existed when the dialog opened. The reviewed call
+    /// is frozen while this dialog is up but nothing else is, so a concurrent
+    /// `git worktree remove` can delete the directory mid-review; this is
+    /// what lets the status line name that race instead of reporting the
+    /// directory as one that was never created.
+    default_existed: bool,
+    /// work/85: whether this editor is granting or withholding.
+    mode: ScopeMode,
+    /// The operation ticks the dialog opened with, so switching back out of
+    /// deny mode restores the reviewed operation rather than leaving all three
+    /// ticked — deny mode ticks everything, and silently carrying that into a
+    /// grant would widen an approval the reviewer never asked for.
+    allow_defaults: (bool, bool, bool),
 }
 
 impl ScopeDialogState {
-    const FOCUS_COUNT: usize = 5;
+    const FOCUS_COUNT: usize = 6;
+    /// Focus index of the allow/deny row.
+    ///
+    /// Last in the tab cycle, first on screen. The directory keeps focus 0
+    /// because the editor's "just start typing a path" behaviour depends on
+    /// it, and one shift-tab (or ctrl-b from anywhere) reaches the mode row
+    /// without costing that.
+    const FOCUS_MODE: usize = 5;
 
     /// Create the safe operation-specific default for a permission request.
     pub fn for_request(req: &PermissionRequest) -> Option<Self> {
+        Self::for_request_in_mode(req, ScopeMode::Allow)
+    }
+
+    /// Open the editor already set to block the directory — the `[b]` entry
+    /// point on the permission dialog.
+    pub fn blocking_for_request(req: &PermissionRequest) -> Option<Self> {
+        Self::for_request_in_mode(req, ScopeMode::Deny)
+    }
+
+    fn for_request_in_mode(req: &PermissionRequest, mode: ScopeMode) -> Option<Self> {
         if !req.scope_enabled {
             return None;
         }
-        Some(Self {
-            request: grith_supervisor::scoped_permissions::default_scoped_allow(&req.tool)?,
+        let request = grith_supervisor::scoped_permissions::default_scoped_allow(&req.tool)?;
+        let narrowest = request.directory.clone();
+        let default_existed = std::path::Path::new(&narrowest).is_dir();
+        let mut state = Self {
+            cursor: request.directory.chars().count(),
+            allow_defaults: (request.read, request.write, request.delete),
+            request,
             focus: 0,
             error: None,
-        })
+            editing: false,
+            narrowest,
+            default_existed,
+            mode: ScopeMode::Allow,
+        };
+        state.set_mode(mode);
+        Some(state)
+    }
+
+    /// Which direction the editor currently points.
+    #[must_use]
+    pub fn mode(&self) -> ScopeMode {
+        self.mode
+    }
+
+    /// Whether the editor is withholding rather than granting.
+    #[must_use]
+    pub fn is_blocking(&self) -> bool {
+        matches!(self.mode, ScopeMode::Deny)
+    }
+
+    /// Whether the allow/deny row has focus.
+    #[must_use]
+    pub fn mode_focused(&self) -> bool {
+        self.focus == Self::FOCUS_MODE
+    }
+
+    /// Switch direction.
+    ///
+    /// Deny ticks all three operations: an operator blocking a directory
+    /// almost always means the whole directory, and the alternative — a block
+    /// that silently covers reads only because the prompt happened to be a
+    /// read — is the kind of half-applied rule that sends them back to the
+    /// dialog. Returning to allow restores the operation the dialog opened
+    /// with, so a grant is never widened by a visit to deny mode.
+    pub fn set_mode(&mut self, mode: ScopeMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        match mode {
+            ScopeMode::Deny => {
+                self.request.read = true;
+                self.request.write = true;
+                self.request.delete = true;
+            }
+            ScopeMode::Allow => {
+                let (read, write, delete) = self.allow_defaults;
+                self.request.read = read;
+                self.request.write = write;
+                self.request.delete = delete;
+            }
+        }
+        self.error = None;
+    }
+
+    /// Flip between granting and blocking.
+    pub fn toggle_mode(&mut self) {
+        self.set_mode(match self.mode {
+            ScopeMode::Allow => ScopeMode::Deny,
+            ScopeMode::Deny => ScopeMode::Allow,
+        });
+    }
+
+    /// The proposal as a refusal, for the deny-mode preview and validation.
+    fn deny_request(&self) -> ScopedDenyRequest {
+        ScopedDenyRequest {
+            directory: self.request.directory.clone(),
+            read: self.request.read,
+            write: self.request.write,
+            delete: self.request.delete,
+        }
+    }
+
+    /// Live verdict for the current proposal, in the current mode.
+    #[must_use]
+    pub fn status(
+        &self,
+        req: &PermissionRequest,
+    ) -> grith_supervisor::scoped_permissions::ScopeStatus {
+        match self.mode {
+            ScopeMode::Allow => grith_supervisor::scoped_permissions::preview_scoped_allow(
+                &self.request,
+                &req.tool,
+                self.default_directory_existed(),
+            ),
+            ScopeMode::Deny => grith_supervisor::scoped_permissions::preview_scoped_deny(
+                &self.deny_request(),
+                &req.tool,
+                self.default_directory_existed(),
+            ),
+        }
     }
 
     /// Move focus to the next field or duration choice.
     pub fn focus_next(&mut self) {
         self.focus = (self.focus + 1) % Self::FOCUS_COUNT;
+        self.editing = false;
         self.error = None;
     }
 
     /// Move focus to the previous field or duration choice.
     pub fn focus_previous(&mut self) {
         self.focus = (self.focus + Self::FOCUS_COUNT - 1) % Self::FOCUS_COUNT;
+        self.editing = false;
         self.error = None;
     }
 
@@ -60,22 +231,175 @@ impl ScopeDialogState {
         self.focus == 4
     }
 
-    /// Append a character to the directory field.
-    pub fn push_directory_char(&mut self, ch: char) {
-        self.request.directory.push(ch);
+    /// Whether the directory row is currently a free-text field.
+    pub fn editing(&self) -> bool {
+        self.editing
+    }
+
+    /// Caret position as a char index into the directory field.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether the dialog's own default directory existed when it opened and
+    /// the field still names it.
+    ///
+    /// Only the untouched default can report the mid-review deletion race: a
+    /// directory the reviewer typed or walked to was never shown as existing,
+    /// so a missing one there is just "not created yet".
+    pub fn default_directory_existed(&self) -> bool {
+        self.default_existed && self.request.directory == self.narrowest
+    }
+
+    /// The next wider scope, or why the breadth floor refuses one.
+    pub fn widen_probe(&self, req: &PermissionRequest) -> WidenProbe {
+        let Some(candidate) = self.widen_candidate() else {
+            return WidenProbe::Blocked("already at the filesystem root".to_string());
+        };
+        // `false`: a walk candidate is never the dialog's own default, so the
+        // "removed while frozen" wording cannot apply to it.
+        let status = match self.mode {
+            ScopeMode::Allow => {
+                let probe = ScopedAllowRequest {
+                    directory: candidate.clone(),
+                    ..self.request.clone()
+                };
+                grith_supervisor::scoped_permissions::preview_scoped_allow(&probe, &req.tool, false)
+            }
+            ScopeMode::Deny => {
+                let probe = ScopedDenyRequest {
+                    directory: candidate.clone(),
+                    ..self.deny_request()
+                };
+                grith_supervisor::scoped_permissions::preview_scoped_deny(&probe, &req.tool, false)
+            }
+        };
+        if !status.blocks_apply() {
+            return WidenProbe::Available(candidate);
+        }
+        let shown = candidate.trim_end_matches('/');
+        let shown = if shown.is_empty() { "/" } else { shown };
+        WidenProbe::Blocked(match status {
+            grith_supervisor::scoped_permissions::ScopeStatus::TooBroad { .. } => {
+                format!("{shown} is too broad")
+            }
+            grith_supervisor::scoped_permissions::ScopeStatus::Sensitive { .. } => {
+                format!("{shown} is sensitive")
+            }
+            other => other.message(),
+        })
+    }
+
+    /// The next scope back toward the reviewed target, if any.
+    pub fn narrow_candidate(&self) -> Option<String> {
+        if !self.request.directory.starts_with('/') || !self.narrowest.starts_with('/') {
+            return None;
+        }
+        let current = path_components(&self.request.directory);
+        let target = path_components(&self.narrowest);
+        if target.len() <= current.len() || target[..current.len()] != current[..] {
+            return None;
+        }
+        Some(format!("/{}/", target[..=current.len()].join("/")))
+    }
+
+    /// Widen the scope by one path component. Returns whether it moved.
+    pub fn walk_wider(&mut self, req: &PermissionRequest) -> bool {
+        match self.widen_probe(req) {
+            WidenProbe::Available(directory) => {
+                self.set_directory(directory);
+                true
+            }
+            WidenProbe::Blocked(_) => false,
+        }
+    }
+
+    /// Narrow the scope by one path component, back toward the reviewed
+    /// target. Never needs a floor check: every candidate is a descendant of
+    /// the current directory, so it can only get tighter.
+    pub fn walk_narrower(&mut self) -> bool {
+        match self.narrow_candidate() {
+            Some(directory) => {
+                self.set_directory(directory);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Enter free-text editing with the caret at the end of the field.
+    pub fn start_editing(&mut self) {
+        self.editing = true;
+        self.cursor = self.request.directory.chars().count();
+    }
+
+    /// Insert a character at the caret.
+    pub fn insert_char(&mut self, ch: char) {
+        let at = byte_index(&self.request.directory, self.cursor);
+        self.request.directory.insert(at, ch);
+        self.cursor += 1;
         self.error = None;
     }
 
-    /// Remove the final character from the directory field.
-    pub fn pop_directory_char(&mut self) {
-        self.request.directory.pop();
+    /// Delete the character before the caret.
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = byte_index(&self.request.directory, self.cursor - 1);
+        let end = byte_index(&self.request.directory, self.cursor);
+        self.request.directory.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.error = None;
+    }
+
+    /// Ctrl-W: delete the whole path component before the caret.
+    ///
+    /// The component-at-a-time unit matters because the containment check is
+    /// component-wise: deleting "grith-analytics-local" one character at a
+    /// time passes through thirteen partial components that all validate as
+    /// "does not contain the target".
+    pub fn delete_previous_component(&mut self) {
+        let chars: Vec<char> = self.request.directory.chars().collect();
+        let mut start = self.cursor.min(chars.len());
+        while start > 0 && chars[start - 1] == '/' {
+            start -= 1;
+        }
+        while start > 0 && chars[start - 1] != '/' {
+            start -= 1;
+        }
+        let from = byte_index(&self.request.directory, start);
+        let to = byte_index(&self.request.directory, self.cursor);
+        self.request.directory.replace_range(from..to, "");
+        self.cursor = start;
         self.error = None;
     }
 
     /// Clear the directory field.
     pub fn clear_directory(&mut self) {
         self.request.directory.clear();
+        self.cursor = 0;
         self.error = None;
+    }
+
+    /// Move the caret one character left.
+    pub fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the caret one character right.
+    pub fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.request.directory.chars().count());
+    }
+
+    /// Move the caret to the start of the field.
+    pub fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the caret to the end of the field.
+    pub fn move_cursor_end(&mut self) {
+        self.cursor = self.request.directory.chars().count();
     }
 
     /// Toggle the focused operation checkbox.
@@ -88,25 +412,214 @@ impl ScopeDialogState {
             // reaffirms the only supported choice instead of silently
             // changing the wire request.
             4 => self.request.persist = false,
+            Self::FOCUS_MODE => self.toggle_mode(),
             _ => {}
         }
         self.error = None;
     }
 
+    /// Handle one keystroke. The single key map both review hosts share.
+    pub fn handle_key(&mut self, key: &KeyEvent, req: &PermissionRequest) -> ScopeKeyOutcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            // Esc leaves the free-text field before it leaves the dialog, so
+            // the escape hatch is never a trap door out of the review.
+            KeyCode::Esc if self.editing => self.editing = false,
+            KeyCode::Esc => return ScopeKeyOutcome::Cancel,
+            KeyCode::Enter => {
+                if let Some(action) = self.apply(req) {
+                    return ScopeKeyOutcome::Applied(action);
+                }
+            }
+            KeyCode::Tab if shift => self.focus_previous(),
+            KeyCode::Tab | KeyCode::Down => self.focus_next(),
+            KeyCode::BackTab | KeyCode::Up => self.focus_previous(),
+            KeyCode::Left if self.editing => self.move_cursor_left(),
+            KeyCode::Right if self.editing => self.move_cursor_right(),
+            KeyCode::Home if self.editing => self.move_cursor_home(),
+            KeyCode::End if self.editing => self.move_cursor_end(),
+            // Ctrl-B works from anywhere, including mid-edit, so the
+            // reviewer never has to leave the path field to change direction.
+            KeyCode::Char('b') if ctrl => self.toggle_mode(),
+            KeyCode::Left if self.mode_focused() => self.set_mode(ScopeMode::Allow),
+            KeyCode::Right if self.mode_focused() => self.set_mode(ScopeMode::Deny),
+            KeyCode::Left if self.directory_focused() => {
+                self.walk_wider(req);
+            }
+            KeyCode::Right if self.directory_focused() => {
+                self.walk_narrower();
+            }
+            KeyCode::Backspace if self.directory_focused() => {
+                self.editing = true;
+                self.backspace();
+            }
+            KeyCode::Char('w') if ctrl && self.directory_focused() => {
+                self.editing = true;
+                self.delete_previous_component();
+            }
+            KeyCode::Char('u') if ctrl && self.directory_focused() => {
+                self.editing = true;
+                self.clear_directory();
+            }
+            KeyCode::Char(' ') if !self.directory_focused() => self.toggle_focused(),
+            KeyCode::Char(ch) if self.editing && (key.modifiers.is_empty() || shift) => {
+                self.insert_char(ch);
+            }
+            // `[e]` opens the field, as the footer advertises. Any other
+            // printable key opens it and types itself, so a reviewer who
+            // starts typing a path is not silently ignored the way the old
+            // walk-less field ignored cursor keys.
+            KeyCode::Char('e' | 'E') if self.directory_focused() && key.modifiers.is_empty() => {
+                self.start_editing();
+            }
+            KeyCode::Char(ch)
+                if self.directory_focused() && (key.modifiers.is_empty() || shift) =>
+            {
+                self.start_editing();
+                self.insert_char(ch);
+            }
+            _ => {}
+        }
+        ScopeKeyOutcome::Continue
+    }
+
     /// Validate the proposal and return its canonical structured action.
     pub fn apply(&mut self, req: &PermissionRequest) -> Option<PermissionReviewAction> {
-        match grith_supervisor::scoped_permissions::validate_scoped_allow(&self.request, &req.tool)
-        {
-            Ok(validated) => {
-                self.request.directory = validated.directory;
+        let validated = match self.mode {
+            ScopeMode::Allow => grith_supervisor::scoped_permissions::validate_scoped_allow(
+                &self.request,
+                &req.tool,
+            )
+            .map(|validated| validated.directory),
+            ScopeMode::Deny => grith_supervisor::scoped_permissions::validate_scoped_deny(
+                &self.deny_request(),
+                &req.tool,
+            )
+            .map(|validated| validated.directory),
+        };
+        match validated {
+            Ok(directory) => {
+                self.request.directory = directory;
+                self.cursor = self.request.directory.chars().count();
                 self.error = None;
-                Some(PermissionReviewAction::ScopedAllow(self.request.clone()))
+                Some(match self.mode {
+                    ScopeMode::Allow => PermissionReviewAction::ScopedAllow(self.request.clone()),
+                    ScopeMode::Deny => PermissionReviewAction::ScopedDeny(self.deny_request()),
+                })
             }
             Err(error) => {
                 self.error = Some(error);
                 None
             }
         }
+    }
+
+    /// The parent of the current scope, in directory form.
+    fn widen_candidate(&self) -> Option<String> {
+        if !self.request.directory.starts_with('/') {
+            return None;
+        }
+        let trimmed = self.request.directory.trim_end_matches('/');
+        let parent = std::path::Path::new(trimmed).parent()?;
+        let parent = parent.to_string_lossy();
+        if parent.is_empty() {
+            return None;
+        }
+        Some(directory_form(&parent))
+    }
+
+    fn set_directory(&mut self, directory: String) {
+        self.request.directory = directory;
+        self.cursor = self.request.directory.chars().count();
+        self.error = None;
+    }
+}
+
+/// Non-empty path components of an absolute path.
+fn path_components(path: &str) -> Vec<&str> {
+    path.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+/// A path with exactly one trailing separator, which is the form every
+/// `*-prefix:` session rule is stored in.
+fn directory_form(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+fn byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or_else(|| text.len(), |(index, _)| index)
+}
+
+/// A slice of a text field guaranteed to contain the caret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldWindow {
+    /// Text to draw, including any clip markers.
+    text: String,
+    /// Column of the caret within `text`.
+    cursor_col: usize,
+}
+
+/// Window a single-line field so the caret is always on screen.
+///
+/// The old field rendered `truncate(head) + "..."` and drew its caret after
+/// the ellipsis, so on any path longer than the field every keystroke landed
+/// somewhere the reviewer could not see. Clipped ends are marked so the
+/// reviewer knows the value continues past the window.
+fn field_window(text: &str, cursor: usize, width: usize) -> FieldWindow {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let cursor = cursor.min(len);
+    if width == 0 {
+        return FieldWindow {
+            text: String::new(),
+            cursor_col: 0,
+        };
+    }
+    // `len < width` rather than `<=`: the caret needs a column of its own
+    // when it sits past the final character.
+    if len < width {
+        return FieldWindow {
+            text: text.to_string(),
+            cursor_col: cursor,
+        };
+    }
+
+    // Marker columns come out of the text budget, which can itself change
+    // whether a side is clipped; two passes always settle it.
+    let (mut left, mut right) = (0usize, 0usize);
+    let (mut offset, mut text_width) = (0usize, width);
+    for _ in 0..3 {
+        text_width = width.saturating_sub(left + right).max(1);
+        offset = cursor.saturating_sub(text_width - 1);
+        let next_left = usize::from(offset > 0);
+        let next_right = usize::from(offset + text_width < len);
+        if next_left == left && next_right == right {
+            break;
+        }
+        left = next_left;
+        right = next_right;
+    }
+
+    let end = (offset + text_width).min(len);
+    let mut rendered = String::new();
+    if left == 1 {
+        rendered.push('\u{2039}');
+    }
+    rendered.extend(chars[offset..end].iter());
+    if right == 1 {
+        rendered.push('\u{203a}');
+    }
+    FieldWindow {
+        text: rendered,
+        cursor_col: left + (cursor - offset),
     }
 }
 
@@ -149,7 +662,7 @@ pub fn render_scope_permission_dialog(
     req: &PermissionRequest,
     state: &ScopeDialogState,
 ) {
-    let area = centered_rect(76, 60, frame.area());
+    let area = centered_rect(scope_dialog_width(state), 60, frame.area());
     frame.render_widget(Clear, area);
     render_scope_container(frame, area, req, state);
 }
@@ -249,6 +762,11 @@ fn render_help_body(frame: &mut Frame, area: Rect, req: &PermissionRequest, is_d
                 AMBER,
                 "Allow a directory for operations you pick, this session only",
             ));
+            lines.push(help_line(
+                "[b]",
+                RED,
+                "Block a directory for the rest of the session — no more prompts for it",
+            ));
         }
         lines.push(help_line("[t]", RED, "Deny and stop the supervised tool"));
         lines.push(help_line(
@@ -282,11 +800,19 @@ fn render_scope_container(
     req: &PermissionRequest,
     state: &ScopeDialogState,
 ) {
+    // A block and a grant must not look alike. The reviewer is about to
+    // install a standing session rule either way, and the title bar is the
+    // one part of the dialog that is always on screen.
+    let (title, colour) = if state.is_blocking() {
+        (" BLOCK DIRECTORY ", RED)
+    } else {
+        (" SCOPE PERMISSION ", AMBER)
+    };
     let block = Block::default()
-        .title(" SCOPE PERMISSION ")
-        .title_style(Style::new().fg(AMBER).add_modifier(Modifier::BOLD))
+        .title(title)
+        .title_style(Style::new().fg(colour).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(AMBER))
+        .border_style(Style::new().fg(colour))
         .style(Style::new().bg(BG_PANEL));
     frame.render_widget(block, area);
     let inner = area.inner(Margin {
@@ -294,6 +820,26 @@ fn render_scope_container(
         vertical: 1,
     });
     render_scope_body(frame, inner, req, state);
+}
+
+/// Label in front of the editable directory. Its width is the field's left
+/// margin, so the walk hints and the resolved path line up under the path.
+const SCOPE_LABEL: &str = "scope:    ";
+
+/// Width the scope dialog wants.
+///
+/// 76 columns was hard-coded, which is ~58 usable characters for a path; the
+/// recorded failure case was 85 characters long, so the value the reviewer
+/// was editing could not be shown at any caret position. Grow with the path
+/// and let `centered_rect` clamp to the terminal.
+fn scope_dialog_width(state: &ScopeDialogState) -> u16 {
+    let needed = state
+        .request
+        .directory
+        .chars()
+        .count()
+        .saturating_add(SCOPE_LABEL.len() + 8);
+    u16::try_from(needed).unwrap_or(u16::MAX).max(76)
 }
 
 fn render_scope_body(
@@ -308,59 +854,91 @@ fn render_scope_body(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // 0 allow / block
+            Constraint::Length(1), // 1 editable directory
+            Constraint::Length(1), // 2 walk controls
+            Constraint::Length(1), // 3 resolved path, when it differs
+            Constraint::Length(1), // 4 operation checkboxes
+            Constraint::Length(1), // 5 duration
+            Constraint::Length(1), // 6 rename detail
+            Constraint::Length(1), // 7 what will be granted or blocked
+            Constraint::Min(1),    // 8 status, wrapped
+            Constraint::Length(2), // 9 footer, wrapped
         ])
         .split(area);
     let width = area.width as usize;
+    let label_width = SCOPE_LABEL.chars().count();
+    frame.render_widget(
+        Paragraph::new(scope_mode_line(state, label_width)).style(Style::new().bg(BG_PANEL)),
+        chunks[0],
+    );
+    let field_width = width.saturating_sub(label_width);
     let field_style = if state.directory_focused() {
         Style::new().fg(WHITE).add_modifier(Modifier::BOLD)
     } else {
         Style::new().fg(TEXT_MID)
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("directory: ", Style::new().fg(TEXT_DIM)),
-            Span::styled(
-                truncate(
-                    &state.request.directory,
-                    width.saturating_sub("directory: ".len() + 1),
-                ),
-                field_style,
-            ),
-            Span::styled(
-                if state.directory_focused() { "▏" } else { "" },
-                Style::new().fg(AMBER),
-            ),
-        ]))
-        .style(Style::new().bg(BG_PANEL)),
-        chunks[0],
-    );
 
-    let preview =
-        grith_supervisor::scoped_permissions::preview_scope_path(&state.request.directory);
-    let (resolved, preview_error, exists) = match preview {
-        Ok(preview) => (preview.resolved_directory, None, preview.exists),
-        Err(error) => (String::new(), Some(error), false),
-    };
+    let mut field_spans = vec![Span::styled(SCOPE_LABEL, Style::new().fg(TEXT_DIM))];
+    if state.editing() {
+        let window = field_window(&state.request.directory, state.cursor(), field_width);
+        let chars: Vec<char> = window.text.chars().collect();
+        let before: String = chars.iter().take(window.cursor_col).collect();
+        field_spans.push(Span::styled(before, field_style));
+        match chars.get(window.cursor_col) {
+            // The caret is drawn ON the character it is over, not after an
+            // ellipsis somewhere else in the string.
+            Some(under) => {
+                field_spans.push(Span::styled(
+                    under.to_string(),
+                    Style::new().fg(BG_PANEL).bg(AMBER),
+                ));
+                let after: String = chars.iter().skip(window.cursor_col + 1).collect();
+                field_spans.push(Span::styled(after, field_style));
+            }
+            None => field_spans.push(Span::styled("\u{258f}", Style::new().fg(AMBER))),
+        }
+    } else {
+        // Not editing: keep the basename, which is the part that tells the
+        // reviewer which directory this is.
+        field_spans.push(Span::styled(
+            shorten_path_middle(&state.request.directory, field_width),
+            field_style,
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("resolved:  ", Style::new().fg(TEXT_DIM)),
-            Span::styled(
-                truncate(&resolved, width.saturating_sub("resolved:  ".len())),
-                Style::new().fg(TEXT_MID),
-            ),
-        ]))
-        .style(Style::new().bg(BG_PANEL)),
+        Paragraph::new(Line::from(field_spans)).style(Style::new().bg(BG_PANEL)),
         chunks[1],
     );
+
+    frame.render_widget(
+        Paragraph::new(scope_walk_line(req, state, label_width)).style(Style::new().bg(BG_PANEL)),
+        chunks[2],
+    );
+
+    // Show the resolved path only when it differs from what is typed: a
+    // symlinked scope directory resolves somewhere broader, and work/70
+    // requires that never be silent.
+    let preview =
+        grith_supervisor::scoped_permissions::preview_scope_path(&state.request.directory);
+    if let Ok(preview) = &preview {
+        if preview.resolved_directory != directory_form(&state.request.directory) {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("resolves:  ", Style::new().fg(TEXT_DIM)),
+                    Span::styled(
+                        shorten_path_middle(
+                            &preview.resolved_directory,
+                            width.saturating_sub("resolves:  ".len()),
+                        ),
+                        Style::new().fg(TEXT_MID),
+                    ),
+                ]))
+                .style(Style::new().bg(BG_PANEL)),
+                chunks[3],
+            );
+        }
+    }
 
     let operation_line = Line::from(vec![
         checkbox_span("read", state.request.read, state.focus == 1),
@@ -371,7 +949,7 @@ fn render_scope_body(
     ]);
     frame.render_widget(
         Paragraph::new(operation_line).style(Style::new().bg(BG_PANEL)),
-        chunks[3],
+        chunks[4],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -392,7 +970,7 @@ fn render_scope_body(
             Span::styled("   not saved to the profile", Style::new().fg(TEXT_DIM)),
         ]))
         .style(Style::new().bg(BG_PANEL)),
-        chunks[4],
+        chunks[5],
     );
 
     let rename_detail = if let Some(body) = req
@@ -417,41 +995,219 @@ fn render_scope_body(
     if let Some(detail) = rename_detail {
         frame.render_widget(
             Paragraph::new(truncate(&detail, width)).style(Style::new().fg(TEXT_DIM).bg(BG_PANEL)),
-            chunks[5],
-        );
-    }
-
-    let message = state
-        .error
-        .clone()
-        .or(preview_error)
-        .or_else(|| (!exists).then(|| "Warning: directory does not exist yet".to_string()));
-    if let Some(message) = message {
-        frame.render_widget(
-            Paragraph::new(truncate(&message, width)).style(
-                Style::new()
-                    .fg(if state.error.is_some() { RED } else { AMBER })
-                    .bg(BG_PANEL),
-            ),
             chunks[6],
         );
     }
 
+    let status = state.status(req);
+
+    // Say what will be granted, in the rule's own terms, so "apply" is not a
+    // leap of faith about which directory the rule ends up naming.
+    if !status.blocks_apply() {
+        let granted = preview.as_ref().map_or_else(
+            |_| directory_form(&state.request.directory),
+            |preview| preview.resolved_directory.clone(),
+        );
+        // "everything" rather than three comma-separated labels: block mode
+        // ticks all three by default, and spelling them out consumed the room
+        // the DIRECTORY needs — the one value on this line the reviewer has to
+        // read before pressing enter.
+        let labels = selected_operation_labels(state);
+        let operations = if labels.len() == 3 {
+            "everything".to_string()
+        } else {
+            labels.join(", ")
+        };
+        let head = if state.is_blocking() {
+            format!("will BLOCK: {operations} under ")
+        } else {
+            format!("will allow: {operations} under ")
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    head.clone(),
+                    Style::new().fg(if state.is_blocking() { RED } else { TEXT_DIM }),
+                ),
+                Span::styled(
+                    shorten_path_middle(&granted, width.saturating_sub(head.chars().count() + 16)),
+                    Style::new().fg(TEXT_MID),
+                ),
+                Span::styled(" (this session)", Style::new().fg(TEXT_DIM)),
+            ]))
+            .style(Style::new().bg(BG_PANEL)),
+            chunks[7],
+        );
+    }
+
+    // One status line that always reflects the current field. Enter can no
+    // longer surprise the reviewer with a check that only ran on Enter.
+    let (glyph, colour, message) = if let Some(error) = &state.error {
+        ("\u{2717}", RED, error.clone())
+    } else if status.blocks_apply() {
+        ("\u{2717}", RED, status.message())
+    } else if status.is_warning() {
+        ("\u{26a0}", AMBER, status.message())
+    } else {
+        ("\u{2713}", GREEN_HI, status.message())
+    };
     frame.render_widget(
+        // Wrapped, not truncated: the failure the reviewer is being asked to
+        // fix used to be cut off mid-sentence at the dialog's edge.
         Paragraph::new(Line::from(vec![
-            Span::styled(" [tab/↑↓] ", Style::new().fg(TEXT_MID)),
-            Span::styled("Select  ", Style::new().fg(TEXT_DIM)),
-            Span::styled("[space] ", Style::new().fg(TEXT_MID)),
-            Span::styled("Toggle  ", Style::new().fg(TEXT_DIM)),
-            Span::styled("[enter] ", Style::new().fg(GREEN_HI)),
-            Span::styled("Apply scope  ", Style::new().fg(TEXT_MID)),
-            Span::styled("[esc] ", Style::new().fg(TEXT_MID)),
-            Span::styled("Back", Style::new().fg(TEXT_DIM)),
+            Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+            Span::styled(message, Style::new().fg(colour)),
         ]))
         .style(Style::new().bg(BG_PANEL))
         .wrap(Wrap { trim: true }),
         chunks[8],
     );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(scope_footer_spans(state)))
+            .style(Style::new().bg(BG_PANEL))
+            .wrap(Wrap { trim: true }),
+        chunks[9],
+    );
+}
+
+/// The `[<-] wider / [->] narrower` control row.
+///
+/// Walking whole components is the primary interaction: it replaces thirteen
+/// invisible backspaces with two keystrokes and cannot produce the partial
+/// component that the containment check rejects.
+fn scope_walk_line(
+    req: &PermissionRequest,
+    state: &ScopeDialogState,
+    indent: usize,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    if state.editing() {
+        spans.push(Span::styled(
+            "editing \u{2014} [esc] returns to component walking",
+            Style::new().fg(TEXT_DIM),
+        ));
+        return Line::from(spans);
+    }
+
+    let widen = state.widen_probe(req);
+    let can_widen = matches!(widen, WidenProbe::Available(_));
+    spans.push(Span::styled(
+        "[\u{2190}] wider",
+        Style::new().fg(if can_widen && state.directory_focused() {
+            TEXT_MID
+        } else {
+            TEXT_DIM
+        }),
+    ));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(
+        "[\u{2192}] narrower",
+        Style::new().fg(
+            if state.narrow_candidate().is_some() && state.directory_focused() {
+                TEXT_MID
+            } else {
+                TEXT_DIM
+            },
+        ),
+    ));
+    if let WidenProbe::Blocked(reason) = widen {
+        spans.push(Span::styled(
+            format!("   \u{2014} {reason}"),
+            Style::new().fg(TEXT_DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The `allow / block` row.
+///
+/// Rendered first because it changes what every row under it means, and drawn
+/// as two mutually exclusive choices rather than a checkbox: "block" as a tick
+/// box next to three operation tick boxes would read as a fourth operation.
+fn scope_mode_line(state: &ScopeDialogState, indent: usize) -> Line<'static> {
+    let focused = state.mode_focused();
+    let blocking = state.is_blocking();
+    let choice = |label: &str, selected: bool, colour| {
+        Span::styled(
+            format!("({}) {label}", if selected { '\u{25cf}' } else { ' ' }),
+            Style::new()
+                .fg(if selected { colour } else { TEXT_DIM })
+                .add_modifier(if focused && selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )
+    };
+    let mut spans = vec![Span::styled(
+        format!("{:<indent$}", "action:"),
+        Style::new().fg(TEXT_DIM),
+    )];
+    spans.push(choice("allow", !blocking, GREEN_HI));
+    spans.push(Span::raw("   "));
+    spans.push(choice("block", blocking, RED));
+    spans.push(Span::styled(
+        if focused {
+            "   [\u{2190}\u{2192}] choose"
+        } else {
+            "   [ctrl-b] switch"
+        },
+        Style::new().fg(TEXT_DIM),
+    ));
+    Line::from(spans)
+}
+
+fn selected_operation_labels(state: &ScopeDialogState) -> Vec<&'static str> {
+    let mut labels = Vec::with_capacity(3);
+    if state.request.read {
+        labels.push("read");
+    }
+    if state.request.write {
+        labels.push("write/create");
+    }
+    if state.request.delete {
+        labels.push("delete/rename");
+    }
+    labels
+}
+
+/// The key hints. The old footer never mentioned that the directory was a
+/// text field at all, which is half of why it read as frozen.
+fn scope_footer_spans(state: &ScopeDialogState) -> Vec<Span<'static>> {
+    if state.editing() {
+        return vec![
+            Span::styled(" [\u{2190}\u{2192}] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Move  ", Style::new().fg(TEXT_DIM)),
+            Span::styled("[home/end] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Ends  ", Style::new().fg(TEXT_DIM)),
+            Span::styled("[ctrl-w] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Drop component  ", Style::new().fg(TEXT_DIM)),
+            Span::styled("[ctrl-u] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Clear  ", Style::new().fg(TEXT_DIM)),
+            Span::styled("[enter] ", Style::new().fg(GREEN_HI)),
+            Span::styled("Apply  ", Style::new().fg(TEXT_MID)),
+            Span::styled("[esc] ", Style::new().fg(TEXT_MID)),
+            Span::styled("Done editing", Style::new().fg(TEXT_DIM)),
+        ];
+    }
+    vec![
+        Span::styled(" [\u{2190}\u{2192}] ", Style::new().fg(AMBER)),
+        Span::styled("Scope  ", Style::new().fg(TEXT_DIM)),
+        Span::styled("[tab] ", Style::new().fg(TEXT_MID)),
+        Span::styled("Select  ", Style::new().fg(TEXT_DIM)),
+        Span::styled("[space] ", Style::new().fg(TEXT_MID)),
+        Span::styled("Toggle  ", Style::new().fg(TEXT_DIM)),
+        Span::styled("[e] ", Style::new().fg(TEXT_MID)),
+        Span::styled("Edit path  ", Style::new().fg(TEXT_DIM)),
+        Span::styled(
+            "[enter] ",
+            Style::new().fg(if state.is_blocking() { RED } else { GREEN_HI }),
+        ),
+        Span::styled("Apply  ", Style::new().fg(TEXT_MID)),
+        Span::styled("[esc] ", Style::new().fg(TEXT_MID)),
+        Span::styled("Back", Style::new().fg(TEXT_DIM)),
+    ]
 }
 
 fn checkbox_span(label: &str, checked: bool, focused: bool) -> Span<'static> {
@@ -1032,6 +1788,8 @@ fn render_dialog_body(
             actions.extend([
                 Span::styled(" [s] ", Style::new().fg(AMBER)),
                 Span::styled("Scope...  ", Style::new().fg(TEXT_MID)),
+                Span::styled(" [b] ", Style::new().fg(RED)),
+                Span::styled("Block dir...  ", Style::new().fg(TEXT_MID)),
             ]);
         }
         actions.extend([
@@ -1550,6 +2308,8 @@ fn render_panel_body(
             actions.extend([
                 Span::styled(" [s] ", Style::new().fg(AMBER)),
                 Span::styled("Scope...  ", Style::new().fg(TEXT_MID)),
+                Span::styled(" [b] ", Style::new().fg(RED)),
+                Span::styled("Block dir...  ", Style::new().fg(TEXT_MID)),
             ]);
         }
         actions.extend([
@@ -2137,7 +2897,11 @@ mod tests {
         assert!(contents.contains("delete/rename"));
         assert!(contents.contains("this session only"));
         assert!(contents.contains("not saved to the profile"));
-        assert!(contents.contains("Apply scope"));
+        assert!(contents.contains("Apply"));
+        // The footer has to fit the exec panel's 18 rows while still saying
+        // the directory is editable and walkable.
+        assert!(contents.contains("Edit path"));
+        assert!(contents.contains("wider"));
     }
 
     fn buffer_contents(terminal: &Terminal<TestBackend>) -> String {
@@ -2242,10 +3006,15 @@ mod tests {
 
         state.toggle_focused();
         assert!(!state.request.persist);
+        // work/85: the allow/block row is the last stop before the cycle
+        // wraps, so the directory keeps focus 0 and "just start typing a
+        // path" still works when the editor opens.
+        state.focus_next();
+        assert!(state.mode_focused());
         state.focus_next();
         assert!(state.directory_focused());
         state.focus_previous();
-        assert!(state.duration_focused());
+        assert!(state.mode_focused());
     }
 
     #[test]
@@ -2259,6 +3028,580 @@ mod tests {
 
         assert!(state.apply(&req).is_none());
         assert!(state.error.is_some());
+    }
+
+    fn scope_request(tool: &str, call_type: &str) -> PermissionRequest {
+        let mut req = make_request(false);
+        req.tool = tool.to_string();
+        req.call_type = call_type.to_string();
+        req.scope_enabled = true;
+        req
+    }
+
+    // ---- work/85: block mode ------------------------------------------
+
+    #[test]
+    fn block_entry_point_opens_in_deny_mode_with_every_operation_ticked() {
+        let req = scope_request("FileRead(/repo/secrets/token)", "FileRead");
+        let state = ScopeDialogState::blocking_for_request(&req).unwrap();
+
+        assert!(state.is_blocking());
+        // A reviewer blocking a directory over a read prompt means the
+        // directory, not "reads of the directory".
+        assert!(state.request.read);
+        assert!(state.request.write);
+        assert!(state.request.delete);
+        assert_eq!(state.request.directory, "/repo/secrets/");
+    }
+
+    #[test]
+    fn toggling_back_to_allow_restores_the_reviewed_operation() {
+        let req = scope_request("FileRead(/repo/secrets/token)", "FileRead");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        assert!(!state.is_blocking());
+        assert!(state.request.read && !state.request.write && !state.request.delete);
+
+        assert_eq!(
+            state.handle_key(&ctrl('b'), &req),
+            ScopeKeyOutcome::Continue
+        );
+        assert!(state.is_blocking());
+        assert!(state.request.write && state.request.delete);
+
+        // A visit to block mode must not widen the grant on the way back.
+        assert_eq!(
+            state.handle_key(&ctrl('b'), &req),
+            ScopeKeyOutcome::Continue
+        );
+        assert!(!state.is_blocking());
+        assert!(state.request.read && !state.request.write && !state.request.delete);
+    }
+
+    #[test]
+    fn the_mode_row_picks_a_direction_with_the_arrow_keys() {
+        let req = scope_request("FileRead(/repo/secrets/token)", "FileRead");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        // Shift-tab from the directory row reaches the mode row directly.
+        state.handle_key(&KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), &req);
+        assert!(state.mode_focused());
+
+        state.handle_key(&press(KeyCode::Right), &req);
+        assert!(state.is_blocking());
+        state.handle_key(&press(KeyCode::Right), &req);
+        assert!(state.is_blocking(), "choosing block twice stays on block");
+        state.handle_key(&press(KeyCode::Left), &req);
+        assert!(!state.is_blocking());
+        state.handle_key(&press(KeyCode::Char(' ')), &req);
+        assert!(state.is_blocking(), "space toggles the focused row");
+    }
+
+    #[test]
+    fn applying_in_block_mode_returns_a_scoped_deny() {
+        let req = scope_request("FileRead(/repo/secrets/token)", "FileRead");
+        let mut state = ScopeDialogState::blocking_for_request(&req).unwrap();
+
+        match state.handle_key(&press(KeyCode::Enter), &req) {
+            ScopeKeyOutcome::Applied(PermissionReviewAction::ScopedDeny(request)) => {
+                assert_eq!(request.directory, "/repo/secrets/");
+                assert!(request.read && request.write && request.delete);
+            }
+            other => panic!("expected a scoped deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_mode_accepts_a_directory_allow_mode_refuses() {
+        let home = dirs::home_dir().expect("home directory");
+        let ssh = home.join(".ssh");
+        let req = scope_request(
+            &format!("FileRead({}/id_ed25519)", ssh.display()),
+            "FileRead",
+        );
+
+        let mut granting = ScopeDialogState::for_request(&req).unwrap();
+        granting.request.write = true;
+        assert!(
+            granting.apply(&req).is_none(),
+            "write authority over ~/.ssh must stay refused"
+        );
+
+        let mut blocking = ScopeDialogState::blocking_for_request(&req).unwrap();
+        assert!(
+            matches!(
+                blocking.apply(&req),
+                Some(PermissionReviewAction::ScopedDeny(_))
+            ),
+            "blocking ~/.ssh is exactly what the mode is for"
+        );
+    }
+
+    #[test]
+    fn block_mode_says_so_on_screen() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let req = scope_request("FileRead(/repo/secrets/token)", "FileRead");
+        let state = ScopeDialogState::blocking_for_request(&req).unwrap();
+
+        terminal
+            .draw(|frame| render_scope_permission_panel(frame, frame.area(), &req, &state))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("BLOCK DIRECTORY"));
+        assert!(contents.contains("action:"));
+        assert!(!contents.contains("will allow"));
+        // The directory has to survive the summary line's truncation budget:
+        // it is the value the reviewer must read before pressing enter.
+        assert!(
+            contents.contains("will BLOCK: everything under /repo/secrets/"),
+            "the blocked directory must be legible in the summary"
+        );
+    }
+
+    #[test]
+    fn the_action_row_offers_the_block_entry_point() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let req = scope_request("FileRead(/repo/secrets/token)", "FileRead");
+
+        terminal
+            .draw(|frame| render_permission_dialog(frame, &req, false, false))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(contents.contains("[b]"));
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    /// The caret has to be on screen and on the character it is actually
+    /// over. The old field failed both: it drew the caret after a
+    /// head-truncating ellipsis while edits landed in the invisible tail.
+    fn assert_caret_visible(text: &str, cursor: usize, width: usize) {
+        let window = field_window(text, cursor, width);
+        assert!(
+            window.text.chars().count() <= width,
+            "window overflows the field: {:?}",
+            window.text
+        );
+        assert!(
+            window.cursor_col < width,
+            "caret at {} is off the {width}-column field for {text:?}",
+            window.cursor_col
+        );
+        let full: Vec<char> = text.chars().collect();
+        let shown: Vec<char> = window.text.chars().collect();
+        if cursor < full.len() {
+            assert_eq!(
+                shown[window.cursor_col], full[cursor],
+                "caret is drawn over the wrong character in {:?}",
+                window.text
+            );
+        }
+    }
+
+    #[test]
+    fn scope_walk_widens_one_component_at_a_time_and_stops_at_the_floor() {
+        let req = scope_request("FileWrite(/a/b/c/d/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        assert_eq!(state.request.directory, "/a/b/c/d/");
+
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Left), &req),
+            ScopeKeyOutcome::Continue
+        );
+        assert_eq!(state.request.directory, "/a/b/c/");
+        state.handle_key(&press(KeyCode::Left), &req);
+        assert_eq!(state.request.directory, "/a/b/");
+
+        // The floor `reject_broad_or_sensitive_scope` defines. The control is
+        // greyed and says why instead of letting the reviewer walk into an
+        // Enter-time rejection.
+        let WidenProbe::Blocked(reason) = state.widen_probe(&req) else {
+            panic!("widening past /a/b/ must be refused");
+        };
+        assert!(
+            reason.contains("/a"),
+            "the reason must name the floor: {reason}"
+        );
+        state.handle_key(&press(KeyCode::Left), &req);
+        assert_eq!(
+            state.request.directory, "/a/b/",
+            "the walk must stop at the floor"
+        );
+
+        // A component walk can never land on a partial component, so it can
+        // never produce the "does not contain the target" rejection.
+        let status = grith_supervisor::scoped_permissions::preview_scoped_allow(
+            &state.request,
+            &req.tool,
+            false,
+        );
+        assert!(
+            !status.blocks_apply(),
+            "walked scope must stay applicable: {status:?}"
+        );
+    }
+
+    #[test]
+    fn scope_walk_narrows_back_toward_the_reviewed_target() {
+        let req = scope_request("FileWrite(/a/b/c/d/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        for _ in 0..2 {
+            state.handle_key(&press(KeyCode::Left), &req);
+        }
+        assert_eq!(state.request.directory, "/a/b/");
+
+        state.handle_key(&press(KeyCode::Right), &req);
+        assert_eq!(state.request.directory, "/a/b/c/");
+        state.handle_key(&press(KeyCode::Right), &req);
+        assert_eq!(state.request.directory, "/a/b/c/d/");
+
+        // The reviewed target's own directory is the narrowest scope offered.
+        assert!(state.narrow_candidate().is_none());
+        state.handle_key(&press(KeyCode::Right), &req);
+        assert_eq!(state.request.directory, "/a/b/c/d/");
+    }
+
+    #[test]
+    fn directory_field_keeps_the_caret_visible_while_typing_and_backspacing() {
+        let long =
+            "/home/dan/projects/PersonalProjects/Grith/worktrees/grith-analytics-local/work/todos/";
+        let req = scope_request(&format!("FileWrite({long}notes.md)"), "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        // 58 columns is what the old fixed-width dialog left for a path; the
+        // recorded value is 85 characters long.
+        let field = 58;
+        assert!(state.request.directory.chars().count() > field);
+
+        state.handle_key(&press(KeyCode::Char('e')), &req);
+        assert!(state.editing());
+        assert_caret_visible(&state.request.directory, state.cursor(), field);
+
+        for _ in 0..13 {
+            state.handle_key(&press(KeyCode::Backspace), &req);
+            assert_caret_visible(&state.request.directory, state.cursor(), field);
+        }
+        for ch in "worktree/".chars() {
+            state.handle_key(&press(KeyCode::Char(ch)), &req);
+            assert_caret_visible(&state.request.directory, state.cursor(), field);
+        }
+
+        // Clipped ends are marked so the value is visibly longer than the box.
+        let window = field_window(&state.request.directory, state.cursor(), field);
+        assert!(
+            window.text.starts_with('\u{2039}'),
+            "left clip marker missing: {:?}",
+            window.text
+        );
+    }
+
+    #[test]
+    fn cursor_keys_move_within_the_directory_field() {
+        let req = scope_request("FileWrite(/a/b/c/d/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        state.handle_key(&press(KeyCode::Char('e')), &req);
+        let end = state.request.directory.chars().count();
+        assert_eq!(state.cursor(), end);
+
+        state.handle_key(&press(KeyCode::Left), &req);
+        state.handle_key(&press(KeyCode::Left), &req);
+        assert_eq!(state.cursor(), end - 2);
+        state.handle_key(&press(KeyCode::Right), &req);
+        assert_eq!(state.cursor(), end - 1);
+        state.handle_key(&press(KeyCode::Home), &req);
+        assert_eq!(state.cursor(), 0);
+        state.handle_key(&press(KeyCode::Left), &req);
+        assert_eq!(state.cursor(), 0, "the caret must not run off the front");
+        state.handle_key(&press(KeyCode::End), &req);
+        assert_eq!(state.cursor(), end);
+
+        // Typing lands at the caret, not at the end of an invisible tail.
+        state.handle_key(&press(KeyCode::Home), &req);
+        state.handle_key(&press(KeyCode::Right), &req);
+        state.handle_key(&press(KeyCode::Char('x')), &req);
+        assert!(
+            state.request.directory.starts_with("/xa/"),
+            "{}",
+            state.request.directory
+        );
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_whole_component() {
+        let req = scope_request("FileWrite(/a/b/c/todos/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        assert_eq!(state.request.directory, "/a/b/c/todos/");
+
+        state.handle_key(&ctrl('w'), &req);
+        assert_eq!(state.request.directory, "/a/b/c/");
+        state.handle_key(&ctrl('w'), &req);
+        assert_eq!(state.request.directory, "/a/b/");
+        assert_eq!(state.cursor(), state.request.directory.chars().count());
+    }
+
+    #[test]
+    fn status_line_reports_a_missing_target_before_enter() {
+        let req = scope_request("FileWrite(/a/b/c/todos/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        state.handle_key(&press(KeyCode::Char('e')), &req);
+        // Overshoot the component boundary the way blind backspacing did.
+        for _ in 0..3 {
+            state.handle_key(&press(KeyCode::Backspace), &req);
+        }
+        assert_eq!(state.request.directory, "/a/b/c/tod");
+        assert!(state.error.is_none(), "nothing has been applied yet");
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_scope_permission_panel(frame, frame.area(), &req, &state))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(
+            contents.contains("does not contain the target: file.txt"),
+            "status line must explain the real cause before Enter: {contents}"
+        );
+
+        // And Enter agrees with what the status line said.
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Enter), &req),
+            ScopeKeyOutcome::Continue
+        );
+        assert!(state.error.is_some());
+    }
+
+    /// M6 defect 5: the refusal was rendered with `truncate(&message, width)`,
+    /// so the sentence the reviewer was being asked to act on was cut off at
+    /// the panel edge. It wraps now, which is only useful if the tail
+    /// actually survives.
+    #[test]
+    fn a_long_refusal_wraps_instead_of_being_cut_off() {
+        let name = "a-very-long-file-name-that-pushes-the-status-line-past-the-panel-edge.txt";
+        let req = scope_request(&format!("FileWrite(/a/b/c/todos/{name})"), "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        state.handle_key(&press(KeyCode::Char('e')), &req);
+        for _ in 0..3 {
+            state.handle_key(&press(KeyCode::Backspace), &req);
+        }
+        // Apply so the inline error path is exercised too, not just the live
+        // status: both used to go through the same truncating renderer.
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Enter), &req),
+            ScopeKeyOutcome::Continue
+        );
+        assert!(state.error.is_some());
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_scope_permission_panel(frame, frame.area(), &req, &state))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(
+            contents.contains(name),
+            "the refusal was cut off before it named the target: {contents}"
+        );
+    }
+
+    /// A `[token]` directory is a Next.js dynamic route segment, not a glob.
+    /// Session rules match literally, so scoping one works — and these paths
+    /// are all over the tree that generated this work item, so refusing them
+    /// would take the escape hatch away exactly where it is needed.
+    #[test]
+    fn a_dynamic_route_segment_is_still_scopable() {
+        let req = scope_request("FileRead(/srv/app/api/[token]/route.ts)", "FileRead");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        assert_eq!(state.request.directory, "/srv/app/api/[token]/");
+
+        let status = grith_supervisor::scoped_permissions::preview_scoped_allow(
+            &state.request,
+            &req.tool,
+            false,
+        );
+        assert!(
+            !status.blocks_apply(),
+            "a bracketed route segment must stay scopable: {status:?}"
+        );
+        assert!(matches!(
+            state.handle_key(&press(KeyCode::Enter), &req),
+            ScopeKeyOutcome::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn glob_directory_is_refused_with_the_teaching_message() {
+        let req = scope_request("FileWrite(/a/b/c/todos/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        state.handle_key(&press(KeyCode::Char('e')), &req);
+        for ch in "**".chars() {
+            state.handle_key(&press(KeyCode::Char(ch)), &req);
+        }
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_scope_permission_panel(frame, frame.area(), &req, &state))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(
+            contents.contains("already covers everything beneath it"),
+            "the glob refusal must teach the model: {contents}"
+        );
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Enter), &req),
+            ScopeKeyOutcome::Continue,
+            "a glob scope must never be applied: it produces a rule that cannot match"
+        );
+    }
+
+    #[test]
+    fn applied_scope_always_covers_the_reviewed_call() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("build");
+        std::fs::create_dir(&directory).unwrap();
+        let target = directory.join("out.o");
+        let req = scope_request(&format!("FileWrite({})", target.display()), "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+
+        let ScopeKeyOutcome::Applied(PermissionReviewAction::ScopedAllow(applied)) =
+            state.handle_key(&press(KeyCode::Enter), &req)
+        else {
+            panic!("the default scope must apply");
+        };
+        let validated =
+            grith_supervisor::scoped_permissions::validate_scoped_allow(&applied, &req.tool)
+                .unwrap();
+        // Mirror the supervisor's own target resolution: canonical parent
+        // plus the (possibly not-yet-created) leaf.
+        let resolved = std::fs::canonicalize(&directory)
+            .unwrap()
+            .join("out.o")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            validated.rules.iter().any(|rule| {
+                rule.strip_prefix("write-prefix:").is_some_and(|dir| {
+                    resolved
+                        .strip_prefix(dir.trim_end_matches('/'))
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+            }),
+            "applied scope installs no rule that matches the reviewed call: {:?}",
+            validated.rules
+        );
+    }
+
+    #[test]
+    fn scope_footer_advertises_walking_and_editing() {
+        let req = scope_request("FileWrite(/a/b/c/todos/file.txt)", "FileWrite");
+        let state = ScopeDialogState::for_request(&req).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_scope_permission_panel(frame, frame.area(), &req, &state))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(
+            contents.contains("wider"),
+            "walk control missing: {contents}"
+        );
+        assert!(
+            contents.contains("narrower"),
+            "walk control missing: {contents}"
+        );
+        assert!(
+            contents.contains("Edit path"),
+            "the footer never said the field was editable: {contents}"
+        );
+        assert!(
+            contents.contains("will allow:"),
+            "grant summary missing: {contents}"
+        );
+    }
+
+    #[test]
+    fn typing_opens_the_field_rather_than_being_swallowed() {
+        let req = scope_request("FileWrite(/a/b/c/todos/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        assert!(!state.editing());
+        state.handle_key(&press(KeyCode::Char('x')), &req);
+        assert!(state.editing(), "a printable key must open the field");
+        assert_eq!(state.request.directory, "/a/b/c/todos/x");
+    }
+
+    /// work/70: an edited path must never be followed into a broader target
+    /// silently. A symlinked scope directory grants authority over wherever
+    /// it resolves to, so the resolved path is shown whenever it differs.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_scope_directory_shows_where_it_resolves() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let req = scope_request(
+            &format!("FileWrite({})", link.join("out.o").display()),
+            "FileWrite",
+        );
+        let state = ScopeDialogState::for_request(&req).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_scope_permission_panel(frame, frame.area(), &req, &state))
+            .unwrap();
+        let contents = buffer_contents(&terminal);
+        assert!(
+            contents.contains("resolves:"),
+            "a symlinked scope must say where it lands: {contents}"
+        );
+        assert!(contents.contains("/real/"), "{contents}");
+    }
+
+    #[test]
+    fn escape_leaves_the_field_before_it_leaves_the_dialog() {
+        let req = scope_request("FileWrite(/a/b/c/todos/file.txt)", "FileWrite");
+        let mut state = ScopeDialogState::for_request(&req).unwrap();
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Esc), &req),
+            ScopeKeyOutcome::Cancel
+        );
+
+        state.handle_key(&press(KeyCode::Char('e')), &req);
+        assert!(state.editing());
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Esc), &req),
+            ScopeKeyOutcome::Continue
+        );
+        assert!(!state.editing());
+        assert_eq!(
+            state.handle_key(&press(KeyCode::Esc), &req),
+            ScopeKeyOutcome::Cancel
+        );
+    }
+
+    #[test]
+    fn scope_dialog_widens_for_a_path_the_default_cannot_show() {
+        let long =
+            "/home/dan/projects/PersonalProjects/Grith/worktrees/grith-analytics-local/work/todos/";
+        let req = scope_request(&format!("FileWrite({long}notes.md)"), "FileWrite");
+        let state = ScopeDialogState::for_request(&req).unwrap();
+        assert!(
+            scope_dialog_width(&state) > 76,
+            "an 85-character path must not be squeezed into the fixed 76 columns"
+        );
+
+        let short = scope_request("FileWrite(/a/b/c.txt)", "FileWrite");
+        let short = ScopeDialogState::for_request(&short).unwrap();
+        assert_eq!(scope_dialog_width(&short), 76);
     }
 
     #[test]

@@ -38,3 +38,6 @@ libc.workspace = true
 [dev-dependencies]
 # Timeline scripts for the demo_player / demo_timeline_gen examples.
 toml.workspace = true
+# Real directories for the scope-editor tests: the editor's verdicts depend
+# on what is actually on disk, so a fixture path is not enough.
+tempfile.workspace = true

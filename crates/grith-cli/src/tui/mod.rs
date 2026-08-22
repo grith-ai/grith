@@ -102,7 +102,7 @@ pub fn run_tui(
 pub fn run_review_dialog(
     req: &state::PermissionRequest,
 ) -> Option<grith_digest::PermissionReviewAction> {
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::event::{self, Event, KeyCode};
     use grith_digest::PermissionReviewAction;
 
     #[cfg(unix)]
@@ -167,38 +167,16 @@ pub fn run_review_dialog(
                     }
                     continue;
                 }
+                // One key map, shared with the exec TUI host in `exec_tui.rs`
+                // so the two cannot drift apart again.
                 if let Some(scope) = scope_dialog.as_mut() {
-                    match key.code {
-                        KeyCode::Esc => scope_dialog = None,
-                        KeyCode::Enter => {
-                            if let Some(action) = scope.apply(req) {
-                                result = Some(action);
-                                break;
-                            }
+                    match scope.handle_key(&key, req) {
+                        widgets::permission::ScopeKeyOutcome::Cancel => scope_dialog = None,
+                        widgets::permission::ScopeKeyOutcome::Applied(action) => {
+                            result = Some(action);
+                            break;
                         }
-                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            scope.focus_previous();
-                        }
-                        KeyCode::Tab | KeyCode::Down => scope.focus_next(),
-                        KeyCode::BackTab | KeyCode::Up => scope.focus_previous(),
-                        KeyCode::Backspace if scope.directory_focused() => {
-                            scope.pop_directory_char();
-                        }
-                        KeyCode::Char('u')
-                            if scope.directory_focused()
-                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            scope.clear_directory();
-                        }
-                        KeyCode::Char(' ') if !scope.directory_focused() => {
-                            scope.toggle_focused();
-                        }
-                        KeyCode::Char(ch)
-                            if scope.directory_focused() && key.modifiers.is_empty() =>
-                        {
-                            scope.push_directory_char(ch);
-                        }
-                        _ => {}
+                        widgets::permission::ScopeKeyOutcome::Continue => {}
                     }
                     continue;
                 }
@@ -225,6 +203,10 @@ pub fn run_review_dialog(
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') if !is_deny => {
                         scope_dialog = widgets::permission::ScopeDialogState::for_request(req);
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B') if !is_deny => {
+                        scope_dialog =
+                            widgets::permission::ScopeDialogState::blocking_for_request(req);
                     }
                     KeyCode::Char('i') | KeyCode::Char('I') => {
                         show_inspect = !show_inspect;

@@ -30,6 +30,16 @@ pub enum Error {
     /// refused so broken evidence is preserved rather than extended (B-CORE-1).
     #[error("audit chain quarantined: {0}")]
     ChainQuarantined(String),
+
+    #[error("analytics projection error: {0}")]
+    Analytics(String),
+
+    /// The projection tables do not exist in this database — the writer-lock
+    /// owner is an older grith that never created them. Distinct from
+    /// `Analytics` so HTTP surfaces can answer 503 with remediation instead
+    /// of a bare 500.
+    #[error("analytics is unavailable: the process that owns the audit database predates local analytics")]
+    AnalyticsUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

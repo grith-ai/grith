@@ -605,6 +605,19 @@ impl SupervisorProfile {
         }
     }
 
+    /// Whether this profile grants project-derived path trust at all, i.e.
+    /// whether any `routine_paths` entry mentions `${PROJECT_DIR}`.
+    ///
+    /// work/83 F4 gates workspace-wide trust on this: extending trust to a
+    /// sibling worktree is *mirroring* the trust the launch tree already has.
+    /// A profile that deliberately does not trust its own project directory
+    /// must not acquire trust in a sibling one through the back door.
+    pub fn declares_project_dir_trust(&self) -> bool {
+        self.routine_paths
+            .iter()
+            .any(|pattern| pattern.contains("${PROJECT_DIR}"))
+    }
+
     /// Build the session allowlist `HashSet` from this profile's configuration.
     ///
     /// The returned set contains entries in the namespaced format expected by
@@ -645,11 +658,9 @@ impl SupervisorProfile {
         // included — so those roots get no project-derived trust at all.
         // Surviving project-derived path prefixes are additionally recorded
         // as inert `projdir:` markers, letting the allow gates refuse to
-        // let launch-derived trust cover credential stores
-        // (`syscall_map::is_credential_store_path`).
-        let dangerous_project_root = project_dir == "/"
-            || (!home.is_empty()
-                && (project_dir == home || home.starts_with(&format!("{project_dir}/"))));
+        // let launch-derived trust cover credential stores or in-project
+        // secrets (`syscall_map::is_project_trust_guarded_path`).
+        let dangerous_project_root = is_dangerous_project_root(home, project_dir);
         if dangerous_project_root
             && (self
                 .routine_paths
@@ -859,9 +870,7 @@ impl SupervisorProfile {
         // A `${PROJECT_DIR}` exec root expanded at `/`, `$HOME`, or an
         // ancestor of `$HOME` would extend routine-spawn provenance trust
         // to every binary under that tree.
-        let dangerous_project_root = project_dir == "/"
-            || (!home.is_empty()
-                && (project_dir == home || home.starts_with(&format!("{project_dir}/"))));
+        let dangerous_project_root = is_dangerous_project_root(&home, &project_dir);
 
         let mut out = BTreeSet::<String>::new();
         for root in &self.routine_exec_roots {
@@ -931,7 +940,7 @@ impl SupervisorProfile {
 /// must agree, or the dangerous-root drop can silently miss under a
 /// symlinked `$HOME`). Only the ROOTS are canonicalised — see the
 /// build_session_allowlist comment for why full paths never are.
-fn resolved_home_and_project_dir() -> (String, String) {
+pub(crate) fn resolved_home_and_project_dir() -> (String, String) {
     let canon_root = |raw: String| -> String {
         std::fs::canonicalize(&raw)
             .ok()
@@ -946,6 +955,608 @@ fn resolved_home_and_project_dir() -> (String, String) {
             .unwrap_or_default(),
     );
     (home, project_dir)
+}
+
+// ---------------------------------------------------------------------------
+// work/83 F4 — workspace-wide project trust
+// ---------------------------------------------------------------------------
+
+/// Hard cap on the number of workspace roots one session will trust.
+///
+/// Trust is bounded on purpose: a repository with hundreds of linked
+/// worktrees (or an operator config that lists a directory per project)
+/// would otherwise turn "project trust" into "trust most of `$HOME`" one
+/// entry at a time — the same overreach work/80 closed for a single root.
+/// 32 covers every real multi-worktree layout; beyond it we keep the first
+/// 32 and warn rather than silently widening.
+pub const MAX_WORKSPACE_ROOTS: usize = 32;
+
+/// Wall-clock budget for each git probe at session start.
+///
+/// The probes run on the supervisor's thread before the event loop starts, so
+/// a wedged `git` (network-mounted repo, filesystem stall, a hook that reads
+/// stdin) must not hold the supervised tool at its first stop indefinitely.
+/// Timing out yields no extra roots, which is the fail-safe direction.
+const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// work/80's dangerous-root predicate, shared by every place that expands
+/// `${PROJECT_DIR}` (and by work/83's workspace roots).
+///
+/// `/`, `$HOME`, and any ancestor of `$HOME` are refused: a session-trust
+/// prefix at one of those covers every credential directory on the box, which
+/// is the overreach work/80 closed. An empty `home` disables the `$HOME` half
+/// (nothing to compare against) but still refuses `/`.
+pub(crate) fn is_dangerous_project_root(home: &str, project_dir: &str) -> bool {
+    project_dir == "/"
+        || (!home.is_empty()
+            && (project_dir == home || home.starts_with(&format!("{project_dir}/"))))
+}
+
+/// Parse `git worktree list --porcelain` into working-tree root paths.
+///
+/// The porcelain format is a blank-line-separated record per worktree whose
+/// first line is `worktree <absolute path>`. Paths are emitted verbatim, so
+/// embedded spaces round-trip correctly (git documents newlines in paths as
+/// unrepresentable in this format — such an entry simply fails to
+/// canonicalise later and is dropped).
+///
+/// Bare entries are skipped: a bare repository has no working tree, so there
+/// is nothing there for the supervised tool to legitimately edit, and
+/// trusting the object store would hand it write access to git history.
+///
+/// **Prunable entries are skipped too.** `prunable` means git could not
+/// follow the entry's `gitdir` file to a real working tree — the shape a
+/// hand-written `.git/worktrees/<name>/gitdir` produces. That file lives
+/// inside the launch tree, so a supervised tool can create it with an
+/// unprompted write; keeping the record would let it name any absolute path
+/// as a "worktree" and have this function hand it back as a trust candidate.
+/// Skipping prunable records is only the first of the four constraints
+/// [`resolve_workspace_roots`] applies to git-derived candidates — on its own
+/// it is defeated by also creating `<victim>/.git`, which makes the entry
+/// non-prunable.
+pub(crate) fn parse_worktree_porcelain(output: &str) -> Vec<String> {
+    let mut roots = Vec::new();
+    let mut current: Option<String> = None;
+    let mut skip = false;
+    let flush = |current: &mut Option<String>, skip: &mut bool, roots: &mut Vec<String>| {
+        if let Some(path) = current.take() {
+            if !*skip {
+                roots.push(path);
+            }
+        }
+        *skip = false;
+    };
+    for line in output.lines() {
+        if line.is_empty() {
+            flush(&mut current, &mut skip, &mut roots);
+        } else if let Some(path) = line.strip_prefix("worktree ") {
+            // A `worktree` line always opens a record; flush any record that
+            // was not terminated by a blank line (last record, truncated
+            // output).
+            flush(&mut current, &mut skip, &mut roots);
+            if !path.is_empty() {
+                current = Some(path.to_string());
+            }
+        } else if line == "bare"
+            // git emits `prunable` bare, or `prunable <reason>` with an
+            // explanation ("gitdir file points to non-existent location").
+            || line == "prunable"
+            || line.starts_with("prunable ")
+        {
+            skip = true;
+        }
+    }
+    flush(&mut current, &mut skip, &mut roots);
+    roots
+}
+
+/// Path components that disqualify a workspace root outright.
+///
+/// A git-derived candidate is attacker-influenced (see
+/// [`resolve_workspace_roots`]) and an operator-declared one is a
+/// hand-written path that could be a typo; neither is ever legitimately a
+/// personal-data or credential directory. `is_credential_store_path` covers
+/// the classic credential stores, but the trust prefix this produces
+/// auto-allows everything beneath it, so the refusal list is deliberately
+/// wider than that: browser profiles, the password store, the keyring
+/// directory, and the XDG dot-trees that hold autostart entries and
+/// user-installed binaries are all locations where a silent prefix grant is
+/// a persistence primitive rather than a project-tree convenience.
+///
+/// Matched component-wise on the CANONICAL path, so `~/link-to-mozilla`
+/// cannot dodge it and `.mozilla-notes` is not caught by accident. Ordinary
+/// worktree conventions (`.worktrees/`, `.git/`) are deliberately absent —
+/// refusing those would break the layouts F4 exists to serve.
+const REFUSED_ROOT_COMPONENTS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".pki",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".gcloud",
+    ".config",
+    ".local",
+    ".var",
+    ".mozilla",
+    ".thunderbird",
+    ".password-store",
+    ".gnome",
+    ".gnome2",
+    ".kde",
+    ".putty",
+    ".netrc",
+];
+
+/// `Some(component)` when `root` is, or lives under, a directory the
+/// [`REFUSED_ROOT_COMPONENTS`] list forbids.
+pub(crate) fn refused_root_component(root: &str) -> Option<&'static str> {
+    let lower = root.replace('\\', "/").to_lowercase();
+    let mut hit = lower
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .find_map(|component| {
+            REFUSED_ROOT_COMPONENTS
+                .iter()
+                .find(|refused| **refused == component)
+                .copied()
+        });
+    if hit.is_none() && crate::syscall_map::is_credential_store_path(&format!("{lower}/")) {
+        hit = Some("credential store");
+    }
+    hit
+}
+
+/// The directory a git-derived workspace root must live inside.
+///
+/// `git rev-parse --git-common-dir` names the repository's shared admin
+/// directory: `<repo>/.git` for an ordinary repository, `<repo>.git` for a
+/// bare one. Its parent is the repository's own home, and THAT parent — the
+/// directory the repository sits in — is the widest tree a linked worktree of
+/// this repository is ever legitimately found in. Both shapes the false
+/// positive was measured on live there: sibling worktrees
+/// (`<parent>/worktrees/*`) and nested ones (`<repo>/.worktrees/*`).
+///
+/// Constraining candidates to this scope is what stops the
+/// `.git/worktrees/<name>/gitdir` mint from naming `~/.mozilla`,
+/// `~/.password-store` or `~/Documents`: those are not under the scope unless
+/// the scope IS `$HOME`, and a `$HOME`-or-above scope is refused by the
+/// caller.
+///
+/// git prints the common dir relative to the cwd when the cwd is inside the
+/// main working tree and absolute from a linked worktree, so a relative
+/// answer is resolved against `launch_cwd` before canonicalisation.
+fn git_common_dir(launch_cwd: &Path) -> Option<std::path::PathBuf> {
+    let raw = git_probe(launch_cwd, &["rev-parse", "--git-common-dir"])?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(trimmed);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        launch_cwd.join(candidate)
+    };
+    std::fs::canonicalize(joined).ok()
+}
+
+/// Repository home + enclosing scope derived from a canonical common dir.
+fn workspace_scope_for(common_dir: &Path) -> Option<std::path::PathBuf> {
+    let home = if common_dir.file_name().is_some_and(|n| n == ".git") {
+        common_dir.parent()?
+    } else {
+        // Bare repository (`<name>.git`): it IS the repository home, and its
+        // linked worktrees are parked beside it.
+        common_dir
+    };
+    home.parent().map(Path::to_path_buf)
+}
+
+/// True when `candidate` is `scope` itself or a descendant of it. Compared
+/// component-wise on canonical paths, so `…/Grith-backup` never borrows
+/// `…/Grith`'s scope.
+fn path_within(candidate: &Path, scope: &Path) -> bool {
+    candidate == scope || candidate.starts_with(scope)
+}
+
+/// Verify that `candidate` really is a working tree of the repository whose
+/// admin directory is `common_dir`, by reading the back-pointer git keeps in
+/// the working tree itself.
+///
+/// The porcelain listing is derived from `<common_dir>/worktrees/<name>/gitdir`
+/// — a file inside the launch tree that a supervised tool writes without a
+/// prompt. The back-pointer is the OTHER half of the pair, and it lives in
+/// the candidate: a linked worktree has a `.git` FILE reading
+/// `gitdir: <common_dir>/worktrees/<name>`, and the main worktree has a `.git`
+/// DIRECTORY that IS `<common_dir>`.
+///
+/// This is not a boundary on its own — a tool can write `<victim>/.git` for a
+/// victim that has none — but it is the layer that makes an existing
+/// repository unmintable: `std::fs::write` cannot replace that repository's
+/// `.git` DIRECTORY with a file, so the sibling checkouts that actually hold
+/// `.env` files and deploy keys cannot be named as worktrees of this one.
+/// Combined with the scope constraint, what remains reachable is a
+/// non-repository directory inside the launch repository's own parent.
+///
+/// A `.git` that is a symlink is refused: git never creates one, and
+/// following it would re-open the escape the canonical-path comparisons
+/// close.
+fn worktree_backlink_verified(candidate: &Path, common_dir: &Path) -> bool {
+    /// A real `.git` link file is one short line; anything larger is not one.
+    const MAX_DOT_GIT_FILE_LEN: u64 = 4096;
+
+    let dot_git = candidate.join(".git");
+    let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
+        return false;
+    };
+    if meta.is_dir() {
+        // Main worktree: its `.git` directory is the common dir itself.
+        return std::fs::canonicalize(&dot_git).is_ok_and(|resolved| resolved == common_dir);
+    }
+    if !meta.is_file() || meta.len() > MAX_DOT_GIT_FILE_LEN {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(target) = content
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return false;
+    };
+    let target = Path::new(target);
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        candidate.join(target)
+    };
+    let Ok(resolved) = std::fs::canonicalize(joined) else {
+        return false;
+    };
+    // Linked worktree: `<common_dir>/worktrees/<name>`. The equality arm
+    // covers a main worktree configured with `--separate-git-dir`, whose
+    // `.git` is a file pointing straight at the common dir.
+    let admin = common_dir.join("worktrees");
+    resolved == common_dir || (resolved.starts_with(&admin) && resolved != admin)
+}
+
+/// Canonicalised candidates → the roots this session will actually trust.
+///
+/// Pure (no filesystem, no git) so the refusal and cap rules are unit
+/// testable. Applies, in order: work/80's dangerous-root refusal, removal of
+/// the launch cwd (already trusted via `${PROJECT_DIR}`, and re-adding it
+/// would only duplicate entries), de-duplication, and the
+/// [`MAX_WORKSPACE_ROOTS`] cap.
+pub(crate) fn collect_workspace_roots<I>(candidates: I, home: &str, launch_cwd: &str) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let root = candidate.trim_end_matches('/').to_string();
+        if root.is_empty() {
+            continue;
+        }
+        if is_dangerous_project_root(home, &root) {
+            tracing::warn!(
+                event = "workspace_root_refused",
+                root = %root,
+                "refusing to extend project trust to / or the home directory; \
+                 declare a project subdirectory instead"
+            );
+            continue;
+        }
+        // Applies to EVERY root, however it was derived. A git-derived
+        // candidate is attacker-influenced; an operator-declared one can be
+        // a typo. Neither is ever legitimately a credential store, a browser
+        // profile or an XDG dot-tree, and a trust prefix at one of those is
+        // a persistence primitive.
+        if let Some(component) = refused_root_component(&root) {
+            tracing::warn!(
+                event = "workspace_root_refused",
+                root = %root,
+                component,
+                "refusing to extend project trust to a credential/personal-data \
+                 directory"
+            );
+            continue;
+        }
+        if root == launch_cwd.trim_end_matches('/') {
+            continue;
+        }
+        if out.iter().any(|existing| existing == &root) {
+            continue;
+        }
+        if out.len() >= MAX_WORKSPACE_ROOTS {
+            tracing::warn!(
+                event = "workspace_roots_truncated",
+                cap = MAX_WORKSPACE_ROOTS,
+                dropped = %root,
+                "workspace trust capped; further roots are ignored"
+            );
+            break;
+        }
+        out.push(root);
+    }
+    out
+}
+
+/// Run one `git` probe in `cwd`, capturing stdout, bounded by
+/// [`GIT_PROBE_TIMEOUT`].
+///
+/// Any failure — git missing, not a repository, non-zero exit, timeout — is
+/// `None`, i.e. "no extra roots". Never an error: a non-git launch directory
+/// is the ordinary case, not a misconfiguration.
+///
+/// stdout is read only after the child exits, so a probe whose output exceeds
+/// the pipe buffer blocks the child and is killed at the deadline. That is
+/// acceptable here: `git worktree list` output for the ~32 roots we would
+/// keep is orders of magnitude below the buffer, and losing a pathological
+/// case costs trust, not safety.
+fn git_probe(cwd: &Path, args: &[&str]) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        // stdin closed so a repository hook or credential helper that reads
+        // stdin fails instead of hanging the probe.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // The probe runs while the supervised tool owns the terminal, and it
+        // reads a repository whose `.git/config` the tool can rewrite without
+        // a prompt (it is inside the trusted tree). Neither of these probes
+        // authenticates or refreshes the index, but pin the two behaviours
+        // that could still reach outside the pipe:
+        //  - `GIT_TERMINAL_PROMPT=0`: git opens `/dev/tty` directly for
+        //    credential prompts, which `Stdio::null()` on stdin does not
+        //    cover; a prompt there would corrupt the tool's PTY.
+        //  - `GIT_OPTIONAL_LOCKS=0`: a read-only probe must not contend for
+        //    the repository lock with the supervised tool's own git.
+        // The piped (non-TTY) stdout already keeps git from spawning a pager.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + GIT_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!(
+                        event = "workspace_git_probe_timeout",
+                        args = ?args,
+                        "git probe timed out; no linked-worktree trust this session"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    Some(stdout)
+}
+
+/// Resolve every project root this session trusts beyond the launch cwd
+/// (work/83 F4).
+///
+/// **Session start only.** The result is snapshotted into the session
+/// allowlist and the mass-destruction working set and never recomputed: a
+/// supervised tool that could make grith re-read `git worktree list` would
+/// widen its own trust with one `git worktree add /home/<user>` — turning a
+/// false-positive fix into a privilege escalation. Everything below therefore
+/// runs before the event loop, once.
+///
+/// Sources, both optional:
+///  - every worktree of the launch repository (`include_linked_worktrees`) —
+///    the MAIN one included, so launching from a subdirectory also trusts the
+///    repository root;
+///  - operator-declared `additional_project_roots`, for the layout git cannot
+///    infer — a worktree of a *different* repository parked alongside this one.
+///
+/// Every candidate is canonicalised (a symlinked worktree path must compare
+/// against the paths the supervisor's B3 resolution produces), then filtered
+/// by [`collect_workspace_roots`]. The git-derived half carries four extra
+/// constraints because its input is writable by the supervised tool — see
+/// [`git_derived_roots`].
+pub fn resolve_workspace_roots(
+    launch_cwd: &Path,
+    home: &str,
+    include_linked_worktrees: bool,
+    additional_project_roots: &[String],
+) -> Vec<String> {
+    let launch = launch_cwd.to_string_lossy().into_owned();
+    let mut candidates: Vec<String> = Vec::new();
+
+    // Operator-declared roots go in FIRST so the [`MAX_WORKSPACE_ROOTS`] cap
+    // can never silently drop an explicit declaration in favour of an
+    // enumerated one: `additional_project_roots` exists precisely for the
+    // layout git cannot infer, and losing it is the failure the operator
+    // would not be able to diagnose.
+    for declared in additional_project_roots {
+        let substituted = substitute_path_vars(declared, home, &launch);
+        if substituted.is_empty() {
+            continue;
+        }
+        candidates.push(substituted);
+    }
+
+    // Canonicalise the operator-declared roots before filtering so the
+    // dangerous-root refusal cannot be sidestepped by a symlink
+    // (`~/link-to-home` resolving to `$HOME`), and so the stored prefixes
+    // match the canonical paths the syscall classifier produces. A candidate
+    // that does not resolve is dropped: an unresolvable root can never match
+    // a real path anyway.
+    let mut canonical: Vec<String> = candidates
+        .into_iter()
+        .filter_map(|candidate| canonicalise_candidate(&candidate))
+        .collect();
+
+    if include_linked_worktrees {
+        canonical.extend(git_derived_roots(launch_cwd, home));
+    }
+
+    collect_workspace_roots(canonical, home, &launch)
+}
+
+/// Canonicalise one candidate root, tracing (and dropping) the ones that do
+/// not resolve.
+fn canonicalise_candidate(candidate: &str) -> Option<String> {
+    match std::fs::canonicalize(candidate) {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Err(error) => {
+            tracing::debug!(
+                event = "workspace_root_unresolved",
+                root = %candidate,
+                error = %error,
+                "workspace root does not resolve; not trusted"
+            );
+            None
+        }
+    }
+}
+
+/// Enumerate the launch repository's worktrees, keeping only the candidates
+/// that survive every constraint git-derived input has to earn.
+///
+/// **`git worktree list` is attacker-influenced input, not testimony.** Its
+/// records come from `<common_dir>/worktrees/<name>/gitdir`, files that sit
+/// inside the launch tree; project trust already covers that tree, so a
+/// supervised tool writes them with no prompt and no proxy evaluation. Left
+/// unconstrained, three plain writes let a tool nominate any absolute path on
+/// the box — `~/.mozilla`, `~/.password-store`, `~/Documents` — as a
+/// project-trusted root, and everything beneath it that is not a credential
+/// store would be auto-allowed and would stop escalating under
+/// `mass_destruction::is_valuable_out_of_tree`.
+///
+/// Four constraints, all required, none sufficient alone:
+///
+/// 1. `prunable` records are dropped by [`parse_worktree_porcelain`] — the
+///    shape a bare `gitdir` forgery produces. Defeated on its own by also
+///    creating `<victim>/.git`.
+/// 2. The candidate must be inside the launch repository's own enclosing
+///    directory ([`workspace_scope_for`]), compared component-wise on
+///    canonical paths so neither `..` nor a symlink escapes it. This is what
+///    puts `$HOME`'s dot-trees out of reach.
+/// 3. That scope must not itself be `$HOME`, an ancestor of it, or `/` — a
+///    repository checked out directly into the home directory would
+///    otherwise have "inside the enclosing directory" mean "anywhere".
+///    Such a layout gets no linked-worktree trust at all.
+/// 4. The candidate must carry git's own back-pointer to this repository
+///    ([`worktree_backlink_verified`]), which makes an existing repository
+///    unmintable — its `.git` DIRECTORY cannot be overwritten with a link
+///    file.
+///
+/// Residual, stated plainly: a tool can still mint a root over a
+/// NON-repository directory inside the launch repository's parent, or over a
+/// directory it creates there. Those roots are project-derived (`projdir:`
+/// marked), so work/80's credential-store guard still applies to everything
+/// under them. Operators who will not accept that set
+/// `supervisor.trust.include_linked_worktrees = false` and declare
+/// `additional_project_roots` instead.
+fn git_derived_roots(launch_cwd: &Path, home: &str) -> Vec<String> {
+    // `--git-common-dir` doubles as the cheap "is this a working tree at
+    // all?" probe: it fails outside a repository, so an ordinary non-git
+    // launch directory costs one failed exec and no worktree enumeration.
+    let Some(common_dir) = git_common_dir(launch_cwd) else {
+        return Vec::new();
+    };
+    let Some(scope) = workspace_scope_for(&common_dir) else {
+        return Vec::new();
+    };
+    let scope_str = scope.to_string_lossy().into_owned();
+    if is_dangerous_project_root(home, scope_str.trim_end_matches('/')) || scope_str == "/" {
+        tracing::warn!(
+            event = "workspace_scope_refused",
+            scope = %scope_str,
+            "the launch repository sits directly in the home directory; \
+             linked-worktree trust is disabled for this session (declare \
+             additional_project_roots instead)"
+        );
+        return Vec::new();
+    }
+
+    let Some(listing) = git_probe(launch_cwd, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+
+    let mut roots = Vec::new();
+    for candidate in parse_worktree_porcelain(&listing) {
+        let Ok(resolved) = std::fs::canonicalize(&candidate) else {
+            tracing::debug!(
+                event = "workspace_root_unresolved",
+                root = %candidate,
+                "worktree does not resolve; not trusted"
+            );
+            continue;
+        };
+        if !path_within(&resolved, &scope) {
+            tracing::warn!(
+                event = "workspace_root_out_of_scope",
+                root = %resolved.display(),
+                scope = %scope_str,
+                "refusing a reported worktree outside the launch repository's \
+                 enclosing directory; git worktree metadata is writable by the \
+                 supervised tool"
+            );
+            continue;
+        }
+        if !worktree_backlink_verified(&resolved, &common_dir) {
+            tracing::warn!(
+                event = "workspace_root_unverified",
+                root = %resolved.display(),
+                "reported worktree does not carry this repository's back-pointer; \
+                 not trusted"
+            );
+            continue;
+        }
+        roots.push(resolved.to_string_lossy().into_owned());
+    }
+    roots
+}
+
+/// Fold resolved workspace roots into an already-built session allowlist.
+///
+/// Each root is inserted as a boundary-safe directory prefix (`<root>/`) plus
+/// the inert `projdir:` twin work/80 introduced, so every guard that refuses
+/// to let launch-derived trust cover a credential store applies to these roots
+/// too — `resolve_workspace_roots` supplies the tree, it does not supply an
+/// exemption from `is_project_trust_guarded_path`.
+///
+/// The trailing slash is deliberate and is *stricter* than the legacy
+/// `${PROJECT_DIR}/**` expansion (which stores the bare launch path): a
+/// sibling directory that merely shares the prefix — `…/worktrees/api` vs
+/// `…/worktrees/api-secrets` — must not inherit trust from a string match.
+pub fn extend_allowlist_with_workspace_roots(
+    allowed: &mut std::collections::HashSet<String>,
+    roots: &[String],
+) {
+    for root in roots {
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        allowed.insert(format!("projdir:{prefix}"));
+        allowed.insert(prefix);
+    }
 }
 
 /// PR 4 Phase B: substitute `${HOME}`, `${PROJECT_DIR}`, and a leading
@@ -1606,6 +2217,245 @@ mod tests {
                 .any(|e| e.starts_with("exec-prefix:") && e.contains("node_modules")),
             "project exec roots must drop when canonical project_dir == canonical home"
         );
+    }
+
+    // ---- work/83 F4: workspace-wide project trust -------------------------
+
+    /// The porcelain format is a blank-line-separated record per worktree.
+    /// Multiple worktrees, a bare main entry (no working tree — nothing there
+    /// for a tool to legitimately edit, and its object store is git history),
+    /// and paths containing spaces must all be handled.
+    #[test]
+    fn worktree_porcelain_parses_records_bare_and_spaced_paths() {
+        let listing = "worktree /home/u/proj\n\
+                       HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                       branch refs/heads/main\n\
+                       \n\
+                       worktree /home/u/worktrees/feature one\n\
+                       HEAD 89abcdef0123456789abcdef0123456789abcdef\n\
+                       detached\n\
+                       \n\
+                       worktree /home/u/mirror.git\n\
+                       bare\n\
+                       \n\
+                       worktree /home/u/worktrees/fix\n\
+                       HEAD fedcba9876543210fedcba9876543210fedcba98\n\
+                       branch refs/heads/fix\n";
+        assert_eq!(
+            parse_worktree_porcelain(listing),
+            vec![
+                "/home/u/proj".to_string(),
+                "/home/u/worktrees/feature one".to_string(),
+                "/home/u/worktrees/fix".to_string(),
+            ],
+            "bare entries are skipped; spaced paths survive verbatim"
+        );
+
+        // A listing whose final record is not terminated by a blank line
+        // (truncated output) still yields that record.
+        assert_eq!(
+            parse_worktree_porcelain("worktree /a\nHEAD 00\n"),
+            vec!["/a".to_string()]
+        );
+        assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    /// A `prunable` record is what a hand-written
+    /// `.git/worktrees/<name>/gitdir` produces, and that file lives inside
+    /// the tree project trust already covers — so the supervised tool writes
+    /// it with no prompt. Keeping the record would hand back any absolute
+    /// path on the box as a trust candidate. Both spellings git uses
+    /// (bare `prunable`, and `prunable <reason>`) are dropped.
+    #[test]
+    fn worktree_porcelain_skips_prunable_records() {
+        let listing = "worktree /home/u/proj\n\
+                       HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                       branch refs/heads/main\n\
+                       \n\
+                       worktree /home/u/Documents\n\
+                       HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                       branch refs/heads/main\n\
+                       prunable gitdir file points to non-existent location\n\
+                       \n\
+                       worktree /home/u/.mozilla\n\
+                       prunable\n\
+                       \n\
+                       worktree /home/u/worktrees/fix\n\
+                       branch refs/heads/fix\n";
+        assert_eq!(
+            parse_worktree_porcelain(listing),
+            vec![
+                "/home/u/proj".to_string(),
+                "/home/u/worktrees/fix".to_string(),
+            ],
+            "prunable records are forged-metadata shaped and must be dropped"
+        );
+    }
+
+    /// The component refusal is matched on canonical path components, so a
+    /// directory whose NAME merely starts with a refused one is unaffected
+    /// and the ordinary worktree conventions keep working.
+    #[test]
+    fn refused_root_components_cover_stores_without_catching_worktrees() {
+        for refused in [
+            "/home/u/.mozilla/firefox/abc.default",
+            "/home/u/.password-store",
+            "/home/u/.local/share/keyrings",
+            "/home/u/.config/autostart",
+            "/home/u/.ssh",
+            "/home/u/proj/.aws",
+            "/home/u/.gnupg/private-keys-v1.d",
+            "/home/u/.config/grith",
+        ] {
+            assert!(
+                refused_root_component(refused).is_some(),
+                "{refused} must be refused as a workspace root"
+            );
+        }
+        for allowed in [
+            "/home/u/projects/grith/.worktrees/feature",
+            "/home/u/projects/grith",
+            "/home/u/projects/.mozilla-notes",
+            "/home/u/projects/localstack",
+            "/home/u/worktrees/fix",
+        ] {
+            assert_eq!(
+                refused_root_component(allowed),
+                None,
+                "{allowed} is an ordinary project tree and must stay declarable"
+            );
+        }
+    }
+
+    /// The scope a git-derived root has to live inside is the directory the
+    /// repository itself sits in — the same answer for an ordinary
+    /// repository and for a bare one with worktrees parked beside it.
+    #[test]
+    fn workspace_scope_is_the_repositorys_enclosing_directory() {
+        assert_eq!(
+            workspace_scope_for(std::path::Path::new("/home/u/projects/proj/.git")),
+            Some(std::path::PathBuf::from("/home/u/projects"))
+        );
+        assert_eq!(
+            workspace_scope_for(std::path::Path::new("/home/u/projects/proj.git")),
+            Some(std::path::PathBuf::from("/home/u/projects"))
+        );
+    }
+
+    /// work/80's dangerous-root refusal applies to every workspace root, and
+    /// the total is capped: trust must not grow one worktree at a time into
+    /// "most of `$HOME`".
+    #[test]
+    fn workspace_roots_refuse_dangerous_roots_and_hold_the_cap() {
+        let home = "/home/u";
+        let launch = "/home/u/proj";
+
+        let refused = collect_workspace_roots(
+            [
+                "/".to_string(),
+                "/home/u".to_string(),
+                "/home".to_string(),
+                "/home/u/proj".to_string(),  // the launch cwd itself
+                "/home/u/proj/".to_string(), // ... with a trailing slash
+                "/home/u/wt/a".to_string(),
+                "/home/u/wt/a".to_string(), // duplicate
+            ],
+            home,
+            launch,
+        );
+        assert_eq!(
+            refused,
+            vec!["/home/u/wt/a".to_string()],
+            "/, $HOME, ancestors of $HOME, the launch cwd and duplicates all drop"
+        );
+
+        // Cap: the 33rd root is dropped, not trusted.
+        let many: Vec<String> = (0..40).map(|i| format!("/home/u/wt/{i}")).collect();
+        let capped = collect_workspace_roots(many, home, launch);
+        assert_eq!(capped.len(), MAX_WORKSPACE_ROOTS);
+        assert_eq!(capped[0], "/home/u/wt/0");
+        assert_eq!(capped[MAX_WORKSPACE_ROOTS - 1], "/home/u/wt/31");
+    }
+
+    /// Workspace roots enter the allowlist as boundary-safe prefixes carrying
+    /// the inert `projdir:` twin, so work/80's credential-store guard covers
+    /// them exactly as it covers the launch tree.
+    #[test]
+    fn workspace_roots_enter_the_allowlist_projdir_marked() {
+        let mut allowed = std::collections::HashSet::new();
+        extend_allowlist_with_workspace_roots(
+            &mut allowed,
+            &["/home/u/wt/a".to_string(), "/home/u/wt/b/".to_string()],
+        );
+        for root in ["/home/u/wt/a/", "/home/u/wt/b/"] {
+            assert!(allowed.contains(root), "{root} must be a trusted prefix");
+            assert!(
+                allowed.contains(&format!("projdir:{root}")),
+                "{root} must carry its projdir marker"
+            );
+        }
+        // Boundary safety: the trailing slash is what stops a sibling
+        // directory that merely shares the prefix from inheriting trust.
+        assert!(!allowed.contains("/home/u/wt/a"));
+    }
+
+    /// F4 mirrors trust; it never invents it. A profile with no
+    /// `${PROJECT_DIR}` routine path grants no project trust to mirror.
+    #[test]
+    fn project_dir_trust_declaration_gates_workspace_trust() {
+        let mut profile = SupervisorProfile {
+            name: "t".into(),
+            display_name: "t".into(),
+            rationale: None,
+            extends: None,
+            routine_paths: vec!["${PROJECT_DIR}/**".into()],
+            routine_commands: Vec::new(),
+            routine_destinations: Vec::new(),
+            routine_listen_addresses: Vec::new(),
+            routine_exec_roots: Vec::new(),
+            scratch_roots: Vec::new(),
+            readonly_paths: Vec::new(),
+            readonly_path_patterns: Vec::new(),
+            launch_contract: None,
+            local_listener_policy: vec![],
+            namespace_users: vec![],
+            permit_authority_delegating: vec![],
+            permit_control_sockets: vec![],
+        };
+        assert!(profile.declares_project_dir_trust());
+        profile.routine_paths = vec!["${HOME}/.cache/tool/**".into()];
+        assert!(!profile.declares_project_dir_trust());
+    }
+
+    /// `resolve_workspace_roots` is the impure entry point: a non-git launch
+    /// directory is not an error, it simply yields nothing, and a declared
+    /// root that does not resolve is dropped rather than trusted.
+    #[test]
+    fn resolve_workspace_roots_tolerates_non_git_and_unresolvable_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launch = tmp.path().join("launch");
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+
+        let roots = resolve_workspace_roots(
+            &launch,
+            &home,
+            true,
+            &[
+                sibling.to_string_lossy().into_owned(),
+                tmp.path()
+                    .join("does-not-exist")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+        );
+        let canonical_sibling = std::fs::canonicalize(&sibling)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(roots, vec![canonical_sibling]);
     }
 
     #[test]

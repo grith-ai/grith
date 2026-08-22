@@ -4,7 +4,7 @@
 //! Curated registry of "outbound-capable" binaries — programs that can
 //! move data off the supervised host once they execute. This list is the
 //! load-bearing piece of PR 2's "Taint-on-Spawn Requires Real Data Flow"
-//! rule (`work/62-pr2-taint-data-flow-work.md`). A spawn whose target
+//! rule (`work/completed/62-pr2-taint-data-flow-work.md`). A spawn whose target
 //! binary is on this list and whose argv carries a destination argument
 //! is treated as an exfil sink when the session has active taint.
 //!

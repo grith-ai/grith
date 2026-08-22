@@ -3,6 +3,7 @@
 
 //! CLI subcommand implementations dispatched from `main`.
 
+pub mod analytics;
 pub mod audit;
 pub mod canary;
 pub mod dashboard;

@@ -574,6 +574,10 @@ pub struct SupervisorCoreConfig {
     /// PR 6: per-category coverage flags for the staged rollout of
     /// syscall-coverage expansion. See `CoverageConfig`.
     pub coverage: CoverageConfig,
+    /// work/83 F4: how far the session's project trust reaches. See
+    /// [`TrustConfig`].
+    #[serde(default)]
+    pub trust: TrustConfig,
     /// H2 Option 1: enforce PTY ownership. When `false` (default), writes to a
     /// `/dev/pts/N` that is not the supervised tool's own controlling terminal
     /// are detected + forensically logged but still allowed (audit-only); when
@@ -619,6 +623,71 @@ pub struct SupervisorCoreConfig {
     /// watching the banner, can opt into a grace period.
     #[serde(default)]
     pub authority_lost_terminate_after_seconds: u64,
+}
+
+/// work/83 F4: how far a session's project-derived trust reaches.
+///
+/// `${PROJECT_DIR}` expands to the launch cwd, so in a multi-worktree layout
+/// only the tree `grith exec` was launched from is trusted: measured 0.32%
+/// of calls QUEUEd under the launch cwd against 24.9% in sibling worktrees of
+/// the same repositories — a 78x difference in prompt rate for the same work,
+/// decided purely by which directory the operator was standing in.
+///
+/// Both keys widen trust, so both are resolved ONCE at session start and
+/// never re-read (see `grith_supervisor::profiles::resolve_workspace_roots`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrustConfig {
+    /// Extend the session's project trust to every git worktree of the launch
+    /// repository (`git worktree list --porcelain`). **Default on** — a linked
+    /// worktree is the same project checked out twice, and the alternative
+    /// operators reach for (launching from the shared parent directory) grants
+    /// strictly more.
+    ///
+    /// The listing includes the MAIN worktree, so launching from a
+    /// subdirectory trusts the repository root as well — the common case where
+    /// a tool working in `repo/frontend/` prompts on every read of
+    /// `../package.json`. A repository whose top level is `$HOME` (or an
+    /// ancestor of it) is still refused.
+    ///
+    /// `git worktree list` is derived from files inside the repository, which
+    /// the supervised tool writes without a prompt, so its records are treated
+    /// as attacker-influenced input: a reported worktree earns trust only if it
+    /// is non-prunable, sits inside the launch repository's own enclosing
+    /// directory, carries git's back-pointer to that repository, and is not a
+    /// credential or personal-data directory. A repository checked out directly
+    /// into `$HOME` therefore gets no git-derived trust at all — that layout's
+    /// enclosing directory would be all of `$HOME`. See
+    /// `grith_supervisor::profiles::git_derived_roots` for the residual this
+    /// leaves and set this to `false` to decline it.
+    pub include_linked_worktrees: bool,
+    /// Extra project roots to trust, for the case git cannot infer them — a
+    /// worktree of a *different* repository living alongside this one, or a
+    /// non-git sibling checkout. `${HOME}` / `${PROJECT_DIR}` / `~` expand as
+    /// in `routine_paths`. Each entry is canonicalised and refused if it
+    /// resolves to `/`, `$HOME`, or an ancestor of `$HOME` (work/80), or to a
+    /// credential / personal-data directory (`~/.ssh`, `~/.mozilla`,
+    /// `~/.password-store`, `~/.config`, …) — a hand-written path that lands on
+    /// one of those is a typo or a project-local config a supervised tool
+    /// wrote, never a project tree.
+    pub additional_project_roots: Vec<String>,
+    /// work/85: deny file operations outside the workspace instead of scoring
+    /// them, including the read-only opens `ignore_read_only` waves through.
+    /// Runtime roots stay readable and profile-declared routine paths stay
+    /// usable; everything else outside the workspace is refused. Subtractive
+    /// only — it never allows what the pipeline would block. Default off.
+    /// CLI: `grith exec --workspace-only`.
+    pub restrict_to_workspace: bool,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self {
+            include_linked_worktrees: true,
+            additional_project_roots: Vec::new(),
+            restrict_to_workspace: false,
+        }
+    }
 }
 
 /// PR 6 Phase F: per-category coverage feature flags.
@@ -1150,6 +1219,7 @@ impl Default for SupervisorCoreConfig {
             noise_reduction: SupervisorNoiseConfig::default(),
             dns_inspection: SupervisorDnsInspectionConfig::default(),
             coverage: CoverageConfig::default(),
+            trust: TrustConfig::default(),
             pty_ownership_enforce: false,
             enforce_authority_delegating_spawn: true,
             enforce_control_socket_connect: true,
@@ -1984,6 +2054,44 @@ mod tests {
         assert_eq!(dns.proxy_query_capacity, 32);
         assert_eq!(dns.proxy_control_capacity, 16);
         assert_eq!(dns.proxy_policy_capacity, 4);
+    }
+
+    /// work/83 F4: the `[supervisor.trust]` table must actually be read from
+    /// TOML. Both keys widen (or withhold) session trust, and serde silently
+    /// ignores an unknown table — so a misspelt section or field name would
+    /// ship a dead knob that leaves linked-worktree trust ON for an operator
+    /// who explicitly turned it off. Non-default values are asserted because
+    /// matching the defaults would pass even if the table were ignored.
+    #[test]
+    fn supervisor_trust_table_is_read_from_toml() {
+        let parsed: GrithConfig = toml::from_str(
+            r#"
+[supervisor.trust]
+include_linked_worktrees = false
+additional_project_roots = ["${HOME}/work/other-repo", "~/scratch"]
+restrict_to_workspace = true
+"#,
+        )
+        .unwrap();
+        let trust = &parsed.supervisor.trust;
+        assert!(!trust.include_linked_worktrees);
+        // work/85: the same argument applies with more force to this one. An
+        // ignored key here leaves a session the operator believes is fenced
+        // in reading their whole home directory.
+        assert!(trust.restrict_to_workspace);
+        assert_eq!(
+            trust.additional_project_roots,
+            vec![
+                "${HOME}/work/other-repo".to_string(),
+                "~/scratch".to_string()
+            ]
+        );
+
+        // Omitting the table entirely keeps the shipped defaults.
+        let bare: GrithConfig = toml::from_str("").unwrap();
+        assert!(bare.supervisor.trust.include_linked_worktrees);
+        assert!(bare.supervisor.trust.additional_project_roots.is_empty());
+        assert!(!bare.supervisor.trust.restrict_to_workspace);
     }
 
     #[test]

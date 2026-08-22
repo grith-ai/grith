@@ -84,25 +84,77 @@ score = 4.0
 severity = "error"
 message = "Access to Terraform state file"
 
+# work/83 F2.1 fallout: `credentials-file` below used to match the WHOLE path as
+# a substring, so `~/.git-credentials` collected 3.0 from it by accident. That
+# rule is now basename-anchored AND de-weighted to 1.5, which on its own would
+# have dropped a plaintext credential store from QUEUE to ALLOW. This file holds
+# `https://user:token@host` lines in clear text; it is already named as a
+# credential store by `grith_supervisor::syscall_map::is_credential_store_path`
+# and by the taint filter's sensitive-source list, so it gets a rule of its own
+# rather than depending on a weak name coincidence. Scored with the other
+# plaintext stores (aws-credentials, gnupg, gcloud) at 4.0.
+#
+# Its siblings in that list — `.netrc`, `.pgpass`, `.npmrc`, `.pypirc` — scored
+# ZERO here before this change too, so they are a pre-existing gap rather than
+# something work/83 narrowed, and `.npmrc` in particular is read on every npm
+# invocation. Adding them is a widening and belongs in its own change.
 [[rules]]
-id = "credentials-file"
-pattern = "*credentials*"
+# crates.io registry token, plaintext. Anchored at the store's real location so
+# an ordinary project file called `credentials.toml` is unaffected.
+id = "cargo-credentials-store"
+pattern = "~/.cargo/credentials*"
 operations = ["read", "write", "delete"]
-score = 3.0
-severity = "warning"
-message = "Access to credentials file"
+score = 4.0
+severity = "error"
+message = "Access to the cargo registry token store"
 
 [[rules]]
-id = "secrets-file"
-pattern = "*secrets*"
+# git-credential-store's OTHER documented location. `~/.git-credentials` is
+# below; this is the XDG one, same `https://user:token@host` lines.
+id = "git-credentials-store-xdg"
+pattern = "~/.config/git/credentials"
 operations = ["read", "write", "delete"]
-score = 3.0
-severity = "warning"
-message = "Access to secrets file"
+score = 4.0
+severity = "error"
+message = "Access to the git credential store"
+
+[[rules]]
+id = "git-credentials-store"
+pattern = ".git-credentials"
+operations = ["read", "write", "delete"]
+score = 4.0
+severity = "error"
+message = "Access to git credential store"
+
+# work/83 finding 1: the weak `*credentials*` / `*secrets*` globs used to live
+# here at 3.0 each. They were the SAME evidence as sensitive_path's
+# `secretish-filename` — one filename, priced by two additive filters — which is
+# how `apps/web/bin/with-secrets` collected 3.0 + 2.8 = 5.8 on a plain read.
+#
+# work/83 tried to fix that with two independent subtractions (de-weight to 1.5
+# AND a -1.5 meta-rule), which composed: a READ of `secrets.yaml` landed on
+# exactly 2.80, and `route_decision` routes on `score > allow_threshold`, so
+# that ALLOWS. The duplicate is now removed STRUCTURALLY instead — these two
+# rules are deleted, `secretish-filename` is the single weak-name signal, and
+# the credential FILE shapes (`secrets.{yaml,yml,json}`, `credentials.json`,
+# `*-credentials.json`) are scored once by sensitive_path's
+# `credential-file-shape` rule at 3.5 read / 4.0 write. No subtraction is left
+# to compose with anything, and the `*-filename-single-signal` meta-rules are
+# deleted with them.
+#
+# Nothing that could DECIDE an outcome was lost: at 1.5 neither rule could
+# reach the 3.0 boundary on any operation without `secretish-filename`, which
+# still fires and is strictly better behaved (whole-token matching, source /
+# artifact / migration / dependency-tree carveouts).
 
 [[rules]]
 id = "etc-shadow"
-pattern = "/etc/shadow"
+# `*` cannot cross `/`, so this stays anchored at /etc while covering the
+# backups `passwd`/`useradd` write beside it: /etc/shadow-, /etc/shadow.bak.
+# Those hold the same password hashes. Before the trailing `*`, a read of
+# /etc/shadow- fell through to `system-etc-path` at exactly 3.0 — which
+# `route_decision` ALLOWS, since it routes on `score > allow_threshold`.
+pattern = "/etc/shadow*"
 operations = ["read", "write"]
 score = 5.0
 severity = "critical"

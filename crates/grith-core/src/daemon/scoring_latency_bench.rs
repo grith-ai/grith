@@ -168,7 +168,7 @@ fn percentile(sorted_nanos: &[u64], p: f64) -> f64 {
 /// P2 latency measurement: full default 18-filter pipeline, realistic mixed
 /// workload, per-call timing, percentile report. See module docs for the
 /// invocation command; results are recorded in
-/// `work/77-p2-scoring-latency-measurement.md`.
+/// `work/completed/77-p2-scoring-latency-measurement.md`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "bench: run with `cargo test --release -p grith-core scoring_latency -- --ignored --nocapture`"]
 async fn scoring_latency_full_default_pipeline() {

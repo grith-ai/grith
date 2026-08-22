@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/grith-analytics",
     "crates/grith-core",
     "crates/grith-llm",
     "crates/grith-proxy",
@@ -19,6 +20,7 @@ members = [
 # cost; the docs-regen flow invokes it explicitly via
 # `cargo run -p grith-docgen`.
 default-members = [
+    "crates/grith-analytics",
     "crates/grith-core",
     "crates/grith-llm",
     "crates/grith-proxy",
@@ -32,7 +34,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.88"

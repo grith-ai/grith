@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
+import { Link } from "react-router-dom";
 import {
-  getAnalyticsSummary,
+  getAnalyticsV2Free,
   listPolicies,
   createPolicy,
   updatePolicy,
   deletePolicy,
 } from "@/lib/api";
 import type {
-  AnalyticsSummaryResponse,
+  LocalFreeAnalyticsResponse,
   Policy,
   PolicyRules,
 } from "@/types/api";
@@ -96,11 +97,13 @@ function ScoreDistributionBar({
 // ---------------------------------------------------------------------------
 
 function AnalyticsContent() {
-  const [data, setData] = useState<AnalyticsSummaryResponse | null>(null);
+  // A 7-day glance from the precomputed projection (the same Free contract
+  // the Analytics page uses) — never a raw-table aggregation per render.
+  const [data, setData] = useState<LocalFreeAnalyticsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getAnalyticsSummary()
+    getAnalyticsV2Free()
       .then(setData)
       .catch((e) => setError(e.message));
   }, []);
@@ -114,77 +117,47 @@ function AnalyticsContent() {
 
   return (
     <div className="space-y-5">
-      {/* Summary stat cards */}
+      {/* 7-day decision stat cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <StatCard label="Total Evaluations" value={data.total_evaluations.toLocaleString()} />
-        <StatCard label="Allowed" value={data.allow_count.toLocaleString()} color="text-accent-text" />
-        <StatCard label="Queued" value={data.queue_count.toLocaleString()} color="text-warning-text" />
-        <StatCard label="Denied" value={data.deny_count.toLocaleString()} color="text-danger-text" />
-      </div>
-
-      {/* Average score */}
-      <div className="flex items-center gap-4">
-        <span className="text-xs text-text-secondary">Avg Score</span>
-        <span className="text-sm font-code text-text">{data.avg_score.toFixed(2)}</span>
+        <StatCard
+          label="Decisions · 7 days"
+          value={data.decisions.total.toLocaleString()}
+        />
+        <StatCard
+          label="Allowed"
+          value={data.decisions.allow.toLocaleString()}
+          color="text-accent-text"
+        />
+        <StatCard
+          label="Queued"
+          value={data.decisions.queue.toLocaleString()}
+          color="text-warning-text"
+        />
+        <StatCard
+          label="Denied"
+          value={data.decisions.deny.toLocaleString()}
+          color="text-danger-text"
+        />
       </div>
 
       {/* Decision distribution */}
       <div>
-        <h3 className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.08em] mb-2">Decision Distribution</h3>
+        <h3 className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.08em] mb-2">
+          Decision Distribution
+        </h3>
         <ScoreDistributionBar
-          allow={data.allow_count}
-          queue={data.queue_count}
-          deny={data.deny_count}
+          allow={data.decisions.allow}
+          queue={data.decisions.queue}
+          deny={data.decisions.deny}
         />
-        <div className="flex gap-6 mt-2 text-xs text-text-secondary">
-          <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-sm bg-green" />
-            Allow: {data.allow_count.toLocaleString()}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-sm bg-warning" />
-            Queue: {data.queue_count.toLocaleString()}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-sm bg-danger" />
-            Deny: {data.deny_count.toLocaleString()}
-          </span>
-        </div>
       </div>
 
-      {/* Latency percentiles */}
-      <div>
-        <h3 className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.08em] mb-2">Latency Percentiles</h3>
-        <div className="grid grid-cols-4 gap-3">
-          <StatCard label="Avg" value={`${data.latency.avg_ms.toFixed(1)}ms`} />
-          <StatCard label="p50" value={`${data.latency.p50_ms.toFixed(1)}ms`} />
-          <StatCard label="p95" value={`${data.latency.p95_ms.toFixed(1)}ms`} />
-          <StatCard label="p99" value={`${data.latency.p99_ms.toFixed(1)}ms`} />
-        </div>
-      </div>
-
-      {/* Top triggered filters */}
-      {data.top_filters.length > 0 && (
-        <div>
-          <h3 className="font-label text-[11px] font-medium text-text-dim uppercase tracking-[0.08em] mb-2">Top Triggered Filters</h3>
-          <div className="space-y-1.5">
-            {data.top_filters.map((f) => (
-              <div key={f.name} className="flex items-center justify-between text-xs">
-                <span className="font-code text-text">{f.name}</span>
-                <span className="text-text-secondary">{f.trigger_count.toLocaleString()} hits</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Time range */}
-      {data.time_range.earliest && (
-        <div className="text-xs text-text-secondary">
-          Data from {new Date(data.time_range.earliest).toLocaleDateString()} to{" "}
-          {data.time_range.latest ? new Date(data.time_range.latest).toLocaleDateString() : "now"}
-        </div>
-      )}
+      <Link
+        to="/analytics"
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-btn bg-green-light border border-green-border text-accent-text hover:bg-green/15 transition-colors"
+      >
+        Open Analytics — 30/90-day trends, filters &amp; cost →
+      </Link>
     </div>
   );
 }

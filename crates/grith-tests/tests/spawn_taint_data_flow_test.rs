@@ -25,7 +25,7 @@
 //!
 //! The Codex-startup binary replay (the literal capture of ~25 prompts
 //! reduced to ≤2) requires a real environment to capture and replay; it is
-//! tracked in `work/62-pr2-taint-data-flow-tasks.md` Phase A's A2/A3 items.
+//! tracked in `work/completed/62-pr2-taint-data-flow-tasks.md` Phase A's A2/A3 items.
 
 use grith_proxy::engine::SecurityProxy;
 use grith_proxy::filters::taint::TaintFilter;

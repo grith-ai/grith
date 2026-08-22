@@ -788,7 +788,7 @@ pub fn cmd_pro_logout() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_pro_sync(daemon: &daemon::Daemon) -> anyhow::Result<()> {
+pub fn cmd_pro_sync(_daemon: &daemon::Daemon) -> anyhow::Result<()> {
     let creds = license::load_credentials().map_err(|e| anyhow::anyhow!("{e}"))?;
     let Some(mut creds) = creds else {
         anyhow::bail!("Not logged in. Run: grith pro login");
@@ -800,71 +800,10 @@ pub fn cmd_pro_sync(daemon: &daemon::Daemon) -> anyhow::Result<()> {
         anyhow::bail!("Sync requires an active Pro license. Run: grith pro activate");
     }
 
-    let since = creds
-        .last_synced
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::days(30));
-
-    let storage = daemon
-        .audit_storage
-        .lock()
-        .map_err(|_| anyhow::anyhow!("audit storage lock poisoned"))?;
-    let records = grith_audit::AuditQuery::new()
-        .since(since)
-        .paginate(1000, 0)
-        .execute(&storage)
-        .map_err(|e| anyhow::anyhow!("audit query failed: {e}"))?;
-    drop(storage);
-
-    let sync_records: Vec<license::SyncRecord> = records
-        .iter()
-        .map(|r| license::SyncRecord {
-            tool_call_type: r.tool_call_type.clone(),
-            composite_score: r.composite_score,
-            proxy_action: format!("{:?}", r.proxy_action).to_lowercase(),
-            filter_scores: r.filter_scores.clone(),
-            timestamp: r.timestamp.to_rfc3339(),
-            session_id: Some(r.session_id.to_string()),
-            project_name: r.task_context.clone(),
-            supervised_tool: r.supervised_tool.clone(),
-            llm_provider: r.llm_provider.clone(),
-            llm_model: r.llm_model.clone(),
-            prompt_tokens: r.prompt_tokens,
-            completion_tokens: r.completion_tokens,
-            estimated_cost_usd: r.estimated_cost_usd,
-        })
-        .collect();
-
-    let record_count = sync_records.len();
-
-    if record_count == 0 {
-        println!("No new audit records to sync.");
-    } else {
-        println!("Syncing {record_count} audit records...");
-
-        /// Maximum records per sync API call (stays under CloudFront WAF body size limits).
-        const AUDIT_SYNC_BATCH_LIMIT: usize = 25;
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        let mut synced = 0usize;
-        for chunk in sync_records.chunks(AUDIT_SYNC_BATCH_LIMIT) {
-            runtime
-                .block_on(async { license::sync_records(&creds, chunk.to_vec()).await })
-                .map_err(|e| anyhow::anyhow!("sync failed: {e}"))?;
-            synced += chunk.len();
-            if synced < record_count {
-                print!("\r  {synced}/{record_count} synced...");
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-            }
-        }
-
-        println!("\rSynced {record_count} records.     ");
-    }
+    // The raw audit-record upload was retired with the server's /sync route;
+    // usage analytics now sync automatically via the daemon's analytics-v2
+    // upload worker. This command still pulls team-shared state on demand.
+    println!("Usage analytics sync automatically while the daemon runs.");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

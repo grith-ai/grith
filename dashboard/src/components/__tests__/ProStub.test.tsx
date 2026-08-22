@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { PolicyEditor, UsageAnalytics } from "../ProStub";
 
 /**
@@ -37,15 +38,31 @@ function tierResponse(
   };
 }
 
-const EMPTY_ANALYTICS_SUMMARY = {
-  total_evaluations: 0,
-  allow_count: 0,
-  queue_count: 0,
-  deny_count: 0,
-  avg_score: 0,
-  latency: { avg_ms: 0, p50_ms: 0, p95_ms: 0, p99_ms: 0 },
-  top_filters: [],
-  time_range: { earliest: null, latest: null },
+// The explicit Free contract served by /api/analytics/v2/free — the gated
+// content reads the precomputed projection, never a raw-table summary.
+const EMPTY_FREE_ANALYTICS = {
+  protocol_version: 2,
+  schema_version: 1,
+  access: "free",
+  window: { start_day: "2026-08-15", end_day: "2026-08-21", current_day_partial: true },
+  decisions: {
+    total: 0,
+    allow: 0,
+    queue: 0,
+    deny: 0,
+    allow_rate_ppm: 0,
+    queue_rate_ppm: 0,
+    deny_rate_ppm: 0,
+  },
+  chain_health: "healthy",
+  recent_queue_and_deny: [],
+  freshness: {
+    materialized_through_sequence: 0,
+    dirty_day_count: 0,
+    rebuilding: false,
+    gap_count: 0,
+  },
+  pro_available: true,
 };
 
 describe("ProStub", () => {
@@ -102,7 +119,11 @@ describe("ProStub", () => {
       }),
     });
 
-    render(<UsageAnalytics />);
+    render(
+      <MemoryRouter>
+        <UsageAnalytics />
+      </MemoryRouter>,
+    );
 
     await waitFor(() => {
       expect(screen.getByText("Upgrade Required")).toBeTruthy();
@@ -115,10 +136,14 @@ describe("ProStub", () => {
         policy_editor: false,
         usage_analytics: true,
       }),
-      "/api/analytics/summary": EMPTY_ANALYTICS_SUMMARY,
+      "/api/analytics/v2/free": EMPTY_FREE_ANALYTICS,
     });
 
-    render(<UsageAnalytics />);
+    render(
+      <MemoryRouter>
+        <UsageAnalytics />
+      </MemoryRouter>,
+    );
 
     await waitFor(() => {
       expect(screen.getByText("Usage Analytics")).toBeTruthy();
@@ -128,10 +153,10 @@ describe("ProStub", () => {
     expect(screen.queryByText("Upgrade Required")).toBeNull();
     expect(screen.queryByText("Coming Soon")).toBeNull();
 
-    // The gated content's own fetch resolves with a real summary shape -
+    // The gated content's own fetch resolves with the Free contract shape -
     // wait for it to render so no in-flight promise outlives the test.
     await waitFor(() => {
-      expect(screen.getByText("Total Evaluations")).toBeTruthy();
+      expect(screen.getByText("Decisions \u00b7 7 days")).toBeTruthy();
     });
   });
 });

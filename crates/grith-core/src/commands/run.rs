@@ -54,15 +54,6 @@ pub fn cmd_repl(
         .enable_all()
         .build()?;
 
-    let _sync_handle = if daemon.config.general.audit_sync {
-        runtime.spawn(daemon::Daemon::audit_sync_task(
-            daemon.audit_storage.clone(),
-            daemon.subscribe_shutdown(),
-        ))
-    } else {
-        runtime.spawn(async {})
-    };
-
     let tools = agent::tools::agent_tool_definitions();
     let session_id = uuid::Uuid::new_v4();
     let session_name = project_override
@@ -427,15 +418,6 @@ async fn cmd_run_async(
     audit_forward_client: Option<crate::daemon::client::DaemonClient>,
 ) -> anyhow::Result<()> {
     tracing::info!(%task, "executing single task");
-
-    let _sync_handle = if daemon.config.general.audit_sync {
-        tokio::spawn(daemon::Daemon::audit_sync_task(
-            daemon.audit_storage.clone(),
-            daemon.subscribe_shutdown(),
-        ))
-    } else {
-        tokio::spawn(async {})
-    };
 
     let router = daemon.create_llm_router()?;
 

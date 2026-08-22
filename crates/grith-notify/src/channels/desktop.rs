@@ -57,10 +57,25 @@ impl NotificationChannel for DesktopChannel {
         // stall every channel routed after desktop, so we fire-and-forget and
         // report delivered optimistically — matching the previous best-effort
         // show (which ignored the show Result).
+        //
+        // A plain OS thread, NOT `spawn_blocking`. `wait_for_action` blocks
+        // until the notification server reports the notification closed or
+        // actioned — and GNOME never reports either for a notification that
+        // expires into the tray unclicked, so this wait can be PERMANENT.
+        // The 10s expiry below is a display hint the server is free to
+        // ignore, not a bound on the wait. On the tokio blocking pool each
+        // such wait pinned a pool thread forever, and `Runtime::drop` joins
+        // that pool with no timeout: one expired, unclicked notification was
+        // enough to hang daemon shutdown after its drain completed — port
+        // released, audit writer lock held, process immortal. A detached OS
+        // thread is invisible to runtime teardown and to process exit.
         let dashboard_url = self.dashboard_url.clone();
-        tokio::task::spawn_blocking(move || {
-            show_permission_request(&title, &body, &dashboard_url);
-        });
+        std::thread::Builder::new()
+            .name("grith-notify-click".to_string())
+            .spawn(move || {
+                show_permission_request(&title, &body, &dashboard_url);
+            })
+            .map_err(|e| Error::DeliveryFailed("desktop".into(), e.to_string()))?;
 
         Ok(NotifyResult {
             external_id: None,

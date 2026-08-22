@@ -210,12 +210,13 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
         // `grith pro login`/`refresh` after writing a new license). The task
         // detaches and self-terminates on the shutdown broadcast.
         let _regate_handle = daemon.spawn_license_regate_on_sighup();
-        let sync_handle = if daemon.config.general.audit_sync {
-            daemon.spawn_audit_sync()
-        } else {
-            tracing::info!("audit sync disabled by configuration");
-            tokio::spawn(async {})
-        };
+        // Cloud analytics upload worker — owner only (one uploader per
+        // audit database); it self-gates on entitlement + consent. This
+        // replaced the raw audit-record sync, which was retired with the
+        // server's /sync route.
+        if daemon.audit_role.can_write() {
+            let _analytics_handle = daemon.spawn_analytics_upload();
+        }
         let mut notification_handles = daemon
             .notification_dispatcher
             .spawn_background_tasks(daemon.subscribe_shutdown());
@@ -265,19 +266,61 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
         reaper_handle.abort();
         daemon.shutdown();
         let _ = shutdown_tx.send(());
-        let _ = server_handle.await;
-        if let Err(e) = license_handle.await {
-            tracing::warn!(error = %e, "license revalidation task panicked");
-        }
-        if let Err(e) = sync_handle.await {
-            tracing::warn!(error = %e, "audit sync task panicked");
-        }
-        for handle in notification_handles.drain(..) {
-            if let Err(e) = handle.await {
-                tracing::warn!(error = %e, "notification background task panicked");
+
+        // Bounded drain. Every task above is signalled to stop, but this
+        // process holds the exclusive audit writer lock until it exits, and a
+        // successor daemon waits only DAEMON_WRITER_LOCK_WAIT (10s) for it —
+        // so ONE task that fails to observe shutdown must cost seconds, not
+        // the machine. (The wedge that motivated this hardening turned out to
+        // live one step later — a stuck blocking-pool task joined by the
+        // runtime's drop, bounded by `shutdown_timeout` below — but the same
+        // reasoning applies here: any await on this list is one missed
+        // shutdown subscription away from being unbounded.) The budget stays
+        // under the successor's lock wait so even a drain that spends all of
+        // it still hands over cleanly.
+        //
+        // On timeout the stragglers are abandoned: returning from `block_on`
+        // reaches `shutdown_timeout`, and process exit releases the lock at
+        // the kernel regardless of what they were doing.
+        const SHUTDOWN_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+        let drain = async {
+            let _ = server_handle.await;
+            if let Err(e) = license_handle.await {
+                tracing::warn!(error = %e, "license revalidation task panicked");
             }
+            for handle in notification_handles.drain(..) {
+                if let Err(e) = handle.await {
+                    tracing::warn!(error = %e, "notification background task panicked");
+                }
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN_BUDGET, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                event = "daemon_shutdown_drain_timeout",
+                budget_secs = SHUTDOWN_DRAIN_BUDGET.as_secs(),
+                "a background task did not stop within the drain budget; \
+                 abandoning it and exiting so the audit writer lock is released"
+            );
         }
     });
+
+    // Bounded runtime teardown — this line is the actual fix for the wedged
+    // daemons of 2026-08-21. Dropping the runtime implicitly joins every
+    // RUNNING blocking-pool task with no timeout, and the desktop
+    // notification channel used to park a `spawn_blocking` in
+    // `wait_for_action` that GNOME never resolves for a notification that
+    // expires unclicked into the tray. Result, reproduced deterministically:
+    // SIGTERM → clean drain → port released → `Runtime::drop` joins the
+    // stuck thread forever, with the audit writer lock held — while
+    // `restart` (which then only waited on the port) reported the daemon
+    // stopped and its successor timed out on the lock. The notification
+    // channel now uses a detached OS thread, and `shutdown_timeout` makes
+    // sure no future blocking task can revive the wedge: wait briefly, then
+    // abandon; process exit releases the writer lock at the kernel.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
 
     let _ = daemon::remove_dashboard_pid();
     daemon::remove_dashboard_opened();
@@ -703,6 +746,9 @@ pub fn ensure_dashboard_running_with_port(
         // process exits a moment from now.
         command.env("GRITH_DASHBOARD_PERSISTENT", "1");
     }
+    // Anything in the last-error file after the readiness wait below expires
+    // was written by the child of THIS attempt.
+    crate::daemon::last_error::clear();
     match command.spawn() {
         Ok(_child) => {
             // Success means a daemon of *this build* answering on the port —
@@ -752,6 +798,14 @@ pub fn ensure_dashboard_running_with_port(
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(STARTUP_POLL_INTERVAL_MS));
+            }
+            // The child recorded its fatal startup error: the wait did not
+            // merely expire, the start FAILED, and the recorded message names
+            // the cause the discarded stderr used to hide — most usefully the
+            // pid of a wedged predecessor still holding the audit database.
+            if let Some(cause) = crate::daemon::last_error::take() {
+                eprintln!("Dashboard did not start:\n  {cause}");
+                return None;
             }
             // Nothing answering yet — the child may legitimately still be
             // initialising (first-run database setup and audit verification

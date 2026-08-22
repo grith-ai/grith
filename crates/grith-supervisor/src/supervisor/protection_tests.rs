@@ -353,6 +353,16 @@ impl Harness {
         self
     }
 
+    /// Seed the session allowlist with a project-derived prefix — the shape
+    /// `${PROJECT_DIR}/**` and the work/83 workspace roots both produce: a
+    /// boundary-safe directory prefix plus its inert `projdir:` twin.
+    fn with_project_trust(mut self, root: &str) -> Self {
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        self.session_allowed.insert(format!("projdir:{prefix}"));
+        self.session_allowed.insert(prefix);
+        self
+    }
+
     /// Drive `events` through `handle_syscall_event` against one session and
     /// return what the supervisor did. The `SupervisorLoopContext` is built
     /// once and reused across events so cross-call session state (taint,
@@ -409,6 +419,9 @@ impl Harness {
             persist_local_reputation: true,
             routine_exec_roots: self.routine_exec_roots.clone(),
             scratch_roots: self.scratch_roots.clone(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: self.namespace_users.clone(),
             permit_authority_delegating: self.permit_authority_delegating.clone(),
@@ -421,6 +434,7 @@ impl Harness {
                 super::mass_destruction::MassDestructionTracker::with_defaults(),
             ),
             yama_ptrace_scope: self.yama_ptrace_scope,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         let scope = SessionScopeKey::from_session_id(session.id);
@@ -1960,4 +1974,204 @@ async fn protection_delegating_approval_re_reviews_under_containment() {
         "under containment a previously-approved delegating command must be \
          re-reviewed, not auto-allowed: {r:?}"
     );
+}
+
+// ===========================================================================
+// Project trust vs. in-project secrets (work/83 adversarial review, finding 2)
+// ===========================================================================
+
+/// The shipped `path-match` rules, so the two name-derived filters score a
+/// path exactly as they do in production. `sensitive_path` alone gives `.env`
+/// 3.0, and the allow threshold is `score > 3.0` — the pair is what makes it
+/// a 6.00 QUEUE.
+fn shipped_path_rules() -> Vec<grith_proxy::filters::path_match::PathRule> {
+    #[derive(serde::Deserialize)]
+    struct PathRulesFile {
+        rules: Vec<grith_proxy::filters::path_match::PathRule>,
+    }
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/filters/paths.toml"
+    ))
+    .expect("config/filters/paths.toml is a shipped, required config file");
+    toml::from_str::<PathRulesFile>(&text)
+        .expect("shipped path rules must parse")
+        .rules
+}
+
+/// `ignore_read_only` returns BEFORE the allowlist matcher runs, so a guard
+/// that only the matcher applied would still serve the file here. This drives
+/// the real fast path with a real file on disk: a `.env` inside a
+/// project-trusted tree must reach the proxy (6.00 → QUEUE → DenyReviewer →
+/// deny), while an ordinary source file beside it stays noise.
+#[tokio::test]
+async fn protection_project_trusted_env_read_reaches_proxy() {
+    // NOT `tempfile::tempdir()`: its default `.tmp` prefix puts the tree
+    // under `/tmp/.`, which `is_noise_path` exempts wholesale — the test
+    // would pass for the wrong reason.
+    let tmp = tempfile::Builder::new()
+        .prefix("grith-fp83-")
+        .tempdir()
+        .unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let env_file = root.join(".env");
+    let source = root.join("main.rs");
+    std::fs::write(&env_file, "TOKEN=real").unwrap();
+    std::fs::write(&source, "fn main() {}").unwrap();
+
+    let proxy = filters_proxy(vec![
+        Box::new(SensitivePathHeuristicFilter::new()),
+        Box::new(grith_proxy::filters::path_match::PathMatchFilter::new(
+            shipped_path_rules(),
+        )),
+    ]);
+    let secret_pid = 7300;
+    let source_pid = 7301;
+    let r = Harness::new()
+        .with_proxy(proxy)
+        .with_project_trust(&root.to_string_lossy())
+        .run(vec![
+            event(
+                secret_pid,
+                syscall_nr::OPENAT,
+                SyscallKind::FileOpen {
+                    path: env_file.to_string_lossy().into_owned(),
+                    flags: OpenFlags::ReadOnly,
+                },
+            ),
+            event(
+                source_pid,
+                syscall_nr::OPENAT,
+                SyscallKind::FileOpen {
+                    path: source.to_string_lossy().into_owned(),
+                    flags: OpenFlags::ReadOnly,
+                },
+            ),
+        ])
+        .await;
+
+    assert!(
+        r.deny_pids.contains(&secret_pid) && !r.allow_pids.contains(&secret_pid),
+        "a .env inside a project-trusted tree must reach the proxy, not be \
+         served by the read-only fast path: {r:?}"
+    );
+    assert!(
+        r.allow_pids.contains(&source_pid) && !r.deny_pids.contains(&source_pid),
+        "ordinary project files stay noise — the guard must not cost the \
+         false-positive win: {r:?}"
+    );
+}
+
+/// The other half of the same trade: the weak name signals project trust was
+/// narrowed for in work/80 stay covered, so a TLS test fixture and a
+/// keyword-named config inside a project tree still cost nothing. Measured,
+/// every `*.pem`/`*.key` in this workspace is one of those.
+#[tokio::test]
+async fn protection_project_trusted_pem_read_stays_noise() {
+    let tmp = tempfile::Builder::new()
+        .prefix("grith-fp83-")
+        .tempdir()
+        .unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let fixture = root.join("server.pem");
+    let template = root.join(".env.example");
+    std::fs::write(&fixture, "-----BEGIN CERTIFICATE-----").unwrap();
+    std::fs::write(&template, "TOKEN=").unwrap();
+
+    let proxy = filters_proxy(vec![
+        Box::new(SensitivePathHeuristicFilter::new()),
+        Box::new(grith_proxy::filters::path_match::PathMatchFilter::new(
+            shipped_path_rules(),
+        )),
+    ]);
+    let pem_pid = 7302;
+    let template_pid = 7303;
+    let r = Harness::new()
+        .with_proxy(proxy)
+        .with_project_trust(&root.to_string_lossy())
+        .run(vec![
+            event(
+                pem_pid,
+                syscall_nr::OPENAT,
+                SyscallKind::FileOpen {
+                    path: fixture.to_string_lossy().into_owned(),
+                    flags: OpenFlags::ReadOnly,
+                },
+            ),
+            event(
+                template_pid,
+                syscall_nr::OPENAT,
+                SyscallKind::FileOpen {
+                    path: template.to_string_lossy().into_owned(),
+                    flags: OpenFlags::ReadOnly,
+                },
+            ),
+        ])
+        .await;
+
+    for pid in [pem_pid, template_pid] {
+        assert!(
+            r.allow_pids.contains(&pid) && !r.deny_pids.contains(&pid),
+            "project trust must still cover the weak name signals (pid {pid}): {r:?}"
+        );
+    }
+}
+
+/// Every path [`crate::syscall_map::is_project_trust_guarded_path`] refuses to
+/// let project trust short-circuit has to *also* be sensitive enough for the
+/// `ignore_read_only` fast path to hold it, because that gate's FIRST clause
+/// is `!is_sensitive_path(path)` — it returns before `session_trusted` is even
+/// consulted. `*.tfstate` was guarded but not sensitive, so a read of one
+/// inside a project-trusted tree was auto-allowed and the shipped
+/// `terraform-state` rule (4.0, read/write/delete) never ran.
+#[tokio::test]
+async fn protection_project_trusted_tfstate_read_reaches_proxy() {
+    let tmp = tempfile::Builder::new()
+        .prefix("grith-fp83-")
+        .tempdir()
+        .unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let state = root.join("terraform.tfstate");
+    let backup = root.join("terraform.tfstate.backup");
+    std::fs::write(&state, "{\"resources\":[]}").unwrap();
+    std::fs::write(&backup, "{\"resources\":[]}").unwrap();
+
+    let proxy = filters_proxy(vec![
+        Box::new(SensitivePathHeuristicFilter::new()),
+        Box::new(grith_proxy::filters::path_match::PathMatchFilter::new(
+            shipped_path_rules(),
+        )),
+    ]);
+    let state_pid = 7304;
+    let backup_pid = 7305;
+    let r = Harness::new()
+        .with_proxy(proxy)
+        .with_project_trust(&root.to_string_lossy())
+        .run(vec![
+            event(
+                state_pid,
+                syscall_nr::OPENAT,
+                SyscallKind::FileOpen {
+                    path: state.to_string_lossy().into_owned(),
+                    flags: OpenFlags::ReadOnly,
+                },
+            ),
+            event(
+                backup_pid,
+                syscall_nr::OPENAT,
+                SyscallKind::FileOpen {
+                    path: backup.to_string_lossy().into_owned(),
+                    flags: OpenFlags::ReadOnly,
+                },
+            ),
+        ])
+        .await;
+
+    for pid in [state_pid, backup_pid] {
+        assert!(
+            r.deny_pids.contains(&pid) && !r.allow_pids.contains(&pid),
+            "terraform state inside a project-trusted tree must reach the \
+             proxy, not be served by the read-only fast path (pid {pid}): {r:?}"
+        );
+    }
 }

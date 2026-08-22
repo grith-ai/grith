@@ -18,7 +18,7 @@ use uuid::Uuid;
 /// by this scope so that fresh sessions cannot inherit state from earlier ones.
 ///
 /// Derived from the session UUID at session start. See
-/// `work/61-pr1-session-scoped-state-work.md` for the design.
+/// `work/completed/61-pr1-session-scoped-state-work.md` for the design.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SessionScopeKey(Uuid);
 

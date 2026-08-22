@@ -34,10 +34,13 @@
 //! * `org.freedesktop.DBus.Properties.Set` — a property write is a mutation
 //!   whose effect depends entirely on the peer. `Get`/`GetAll` are read-only by
 //!   definition and are allowed against any destination.
-//! * The whole `org.freedesktop.portal.*` tree — it carries `Flatpak.Spawn`
-//!   (literally "run this command for me") and `OpenURI` (hands a URI to a
-//!   handler process). A portal allowlist would have to be per-interface and
-//!   nobody has needed one yet.
+//! * The `org.freedesktop.portal.*` tree, excepting two carved interfaces —
+//!   it carries `Flatpak.Spawn` (literally "run this command for me") and
+//!   `OpenURI` (hands a URI to a handler process), so the portal allowlist is
+//!   per-interface: `portal.Settings` reads (the theme/colour-scheme query
+//!   every GTK, Electron and Chromium process makes) and `portal.Secret`
+//!   (the portal spelling of the already-allowlisted Secret Service, same
+//!   rationale). Everything else on the portal escalates.
 //! * `org.freedesktop.systemd1`, `org.freedesktop.login1`,
 //!   `org.freedesktop.PolicyKit1` and the container managers — the escape
 //!   itself. Never allowlist.
@@ -64,6 +67,22 @@ fn universal_read_only(interface: &str, member: &str) -> bool {
         "org.freedesktop.DBus.Peer" => matches!(member, "Ping" | "GetMachineId"),
         // Set is deliberately absent — see the module exclusions.
         "org.freedesktop.DBus.Properties" => matches!(member, "Get" | "GetAll"),
+        // The ObjectManager interface defines exactly one method, and it is a
+        // bulk property read. Chrome calls it against org.bluez on the system
+        // bus to enumerate adapters for Web Bluetooth; same read-only
+        // contract whatever it is addressed to.
+        "org.freedesktop.DBus.ObjectManager" => member == "GetManagedObjects",
+        // GTK VFS mount enumeration — `gio open <uri>` asks gvfsd what mount
+        // types exist and whether the target sits on one before it does
+        // anything. Matched by interface, not destination: gvfsd is reached
+        // by its unique connection name (`:1.N`), which no well-known-name
+        // table can list. The members here only DESCRIBE mounts;
+        // `MountLocation` — which performs one, network authentication
+        // included — is deliberately absent and escalates.
+        "org.gtk.vfs.MountTracker" => matches!(
+            member,
+            "ListMountableInfo" | "LookupMount" | "ListMounts" | "ListMounts2"
+        ),
         _ => false,
     }
 }
@@ -114,6 +133,42 @@ fn destination_allows(destination: &str, interface: &str, member: &str) -> bool 
             interface == "org.freedesktop.DBus" && BUS_DAEMON_METHODS.contains(&member)
         }
         "org.freedesktop.secrets" => SECRET_SERVICE_INTERFACES.contains(&interface),
+        // Notification-server INTROSPECTION only: what the server is and what
+        // it supports. `Notify` is deliberately absent — grith's own security
+        // prompts arrive through this service, so a supervised tool posting
+        // notifications is a spoofing surface — and so is
+        // `CloseNotification`, which could dismiss a real prompt.
+        "org.freedesktop.Notifications" => {
+            interface == "org.freedesktop.Notifications"
+                && matches!(member, "GetCapabilities" | "GetServerInformation")
+        }
+        // Screensaver STATE READ only (browsers poll it for power/idle
+        // handling). `Inhibit`/`SimulateUserActivity` mutate idle behaviour
+        // and stay escalated.
+        "org.freedesktop.ScreenSaver" | "org.gnome.ScreenSaver" => {
+            member == "GetActive"
+                && matches!(
+                    interface,
+                    "org.freedesktop.ScreenSaver" | "org.gnome.ScreenSaver"
+                )
+        }
+        // The desktop portal, PER-INTERFACE — the tree as a whole stays
+        // excluded (see the module exclusions: `Flatpak.Spawn`, `OpenURI`).
+        //
+        // `Settings` is the read-only appearance query (colour scheme,
+        // contrast) every GTK/Electron/Chromium process makes at startup.
+        //
+        // `Secret.RetrieveSecret` is the portal spelling of the Secret
+        // Service this table already allowlists, with the same rationale: a
+        // keyring read is not an authority-delegating escape, the taint
+        // filter registers the credential access, and egress of the result
+        // is scored at the connect or spawn that carries it. Chromium uses
+        // it for its os_crypt storage key on every launch.
+        "org.freedesktop.portal.Desktop" => match interface {
+            "org.freedesktop.portal.Settings" => matches!(member, "Read" | "ReadAll"),
+            "org.freedesktop.portal.Secret" => member == "RetrieveSecret",
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -222,6 +277,122 @@ mod tests {
                 assert!(description.contains("StartTransientUnit"), "{description}");
             }
             Verdict::Allow => panic!("StartTransientUnit must never be allowed"),
+        }
+    }
+
+    /// The Chrome-session additions: read-only probes pass, and the members
+    /// on the same services that could act — post or dismiss a notification,
+    /// inhibit the screensaver, start a transient unit — still escalate.
+    #[test]
+    fn browser_probe_reads_allow_but_acting_members_escalate() {
+        for (dest, iface, member) in [
+            (
+                "org.bluez",
+                "org.freedesktop.DBus.ObjectManager",
+                "GetManagedObjects",
+            ),
+            // gvfsd answers on its unique name; the interface carries the match.
+            (":1.19", "org.gtk.vfs.MountTracker", "ListMountableInfo"),
+            (":1.19", "org.gtk.vfs.MountTracker", "LookupMount"),
+            (
+                "org.freedesktop.Notifications",
+                "org.freedesktop.Notifications",
+                "GetCapabilities",
+            ),
+            (
+                "org.freedesktop.Notifications",
+                "org.freedesktop.Notifications",
+                "GetServerInformation",
+            ),
+            (
+                "org.freedesktop.ScreenSaver",
+                "org.freedesktop.ScreenSaver",
+                "GetActive",
+            ),
+            (
+                "org.gnome.ScreenSaver",
+                "org.gnome.ScreenSaver",
+                "GetActive",
+            ),
+        ] {
+            assert_eq!(
+                classify(&call(dest, iface, member)),
+                Verdict::Allow,
+                "{dest} {member} is a read-only probe"
+            );
+        }
+        for (dest, iface, member) in [
+            (
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.portal.Settings",
+                "Read",
+            ),
+            (
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.portal.Settings",
+                "ReadAll",
+            ),
+            (
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.portal.Secret",
+                "RetrieveSecret",
+            ),
+        ] {
+            assert_eq!(
+                classify(&call(dest, iface, member)),
+                Verdict::Allow,
+                "{iface}.{member} is a carved portal interface"
+            );
+        }
+        for (dest, iface, member) in [
+            // The portal interfaces that ARE the escape: never ride the
+            // Settings/Secret carve.
+            (
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.portal.Flatpak",
+                "Spawn",
+            ),
+            (
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.portal.OpenURI",
+                "OpenURI",
+            ),
+            // Posting a notification is how a supervised tool would spoof a
+            // grith prompt; dismissing one is how it would hide a real one.
+            (
+                "org.freedesktop.Notifications",
+                "org.freedesktop.Notifications",
+                "Notify",
+            ),
+            (
+                "org.freedesktop.Notifications",
+                "org.freedesktop.Notifications",
+                "CloseNotification",
+            ),
+            (
+                "org.freedesktop.ScreenSaver",
+                "org.freedesktop.ScreenSaver",
+                "Inhibit",
+            ),
+            // Read-only member, but the systemd1 exclusion is wholesale.
+            (
+                "org.freedesktop.systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "GetUnit",
+            ),
+            // Actually mounting something (with the network auth flow that
+            // can involve) is an action, not a description.
+            (":1.19", "org.gtk.vfs.MountTracker", "MountLocation"),
+            // bluez members outside the ObjectManager read (pairing etc.).
+            ("org.bluez", "org.bluez.Adapter1", "StartDiscovery"),
+        ] {
+            assert!(
+                matches!(
+                    classify(&call(dest, iface, member)),
+                    Verdict::Escalate { .. }
+                ),
+                "{dest} {member} must escalate"
+            );
         }
     }
 

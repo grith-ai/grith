@@ -175,9 +175,25 @@ async fn launch_supervisor_task(
         let _pty_keepalive = pty_keepalive;
 
         let dlp_redactor = grith_proxy::filters::dlp_gate::DlpRedactor::with_defaults();
-        let audit_sink: Arc<dyn grith_supervisor::AuditSink> = Arc::new(
-            grith_supervisor::StorageAuditSink::new(state.audit_storage.clone()),
-        );
+        let gap_marker_tier = match config.audit_completeness {
+            grith_supervisor::config::AuditCompletenessLevel::Decisions => {
+                grith_analytics::contract::CompletenessTier::Decisions
+            }
+            grith_supervisor::config::AuditCompletenessLevel::Spawns => {
+                grith_analytics::contract::CompletenessTier::Spawns
+            }
+            grith_supervisor::config::AuditCompletenessLevel::Io => {
+                grith_analytics::contract::CompletenessTier::Io
+            }
+            grith_supervisor::config::AuditCompletenessLevel::All => {
+                grith_analytics::contract::CompletenessTier::All
+            }
+        };
+        let audit_sink: Arc<dyn grith_supervisor::AuditSink> =
+            Arc::new(grith_supervisor::StorageAuditSink::with_completeness(
+                state.audit_storage.clone(),
+                gap_marker_tier,
+            ));
         let digest_store: Arc<dyn grith_supervisor::DigestStore> = Arc::new(
             grith_supervisor::LocalDigestStore::new(state.digest_queue.clone()),
         );

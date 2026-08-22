@@ -120,6 +120,14 @@ impl AuditLogger {
                         }
                     }
                     if written {
+                        if let Err(error) = storage.materialize_analytics_tail(
+                            crate::analytics::DEFAULT_MATERIALIZER_BATCH,
+                        ) {
+                            tracing::warn!(
+                                error = %error,
+                                "analytics materializer tail failed; cursor will retry"
+                            );
+                        }
                         batch_count += batch.len() as u64;
                         if batch_count.is_multiple_of(1000) {
                             tracing::debug!(total = batch_count, "audit records written");
@@ -149,7 +157,7 @@ impl AuditLogger {
     }
 
     async fn writer_loop_in_memory(mut receiver: mpsc::Receiver<AuditRecord>) {
-        let storage = match AuditStorage::open_in_memory() {
+        let mut storage = match AuditStorage::open_in_memory() {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "failed to open in-memory audit db");
@@ -161,7 +169,14 @@ impl AuditLogger {
             // H-8: Retry write up to MAX_WRITE_RETRIES times for in-memory too.
             for attempt in 1..=MAX_WRITE_RETRIES {
                 match storage.insert_record(&record) {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        if let Err(error) = storage.materialize_analytics_tail(
+                            crate::analytics::DEFAULT_MATERIALIZER_BATCH,
+                        ) {
+                            tracing::warn!(error = %error, "analytics materializer tail failed");
+                        }
+                        break;
+                    }
                     Err(e) => {
                         tracing::error!(
                             error = %e,

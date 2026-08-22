@@ -298,6 +298,7 @@ pub fn cmd_exec_thin(
     syscall_log: Option<std::path::PathBuf>,
     trace_syscalls_jsonl: Option<std::path::PathBuf>,
     allow_queued: bool,
+    workspace_only: bool,
     command: Vec<String>,
     project_override: Option<&str>,
     config_path: Option<&std::path::Path>,
@@ -590,6 +591,14 @@ pub fn cmd_exec_thin(
         supervisor_cfg.syscall_log_file = syscall_log;
         supervisor_cfg.trace_syscalls_jsonl_file = trace_syscalls_jsonl;
         supervisor_cfg.reputation_config = cfg.reputation.to_proxy_config();
+        // work/85: the CLI flag is one-way. `--workspace-only` turns the mode
+        // on for a session whose config leaves it off; there is no
+        // `--no-workspace-only`, because a flag that could *loosen* a
+        // configured boundary would let anything that can invent an argv undo
+        // the operator's posture.
+        if workspace_only {
+            supervisor_cfg.trust.restrict_to_workspace = true;
+        }
         // Non-interactive session (no dashboard overlay, no TTY): there's no
         // reviewer to answer a Freeze dialog, so a queued op would block for
         // `freeze_timeout_seconds` and then auto-deny. Resolve it immediately

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use grith_analytics::contract::{CompletenessTier, RecordClass};
 use grith_audit::types::AuditRecord;
 use grith_digest::types::{DigestItem, DigestStatus, FilterBreakdown, ScoreSeverity};
 use grith_proxy::audit_bridge;
@@ -45,6 +46,9 @@ pub struct DnsDecisionSession {
     pub session_id: Uuid,
     pub tool_name: String,
     pub profile_name: Option<String>,
+    /// Policy scope name, the analytics `profile_id` fallback when
+    /// `profile_name` is unset (matching the supervisor event producer).
+    pub scope_name: Option<String>,
     pub project_name: Option<String>,
     pub root_pid: u32,
 }
@@ -55,6 +59,7 @@ impl From<&SupervisorSession> for DnsDecisionSession {
             session_id: session.id,
             tool_name: session.tool_name.clone(),
             profile_name: session.profile_name.clone(),
+            scope_name: session.scope_name().map(str::to_string),
             project_name: session.project_name.clone(),
             root_pid: session.root_pid,
         }
@@ -75,6 +80,11 @@ pub struct ProductionDnsDecisionService {
     dlp_redactor: DlpRedactor,
     http_client: reqwest::Client,
     call_sequence: AtomicU64,
+    /// Analytics config envelopes precomputed at construction (the SHA-256
+    /// must not run per audit record). Two variants because the queue action
+    /// is a `queue_policy` dimension and travels per request.
+    analytics_config_forward: grith_audit::AuditConfigVersion,
+    analytics_config_refuse: grith_audit::AuditConfigVersion,
 }
 
 impl ProductionDnsDecisionService {
@@ -87,6 +97,22 @@ impl ProductionDnsDecisionService {
         containment_tracker: Arc<ContainmentTracker>,
         session: DnsDecisionSession,
     ) -> Self {
+        let profile_id = session
+            .profile_name
+            .as_deref()
+            .or(session.scope_name.as_deref())
+            .unwrap_or("unknown");
+        let envelope = |queue_policy: &str| {
+            crate::audit_analytics::config_envelope(
+                profile_id,
+                b"connected-dns-proxy-v1",
+                proxy.scoring_config().auto_allow_threshold,
+                proxy.scoring_config().auto_deny_threshold,
+                queue_policy,
+            )
+        };
+        let analytics_config_forward = envelope("dns-forward");
+        let analytics_config_refuse = envelope("dns-refuse");
         Self {
             proxy,
             audit_sink,
@@ -99,6 +125,8 @@ impl ProductionDnsDecisionService {
             dlp_redactor: DlpRedactor::with_defaults(),
             http_client: reqwest::Client::new(),
             call_sequence: AtomicU64::new(0),
+            analytics_config_forward,
+            analytics_config_refuse,
         }
     }
 
@@ -352,7 +380,16 @@ impl ProductionDnsDecisionService {
                 .project_name
                 .as_deref()
                 .map(|project| self.dlp_redactor.redact(project)),
-        );
+        )
+        .with_analytics_metadata(crate::audit_analytics::metadata(
+            match request.queue_action {
+                DnsProxyQueueAction::Forward => &self.analytics_config_forward,
+                DnsProxyQueueAction::Refuse => &self.analytics_config_refuse,
+            },
+            CompletenessTier::Decisions,
+            RecordClass::Decision,
+            grith_analytics::normalize::category_for_tool_kind(&ctx.call_type.to_string()),
+        ));
         record.arguments_summary = self.dlp_redactor.redact(&record.arguments_summary);
         let decision_reason = (!decision.decision_reason.is_empty())
             .then(|| self.dlp_redactor.redact(&decision.decision_reason));
@@ -661,6 +698,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             tool_name: "test-tool".into(),
             profile_name: Some("test-profile".into()),
+            scope_name: Some("test-profile".into()),
             project_name: Some("test-project".into()),
             root_pid: 123,
         }

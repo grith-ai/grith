@@ -127,41 +127,6 @@ pub struct Credentials {
     pub last_synced: Option<String>,
 }
 
-/// Record format for the cloud sync endpoint.
-#[derive(Debug, Clone, Serialize)]
-pub struct SyncRecord {
-    pub tool_call_type: String,
-    pub composite_score: f64,
-    pub proxy_action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filter_scores: Option<HashMap<String, f64>>,
-    pub timestamp: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_name: Option<String>,
-    /// Name of the supervised external tool (e.g. "claude-code", "codex",
-    /// "aider"). None for built-in agent (`grith run`) records; the wire
-    /// field is omitted entirely in that case.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supervised_tool: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_cost_usd: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SyncResponse {
-    pub synced: usize,
-}
-
 /// Response from `POST /api/device` to start browser-based device authorization.
 #[derive(Debug, Deserialize)]
 pub struct DeviceAuthStartResponse {
@@ -277,7 +242,7 @@ pub fn api_base_url() -> String {
 }
 
 /// Build a full API URL from the configured base URL.
-fn api_url(path: &str) -> String {
+pub(crate) fn api_url(path: &str) -> String {
     format!("{}/{}", api_base_url(), path.trim_start_matches('/'))
 }
 
@@ -496,7 +461,7 @@ pub fn billing_portal_url_from_status(status: &LicenseStatus) -> Option<String> 
 // ---------------------------------------------------------------------------
 
 /// Default config directory: ~/.config/grith/
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("grith")
@@ -1022,31 +987,6 @@ pub async fn validate_license_remote(
         .map_err(|e| LicenseError::Http(e.to_string()))
 }
 
-/// Upload audit records to the cloud sync endpoint.
-pub async fn sync_records(
-    creds: &Credentials,
-    records: Vec<SyncRecord>,
-) -> Result<SyncResponse, LicenseError> {
-    let client = build_client()?;
-    let resp = client
-        .post(api_url("/api/sync"))
-        .header("x-grith-api-key", &creds.api_key)
-        .json(&serde_json::json!({ "records": records }))
-        .send()
-        .await
-        .map_err(|e| LicenseError::Http(e.to_string()))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(LicenseError::Http(format!("{status}: {body}")));
-    }
-
-    resp.json::<SyncResponse>()
-        .await
-        .map_err(|e| LicenseError::Http(e.to_string()))
-}
-
 /// Fetch the latest team policy from the server.
 pub async fn fetch_policies(creds: &Credentials) -> Result<PolicyResponse, LicenseError> {
     let client = build_client()?;
@@ -1560,47 +1500,6 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.user_id, "u1");
         assert_eq!(loaded.api_key, "grith_test");
-    }
-
-    fn make_sync_record() -> SyncRecord {
-        SyncRecord {
-            tool_call_type: "file_read".into(),
-            composite_score: 1.5,
-            proxy_action: "allow".into(),
-            filter_scores: None,
-            timestamp: "2026-08-05T00:00:00+00:00".into(),
-            session_id: Some("s1".into()),
-            project_name: None,
-            supervised_tool: None,
-            llm_provider: None,
-            llm_model: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            estimated_cost_usd: None,
-        }
-    }
-
-    #[test]
-    fn test_sync_record_serializes_supervised_tool_wire_name() {
-        let record = SyncRecord {
-            supervised_tool: Some("claude-code".into()),
-            ..make_sync_record()
-        };
-        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
-        // Exact wire field name and value.
-        assert_eq!(
-            json.get("supervised_tool").and_then(|v| v.as_str()),
-            Some("claude-code")
-        );
-    }
-
-    #[test]
-    fn test_sync_record_omits_supervised_tool_when_none() {
-        let record = make_sync_record();
-        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
-        // Built-in agent records have no supervised tool - the field must be
-        // omitted from the payload entirely, not serialized as null.
-        assert!(json.get("supervised_tool").is_none());
     }
 
     fn make_license(plan: &str, seats: u32) -> License {

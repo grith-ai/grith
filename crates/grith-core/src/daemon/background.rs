@@ -3,9 +3,10 @@
 
 //! Background daemon tasks.
 //!
-//! Spawns long-running async tasks for license re-validation and audit record
-//! synchronization. Both tasks respect the daemon shutdown signal and perform
-//! a final flush/check before exiting.
+//! Spawns long-running async tasks for license re-validation and the cloud
+//! analytics upload worker. Every task respects the daemon shutdown signal.
+//! The legacy raw audit-record sync was retired with the server's /sync
+//! route; analytics-v2 snapshots (analytics_sync.rs) replaced it.
 
 use super::Daemon;
 use crate::license::{
@@ -27,9 +28,6 @@ const REFRESH_INTERVAL_HOURS: i64 = 24;
 
 /// Minimum hours since last sync before triggering an automatic provider key refresh.
 const PROVIDER_KEY_REFRESH_HOURS: i64 = 24;
-
-/// How often (in seconds) to flush unsynced audit records to the server.
-const AUDIT_SYNC_INTERVAL_SECS: u64 = 5;
 
 /// Exponential-backoff schedule for transient refresh failures (5xx, network).
 const TRANSIENT_BACKOFF_MINUTES: &[i64] = &[15, 60, 360];
@@ -300,126 +298,22 @@ impl Daemon {
         })
     }
 
-    /// Spawn a background task that flushes unsynced audit records to the server
-    /// every 5 seconds. On failure, records remain unsynced in SQLite for retry.
-    pub fn spawn_audit_sync(&self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(Self::audit_sync_task(
-            Arc::clone(&self.audit_storage),
+    /// Spawn the cloud analytics upload worker (audit owner only): device
+    /// registration, 30-second heartbeats and dirty-day snapshot uploads.
+    /// The task self-gates every tick on sign-in, Pro entitlement,
+    /// `general.audit_sync` and recorded user consent, so spawning it is
+    /// always safe.
+    pub fn spawn_analytics_upload(&self) -> tokio::task::JoinHandle<()> {
+        let deps = crate::analytics_sync::AnalyticsSyncDeps {
+            audit_storage: Arc::clone(&self.audit_storage),
+            feature_gate: Arc::clone(&self.feature_gate),
+            audit_sync_enabled: self.config.general.audit_sync,
+            completeness: crate::analytics_sync::completeness_tier(self.config.audit.completeness),
+        };
+        tokio::spawn(crate::analytics_sync::analytics_upload_task(
+            deps,
             self.subscribe_shutdown(),
         ))
-    }
-
-    /// The audit sync task as a standalone future (for use with external runtimes).
-    pub async fn audit_sync_task(
-        audit_storage: Arc<Mutex<grith_audit::AuditStorage>>,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(AUDIT_SYNC_INTERVAL_SECS));
-        // Keep batches small to stay under CloudFront/WAF ~8KB body size limit.
-        let batch_limit: usize = 25;
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = shutdown_rx.recv() => {
-                    // Final flush before exit -- drain all remaining records.
-                    Self::flush_all_audit_records(&audit_storage, batch_limit).await;
-                    break;
-                }
-            }
-
-            Self::flush_all_audit_records(&audit_storage, batch_limit).await;
-        }
-    }
-
-    /// Drain all unsynced audit records in batches.
-    async fn flush_all_audit_records(
-        audit_storage: &Arc<Mutex<grith_audit::AuditStorage>>,
-        batch_limit: usize,
-    ) {
-        loop {
-            let flushed = Self::flush_audit_batch(audit_storage, batch_limit).await;
-            if !flushed {
-                break;
-            }
-        }
-    }
-
-    /// Flush a single batch of audit records. Returns true if records were synced
-    /// (and there may be more), false if there was nothing to send or an error.
-    async fn flush_audit_batch(
-        audit_storage: &Arc<Mutex<grith_audit::AuditStorage>>,
-        batch_limit: usize,
-    ) -> bool {
-        let creds = match crate::license::load_credentials() {
-            Ok(Some(c)) => c,
-            _ => return false, // Not logged in, nothing to sync.
-        };
-
-        // Pull unsynced records from SQLite.
-        let (records, ids) = {
-            let storage = match audit_storage.lock() {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            let unsynced = match storage.get_unsynced(batch_limit) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to query unsynced audit records");
-                    return false;
-                }
-            };
-            if unsynced.is_empty() {
-                return false;
-            }
-            let ids: Vec<uuid::Uuid> = unsynced.iter().map(|r| r.id).collect();
-            let sync_records: Vec<crate::license::SyncRecord> = unsynced
-                .iter()
-                .map(|r| crate::license::SyncRecord {
-                    tool_call_type: r.tool_call_type.clone(),
-                    composite_score: r.composite_score,
-                    proxy_action: format!("{}", r.proxy_action).to_lowercase(),
-                    filter_scores: r.filter_scores.clone(),
-                    timestamp: r.timestamp.to_rfc3339(),
-                    session_id: Some(r.session_id.to_string()),
-                    // Prefer the dedicated project_name column; fall back to
-                    // task_context for records written before that column
-                    // existed (the supervisor used to stash the project name
-                    // there).
-                    project_name: r.project_name.clone().or_else(|| r.task_context.clone()),
-                    supervised_tool: r.supervised_tool.clone(),
-                    llm_provider: r.llm_provider.clone(),
-                    llm_model: r.llm_model.clone(),
-                    prompt_tokens: r.prompt_tokens,
-                    completion_tokens: r.completion_tokens,
-                    estimated_cost_usd: r.estimated_cost_usd,
-                })
-                .collect();
-            (sync_records, ids)
-        }; // Lock released here.
-
-        let count = records.len();
-        tracing::debug!(count, "flushing audit records to server");
-
-        match crate::license::sync_records(&creds, records).await {
-            Ok(resp) => {
-                tracing::debug!(synced = resp.synced, "audit records synced");
-                // Mark as synced in SQLite.
-                if let Ok(storage) = audit_storage.lock() {
-                    if let Err(e) = storage.mark_synced(&ids) {
-                        tracing::warn!(error = %e, "failed to mark records as synced");
-                    }
-                }
-                // Return true so the caller knows there may be more records.
-                true
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, count, "audit sync failed, will retry");
-                // Records stay unsynced -- next flush will retry.
-                false
-            }
-        }
     }
 }
 

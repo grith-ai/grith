@@ -214,7 +214,7 @@ impl AuditStorage {
         }
         let conn = Connection::open(&db_path)?;
         apply_pragmas(&conn)?;
-        let storage = Self {
+        let mut storage = Self {
             conn,
             db_path,
             max_size_bytes: 100 * 1024 * 1024, // 100 MB
@@ -225,6 +225,16 @@ impl AuditStorage {
             read_only: false,
         };
         storage.init_schema()?;
+        // Best-effort: a chain re-genesis (quarantine repair, recreated
+        // database) must rotate the analytics source epoch or analytics
+        // silently freezes at the old generation's cursor. Analytics is
+        // derived state — its failure must never stop the audit log opening.
+        if let Err(error) = storage.reconcile_analytics_epoch() {
+            tracing::warn!(
+                error = %error,
+                "could not reconcile the analytics source epoch at open"
+            );
+        }
         Ok(storage)
     }
 
@@ -520,6 +530,7 @@ impl AuditStorage {
                 value TEXT NOT NULL
             );",
         )?;
+        crate::analytics::init_schema(&self.conn)?;
         Ok(())
     }
 
@@ -832,6 +843,12 @@ impl AuditStorage {
             self.conn
                 .execute("ALTER TABLE audit_log ADD COLUMN hash_version INTEGER", [])?;
         }
+        if !cols.contains("analytics_metadata") {
+            self.conn.execute(
+                "ALTER TABLE audit_log ADD COLUMN analytics_metadata TEXT",
+                [],
+            )?;
+        }
         // Compact-record classification. Idempotent ALTER + default 'full'
         // so existing rows remain visible to the standard audit page query.
         if !cols.contains("record_type") {
@@ -890,6 +907,11 @@ impl AuditStorage {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let analytics_metadata_json = record
+            .analytics_metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         // Stage 3: compress the three biggest JSON columns. Below the
         // threshold or if compression doesn't shrink, the bytes stay
         // plain UTF-8 — readers detect via the zstd magic prefix.
@@ -909,8 +931,8 @@ impl AuditStorage {
                 spawn_sha256, matched_routine_root, shadow_phase3_filters,
                 original_addr, rewritten_addr, clamp_profile_entry,
                 record_type, project_name, decision_reason, enforcement_outcome,
-                hash_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+                hash_version, analytics_metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
             params![
                 record.id.to_string(),
                 record.timestamp.to_rfc3339(),
@@ -949,6 +971,7 @@ impl AuditStorage {
                 record.decision_reason,
                 record.enforcement_outcome,
                 record.hash_version,
+                analytics_metadata_json,
             ],
         )?;
         Ok(())
@@ -3709,11 +3732,14 @@ mod tests {
         }
         storage.invalidate_verify_cache();
 
-        // Append through the normal path — these stamp v2.
-        storage
-            .insert_record(&make_fully_populated_record())
-            .unwrap();
-        storage.insert_record(&make_record()).unwrap();
+        // Append explicit v2 rows. New constructors now stamp v3, so pinning
+        // the version here keeps this compatibility boundary meaningful.
+        let mut first_v2 = make_fully_populated_record();
+        first_v2.hash_version = crate::types::HASH_VERSION_V2;
+        let mut second_v2 = make_record();
+        second_v2.hash_version = crate::types::HASH_VERSION_V2;
+        storage.insert_record(&first_v2).unwrap();
+        storage.insert_record(&second_v2).unwrap();
 
         assert_eq!(
             storage.verify_chain().unwrap(),

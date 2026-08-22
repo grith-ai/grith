@@ -549,6 +549,103 @@ mod tests {
         assert_eq!(engine.evaluate(&[result], &ctx), 0.0);
     }
 
+    /// A `rule_id`-qualified condition must key on the WINNING rule of the
+    /// named filter, and must accept both the kebab-case and the legacy
+    /// snake_case spelling of a filter name — a stale cwd-local
+    /// meta_rules.toml takes load precedence, and a silently-not-firing
+    /// adjustment is invisible.
+    ///
+    /// (The shipped `*-filename-single-signal` rules this was written for are
+    /// gone — work/83 finding 1 removed the duplicated filename evidence at
+    /// the source rather than subtracting it back off — but the engine
+    /// behaviour they exercised is still load-bearing for the remaining
+    /// rule_id-qualified meta-rules.)
+    #[test]
+    fn rule_id_qualified_conditions_key_on_the_winning_rule() {
+        let engine = |filter_name: &str| {
+            MetaRuleEngine::new(vec![MetaRule {
+                id: "secrets-filename-single-signal".into(),
+                conditions: vec![
+                    MetaCondition {
+                        filter: Some("path-match".into()),
+                        rule_id: Some("secrets-file".into()),
+                        matched: Some(true),
+                        call_type: None,
+                        path_contains: None,
+                        taint_source: None,
+                        metadata_flag: None,
+                    },
+                    MetaCondition {
+                        filter: Some(filter_name.to_string()),
+                        rule_id: Some("secretish-filename".into()),
+                        matched: Some(true),
+                        call_type: None,
+                        path_contains: None,
+                        taint_source: None,
+                        metadata_flag: None,
+                    },
+                ],
+                score_override: None,
+                score_adjustment: Some(-1.5),
+                message: "collapse".into(),
+            }])
+        };
+
+        let ctx = make_ctx(ToolCallType::FileRead {
+            path: "/p/apps/web/bin/with-secrets".into(),
+        });
+        let both = vec![
+            FilterResult::matched(
+                "path-match",
+                "secrets-file",
+                1.5,
+                Severity::Warning,
+                "secrets file",
+            ),
+            FilterResult::matched(
+                "sensitive-path-heuristic",
+                "secretish-filename",
+                2.8,
+                Severity::Warning,
+                "secretish filename",
+            ),
+        ];
+        // 1.5 + 2.8 = 4.3 summed; -1.5 leaves max(1.5, 2.8) = 2.8 -> allow.
+        for name in ["sensitive-path-heuristic", "sensitive_path_heuristic"] {
+            assert_eq!(
+                engine(name).evaluate(&both, &ctx),
+                -1.5,
+                "filter spelling {name} must fire the collapse"
+            );
+            assert_eq!(
+                crate::scoring::aggregate(&both) + engine(name).evaluate(&both, &ctx),
+                2.8
+            );
+        }
+
+        // A STRONGER sensitive_path rule is different evidence — no deduction.
+        let stronger = vec![
+            FilterResult::matched(
+                "path-match",
+                "secrets-file",
+                1.5,
+                Severity::Warning,
+                "secrets file",
+            ),
+            FilterResult::matched(
+                "sensitive-path-heuristic",
+                "credential-directory",
+                4.0,
+                Severity::Error,
+                "credential dir",
+            ),
+        ];
+        assert_eq!(
+            engine("sensitive-path-heuristic").evaluate(&stronger, &ctx),
+            0.0
+        );
+    }
+
     #[test]
     fn test_taint_source_does_not_match_without_taint_results() {
         let engine = make_taint_exfil_engine();

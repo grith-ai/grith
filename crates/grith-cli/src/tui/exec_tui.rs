@@ -889,37 +889,17 @@ fn handle_input_event(
                     .as_ref()
                     .is_some_and(|dialog| dialog.scope.is_some())
                 {
+                    // One key map, shared with the REPL host in `tui/mod.rs`
+                    // so the two cannot drift apart again.
                     let mut applied = None;
                     if let Some(dialog) = state.permission_dialog.as_mut() {
                         let scope = dialog.scope.as_mut().expect("scope checked above");
-                        match key.code {
-                            KeyCode::Esc => dialog.scope = None,
-                            KeyCode::Enter => {
-                                applied = scope.apply(&dialog.request);
+                        match scope.handle_key(&key, &dialog.request) {
+                            widgets::permission::ScopeKeyOutcome::Cancel => dialog.scope = None,
+                            widgets::permission::ScopeKeyOutcome::Applied(action) => {
+                                applied = Some(action);
                             }
-                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                                scope.focus_previous();
-                            }
-                            KeyCode::Tab | KeyCode::Down => scope.focus_next(),
-                            KeyCode::BackTab | KeyCode::Up => scope.focus_previous(),
-                            KeyCode::Backspace if scope.directory_focused() => {
-                                scope.pop_directory_char();
-                            }
-                            KeyCode::Char('u')
-                                if scope.directory_focused()
-                                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                scope.clear_directory();
-                            }
-                            KeyCode::Char(' ') if !scope.directory_focused() => {
-                                scope.toggle_focused();
-                            }
-                            KeyCode::Char(ch)
-                                if scope.directory_focused() && key.modifiers.is_empty() =>
-                            {
-                                scope.push_directory_char(ch);
-                            }
-                            _ => {}
+                            widgets::permission::ScopeKeyOutcome::Continue => {}
                         }
                     }
                     if let Some(action) = applied {
@@ -945,6 +925,21 @@ fn handle_input_event(
                                 dialog.scope = widgets::permission::ScopeDialogState::for_request(
                                     &dialog.request,
                                 );
+                            }
+                        }
+                    }
+                    // Same editor, opened pointing the other way. A separate
+                    // key rather than "open then toggle": the reviewer who
+                    // wants this is usually reacting to a flood of prompts for
+                    // one directory, and should not have to find a mode
+                    // control first.
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        if let Some(dialog) = state.permission_dialog.as_mut() {
+                            if dialog.request.score <= 8.0 {
+                                dialog.scope =
+                                    widgets::permission::ScopeDialogState::blocking_for_request(
+                                        &dialog.request,
+                                    );
                             }
                         }
                     }

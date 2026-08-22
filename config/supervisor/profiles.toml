@@ -13,6 +13,40 @@
 # destinations explicitly. `generic-cli` is available for manual `--profile`
 # opt-in only.
 
+# ── Control-socket and delegating-spawn carveouts (opt-in, per profile) ──────
+#
+# Two keys exist on every profile and are DELIBERATELY unset everywhere below.
+# They are documented here because an undocumented escape hatch is one nobody
+# can use, and because setting either one wrongly hands a supervised tool a way
+# out of supervision.
+#
+#   permit_control_sockets = ["…"]
+#     Case-insensitive path substrings. A connect to a matching IPC socket skips
+#     control-socket escalation. These sockets let a tool drive a
+#     more-privileged peer that runs commands on its behalf — tmux/screen pane
+#     injection, X11 input synthesis, session D-Bus method calls — so a match
+#     here is a decision to trust the tool with the operator's session.
+#
+#     Do NOT add a blanket "/.X11-unix/" entry. Routine clipboard use
+#     (`xclip`/`xsel`/`wl-copy` writing the selection, resolved by canonical
+#     path at a system binary root) is already allowed without a permit; a
+#     blanket entry would additionally cover clipboard READS and every unknown
+#     X11 client, which is the escape the enforcement exists to close.
+#
+#     Legitimate example — a tool whose whole job is driving a tmux session,
+#     where the operator has accepted that:
+#       # permit_control_sockets = ["/tmp/tmux-1000/default"]
+#
+#   permit_authority_delegating = ["…"]
+#     Binary BASENAMES whose spawn skips authority-delegating escalation
+#     (systemd-run, at, docker, nsenter, …). Those run work in a process that is
+#     not a ptrace descendant of the supervised tool, so none of its syscalls
+#     are intercepted.
+#       # permit_authority_delegating = ["docker"]
+#
+# Both are per-profile, both default empty, and neither is set by any shipped
+# profile.
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Defaults — merged into every profile (universal, local-only settings)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -79,6 +113,27 @@ routine_paths = [
     "/tmp/cc*.ld",
     # Linker staging
     "/tmp/ld-*",
+
+    # ─── Browser runtime scratch ─────────────────────────────────────────────
+    # Chromium-family browsers (Chrome, Chromium, Electron apps) create a
+    # shared-memory segment per renderer under these name templates, plus a
+    # per-instance singleton dir in /tmp — dozens of random-named files per
+    # page load, one measured headless-Chrome test run answered 57 prompts
+    # for them. Trust is file I/O only under the browser's own templates;
+    # the browser SPAWN, its network egress, and its D-Bus traffic are all
+    # still scored on their own axes.
+    "/dev/shm/.com.google.Chrome.*",
+    "/dev/shm/.org.chromium.Chromium.*",
+    "/tmp/.com.google.Chrome.*",
+    "/tmp/com.google.Chrome.*",
+    "/tmp/.org.chromium.Chromium.*",
+
+    # mktemp's default template — `mktemp` with no arguments, which is what
+    # agent-generated shell uses for every scratch file. Each name is random,
+    # so no exact approval can ever cover the next one: one measured session
+    # answered 28 prompts for these alone. Trust here grants file I/O only —
+    # a payload staged in /tmp still gets scored at spawn and at egress.
+    "/tmp/tmp.*",
 
     # Ruby — bundler tempdirs
     "/tmp/bundler*",

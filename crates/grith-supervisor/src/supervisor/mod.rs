@@ -15,6 +15,7 @@ mod authority_delegation;
 mod dns_decision;
 mod event_handler;
 mod mass_destruction;
+mod spawn_families;
 
 // Shared with `crate::learned_rules` so `ipc-socket:` grant validation
 // rejects privileged daemon sockets with the same curated predicate the
@@ -610,6 +611,109 @@ pub async fn run_supervisor_loop(
         .as_ref()
         .map(|p| p.merged_profile.expand_routine_exec_roots())
         .unwrap_or_default();
+    // work/83 F4: workspace-wide project trust, resolved ONCE, here.
+    //
+    // `${PROJECT_DIR}` expands to the launch cwd, so in a multi-worktree
+    // layout the sibling worktrees of the very repository being worked on get
+    // no trust at all — measured 24.9% of calls QUEUEd there against 0.32%
+    // under the launch cwd, and 692 mass-destruction escalations from one
+    // `git worktree remove`.
+    //
+    // Snapshotted at session start and never recomputed: if the worktree list
+    // were re-read mid-session, a supervised tool could widen its own trust
+    // with `git worktree add /home/<user>`, turning a false-positive fix into
+    // a privilege escalation. The extra roots are inserted into the session
+    // allowlist below with the inert `projdir:` twin, so work/80's
+    // credential-store guard, the containment gate and the sensitive-scoped
+    // read check all keep applying to them exactly as they do to the launch
+    // tree — this widens *where* project trust reaches, never *what* project
+    // trust may cover.
+    let (workspace_roots, workspace_boundary): (
+        Vec<String>,
+        Option<crate::workspace_only::WorkspaceBoundary>,
+    ) = {
+        let (home, launch_cwd) = crate::profiles::resolved_home_and_project_dir();
+        // Two gates before any git probe runs. (1) A profile that does not
+        // grant `${PROJECT_DIR}` trust must not acquire trust in a sibling
+        // worktree through this door — F4 mirrors existing trust, it does not
+        // invent it. (2) A launch cwd work/80 already refused (`/`, `$HOME`,
+        // an ancestor of `$HOME`) gets nothing back here either.
+        let mirrors_project_trust = session_policy
+            .as_ref()
+            .is_some_and(|p| p.merged_profile.declares_project_dir_trust())
+            && !crate::profiles::is_dangerous_project_root(&home, &launch_cwd);
+        // work/85: the workspace-only boundary needs the same roots, and
+        // neither gate applies to it. `mirrors_project_trust` exists to stop a
+        // profile *gaining* trust it never declared; the boundary grants
+        // nothing — it only refuses what lies outside — so a session that
+        // trusts no worktree still has to be able to work in one. Resolved in
+        // the same block so the git probes run at most once.
+        let restrict_to_workspace = config.trust.restrict_to_workspace;
+        let resolved = if mirrors_project_trust || restrict_to_workspace {
+            crate::profiles::resolve_workspace_roots(
+                std::path::Path::new(&launch_cwd),
+                &home,
+                config.trust.include_linked_worktrees,
+                &config.trust.additional_project_roots,
+            )
+        } else {
+            Vec::new()
+        };
+        let boundary = restrict_to_workspace.then(|| {
+            // The launch cwd leads: `collect_workspace_roots` drops it from
+            // the enumerated set precisely because `${PROJECT_DIR}` already
+            // covers it for trust purposes, and the boundary has no such
+            // other half to lean on.
+            let mut roots = Vec::with_capacity(resolved.len() + 1);
+            if !launch_cwd.is_empty() {
+                roots.push(launch_cwd.clone());
+            }
+            roots.extend(resolved.iter().cloned());
+            let boundary = crate::workspace_only::WorkspaceBoundary::new(roots);
+            if crate::profiles::is_dangerous_project_root(&home, &launch_cwd) {
+                // Not an error — the mode stays on and stays honest — but a
+                // boundary rooted at `/` or `$HOME` excludes almost nothing,
+                // and an operator who switched this on deserves to know they
+                // are not getting what they asked for.
+                tracing::warn!(
+                    event = "workspace_only_boundary_ineffective",
+                    launch_cwd = %launch_cwd,
+                    "workspace-only was requested from / or the home directory: \
+                     nearly every path is inside the boundary — relaunch from \
+                     the project directory"
+                );
+            }
+            boundary
+        });
+        // Trust — the session-allowlist half — still obeys both gates.
+        let trusted = if mirrors_project_trust {
+            resolved
+        } else {
+            Vec::new()
+        };
+        (trusted, boundary)
+    };
+    if !workspace_roots.is_empty() {
+        match session_allowed.lock() {
+            Ok(mut allowed) => {
+                crate::profiles::extend_allowlist_with_workspace_roots(
+                    &mut allowed,
+                    &workspace_roots,
+                );
+            }
+            Err(_) => {
+                // A poisoned allowlist mutex this early means another thread
+                // panicked holding it; failing closed (no extra trust) is the
+                // safe direction and the session continues with launch-cwd
+                // trust only.
+                tracing::warn!(
+                    event = "workspace_trust_not_installed",
+                    "session allowlist unavailable; workspace roots not trusted"
+                );
+            }
+        }
+    }
+
     // Fix #2: profile-declared scratch_roots, expanded at session start. Writes
     // under these are exempt from the rate-limit burst counter (only) so the
     // tool's XDG-cache churn doesn't queue routine work.
@@ -739,6 +843,11 @@ pub async fn run_supervisor_loop(
         session_sync,
         routine_exec_roots: expanded_routine_exec_roots.clone(),
         scratch_roots: expanded_scratch_roots,
+        workspace_roots: workspace_roots.clone(),
+        // work/85: refusals start empty and only ever grow, from a reviewer
+        // explicitly blocking a directory at the permission dialog.
+        session_denied: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        workspace_boundary,
         local_listener_policy: session_local_listener_policy,
         namespace_users: session_namespace_users,
         permit_authority_delegating: session_permit_authority_delegating,
@@ -754,6 +863,7 @@ pub async fn run_supervisor_loop(
             mass_destruction::MassDestructionTracker::with_defaults(),
         ),
         yama_ptrace_scope,
+        analytics_config: std::sync::OnceLock::new(),
     };
 
     // PR 1 Phase F: sweep stale per-session state from any crashed previous
@@ -813,6 +923,15 @@ pub async fn run_supervisor_loop(
         root_pid = session.root_pid,
         listener_clamp_available = clamp_available,
         yama_ptrace_scope = ?loop_ctx.yama_ptrace_scope,
+        // work/83 F4: exactly which extra trees this session trusts, on the
+        // session_start line, so an operator can audit a widened trust
+        // boundary without reconstructing it from the git layout.
+        workspace_roots = ?loop_ctx.workspace_roots,
+        // work/85: a session that refuses everything outside a boundary has
+        // to say what the boundary is, on the same line.
+        workspace_only = ?loop_ctx.workspace_boundary.as_ref().map(
+            crate::workspace_only::WorkspaceBoundary::roots
+        ),
         "supervisor session started",
     );
     log_session_lifecycle_audit(
@@ -826,6 +945,10 @@ pub async fn run_supervisor_loop(
             "root_pid": session.root_pid,
             "listener_clamp_available": clamp_available,
             "yama_ptrace_scope": loop_ctx.yama_ptrace_scope,
+            "workspace_roots": loop_ctx.workspace_roots,
+            "workspace_only": loop_ctx.workspace_boundary.as_ref().map(
+                crate::workspace_only::WorkspaceBoundary::roots
+            ),
         }),
         "supervisor session started",
     )
@@ -1205,6 +1328,9 @@ async fn evict_session_state_on_end(
         "supervisor session ended",
     )
     .await;
+    // Buffered sinks (the exec path's remote batch sender) must drain before
+    // exec teardown drops the runtime, or the tail of the session is lost.
+    loop_ctx.audit_sink.flush().await;
 }
 
 async fn log_session_lifecycle_audit(
@@ -1225,7 +1351,16 @@ async fn log_session_lifecycle_audit(
         0.0,
         Some(reason.into()),
     )
-    .with_supervisor_source(session.tool_name.clone(), session.root_pid);
+    .with_supervisor_source(session.tool_name.clone(), session.root_pid)
+    // Lifecycle records are system records with an explicit System category;
+    // the event name ("session_start"/"session_end") is not a tool kind and
+    // must not be pattern-matched into a category.
+    .with_analytics_metadata(event_handler::prospective_analytics_metadata_with_category(
+        loop_ctx,
+        session,
+        grith_analytics::contract::RecordClass::System,
+        grith_analytics::contract::Category::System,
+    ));
     record.execution_result = Some(reason.into());
     // B-CORE-2 (b): session lifecycle events are low-volume and important — the
     // session-end summary carries the audit-drop count, so it must not itself be

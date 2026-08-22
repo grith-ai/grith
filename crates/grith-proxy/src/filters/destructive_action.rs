@@ -158,8 +158,21 @@ fn is_database_data_dir(path_lc: &str) -> bool {
 }
 
 /// Backup conventions — deleting these removes the recovery path.
+///
+/// A backup location is a DIRECTORY. The previous `path_lc.contains("/backup")`
+/// was the same unanchored-substring flaw work/83 M7 documents in `path_match`:
+/// it scored `node_modules/aws-sdk/clients/backup.js` — the AWS *Backup service*
+/// client — at 4.5 on every write, 12 prompts during one `npm install`. So a
+/// component must START with `backup` and must not look like a FILE (no dot), and
+/// a vendored or generated tree is excluded outright: a package's own file names
+/// carry no authority.
 fn is_backup_location(path_lc: &str) -> bool {
-    path_lc.contains("/backup")
+    if crate::paths::is_name_opaque_tree(path_lc) {
+        return false;
+    }
+    path_lc
+        .split('/')
+        .any(|component| component.starts_with("backup") && !component.contains('.'))
 }
 
 /// Generic primary-data mounts.

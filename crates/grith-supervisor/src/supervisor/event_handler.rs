@@ -17,6 +17,7 @@ use chrono::Utc;
 use futures::FutureExt;
 use uuid::Uuid;
 
+use grith_analytics::contract::{Category, CompletenessTier, RecordClass};
 use grith_audit::types::AuditRecord;
 use grith_audit::CorrelationTracker;
 use grith_digest::types::{
@@ -46,10 +47,82 @@ use crate::syscall_map;
 
 use super::authority_delegation;
 use super::mass_destruction;
+use super::spawn_families;
 use super::{session_state::SupervisorSession, DaemonRestartConfig};
 
 fn session_scope_name(session: &SupervisorSession) -> &str {
     session.scope_name().unwrap_or("unknown")
+}
+
+fn analytics_completeness(value: crate::config::AuditCompletenessLevel) -> CompletenessTier {
+    match value {
+        crate::config::AuditCompletenessLevel::Decisions => CompletenessTier::Decisions,
+        crate::config::AuditCompletenessLevel::Spawns => CompletenessTier::Spawns,
+        crate::config::AuditCompletenessLevel::Io => CompletenessTier::Io,
+        crate::config::AuditCompletenessLevel::All => CompletenessTier::All,
+    }
+}
+
+/// The `queue_policy` analytics dimension for an [`InteractiveQueueAction`].
+/// Kept in sync with the enum's `#[serde(rename_all = "lowercase")]` names —
+/// serializing through serde_json would wrap the value in JSON quotes.
+fn queue_policy_name(action: crate::config::InteractiveQueueAction) -> &'static str {
+    match action {
+        crate::config::InteractiveQueueAction::Freeze => "freeze",
+        crate::config::InteractiveQueueAction::Log => "log",
+        crate::config::InteractiveQueueAction::Deny => "deny",
+    }
+}
+
+/// Analytics `profile_id`: the session's profile name when set, else the
+/// policy scope name. Matches the DNS producer in `dns_decision.rs`.
+fn analytics_profile_id(session: &SupervisorSession) -> &str {
+    session
+        .profile_name
+        .as_deref()
+        .unwrap_or_else(|| session_scope_name(session))
+}
+
+pub(super) fn prospective_analytics_metadata(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    session: &SupervisorSession,
+    record_class: RecordClass,
+    tool_call_type: &str,
+) -> grith_audit::AuditAnalyticsMetadata {
+    prospective_analytics_metadata_with_category(
+        loop_ctx,
+        session,
+        record_class,
+        grith_analytics::normalize::category_for_tool_kind(tool_call_type),
+    )
+}
+
+pub(super) fn prospective_analytics_metadata_with_category(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    session: &SupervisorSession,
+    record_class: RecordClass,
+    category: Category,
+) -> grith_audit::AuditAnalyticsMetadata {
+    // The config envelope serializes + hashes the session config; both are
+    // immutable for the session's lifetime, so the envelope is computed once
+    // and cloned per record (the hot path runs per intercepted syscall).
+    let config = loop_ctx.analytics_config.get_or_init(|| {
+        let (allow, deny) = loop_ctx.proxy.scoring_config().thresholds();
+        let fingerprint = serde_json::to_vec(loop_ctx.config).unwrap_or_default();
+        crate::audit_analytics::config_envelope(
+            analytics_profile_id(session),
+            &fingerprint,
+            allow,
+            deny,
+            queue_policy_name(loop_ctx.config.interactive_queue_action),
+        )
+    });
+    crate::audit_analytics::metadata(
+        config,
+        analytics_completeness(loop_ctx.config.audit_completeness),
+        record_class,
+        category,
+    )
 }
 
 /// Temporary kill switch for the PR 1 Phase D containment ordering. When set
@@ -425,6 +498,21 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// Paths approved via "learn" during this session. Auto-allowed on
     /// subsequent accesses without going through the proxy.
     pub(super) session_allowed: Arc<Mutex<HashSet<String>>>,
+    /// work/85: directory refusals the reviewer installed from the permission
+    /// dialog's block action, as `deny-ro-prefix:` / `deny-write-prefix:` /
+    /// `deny-delete-prefix:` entries.
+    ///
+    /// A separate set from `session_allowed` on purpose. A `deny-…` string
+    /// living in the allowlist would be one missing namespace exclusion away
+    /// from being read as a bare allow prefix by the catch-all matcher at the
+    /// end of `is_session_allowlist_match` — an inverted security decision
+    /// from a refactor that looked harmless. Two sets make that
+    /// unrepresentable.
+    pub(super) session_denied: Arc<Mutex<HashSet<String>>>,
+    /// work/85: the workspace-only boundary, when
+    /// `[supervisor.trust] restrict_to_workspace` (or `--workspace-only`) is
+    /// on. `None` in every other session, which is the default.
+    pub(super) workspace_boundary: Option<crate::workspace_only::WorkspaceBoundary>,
     /// Reverse DNS cache: resolves raw IPs from `connect()` syscalls
     /// to hostnames so the egress filter can match trusted domains.
     pub(super) dns_cache: Arc<Mutex<DnsCache>>,
@@ -472,6 +560,19 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// the `rate_limit` scratch burst exemption, retired in favour of
     /// risk-gating.)
     pub(super) scratch_roots: Vec<String>,
+    /// work/83 F4: additional project roots this session trusts beyond the
+    /// launch cwd — the launch repository's linked git worktrees plus any
+    /// operator-declared `additional_project_roots`. Resolved ONCE at session
+    /// start (never re-read: a mid-session re-read would let the supervised
+    /// tool widen its own trust with `git worktree add`), canonicalised, with
+    /// work/80's dangerous-root refusal applied and capped at
+    /// `profiles::MAX_WORKSPACE_ROOTS`.
+    ///
+    /// Two consumers: the session allowlist (extended at session start with a
+    /// `projdir:`-marked prefix per root, so the credential-store guard still
+    /// applies) and the mass-destruction backstop, which counts deletions here
+    /// as in-tree rather than as a spree.
+    pub(super) workspace_roots: Vec<String>,
     /// PR 5 Phase C: session profile's declared local-IPC listener
     /// policy. Empty when the profile doesn't declare any entries —
     /// in which case every wildcard bind goes through the standard
@@ -527,6 +628,10 @@ pub(super) struct SupervisorLoopContext<'a> {
     /// outcome the kernel has already decided. Probe failures fail toward
     /// enforcement.
     pub(super) yama_ptrace_scope: Option<u8>,
+    /// Session-lifetime cache of the analytics config envelope. The envelope
+    /// serializes and SHA-256-hashes the (immutable-per-session) supervisor
+    /// config, which must not run per audit record on the syscall hot path.
+    pub(super) analytics_config: std::sync::OnceLock<grith_audit::AuditConfigVersion>,
 }
 
 /// Minimum spacing between daemon restart attempts. Per-outage rather than
@@ -716,6 +821,23 @@ async fn log_supervisor_audit_event(
     } else {
         0.0
     };
+    // These records never pass through the proxy decision pipeline, so they
+    // are `system`, not `decision` (the frozen contract reserves `decision`
+    // for pipeline-evaluated calls). A hard-deny still surfaces on the
+    // security-events plane via the security envelope below.
+    let mut analytics =
+        prospective_analytics_metadata(loop_ctx, session, RecordClass::System, tool_call_type);
+    if matches!(&action, grith_audit::types::ProxyActionSummary::Deny) {
+        analytics.security = Some(grith_audit::AuditSecurityMetadata {
+            event_type: grith_analytics::contract::SecurityEventType::Deny,
+            event_revision: 1,
+            resolution_status: None,
+            resolved_at: None,
+            resolution_code: None,
+            enforcement_outcome_code: Some(event_name.to_string()),
+            gap_count: None,
+        });
+    }
     let mut record = AuditRecord::new(
         session.id,
         "supervisor".into(),
@@ -728,7 +850,8 @@ async fn log_supervisor_audit_event(
         Some(reason.into()),
     )
     .with_supervisor_source(session.tool_name.clone(), pid)
-    .with_project_name(session.project_name.clone());
+    .with_project_name(session.project_name.clone())
+    .with_analytics_metadata(analytics);
     record.execution_result = Some(reason.into());
     if let Err(e) = loop_ctx.audit_sink.log(record).await {
         tracing::error!(
@@ -1946,6 +2069,13 @@ pub(super) async fn handle_syscall_event(
                     address,
                     &loop_ctx.permit_control_sockets,
                 )
+                    // work/84: a curated clipboard tool at a system path,
+                    // writing the selection, is the routine desktop use the
+                    // X11/Wayland de-scoring was written to accommodate — see
+                    // `is_routine_desktop_connect`. Every other connect to the
+                    // display socket, including a clipboard READ and any
+                    // unknown binary, still escalates.
+                    && !authority_delegation::is_routine_desktop_connect(address, event.pid)
             }
             _ => false,
         };
@@ -2146,6 +2276,56 @@ pub(super) async fn handle_syscall_event(
     let scope = SessionScopeKey::from_session_id(session.id);
     let containment_active = SessionStateRegistry::global().is_containment_active(scope);
 
+    // ---- work/85: subtractive controls, ahead of every auto-allow ----
+    //
+    // Both of these are things the operator asked for explicitly — a blocked
+    // directory, or a workspace boundary — and both are checked here, before
+    // the noise fast path, `ignore_read_only`, the batch-read window, the
+    // session allowlist and the reputation auto-allow. Anywhere later and a
+    // block would be silently undone by a short-circuit that ran first, which
+    // is the "allow only works once" failure in reverse: a refusal that only
+    // works when nothing else claims the call.
+    //
+    // Neither path prompts. Suppressing the prompt is the entire point: the
+    // operator answered this question once, for the whole directory.
+    if let Some(rule) = loop_ctx
+        .session_denied
+        .lock()
+        .ok()
+        .and_then(|denied| session_deny_match(&call_type, &denied))
+    {
+        deny_subtractive_control(
+            loop_ctx,
+            session,
+            interceptor,
+            trace_event_id,
+            event.pid,
+            tid,
+            &call_type,
+            "scoped_deny_blocked",
+            &format!("blocked by session rule {rule}"),
+        )
+        .await;
+        return Ok(());
+    }
+    if let Some(outside) = loop_ctx.workspace_boundary.as_ref().and_then(|boundary| {
+        workspace_only_block_reason(boundary, &call_type, &loop_ctx.session_allowed)
+    }) {
+        deny_subtractive_control(
+            loop_ctx,
+            session,
+            interceptor,
+            trace_event_id,
+            event.pid,
+            tid,
+            &call_type,
+            "workspace_only_blocked",
+            &format!("outside the workspace: {outside}"),
+        )
+        .await;
+        return Ok(());
+    }
+
     // Optional noise path check (e.g., reads of /proc/, /sys/, etc.).
     //
     // A call is noise only when EVERY path it touches is noise. Link creation
@@ -2269,8 +2449,13 @@ pub(super) async fn handle_syscall_event(
                         // is the read-only `ignore_read_only` fast path;
                         // reads only, so the read key is the whole story).
                         // Explicit literal profile entries keep overriding.
+                        //
+                        // Same predicate as `projdir_grant_blocked`, and it
+                        // has to be: this fast path returns before the
+                        // allowlist matcher runs, so a set that only the
+                        // matcher guarded would still be served here.
                         && !(s.contains(&format!("projdir:{prefix}"))
-                            && syscall_map::is_credential_store_path(path))
+                            && syscall_map::is_project_trust_guarded_path(path))
                 })
             });
 
@@ -2430,6 +2615,10 @@ pub(super) async fn handle_syscall_event(
                         address,
                         &loop_ctx.permit_control_sockets,
                     )
+                    // Kept in step with `control_socket_enforce` above: if the
+                    // connect is not going to be enforced, it must not skip the
+                    // session-allowlist short-circuit either.
+                    && !authority_delegation::is_routine_desktop_connect(address, event.pid)
             }
             _ => false,
         };
@@ -2604,6 +2793,7 @@ pub(super) async fn handle_syscall_event(
             &mut decision,
             &ctx.call_type,
             loop_ctx.working_root.as_deref(),
+            &loop_ctx.workspace_roots,
             &loop_ctx.routine_exec_roots,
             &loop_ctx.scratch_roots,
             &loop_ctx.mass_destruction,
@@ -3029,7 +3219,13 @@ pub(super) async fn handle_syscall_event(
                     loop_ctx.dlp_redactor,
                     correlation_id,
                     Some(&rep_ctx),
-                );
+                )
+                .with_analytics_metadata(prospective_analytics_metadata(
+                    loop_ctx,
+                    session,
+                    RecordClass::Decision,
+                    &ctx.call_type.to_string(),
+                ));
                 if let Err(e) = loop_ctx.audit_sink.log(audit_record).await {
                     tracing::error!(
                         error = %e,
@@ -3138,7 +3334,13 @@ pub(super) async fn handle_syscall_event(
         loop_ctx.dlp_redactor,
         correlation_id,
         reputation_ctx.as_ref(),
-    );
+    )
+    .with_analytics_metadata(prospective_analytics_metadata(
+        loop_ctx,
+        session,
+        RecordClass::Decision,
+        &ctx.call_type.to_string(),
+    ));
     if let Err(e) = loop_ctx.audit_sink.log(audit_record).await {
         tracing::error!(error = %e, "failed to log audit record");
     }
@@ -3621,6 +3823,11 @@ fn session_scope_now_covers(
                         address,
                         &loop_ctx.permit_control_sockets,
                     )
+                // NOT gated by work/84's clipboard carveout, deliberately:
+                // this path is only reached for a call that ALREADY escalated
+                // and is sitting in the queue, so a carved connect never
+                // arrives here. Adding the check would need the connecting pid
+                // threaded in for no behaviour change.
             }
             _ => false,
         };
@@ -4263,8 +4470,91 @@ async fn queue_and_wait(
             thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
         }
         ReviewOutcome::Denied | ReviewOutcome::TimedOut => {
+            // work/85: a "block this directory" answer installs session
+            // refusals before anything else runs, so the rules are live for
+            // the very next call — the flood this action exists to stop is
+            // usually already queued behind this prompt.
+            //
+            // Re-validated here rather than trusted from the reviewer: the
+            // dialog and the supervisor are different processes on the digest
+            // queue's two ends, and the rule that gets installed has to be one
+            // this side agrees with.
+            let scoped_deny = if matches!(outcome, ReviewOutcome::Denied) {
+                review_action
+                    .as_deref()
+                    .and_then(grith_digest::PermissionReviewAction::from_storage_value)
+                    .and_then(|action| match action {
+                        grith_digest::PermissionReviewAction::ScopedDeny(request) => Some(request),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+            if let Some(request) = &scoped_deny {
+                match crate::scoped_permissions::validate_scoped_deny(
+                    request,
+                    &ctx.call_type.to_string(),
+                ) {
+                    Ok(scope) => {
+                        if let Ok(mut denied) = loop_ctx.session_denied.lock() {
+                            for rule in &scope.rules {
+                                denied.insert(rule.clone());
+                            }
+                        }
+                        let summary = scope.rules.join(", ");
+                        tracing::info!(
+                            event = "scoped_deny_applied",
+                            directory = scope.directory,
+                            rules = summary,
+                            "session directory block applied"
+                        );
+                        write_forensics_stage(
+                            loop_ctx,
+                            trace_event_id,
+                            session,
+                            event_pid,
+                            Some(&ctx.call_type),
+                            "scoped_deny_applied",
+                            Some("manual-deny"),
+                            Some(decision.composite_score),
+                            Some(&summary),
+                        );
+                        if let Some(tx) = loop_ctx.event_tx {
+                            let event = serde_json::json!({
+                                "session_id": session.id.to_string(),
+                                "tool_name": session.tool_name,
+                                "call_type": format!("Blocked: {summary}"),
+                                "plugin_id": format!("supervisor:{}", session.tool_name),
+                                "score": 0.0,
+                                "action": "scoped-deny",
+                                "reason": format!(
+                                    "Session directory block added for {}",
+                                    scope.directory
+                                ),
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                            });
+                            let _ = tx.send(event.to_string());
+                        }
+                    }
+                    Err(error) => {
+                        // The call is denied either way — this is the deny
+                        // branch — so an unusable directory costs the operator
+                        // the standing rule, not the protection they asked
+                        // for, and is worth a warning rather than a re-prompt.
+                        tracing::warn!(
+                            event = "scoped_deny_rejected",
+                            error = %error,
+                            directory = request.directory,
+                            "directory block rejected; this call is still denied"
+                        );
+                    }
+                }
+            }
             let reason = if matches!(outcome, ReviewOutcome::TimedOut) {
                 "timeout"
+            } else if scoped_deny.is_some() {
+                // The raw action is a JSON blob; the log line wants a verb.
+                "scoped_deny"
             } else {
                 review_action.as_deref().unwrap_or("deny")
             };
@@ -5629,6 +5919,20 @@ fn spawn_delegation_would_enforce(
 /// same `Display` the prompt and deny/approve-replay use), so `flatpak run foo`
 /// never covers `flatpak run bar`.
 fn delegating_approval_key(call_type: &grith_proxy::types::ToolCallType) -> String {
+    // Family identity first: for the curated argv shapes in `spawn_families`
+    // (docker compose exec/logs/up/…), the key drops the volatile parts of
+    // the argv — the payload of an in-container exec, `--tail=N` — so one
+    // approval covers the family for the session instead of re-prompting on
+    // every one-character variant. Everything the curation does not
+    // recognise keeps today's exact-argv key. All three users of this key
+    // (the two consult gates and the record site) call this same function on
+    // the same call type, so record and lookup can never disagree about
+    // which identity an approval carries.
+    if let grith_proxy::types::ToolCallType::ProcessSpawn { command, args } = call_type {
+        if let Some(family) = spawn_families::spawn_family(command, args) {
+            return format!("delegating-approved:family:{}", family.key);
+        }
+    }
     format!("delegating-approved:{call_type}")
 }
 
@@ -5645,6 +5949,21 @@ fn session_allowlist_key(call_type: &grith_proxy::types::ToolCallType) -> Option
         | ToolCallType::FileChmod { path, .. }
         | ToolCallType::DirCreate { path } => Some(path.clone()),
         ToolCallType::FileRename { old_path, .. } => Some(old_path.clone()),
+        // work/83 F5: link creation had NO key at all, so a hardlink could
+        // never be covered by project trust even inside the launch cwd —
+        // every rustc incremental hardlink was proxy-scored (511 queued
+        // FileLink calls in one morning, 73% of them random compiler hashes
+        // that happened to contain "auth"/"secret"). Keyed on `link_path`,
+        // the name being created, because that is the path a directory-scoped
+        // grant is about.
+        //
+        // The target is NOT ignored. `is_session_allowlist_match` refuses the
+        // grant unless the TARGET is independently write-trusted by the same
+        // allowlist and neither end is a credential store, so
+        // `ln -s ~/.ssh/id_rsa ./benign` and
+        // `ln -s ./mine ~/.ssh/authorized_keys` both still reach the proxy —
+        // where `ToolCallContext::paths()` scores both ends (go-live B2/B3).
+        ToolCallType::FileLink { link_path, .. } => Some(link_path.clone()),
         ToolCallType::OwnershipChange { target, .. }
         | ToolCallType::FilesystemMutation { target, .. } => Some(target.clone()),
         ToolCallType::NetConnect { address, .. } | ToolCallType::NetListen { address, .. } => {
@@ -5858,6 +6177,23 @@ fn approved_session_allowlist_entry(
         | ToolCallType::FilesystemMutation { target, .. } => {
             canonicalize_allowlist_entry("rw:", target)
         }
+        // work/83 F5 gave `FileLink` a session-allowlist KEY, which is a
+        // lookup path, not a grant. An approved link deliberately stores
+        // nothing (this arm keeps the pre-F5 behaviour explicit rather than
+        // inheriting the fallthrough below):
+        //
+        //  - the key is a bare, un-namespaced path, so storing it would
+        //    register a PREFIX granting every operation under the link path,
+        //    and `approved_session_allowlist_entries` would persist it as a
+        //    learned rule that outlives the session;
+        //  - a grant on the link path alone says nothing about the target,
+        //    and the target is the end that carries the authority — approving
+        //    `ln x /proj/a` must not silently authorise
+        //    `ln ~/.ssh/id_rsa /proj/a` later.
+        //
+        // A durable grant would have to be bound to BOTH ends; until it is,
+        // repeated links are covered by project trust (F5) or re-reviewed.
+        ToolCallType::FileLink { .. } => None,
         _ => session_allowlist_key(call_type),
     }
 }
@@ -5939,28 +6275,45 @@ fn tmp_self_created_prefix(call_type: &grith_proxy::types::ToolCallType) -> Opti
     }
 }
 
-/// Every path a call touches that a launch-derived (`projdir:`-marked)
-/// grant must not cover if it is a credential store.
+/// Every path a call touches that a project-derived (`projdir:`-marked)
+/// grant must not cover if it is a credential store or an in-project
+/// high-value secret.
 ///
-/// This is the lookup key, plus the DESTINATION for a rename. The key is the
-/// source `old_path`, so a rename of a benign project file into
-/// `~/.ssh/authorized_keys` would otherwise slip the guard (review defect 1).
+/// This is the lookup key, plus the OTHER end of every two-ended call. For a
+/// rename the key is the source `old_path`, so a rename of a benign project
+/// file into `~/.ssh/authorized_keys` would otherwise slip the guard (work/80
+/// review defect 1); for a link (work/83 F5) the key is the `link_path`, so
+/// the exposed `target` is the end that would otherwise slip it.
 fn projdir_guarded_paths<'a>(
     key: &'a str,
     call_type: &'a grith_proxy::types::ToolCallType,
 ) -> impl Iterator<Item = &'a str> {
     use grith_proxy::types::ToolCallType;
-    let dest = match call_type {
+    let other_end = match call_type {
         ToolCallType::FileRename { new_path, .. } => Some(new_path.as_str()),
+        ToolCallType::FileLink { target, .. } => Some(target.as_str()),
         _ => None,
     };
-    std::iter::once(key).chain(dest)
+    std::iter::once(key).chain(other_end)
 }
 
-/// True if a launch-derived grant must be denied for this call because one
-/// of the paths it touches is a credential store.
+/// True if a project-derived grant must be denied for this call because one
+/// of the paths it touches is a credential store or an in-project high-value
+/// secret.
+///
+/// The guarded set is [`crate::syscall_map::is_project_trust_guarded_path`],
+/// not the full `is_sensitive_path`: work/80 narrowed it to credential stores
+/// to keep `.pem`/`.key`/keyword-named files inside genuine project trees out
+/// of the prompt flood, and that reasoning still holds — measured, every
+/// `*.pem`/`*.key` in this workspace is a false positive and `config/
+/// secrets.toml` scores 5.80 on the keyword rule alone. What the narrowing
+/// went too far on is the handful of files whose CONTENT is the secret and
+/// which live in a project tree by design (`.env`, Rails `master.key`,
+/// terraform state, `.p12`/`.pfx`); `.env` in particular is the taint
+/// filter's first sensitive source, so short-circuiting its read means no
+/// taint is registered and a later exfiltration cannot be scored.
 fn projdir_grant_blocked(key: &str, call_type: &grith_proxy::types::ToolCallType) -> bool {
-    projdir_guarded_paths(key, call_type).any(crate::syscall_map::is_credential_store_path)
+    projdir_guarded_paths(key, call_type).any(crate::syscall_map::is_project_trust_guarded_path)
 }
 
 /// Return whether a session allowlist entry matches a syscall key.
@@ -5978,6 +6331,58 @@ fn is_session_allowlist_match(
     allowed: &HashSet<String>,
     call_type: &grith_proxy::types::ToolCallType,
 ) -> bool {
+    // work/83 F5: link creation is the one filesystem op whose authority
+    // spans two trees — it publishes `target` under a second name. Giving it
+    // a session key (so in-project build hardlinks stop being individually
+    // scored) must not turn a link into the cheap way to move authority
+    // ACROSS the trust boundary, which is exactly the `ln -s ./mine
+    // ~/.ssh/authorized_keys` hole go-live review B2/B3 closed at the proxy.
+    // The short-circuit skips the proxy entirely, so both conditions are
+    // re-checked here:
+    //
+    //  1. Neither end may be a credential store or an in-project high-value
+    //     secret — unconditionally, not only under a `projdir:` marker. An
+    //     explicit literal profile entry gets to override `is_sensitive_path`
+    //     (documented semantics) but must not get to hardlink
+    //     `~/.aws/credentials` into the trusted tree. Zero FP cost: nothing
+    //     links a credential store during a build. The set is the same one
+    //     `projdir_grant_blocked` uses, and it has to be: the invariant below
+    //     ("a link is strictly weaker than the copy trust already allows")
+    //     only holds while `FileRead <target>` short-circuits too, so any
+    //     path whose READ now reaches the proxy must take its link with it.
+    //  2. The TARGET must be independently write-trusted by this same
+    //     allowlist. Write-shaped, not read-shaped, because a hard link
+    //     confers the underlying inode's write access under the new name —
+    //     a `ro:` (read-only) grant must not become write-through.
+    //
+    // Everything else about the link is then decided by matching `link_path`
+    // (the key) with the ordinary path rules below. An unresolved-or-outside
+    // target simply fails the check and reaches the proxy — fail-safe.
+    //
+    // The invariant that makes this a safe narrowing: with both ends inside
+    // the same trusted tree, a link is strictly weaker than the copy that
+    // trust ALREADY allows unprompted — `FileRead <target>` plus
+    // `FileWrite <link_path>` both short-circuit here today, so `cp` publishes
+    // the same bytes under the same new name with no proxy evaluation. Paths
+    // that are credential-shaped but not credential STORES (a `.pem` in the
+    // repo, `/proj/.env`) are therefore no less covered after F5 than before
+    // it. What must not change is the boundary itself, which is what the two
+    // conditions above pin.
+    if let grith_proxy::types::ToolCallType::FileLink { target, .. } = call_type {
+        if crate::syscall_map::is_project_trust_guarded_path(target)
+            || crate::syscall_map::is_project_trust_guarded_path(key)
+        {
+            return false;
+        }
+        let target_probe = grith_proxy::types::ToolCallType::FileWrite {
+            path: target.clone(),
+            content_hash: String::new(),
+        };
+        if !is_session_allowlist_match(target, allowed, &target_probe) {
+            return false;
+        }
+    }
+
     // Subdomain matching for network destinations: both `net:` and `dns:`
     // keys match against `net:` allowlist entries, so `dns:api.anthropic.com`
     // matches `net:anthropic.com`.
@@ -6074,17 +6479,7 @@ fn is_session_allowlist_match(
         let resolved = crate::scoped_permissions::resolve_target(target)
             .unwrap_or_else(|_| std::path::PathBuf::from(&target));
         let resolved = resolved.to_string_lossy().replace('\\', "/");
-        let prefix_namespace = match call_type {
-            grith_proxy::types::ToolCallType::FileRead { .. }
-            | grith_proxy::types::ToolCallType::DirList { .. } => Some("ro-prefix:"),
-            grith_proxy::types::ToolCallType::FileWrite { .. }
-            | grith_proxy::types::ToolCallType::FileAppend { .. }
-            | grith_proxy::types::ToolCallType::DirCreate { .. } => Some("write-prefix:"),
-            grith_proxy::types::ToolCallType::FileDelete { .. }
-            | grith_proxy::types::ToolCallType::FileRename { .. } => Some("delete-prefix:"),
-            _ => None,
-        };
-        if let Some(namespace) = prefix_namespace {
+        if let Some(namespace) = scoped_prefix_namespace(call_type) {
             if allowed.iter().any(|entry| {
                 entry
                     .strip_prefix(namespace)
@@ -6196,6 +6591,194 @@ fn is_session_allowlist_match(
             && !(allowed.contains(&format!("projdir:{prefix}"))
                 && projdir_grant_blocked(key, call_type))
     })
+}
+
+/// work/85: deny a file operation refused by a subtractive control, with the
+/// forensics stage, syscall log line, audit record and counter every other
+/// pre-proxy deny writes.
+///
+/// One helper for both controls so a refusal is always visible in the same
+/// four places. A silent EPERM is the failure mode that makes a supervised
+/// tool look broken rather than restricted; the tag in the audit record is
+/// what turns "npm failed" into "npm was blocked outside the workspace".
+#[allow(clippy::too_many_arguments)]
+async fn deny_subtractive_control(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    session: &mut SupervisorSession,
+    interceptor: &mut Box<dyn SyscallInterceptor>,
+    trace_event_id: uuid::Uuid,
+    event_pid: u32,
+    tid: u32,
+    call_type: &grith_proxy::types::ToolCallType,
+    audit_event: &str,
+    reason: &str,
+) {
+    write_forensics_stage(
+        loop_ctx,
+        trace_event_id,
+        session,
+        event_pid,
+        Some(call_type),
+        "denied",
+        Some("auto-deny"),
+        None,
+        Some(reason),
+    );
+    write_syscall_log(loop_ctx, session.root_pid, call_type, 0.0, "deny", reason);
+    tracing::info!(
+        event = audit_event,
+        pid = event_pid,
+        tid,
+        call = %call_type,
+        reason,
+        "denied before proxy evaluation by an operator-installed rule"
+    );
+    log_supervisor_audit_event(
+        loop_ctx,
+        session,
+        event_pid,
+        &call_type.to_string(),
+        audit_event,
+        grith_audit::types::ProxyActionSummary::Deny,
+        serde_json::json!({
+            "pid": event_pid,
+            "tid": tid,
+            "reason": reason,
+        }),
+        reason,
+    )
+    .await;
+    session.stats.total_denied += 1;
+    if let Err(e) = interceptor.deny(tid).await {
+        tracing::warn!(error = %e, tid, "deny (subtractive control) failed");
+    }
+}
+
+/// Session-rule namespace that governs `call_type`.
+///
+/// One map, two readers: the allow side (`ro-prefix:` …) and work/85's
+/// refusal side, which is the same string behind
+/// [`scoped_permissions::DENY_RULE_PREFIX`]. They must agree — a refusal that
+/// classified a `FileAppend` differently from the grant would silently fail
+/// to block the very call it was installed for.
+fn scoped_prefix_namespace(call_type: &grith_proxy::types::ToolCallType) -> Option<&'static str> {
+    use grith_proxy::types::ToolCallType;
+    match call_type {
+        ToolCallType::FileRead { .. } | ToolCallType::DirList { .. } => Some("ro-prefix:"),
+        ToolCallType::FileWrite { .. }
+        | ToolCallType::FileAppend { .. }
+        | ToolCallType::DirCreate { .. } => Some("write-prefix:"),
+        ToolCallType::FileDelete { .. } | ToolCallType::FileRename { .. } => Some("delete-prefix:"),
+        _ => None,
+    }
+}
+
+/// work/85: the operator-installed refusal that blocks this call, if any.
+///
+/// Mirrors the operation-specific directory matching in
+/// `is_session_allowlist_match` — same namespaces, same existing-ancestor
+/// target resolution, same `/`-boundary prefix test — so a reviewer who
+/// blocks `/repo/build/` gets exactly the subtree they would have granted by
+/// allowing it, and `/repo/build-secrets/` is not swept in by a string match.
+fn session_deny_match(
+    call_type: &grith_proxy::types::ToolCallType,
+    denied: &HashSet<String>,
+) -> Option<String> {
+    if denied.is_empty() {
+        return None;
+    }
+    let namespace = scoped_prefix_namespace(call_type)?;
+    let namespace = format!("{}{namespace}", crate::scoped_permissions::DENY_RULE_PREFIX);
+    // Every path the call touches is tested, not just the primary one: a
+    // rename out of a blocked directory and a rename *into* one are both
+    // things the operator asked to stop.
+    let targets = crate::workspace_only::governed_paths(call_type)?;
+    for target in targets {
+        let resolved = crate::scoped_permissions::resolve_target(target)
+            .unwrap_or_else(|_| std::path::PathBuf::from(target));
+        let resolved = resolved.to_string_lossy().replace('\\', "/");
+        if let Some(rule) = denied.iter().find(|entry| {
+            entry
+                .strip_prefix(namespace.as_str())
+                .is_some_and(|directory| directory_scope_matches(directory, &resolved))
+        }) {
+            return Some(rule.clone());
+        }
+    }
+    None
+}
+
+/// work/85: why the workspace-only boundary refuses this call, or `None` when
+/// it does not govern it.
+///
+/// The exemptions are ordered cheapest-first, and every one of them means
+/// "the boundary does not decide" — the call carries on into the normal
+/// pipeline and can still be scored, queued or denied there.
+fn workspace_only_block_reason(
+    boundary: &crate::workspace_only::WorkspaceBoundary,
+    call_type: &grith_proxy::types::ToolCallType,
+    session_allowed: &Arc<Mutex<HashSet<String>>>,
+) -> Option<String> {
+    if boundary.is_empty() {
+        return None;
+    }
+    let targets = crate::workspace_only::governed_paths(call_type)?;
+    let read_like = crate::workspace_only::is_read_like(call_type);
+
+    for target in targets {
+        let resolved = crate::scoped_permissions::resolve_target(target)
+            .unwrap_or_else(|_| std::path::PathBuf::from(target));
+        let resolved = resolved.to_string_lossy().replace('\\', "/");
+
+        // 1. Inside the workspace — the whole point of the mode.
+        if boundary.contains(&resolved) {
+            continue;
+        }
+        // 2. Noise: /proc, /sys, the tool's own PTY, CA certificates. These
+        //    are never the user data the mode protects, and /dev/pts is the
+        //    tool's own stdout — blocking it would wedge the session.
+        if syscall_map::is_noise_path(&resolved) || syscall_map::is_noise_path(target) {
+            continue;
+        }
+        // 3. Reads of runtime data. Without this the tool cannot load libc.
+        if read_like && crate::workspace_only::is_system_read_root(&resolved) {
+            continue;
+        }
+        // 4. Declared trust: the profile's routine paths (`~/.claude`,
+        //    `~/.nvm/versions/**`, `/tmp/claude-*`, …) and anything approved
+        //    earlier this session. The operator asked to supervise this tool,
+        //    not to break it, and these are the paths its own profile says it
+        //    needs. Checked last because it takes the lock.
+        //
+        //    Tested per path against a probe of the same operation class,
+        //    NOT by asking the allowlist about the call as a whole:
+        //    `session_allowlist_key` keys a rename on its SOURCE, so
+        //    `mv ~/.claude/notes /home/dev/exfil/notes` would otherwise carry
+        //    the source's declared trust to a destination the boundary exists
+        //    to refuse.
+        let probe = match scoped_prefix_namespace(call_type) {
+            Some("ro-prefix:") => ToolCallType::FileRead {
+                path: resolved.clone(),
+            },
+            Some("delete-prefix:") => ToolCallType::FileDelete {
+                path: resolved.clone(),
+            },
+            _ => ToolCallType::FileWrite {
+                path: resolved.clone(),
+                content_hash: String::new(),
+            },
+        };
+        let allowed_match = session_allowlist_key(&probe).is_some_and(|key| {
+            session_allowed
+                .lock()
+                .is_ok_and(|allowed| is_session_allowlist_match(&key, &allowed, &probe))
+        });
+        if allowed_match {
+            continue;
+        }
+        return Some(resolved);
+    }
+    None
 }
 
 /// Boundary-safe match for a normalized directory rule.
@@ -6515,7 +7098,17 @@ pub(super) async fn maybe_log_compact(
     // `session_id` but evicted at session end) so audit history can be
     // grouped/labelled by project long after the session is gone.
     .with_supervisor_source(session.tool_name.clone(), event_pid)
-    .with_project_name(session.project_name.clone());
+    .with_project_name(session.project_name.clone())
+    .with_analytics_metadata(prospective_analytics_metadata(
+        loop_ctx,
+        session,
+        match tier {
+            CompactTier::RoutineSpawn => RecordClass::RoutineSpawn,
+            CompactTier::RoutineIo => RecordClass::RoutineIo,
+            CompactTier::NoisePath => RecordClass::Noise,
+        },
+        &call_type.to_string(),
+    ));
 
     // Extended summary for ProcessSpawn — the meaningful payload (the
     // bash wrapper around eval $(… | base64 -d), or the full argv of a
@@ -7133,16 +7726,36 @@ mod tests {
             &allowed,
             &read("/home/u/proj/src/main.rs"),
         ));
-        assert!(is_session_allowlist_match(
-            "/home/u/proj/.env",
-            &allowed,
-            &read("/home/u/proj/.env"),
-        ));
+        // work/80 deliberately let project trust cover the weak name-based
+        // signals so `.pem` / `.key` / keyword-named files inside genuine
+        // project trees would not re-open the prompt flood. That still holds
+        // — these stay covered, and the measurement behind each is recorded
+        // on `syscall_map::is_high_value_project_secret`.
+        for path in [
+            "/home/u/proj/tls/server.pem",
+            "/home/u/proj/deploy.key",
+            "/home/u/proj/config/secrets.toml",
+            "/home/u/proj/.env.example",
+        ] {
+            assert!(
+                is_session_allowlist_match(path, &allowed, &read(path)),
+                "project trust must still cover the weak name signals: {path}"
+            );
+        }
 
-        // Credential stores under the project prefix: never.
+        // Credential stores under the project prefix: never. Nor the
+        // in-project high-value secrets — files whose CONTENT is the secret,
+        // which live in a project tree by design, and which the proxy scores
+        // 4.00-8.00 on a read. `.env` also has to reach the proxy for the
+        // taint filter to register it as a sensitive source at all.
         for path in [
             "/home/u/proj/.aws/credentials",
             "/home/u/proj/.ssh/id_deploy",
+            "/home/u/proj/.env",
+            "/home/u/proj/.env.local",
+            "/home/u/proj/config/master.key",
+            "/home/u/proj/terraform.tfstate",
+            "/home/u/proj/certs/client.p12",
         ] {
             assert!(
                 !is_session_allowlist_match(path, &allowed, &read(path)),
@@ -7158,11 +7771,12 @@ mod tests {
         // today's explicit-trust override is preserved.
         let mut explicit = HashSet::new();
         explicit.insert("/home/u/proj".to_string());
-        assert!(is_session_allowlist_match(
-            "/home/u/proj/.aws/credentials",
-            &explicit,
-            &read("/home/u/proj/.aws/credentials"),
-        ));
+        for path in ["/home/u/proj/.aws/credentials", "/home/u/proj/.env"] {
+            assert!(
+                is_session_allowlist_match(path, &explicit, &read(path)),
+                "an explicit literal profile entry keeps its documented override: {path}"
+            );
+        }
 
         // The marker itself must be inert: it is not a usable path prefix
         // and must never match anything on its own.
@@ -7219,6 +7833,247 @@ mod tests {
                 &read("/home/u/proj/.aws/credentials"),
             ),
             "launching inside a credential dir must not exact/prefix-trust its contents"
+        );
+    }
+
+    /// work/83 F4: a workspace root (a linked worktree of the launch
+    /// repository) is trusted the same way the launch tree is — as a
+    /// `projdir:`-marked prefix — so work/80's credential-store guard keeps
+    /// applying to it. Widening *where* project trust reaches must not widen
+    /// *what* it may cover.
+    #[test]
+    fn workspace_root_trust_never_covers_credential_stores() {
+        use grith_proxy::types::ToolCallType;
+        let read = |p: &str| ToolCallType::FileRead {
+            path: p.to_string(),
+        };
+        let write = |p: &str| ToolCallType::FileWrite {
+            path: p.to_string(),
+            content_hash: String::new(),
+        };
+
+        let mut allowed = HashSet::new();
+        crate::profiles::extend_allowlist_with_workspace_roots(
+            &mut allowed,
+            &["/home/u/worktrees/wt".to_string()],
+        );
+
+        // Ordinary files in the worktree: routine, reads and writes — this is
+        // the 24.9%-QUEUE-rate false positive F4 exists to remove.
+        for path in [
+            "/home/u/worktrees/wt/src/main.rs",
+            "/home/u/worktrees/wt/target/debug/incremental/abc123auth.o",
+        ] {
+            assert!(
+                is_session_allowlist_match(path, &allowed, &write(path)),
+                "workspace trust must cover ordinary worktree files: {path}"
+            );
+        }
+
+        // Credential stores inside the trusted worktree: never.
+        for path in [
+            "/home/u/worktrees/wt/.aws/credentials",
+            "/home/u/worktrees/wt/.ssh/id_deploy",
+        ] {
+            assert!(
+                !is_session_allowlist_match(path, &allowed, &read(path)),
+                "workspace trust must not cover reads of {path}"
+            );
+            assert!(
+                !is_session_allowlist_match(path, &allowed, &write(path)),
+                "workspace trust must not cover writes of {path}"
+            );
+        }
+
+        // Boundary safety: the trailing-slash prefix stops a sibling
+        // directory that merely shares the name from inheriting trust.
+        assert!(!is_session_allowlist_match(
+            "/home/u/worktrees/wt-backup/src/main.rs",
+            &allowed,
+            &read("/home/u/worktrees/wt-backup/src/main.rs"),
+        ));
+    }
+
+    /// Project-derived trust — launch-derived or workspace-derived, they share
+    /// the `projdir:` marker — must not short-circuit the files whose CONTENT
+    /// is the secret and that live in a project tree by design. Measured at
+    /// the proxy on a read: `config/master.key` 8.00, `.env`/`.env.local`
+    /// 6.00, `terraform.tfstate` 4.00, `certs/client.p12` 4.00 — all Queue.
+    /// `.env` is also the taint filter's first sensitive source, so a
+    /// short-circuited read registers no taint and the later exfiltration
+    /// cannot be scored.
+    ///
+    /// The guard stops there. Every path in the second list stays covered,
+    /// because widening to the full `is_sensitive_path` would reinstate the
+    /// flood work/83 exists to remove — measured, all three `*.pem`/`*.key`
+    /// files in this workspace are false positives (a public AWS CA bundle
+    /// and two vendored TLS test fixtures, 8.00 each) and grith's own
+    /// `config/secrets.toml` scores 5.80 on the keyword rule.
+    #[test]
+    fn project_trust_never_covers_in_project_secrets() {
+        use grith_proxy::types::ToolCallType;
+        let read = |p: &str| ToolCallType::FileRead {
+            path: p.to_string(),
+        };
+        let write = |p: &str| ToolCallType::FileWrite {
+            path: p.to_string(),
+            content_hash: String::new(),
+        };
+
+        let mut allowed = HashSet::new();
+        crate::profiles::extend_allowlist_with_workspace_roots(
+            &mut allowed,
+            &["/home/u/worktrees/wt".to_string()],
+        );
+
+        for relative in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "config/master.key",
+            "terraform.tfstate",
+            "terraform.tfstate.backup",
+            "certs/client.p12",
+            "certs/bundle.pfx",
+        ] {
+            let path = format!("/home/u/worktrees/wt/{relative}");
+            assert!(
+                !is_session_allowlist_match(&path, &allowed, &read(&path)),
+                "project trust must not short-circuit reads of {path}"
+            );
+            assert!(
+                !is_session_allowlist_match(&path, &allowed, &write(&path)),
+                "project trust must not short-circuit writes of {path}"
+            );
+        }
+
+        for relative in [
+            "tls/server.pem",
+            "deploy.key",
+            "config/secrets.toml",
+            "src/auth/token_store.rs",
+            ".env.example",
+            ".env.sample",
+            "src/main.rs",
+        ] {
+            let path = format!("/home/u/worktrees/wt/{relative}");
+            assert!(
+                is_session_allowlist_match(&path, &allowed, &read(&path)),
+                "the weak name signals stay covered inside a project tree: {path}"
+            );
+        }
+
+        // Two-ended calls are guarded at BOTH ends, exactly as the credential
+        // stores are: a rename INTO `.env`, and a hardlink whose target is
+        // `.env`, would otherwise publish or overwrite the secret behind an
+        // ordinary-looking key. (The link arm additionally has to move with
+        // the read guard: its safety argument is that a link is no stronger
+        // than the copy trust already allows, which stops being true the
+        // moment `FileRead <target>` reaches the proxy.)
+        let rename = ToolCallType::FileRename {
+            old_path: "/home/u/worktrees/wt/build/staged".to_string(),
+            new_path: "/home/u/worktrees/wt/.env".to_string(),
+        };
+        assert!(!is_session_allowlist_match(
+            "/home/u/worktrees/wt/build/staged",
+            &allowed,
+            &rename,
+        ));
+        let link = ToolCallType::FileLink {
+            target: "/home/u/worktrees/wt/.env".to_string(),
+            link_path: "/home/u/worktrees/wt/build/artifact".to_string(),
+            symbolic: false,
+        };
+        assert!(!is_session_allowlist_match(
+            "/home/u/worktrees/wt/build/artifact",
+            &allowed,
+            &link,
+        ));
+    }
+
+    /// work/83 F5: `FileLink` had no session-allowlist key, so in-project
+    /// build hardlinks were proxy-scored forever. It has one now — but only
+    /// when BOTH ends stay inside the trusted tree and neither is a
+    /// credential store, so link creation cannot become the cheap way to
+    /// move authority across the trust boundary.
+    #[test]
+    fn projdir_trust_covers_in_project_links_only() {
+        use grith_proxy::types::ToolCallType;
+        let link = |target: &str, link_path: &str| ToolCallType::FileLink {
+            target: target.to_string(),
+            link_path: link_path.to_string(),
+            symbolic: false,
+        };
+        let symlink = |target: &str, link_path: &str| ToolCallType::FileLink {
+            target: target.to_string(),
+            link_path: link_path.to_string(),
+            symbolic: true,
+        };
+
+        let mut allowed = HashSet::new();
+        allowed.insert("/home/u/proj".to_string());
+        allowed.insert("projdir:/home/u/proj".to_string());
+
+        // The key is the link path (where the new name appears).
+        let rustc_link = link(
+            "/home/u/proj/target/debug/deps/net-9a598f.rcgu.o",
+            "/home/u/proj/target/debug/incremental/773v9mxq3ohs6twiwt1rzauth.o",
+        );
+        assert_eq!(
+            session_allowlist_key(&rustc_link).as_deref(),
+            Some("/home/u/proj/target/debug/incremental/773v9mxq3ohs6twiwt1rzauth.o"),
+        );
+
+        // In-project hardlink: both ends under the trusted tree → short-circuits.
+        assert!(
+            is_session_allowlist_match(
+                &session_allowlist_key(&rustc_link).unwrap(),
+                &allowed,
+                &rustc_link,
+            ),
+            "an in-project build hardlink must be covered by project trust"
+        );
+
+        // Target is a credential store: never, even though the link path is
+        // an ordinary project file inside the trusted tree.
+        let steal = link("/home/u/proj/.ssh/id_deploy", "/home/u/proj/build/artifact");
+        assert!(
+            !is_session_allowlist_match(&session_allowlist_key(&steal).unwrap(), &allowed, &steal,),
+            "a link whose target is a credential store must reach the proxy"
+        );
+
+        // Link path is a credential store: never (the `ln -s ./mine
+        // ~/.ssh/authorized_keys` shape, with the project as the source).
+        let plant = symlink("/home/u/proj/mine", "/home/u/proj/.ssh/authorized_keys");
+        assert!(
+            !is_session_allowlist_match(&session_allowlist_key(&plant).unwrap(), &allowed, &plant,),
+            "a link planted into a credential store must reach the proxy"
+        );
+
+        // Target outside the trusted tree: never — publishing an untrusted
+        // file under a trusted name is the laundering shape.
+        let launder = symlink("/home/u/other/private.key", "/home/u/proj/x");
+        assert!(
+            !is_session_allowlist_match(
+                &session_allowlist_key(&launder).unwrap(),
+                &allowed,
+                &launder,
+            ),
+            "a link whose target is outside the trusted tree must reach the proxy"
+        );
+
+        // A read-only (`ro:`) grant on the target must not become
+        // write-through via a hard link.
+        let mut ro_allowed = allowed.clone();
+        ro_allowed.insert("ro:/home/u/secrets.txt".to_string());
+        let ro_link = link("/home/u/secrets.txt", "/home/u/proj/copy");
+        assert!(
+            !is_session_allowlist_match(
+                &session_allowlist_key(&ro_link).unwrap(),
+                &ro_allowed,
+                &ro_link,
+            ),
+            "a read-only grant on the target must not authorise hardlinking it"
         );
     }
 
@@ -7286,6 +8141,27 @@ mod tests {
             &allowed,
             &d
         ));
+    }
+
+    /// work/83 F5: giving `FileLink` a session-allowlist KEY must not turn an
+    /// approved link into a stored GRANT. The key is a bare, un-namespaced
+    /// path, so storing it would register a prefix covering every operation
+    /// under the link path AND be persisted as a learned rule outliving the
+    /// session — and it would say nothing about the target, which is the end
+    /// that carries the authority.
+    #[test]
+    fn approved_link_stores_no_allowlist_grant() {
+        let call = ToolCallType::FileLink {
+            target: "/proj/target/debug/deps/x.o".into(),
+            link_path: "/proj/target/debug/incremental/y.o".into(),
+            symbolic: false,
+        };
+        assert!(
+            approved_session_allowlist_entries(&call).is_empty(),
+            "an approved link must not mint a prefix grant or a learned rule"
+        );
+        // The lookup key still exists — that is what project trust matches on.
+        assert!(session_allowlist_key(&call).is_some());
     }
 
     #[test]
@@ -7967,6 +8843,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
@@ -7976,6 +8855,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         let event = sample_io_uring_event(pid, crate::platform::linux::syscall_nr::IO_URING_SETUP);
@@ -8048,6 +8928,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
@@ -8057,6 +8940,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         let read_event = |pid: u32| SyscallEvent {
@@ -8217,6 +9101,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
@@ -8226,6 +9113,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         handle_syscall_event(&mut interceptor, &mut session, &loop_ctx, event)
@@ -8471,6 +9359,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
@@ -8480,6 +9371,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         handle_syscall_event(&mut interceptor, &mut session, &loop_ctx, event)
@@ -8639,6 +9531,41 @@ mod tests {
 
     // Helper: create a dummy ToolCallType for tests that don't care about
     // the operation type (exec, net tests).
+    /// work/85 follow-up: one approval covers the docker command family for
+    /// the session. The key function is shared by the record site and both
+    /// consult gates, so equality here IS the auto-allow: the recorded key
+    /// for the first payload matches the derived key for every later one.
+    #[test]
+    fn delegating_approval_key_unifies_docker_families_and_nothing_else() {
+        let spawn = |args: &[&str]| ToolCallType::ProcessSpawn {
+            command: "/usr/bin/docker".to_string(),
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let a = delegating_approval_key(&spawn(&[
+            "docker", "compose", "exec", "-T", "web", "php", "-r", "echo 1;",
+        ]));
+        let b = delegating_approval_key(&spawn(&[
+            "docker", "compose", "exec", "web", "mysql", "-e", "SELECT 1",
+        ]));
+        assert_eq!(a, b, "payload variants must share the approval");
+        assert!(a.starts_with("delegating-approved:family:"));
+
+        // `docker run` mints authority through its flags: exact key, so the
+        // volume-mount variant can never ride the plain variant's approval.
+        let run_a = delegating_approval_key(&spawn(&["docker", "run", "alpine", "sh"]));
+        let run_b =
+            delegating_approval_key(&spawn(&["docker", "run", "-v", "/:/host", "alpine", "sh"]));
+        assert_ne!(run_a, run_b);
+        assert!(!run_a.contains(":family:"));
+
+        // Non-docker delegating binaries keep exact identity.
+        let sysd = delegating_approval_key(&ToolCallType::ProcessSpawn {
+            command: "/usr/bin/systemd-run".to_string(),
+            args: vec!["systemd-run".to_string(), "id".to_string()],
+        });
+        assert!(!sysd.contains(":family:"));
+    }
+
     fn dummy_file_read() -> ToolCallType {
         ToolCallType::FileRead {
             path: "/dummy".into(),
@@ -8781,6 +9708,275 @@ mod tests {
                 path: "/repo/src-old/lib.rs".into(),
             }
         ));
+    }
+
+    // ---- work/85: session refusals and the workspace boundary ---------
+
+    fn denied_set(rules: &[&str]) -> HashSet<String> {
+        rules.iter().map(|rule| (*rule).to_string()).collect()
+    }
+
+    #[test]
+    fn session_deny_blocks_the_matching_operation_only() {
+        let denied = denied_set(&["deny-ro-prefix:/repo/secrets/"]);
+
+        assert_eq!(
+            session_deny_match(
+                &ToolCallType::FileRead {
+                    path: "/repo/secrets/token".into(),
+                },
+                &denied
+            )
+            .as_deref(),
+            Some("deny-ro-prefix:/repo/secrets/")
+        );
+        assert!(session_deny_match(
+            &ToolCallType::DirList {
+                path: "/repo/secrets".into(),
+            },
+            &denied
+        )
+        .is_some());
+        // A read refusal is not a write refusal: the operator ticked one box.
+        assert!(session_deny_match(
+            &ToolCallType::FileWrite {
+                path: "/repo/secrets/token".into(),
+                content_hash: String::new(),
+            },
+            &denied
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn session_deny_is_boundary_safe() {
+        let denied = denied_set(&["deny-ro-prefix:/repo/build/"]);
+        assert!(session_deny_match(
+            &ToolCallType::FileRead {
+                path: "/repo/build/out.o".into(),
+            },
+            &denied
+        )
+        .is_some());
+        // The sibling that merely shares the prefix keeps its access.
+        assert!(session_deny_match(
+            &ToolCallType::FileRead {
+                path: "/repo/build-secrets/out.o".into(),
+            },
+            &denied
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn session_deny_covers_both_ends_of_a_rename() {
+        let denied = denied_set(&["deny-delete-prefix:/repo/quarantine/"]);
+        // Moving *into* a blocked directory is blocked too: the operator said
+        // that subtree is off limits, not that it may only be written to.
+        assert!(session_deny_match(
+            &ToolCallType::FileRename {
+                old_path: "/repo/src/payload".into(),
+                new_path: "/repo/quarantine/payload".into(),
+            },
+            &denied
+        )
+        .is_some());
+        assert!(session_deny_match(
+            &ToolCallType::FileRename {
+                old_path: "/repo/quarantine/payload".into(),
+                new_path: "/repo/src/payload".into(),
+            },
+            &denied
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn session_deny_ignores_calls_it_does_not_govern() {
+        let denied = denied_set(&["deny-ro-prefix:/repo/secrets/"]);
+        assert!(session_deny_match(
+            &ToolCallType::ProcessSpawn {
+                command: "/repo/secrets/run.sh".into(),
+                args: Vec::new(),
+            },
+            &denied
+        )
+        .is_none());
+        assert!(session_deny_match(
+            &ToolCallType::FileRead {
+                path: "/repo/secrets/token".into(),
+            },
+            &HashSet::new()
+        )
+        .is_none());
+    }
+
+    fn empty_allowlist() -> Arc<Mutex<HashSet<String>>> {
+        Arc::new(Mutex::new(HashSet::new()))
+    }
+
+    fn test_boundary() -> crate::workspace_only::WorkspaceBoundary {
+        crate::workspace_only::WorkspaceBoundary::new(vec![
+            "/repo".to_string(),
+            "/repo-worktrees/feature".to_string(),
+        ])
+    }
+
+    #[test]
+    fn workspace_only_allows_the_workspace_and_its_linked_worktrees() {
+        let boundary = test_boundary();
+        let allowed = empty_allowlist();
+        for call in [
+            ToolCallType::FileRead {
+                path: "/repo/src/lib.rs".into(),
+            },
+            ToolCallType::FileWrite {
+                path: "/repo-worktrees/feature/src/lib.rs".into(),
+                content_hash: String::new(),
+            },
+        ] {
+            assert!(
+                workspace_only_block_reason(&boundary, &call, &allowed).is_none(),
+                "{call} is inside the workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_only_blocks_user_data_outside_the_workspace() {
+        let boundary = test_boundary();
+        let allowed = empty_allowlist();
+        for call in [
+            ToolCallType::FileRead {
+                path: "/home/dev/.ssh/id_ed25519".into(),
+            },
+            ToolCallType::FileRead {
+                path: "/repo-secrets/.env".into(),
+            },
+            ToolCallType::FileWrite {
+                path: "/home/dev/other-project/main.rs".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileDelete {
+                path: "/mnt/backup/keys".into(),
+            },
+        ] {
+            assert!(
+                workspace_only_block_reason(&boundary, &call, &allowed).is_some(),
+                "{call} is outside the workspace and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_only_keeps_the_runtime_readable_but_not_writable() {
+        let boundary = test_boundary();
+        let allowed = empty_allowlist();
+        // Without this the tool cannot load libc, and the mode would be an
+        // elaborate way to refuse to run.
+        assert!(workspace_only_block_reason(
+            &boundary,
+            &ToolCallType::FileRead {
+                path: "/usr/lib/os-release".into(),
+            },
+            &allowed
+        )
+        .is_none());
+        // A write into the runtime is exactly what the mode exists to stop.
+        assert!(workspace_only_block_reason(
+            &boundary,
+            &ToolCallType::FileWrite {
+                path: "/usr/lib/evil.so".into(),
+                content_hash: String::new(),
+            },
+            &allowed
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn workspace_only_respects_profile_declared_trust() {
+        let boundary = test_boundary();
+        let allowed = Arc::new(Mutex::new(HashSet::from([
+            "/home/dev/.cache/tool/".to_string()
+        ])));
+        // The profile says the tool needs this directory; the boundary is not
+        // a licence to break the tool the operator asked to supervise.
+        assert!(workspace_only_block_reason(
+            &boundary,
+            &ToolCallType::FileWrite {
+                path: "/home/dev/.cache/tool/state.json".into(),
+                content_hash: String::new(),
+            },
+            &allowed
+        )
+        .is_none());
+        // A sibling of the declared path is still outside.
+        assert!(workspace_only_block_reason(
+            &boundary,
+            &ToolCallType::FileWrite {
+                path: "/home/dev/.cache/other/state.json".into(),
+                content_hash: String::new(),
+            },
+            &allowed
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn workspace_only_governs_file_calls_only_and_is_inert_without_roots() {
+        let allowed = empty_allowlist();
+        assert!(workspace_only_block_reason(
+            &test_boundary(),
+            &ToolCallType::NetConnect {
+                address: "example.com".into(),
+                port: 443,
+            },
+            &allowed
+        )
+        .is_none());
+        // An unresolvable launch directory must not deny every file operation.
+        assert!(workspace_only_block_reason(
+            &crate::workspace_only::WorkspaceBoundary::default(),
+            &ToolCallType::FileRead {
+                path: "/home/dev/.ssh/id_ed25519".into(),
+            },
+            &allowed
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn workspace_only_tests_declared_trust_per_path_not_per_call() {
+        // The rename's SOURCE is declared trust and its destination is not.
+        // `session_allowlist_key` keys a rename on the source, so a per-call
+        // exemption would carry that trust to the destination — the exact
+        // move the boundary exists to refuse.
+        let allowed = Arc::new(Mutex::new(HashSet::from([
+            "/home/dev/.cache/tool/".to_string()
+        ])));
+        assert!(workspace_only_block_reason(
+            &test_boundary(),
+            &ToolCallType::FileRename {
+                old_path: "/home/dev/.cache/tool/notes".into(),
+                new_path: "/home/dev/exfil/notes".into(),
+            },
+            &allowed
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn workspace_only_blocks_a_rename_that_leaves_the_workspace() {
+        assert!(workspace_only_block_reason(
+            &test_boundary(),
+            &ToolCallType::FileRename {
+                old_path: "/repo/src/secret".into(),
+                new_path: "/home/dev/exfil/secret".into(),
+            },
+            &empty_allowlist()
+        )
+        .is_some());
     }
 
     #[test]
@@ -9896,6 +11092,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating,
@@ -9905,6 +11104,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         handle_syscall_event(&mut interceptor, &mut session, &loop_ctx, event)
@@ -10361,6 +11561,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
@@ -10370,6 +11573,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
 
         let ctx = ToolCallContext::new(
@@ -10477,6 +11681,9 @@ mod tests {
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            session_denied: Arc::new(Mutex::new(HashSet::new())),
+            workspace_boundary: None,
             local_listener_policy: Vec::new(),
             namespace_users: Vec::new(),
             permit_authority_delegating: Vec::new(),
@@ -10486,6 +11693,7 @@ mod tests {
             working_root: None,
             mass_destruction: Mutex::new(mass_destruction::MassDestructionTracker::with_defaults()),
             yama_ptrace_scope: None,
+            analytics_config: std::sync::OnceLock::new(),
         };
         session_scope_now_covers(&loop_ctx, session_id, call_type)
     }

@@ -405,6 +405,12 @@ pub(crate) fn to_supervisor_config(
             deny_self_seccomp_notify: core.coverage.deny_self_seccomp_notify,
             observe_self_seccomp_filter: core.coverage.observe_self_seccomp_filter,
         },
+        // work/83 F4: map core TrustConfig -> supervisor TrustConfig.
+        trust: grith_supervisor::config::TrustConfig {
+            include_linked_worktrees: core.trust.include_linked_worktrees,
+            additional_project_roots: core.trust.additional_project_roots.clone(),
+            restrict_to_workspace: core.trust.restrict_to_workspace,
+        },
         // Default tier — callers that need an audit-completeness setting
         // should reach for `to_runtime_supervisor_config_with_audit`
         // instead. This loader-side path is used for legacy/test sites
@@ -564,6 +570,23 @@ mod tests {
     fn test_expand_path_no_tilde() {
         let path = expand_path("/absolute/path");
         assert_eq!(path, PathBuf::from("/absolute/path"));
+    }
+
+    /// work/83 F4: an unmapped `trust` field would leave the supervisor on
+    /// its own defaults — linked-worktree trust ON for an operator who turned
+    /// it off, and declared roots silently ignored.
+    #[test]
+    fn test_to_supervisor_config_maps_trust() {
+        let mut core = crate::config::SupervisorCoreConfig::default();
+        core.trust.include_linked_worktrees = false;
+        core.trust.additional_project_roots = vec!["/srv/other-repo".to_string()];
+
+        let mapped = to_supervisor_config(&core);
+        assert!(!mapped.trust.include_linked_worktrees);
+        assert_eq!(
+            mapped.trust.additional_project_roots,
+            vec!["/srv/other-repo"]
+        );
     }
 
     #[test]

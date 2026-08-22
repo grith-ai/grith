@@ -50,6 +50,7 @@
 //! - [`supervisor`] — Main supervisor event loop and session management.
 //! - [`syscall_map`] — Mapping from OS syscalls to proxy `ToolCallType`.
 
+pub(crate) mod audit_analytics;
 pub mod audit_sink;
 pub mod cdp;
 pub mod config;
@@ -74,6 +75,7 @@ pub mod scoped_permissions;
 pub mod session_sync;
 pub mod supervisor;
 pub mod syscall_map;
+pub mod workspace_only;
 
 pub use audit_sink::{AuditSink, StorageAuditSink};
 pub use config::SupervisorConfig;

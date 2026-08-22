@@ -6,6 +6,7 @@
 //! Provides SQLite-backed storage, async logging, querying, statistics,
 //! export (JSON/CSV/JSONL), and source-to-sink correlation tracking.
 
+pub mod analytics;
 pub mod compression;
 pub mod correlation;
 pub mod error;
@@ -26,6 +27,7 @@ pub use query::AuditQuery;
 pub use stats::AuditStats;
 pub use storage::{AuditStorage, ForkRecord};
 pub use types::{
-    AuditRecord, ChainVerification, FilterResultSummary, ProxyActionSummary, RecordType,
-    SegmentHistory,
+    AuditAnalyticsMetadata, AuditConfigVersion, AuditDestinationMetadata, AuditLlmPricing,
+    AuditRecord, AuditSecurityMetadata, ChainVerification, FilterResultSummary, ProxyActionSummary,
+    RecordType, SegmentHistory,
 };

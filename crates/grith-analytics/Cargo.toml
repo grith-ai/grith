@@ -1,0 +1,23 @@
+[package]
+name = "grith-analytics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Canonical analytics-v2 contracts and deterministic edge accumulator for grith"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }

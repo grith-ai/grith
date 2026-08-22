@@ -522,35 +522,212 @@ export type NotificationEvent =
   | NotificationEventInteractiveResponse;
 
 // ---------------------------------------------------------------------------
-// Analytics (Pro)
+// Analytics v2 — explicit Free/Pro local contracts
+// (mirrors crates/grith-analytics/src/contract.rs; frozen in
+//  contracts/analytics-v2/schema/common.schema.json)
 // ---------------------------------------------------------------------------
 
-export interface LatencyPercentiles {
-  avg_ms: number;
-  p50_ms: number;
-  p95_ms: number;
-  p99_ms: number;
+export type AnalyticsRecordClass =
+  | "decision"
+  | "routine_spawn"
+  | "routine_io"
+  | "noise"
+  | "llm_usage"
+  | "system";
+
+export type AnalyticsCategory =
+  | "file_read"
+  | "file_mutation"
+  | "process"
+  | "network_egress"
+  | "network_listen"
+  | "cross_process"
+  | "namespace"
+  | "llm"
+  | "system"
+  | "other";
+
+export type AnalyticsVerdict = "allow" | "queue" | "deny";
+
+export type SecurityEventType = "queue" | "deny" | "canary" | "gap";
+
+export type ChainHealth =
+  | "healthy"
+  | "gap"
+  | "broken"
+  | "quarantined"
+  | "unknown";
+
+export type DestinationKind =
+  | "domain"
+  | "host_port"
+  | "url_origin"
+  | "unix_socket_class"
+  | "other";
+
+export interface UtcWindow {
+  /** Inclusive first UTC date ("YYYY-MM-DD"). */
+  start_day: string;
+  /** Inclusive last UTC date (today). */
+  end_day: string;
+  current_day_partial: boolean;
 }
 
-export interface FilterTriggerCount {
-  name: string;
-  trigger_count: number;
+export interface VerdictCounts {
+  total: number;
+  allow: number;
+  queue: number;
+  deny: number;
+  /** Rates in parts-per-million of `total`. */
+  allow_rate_ppm: number;
+  queue_rate_ppm: number;
+  deny_rate_ppm: number;
 }
 
-export interface AnalyticsTimeRange {
-  earliest: string | null;
-  latest: string | null;
+export interface LocalFreshness {
+  /** RFC3339 timestamp of the newest materialized audit record, if any. */
+  materialized_through_at?: string;
+  materialized_through_sequence: number;
+  /** UTC days whose rollups are queued for rebuild. */
+  dirty_day_count: number;
+  rebuilding: boolean;
+  /** Audit records the projection could not express (counted, never hidden). */
+  gap_count: number;
 }
 
-export interface AnalyticsSummaryResponse {
-  total_evaluations: number;
-  allow_count: number;
+export interface SecurityResolutionWire {
+  status: "pending" | "approved" | "denied" | "expired" | "escalated";
+  resolved_at?: string;
+  resolution_code?: string;
+}
+
+export interface AnalyticsSecurityEvent {
+  event_id: string;
+  event_revision: number;
+  occurred_at: string;
+  event_type: SecurityEventType;
+  initial_verdict?: AnalyticsVerdict;
+  resolution?: SecurityResolutionWire;
+  session_id?: string;
+  project: string;
+  profile_id: string;
+  supervised_tool: string;
+  category: AnalyticsCategory;
+  score_micros?: number;
+  top_filter_ids: string[];
+  enforcement_outcome_code?: string;
+  gap_count?: number;
+  chain_sequence?: number;
+  chain_hash?: string;
+}
+
+export interface UsageRollupRow {
+  /** UTC hour bucket start (RFC3339). */
+  bucket_start: string;
+  project: string;
+  profile_id: string;
+  config_hash: string;
+  supervised_tool: string;
+  record_class: AnalyticsRecordClass;
+  category: AnalyticsCategory;
+  verdict: AnalyticsVerdict | null;
+  score_bin_version: number;
+  /** Histogram bin 0-29 (v1: half-point bins over [0,15]); null off-histogram. */
+  score_bucket: number | null;
+  event_count: number;
+  score_sum_micros: number;
+  first_event_at: string;
+  last_event_at: string;
+}
+
+export interface FilterRollupRow {
+  day: string;
+  project: string;
+  profile_id: string;
+  config_hash: string;
+  filter_set_version: number;
+  filter_id: string;
+  evaluated_events: number;
+  triggered_events: number;
+  denied_evaluated_events: number;
+  denied_positive_contributions: number;
+}
+
+export interface SessionDayRow {
+  day: string;
+  session_id: string;
+  project: string;
+  profile_id: string;
+  config_hash: string;
+  supervised_tool: string;
+  first_event_at: string;
+  last_event_at: string;
+  decision_count: number;
   queue_count: number;
   deny_count: number;
-  avg_score: number;
-  latency: LatencyPercentiles;
-  top_filters: FilterTriggerCount[];
-  time_range: AnalyticsTimeRange;
+  llm_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+}
+
+export interface LlmRollupRow {
+  day: string;
+  project: string;
+  provider: string;
+  model: string;
+  currency: string;
+  price_source: string;
+  pricing_version: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+}
+
+export interface DestinationRollupRow {
+  day: string;
+  kind: DestinationKind;
+  destination_hmac: string;
+  hmac_key_version: number;
+  approved_display_label: string | null;
+  verdict: AnalyticsVerdict;
+  event_count: number;
+  first_event_at: string;
+  last_event_at: string;
+}
+
+export interface LocalFreeAnalyticsResponse {
+  protocol_version: number;
+  schema_version: number;
+  access: "free";
+  window: UtcWindow;
+  decisions: VerdictCounts;
+  chain_health: ChainHealth;
+  latest_audit_record_at?: string;
+  recent_queue_and_deny: AnalyticsSecurityEvent[];
+  freshness: LocalFreshness;
+  pro_available: boolean;
+}
+
+export interface LocalProAnalyticsResponse {
+  protocol_version: number;
+  schema_version: number;
+  access: "pro";
+  generated_at: string;
+  /** [30-day window, 90-day window]. */
+  windows: UtcWindow[];
+  usage_rows: UsageRollupRow[];
+  filter_rows: FilterRollupRow[];
+  session_rows: SessionDayRow[];
+  llm_rows: LlmRollupRow[];
+  destination_rows: DestinationRollupRow[];
+  security_events: AnalyticsSecurityEvent[];
+  freshness: LocalFreshness;
+  export_formats: ("json" | "csv")[];
+  export_max_days: number;
+  /** True when a rollup family was clipped to its row cap (oldest days dropped). */
+  truncated: boolean;
 }
 
 // ---------------------------------------------------------------------------

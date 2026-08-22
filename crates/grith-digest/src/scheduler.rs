@@ -95,7 +95,7 @@ impl DigestScheduler {
 
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    let delivered = self.deliver_pending(&queue, delivery.as_ref()).await;
+                    let delivered = self.deliver_pending(&queue, delivery.as_ref());
                     if delivered {
                         last_activity_at = tokio::time::Instant::now();
                         if idle {
@@ -111,15 +111,15 @@ impl DigestScheduler {
                         tracing::info!("digest scheduler switching to active mode (activity notified)");
                     }
                     // Deliver immediately on activity to keep latency low.
-                    self.deliver_pending(&queue, delivery.as_ref()).await;
+                    self.deliver_pending(&queue, delivery.as_ref());
                 }
                 _ = self.immediate.notified() => {
-                    self.deliver_pending(&queue, delivery.as_ref()).await;
+                    self.deliver_pending(&queue, delivery.as_ref());
                 }
                 _ = self.shutdown.notified() => {
                     tracing::info!("digest scheduler shutting down");
                     // Final delivery before shutdown
-                    self.deliver_pending(&queue, delivery.as_ref()).await;
+                    self.deliver_pending(&queue, delivery.as_ref());
                     break;
                 }
             }
@@ -138,18 +138,19 @@ impl DigestScheduler {
             if let Ok(count) = queue.count_pending() {
                 if count >= max_size {
                     tracing::info!(count, max_size, "queue overflow, forcing delivery");
-                    self.deliver_pending(&queue, delivery.as_ref()).await;
+                    self.deliver_pending(&queue, delivery.as_ref());
                 }
             }
         }
     }
 
     /// Deliver pending items. Returns `true` if items were actually delivered.
-    async fn deliver_pending(
-        &self,
-        queue: &DigestQueue,
-        delivery: &(dyn DigestDelivery + '_),
-    ) -> bool {
+    ///
+    /// Not `async`: every call inside it is synchronous, and Rust 1.98's
+    /// `clippy::unused_async_trait_impl` refuses an `async fn` with no `.await`
+    /// in it. Callers are on the scheduler's own task and were already
+    /// awaiting a future that resolved immediately.
+    fn deliver_pending(&self, queue: &DigestQueue, delivery: &(dyn DigestDelivery + '_)) -> bool {
         let items = queue.get_pending(self.config.max_queue_size, 0).ok();
 
         match items {

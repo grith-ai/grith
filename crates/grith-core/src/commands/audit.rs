@@ -143,7 +143,67 @@ pub fn cmd_audit(
         }
         Some(crate::AuditAction::Diagnose) => cmd_audit_diagnose(daemon)?,
         Some(crate::AuditAction::Compact { yes }) => cmd_audit_compact(daemon, yes)?,
+        Some(crate::AuditAction::RebuildAnalytics { yes }) => {
+            cmd_audit_rebuild_analytics(daemon, yes)?;
+        }
     }
+    Ok(())
+}
+
+/// `grith audit rebuild-analytics` — discard and rebuild the derived analytics
+/// projection from the active audit database plus the cold archives. A WRITE
+/// maintenance op on derived data only — it never modifies audit records —
+/// but it still requires exclusive write access (no daemon running) and
+/// refuses to touch a quarantined chain's database.
+fn cmd_audit_rebuild_analytics(daemon: &daemon::Daemon, yes: bool) -> anyhow::Result<()> {
+    // Gate 1: writer ownership. Rebuilding under a live daemon would rewrite
+    // the analytics tables out from under the daemon's open handle.
+    if !daemon.audit_role.can_write() {
+        anyhow::bail!(
+            "audit rebuild-analytics needs exclusive write access, but another grith process \
+             owns the audit database (the daemon). Stop it first: `grith daemon stop`."
+        );
+    }
+    // Gate 2: no writes of any kind into a quarantined chain's database until
+    // the operator has inspected it.
+    if let crate::daemon::ChainStatus::Quarantined { reason } = &daemon.chain_status {
+        anyhow::bail!(
+            "audit chain is quarantined; the analytics rebuild is refused until the chain is \
+             inspected. Run `grith audit diagnose`.\n  {reason}"
+        );
+    }
+
+    // Confirmation: the rebuild discards and rewrites derived data only. A
+    // non-interactive invocation without --yes reads an empty line and aborts
+    // safely.
+    if !yes {
+        print!(
+            "Rebuild the analytics projection from the audit database and cold archives? \
+             Audit records themselves are never modified. [y/N] "
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // The daemon's retention thread archives to `<audit_dir>/cold/`; rebuild
+    // from the same place.
+    let cold_dir =
+        crate::daemon::config_loader::expand_path(&daemon.config.general.audit_dir).join("cold");
+
+    let mut storage = daemon
+        .audit_storage
+        .lock()
+        .map_err(|_| anyhow::anyhow!("audit storage lock poisoned"))?;
+    let processed = storage.rebuild_analytics_from_active_and_cold(&cold_dir)?;
+    drop(storage);
+
+    println!("Analytics rebuild complete: {processed} source records processed.");
     Ok(())
 }
 

@@ -15,6 +15,7 @@ pub mod exfil;
 pub mod filters;
 pub mod meta_rules;
 pub mod path_resolution;
+pub mod paths;
 pub mod reputation;
 pub mod scoring;
 pub mod session_state;

@@ -53,6 +53,24 @@ pub fn prune_and_archive(
     cold_storage_enabled: bool,
     respect_sync_state: bool,
 ) -> Result<PruneStats> {
+    // With cold storage disabled the user has chosen age-based deletion
+    // without archives; honouring the configured retention window matters
+    // more than forcing archives they opted out of (a silent no-op would
+    // grow the active database forever while the docs promise 30 days).
+    // Deletion still never outruns the analytics projection: the coverage
+    // gate below holds in both modes, so every pruned row was materialized
+    // first.
+    if !cold_storage_enabled {
+        tracing::info!(
+            "audit retention: cold storage is disabled; pruned rows are deleted without an archive"
+        );
+    }
+
+    // The writer-lock owner catches the projection up before calculating a
+    // deletion boundary. Projection snapshot acknowledgements and archive
+    // acknowledgements are intentionally not consulted here: local materialized
+    // coverage plus a verified cold file are the two independent requirements.
+    storage.catch_up_analytics()?;
     // 1. Find the highest chain_sequence whose timestamp is strictly
     //    older than `cutoff`. We delete a contiguous prefix
     //    [1..=max_pruned_sequence]. Rows with NULL chain_sequence (the
@@ -126,6 +144,13 @@ pub fn prune_and_archive(
     if max_pruned_sequence <= 0 {
         return Ok(PruneStats::default());
     }
+    if !storage.analytics_covers_sequence(max_pruned_sequence)? {
+        tracing::warn!(
+            max_pruned_sequence,
+            "audit retention skipped: analytics projection has not atomically covered the prefix"
+        );
+        return Ok(PruneStats::default());
+    }
 
     // 3. Archive BEFORE deleting.
     //
@@ -163,6 +188,7 @@ pub fn prune_and_archive(
         for (date_key, records) in &by_date {
             let path = cold_dir.join(format!("{date_key}.jsonl.zst"));
             append_zstd_jsonl(&path, records)?;
+            prove_archived_records(&path, records)?;
             archive_files += 1;
         }
     }
@@ -177,6 +203,36 @@ pub fn prune_and_archive(
         archive_files,
         max_pruned_sequence,
     })
+}
+
+/// Prove that every just-appended row can be read back from cold storage with
+/// the same stored hash and a valid record-content hash before any active row
+/// is deleted. Concatenated frames may contain older duplicates, so identity
+/// is keyed by event id rather than by file position.
+fn prove_archived_records(path: &Path, expected: &[AuditRecord]) -> Result<()> {
+    let restored = read_zstd_jsonl(path)?;
+    let by_id: std::collections::HashMap<_, _> =
+        restored.iter().map(|record| (record.id, record)).collect();
+    for record in expected {
+        let Some(cold) = by_id.get(&record.id) else {
+            return Err(crate::error::Error::Analytics(format!(
+                "cold archive {} did not contain appended record {}",
+                path.display(),
+                record.id
+            )));
+        };
+        let recomputed = cold.compute_record_hash();
+        if cold.record_hash != record.record_hash
+            || cold.record_hash.as_deref() != Some(recomputed.as_str())
+        {
+            return Err(crate::error::Error::Analytics(format!(
+                "cold archive {} failed hash proof for record {}",
+                path.display(),
+                record.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Append `records` to an existing `<date>.jsonl.zst` archive, or create
@@ -1043,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_without_cold_storage_just_deletes() {
+    fn prune_without_cold_storage_deletes_on_age_after_materialization() {
         let mut storage = AuditStorage::open_in_memory().unwrap();
         let old = Utc.with_ymd_and_hms(2020, 1, 15, 12, 0, 0).unwrap();
         for _ in 0..3 {
@@ -1052,9 +1108,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cutoff = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let stats = prune_and_archive(&mut storage, cutoff, dir.path(), false, false).unwrap();
-        assert_eq!(stats.archived_rows, 3);
-        assert_eq!(stats.archive_files, 0);
+        assert_eq!(
+            stats.archived_rows, 3,
+            "age-based deletion still counts rows"
+        );
+        assert_eq!(
+            stats.archive_files, 0,
+            "no archive is written when cold storage is off"
+        );
+        assert_eq!(storage.count().unwrap(), 0);
         assert!(!dir.path().join("2020-01-15.jsonl.zst").exists());
+        // The analytics projection kept the rows' events even though the raw
+        // rows are gone: coverage gating ran before deletion.
+        let projected: i64 = storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM analytics_source_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(projected, 3);
     }
 
     #[test]

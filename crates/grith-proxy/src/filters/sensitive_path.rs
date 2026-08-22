@@ -277,9 +277,30 @@ impl SecurityFilter for SensitivePathHeuristicFilter {
         if !handled {
             return Ok(FilterResult::no_match(self.name()));
         }
+        // Creating a directory grants no access to credential CONTENT — the
+        // directory is empty, and whatever is written into it is scored on the
+        // write. So the weakest rule, which keys purely on the name, has
+        // nothing to say about a `mkdir`. Measured: `mkdir api/auth`,
+        // `mkdir packages/auth-core`, `mkdir public/blog/codex-credential-
+        // sweep-syscall-trace` were 39 of the 105 prompts that survived the
+        // rest of work/83.
+        //
+        // A credential DIRECTORY is `credential-directory`'s job, not this
+        // rule's, and that rule is unaffected here. Only `secretish-filename`
+        // is dropped; every other rule still scores a `mkdir` normally.
+        //
+        // `dir_create` is also what separates the two halves of the generic
+        // browser-name rule below (work/83 finding 4): `mkdir` needs location
+        // evidence, a WRITE or DELETE of the same name does not.
+        let dir_create = matches!(ctx.call_type, ToolCallType::DirCreate { .. });
+        let suppress_name_token_rule = dir_create;
+
         let mut worst: Option<FilterResult> = None;
         for (path, op) in path_operations(&ctx.call_type) {
-            let result = self.evaluate_path(path, op);
+            let result = self.evaluate_path(path, op, dir_create);
+            if suppress_name_token_rule && result.rule_id == "secretish-filename" {
+                continue;
+            }
             let better = match &worst {
                 Some(current) => result.score > current.score,
                 None => true,
@@ -293,9 +314,14 @@ impl SecurityFilter for SensitivePathHeuristicFilter {
 }
 
 impl SensitivePathHeuristicFilter {
-    fn evaluate_path(&self, path: &str, op: &'static str) -> FilterResult {
+    fn evaluate_path(&self, path: &str, op: &'static str, dir_create: bool) -> FilterResult {
         let path_lc = normalize_path_for_match(path);
         let file_name_lc = normalized_file_name(&path_lc);
+        // Case-preserving basename: `paths::name_has_sensitive_token` treats a
+        // camelCase transition as a token boundary, which a lowercased name
+        // cannot express (`AccessToken.bin` -> `access` + `token`). Borrowed,
+        // not allocated — this runs on every scored file operation.
+        let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         let destructive = matches!(op, "write" | "delete");
 
         // A#4: `~/.pki/nssdb` is the NSS *shared* certificate DB — an app cert
@@ -518,45 +544,103 @@ impl SensitivePathHeuristicFilter {
             || path_lc.contains("/appdata/local/google/chrome/")
             || path_lc.contains("/appdata/local/microsoft/edge/");
 
-        // High-value browser credential and session filenames.  These are
-        // meaningful wherever they appear, not just inside a browser profile.
-        let browser_credential_file = matches!(
+        // DISTINCTIVE browser credential filenames: multi-word or
+        // product-specific names that essentially never occur by accident.
+        // These keep firing wherever they appear — a `Login Data` or `key4.db`
+        // copied out of a profile into `~/Downloads` is exactly the shape this
+        // rule exists to catch, and the copy is the interesting event.
+        let distinctive_browser_credential_file = matches!(
             file_name_lc.as_str(),
-            // Chromium session and auth tokens
-            "cookies"
-            | "login data"
-            | "web data"           // autofill + saved payment methods
-            | "local state"        // master key used to decrypt saved passwords
-            | "secure preferences" // security-sensitive Chrome prefs
-            | "network persistent state"
-            | "wallet"             // Chrome Web3 wallet
-            // Firefox credential stores
-            | "key4.db"            // Firefox password manager key
-            | "cert9.db"           // Firefox/NSS certificate store (incl. private keys)
-            | "cert8.db"           // Older Firefox cert store
-            | "logins.json"        // Firefox saved logins
-            | "signons.sqlite"     // Very old Firefox passwords
-            | "signedinusers.json" // Firefox Accounts session tokens
+            "login data"
+                | "secure preferences" // security-sensitive Chrome prefs
+                | "key4.db"            // Firefox password manager key
+                | "cert9.db"           // Firefox/NSS cert store (incl. private keys)
+                | "cert8.db"           // Older Firefox cert store
+                | "logins.json"        // Firefox saved logins
+                | "signons.sqlite"     // Very old Firefox passwords
+                | "signedinusers.json" // Firefox Accounts session tokens
         );
 
-        if browser_profile_path || browser_credential_file {
+        // GENERIC names (work/83 M8): each is an ordinary English word or word
+        // pair that occurs constantly as a project or package directory. The
+        // npm package `cookies` — a dependency of Koa, Next.js and much of the
+        // Node ecosystem — made `mkdir node_modules/cookies` score +4.0
+        // (destructive) and prompt. `wallet`, `web data`, `local state` and
+        // `network persistent state` have the same problem.
+        //
+        // A READ or a `mkdir` requires LOCATION evidence: a known browser
+        // profile root, or a sibling Chromium marker file in the same directory
+        // (which is what a copied-out profile directory looks like).
+        //
+        // A WRITE or DELETE does not, and requiring it there was a regression
+        // (work/83 finding 4). A freshly COPIED-OUT `Cookies` has neither a
+        // profile path nor siblings yet — the copy IS the interesting event, and
+        // it is the one that leaves no other trace: `is_sensitive_path` has
+        // never covered browser profile paths, so the READ half of a copy-out
+        // chain is noise-suppressed at the supervisor, and requiring context on
+        // the write half left the whole chain producing zero scored events.
+        // `mkdir` keeps the requirement because the recorded false positive was
+        // `mkdir node_modules/cookies` (the npm package `cookies`, a Koa/Next
+        // dependency), and an empty directory grants no access to content.
+        //
+        // Never inside a dependency tree or a generated-output tree, on any
+        // operation.
+        let copy_out_or_removal = destructive && !dir_create;
+        let generic_browser_credential_file = matches!(
+            file_name_lc.as_str(),
+            "cookies" | "web data" | "local state" | "network persistent state" | "wallet"
+        ) && !crate::paths::is_name_opaque_tree(path)
+            && (browser_profile_path || copy_out_or_removal || has_sibling_chromium_marker(path));
+
+        // A named credential file scores above the allow boundary; an ordinary
+        // file that merely lives in a profile directory does not.
+        //
+        // `route_decision` routes on `score > allow_threshold` and `FileRead`
+        // carries a 0.0 operation-risk baseline, so a read whose only signal
+        // was this rule at 3.0 landed on exactly 3.0 and was ALLOWED — the
+        // browser cookie jar and saved-password store, the classic
+        // session-hijack targets, were readable without a prompt. Nothing
+        // compensated: content scanning never sees file bytes on a read, only
+        // syscall arguments.
+        //
+        // 3.5 is deliberately scoped to the credential FILES. Leaving the
+        // plain profile-path hit at 3.0 keeps a tool that legitimately drives
+        // a real Chrome profile (it reads hundreds of ordinary files there)
+        // from being flooded.
+        let credential_file_hit =
+            distinctive_browser_credential_file || generic_browser_credential_file;
+        if browser_profile_path || credential_file_hit {
             hits.push(HeuristicHit {
                 rule_id: "browser-session-data",
-                score: if destructive { 4.0 } else { 3.0 },
+                score: match (destructive, credential_file_hit) {
+                    (true, _) => 4.0,
+                    (false, true) => 3.5,
+                    (false, false) => 3.0,
+                },
                 severity: Severity::Warning,
                 message: format!("{op} access to browser session/credential data"),
             });
         }
 
         // Key/certificate-like filenames.
-        if file_name_lc.ends_with(".pem")
-            || file_name_lc.ends_with(".key")
-            || file_name_lc.ends_with(".p12")
-            || file_name_lc.ends_with(".pfx")
-            || matches!(
-                file_name_lc.as_str(),
-                "id_rsa" | "id_ed25519" | "id_dsa" | "id_ecdsa"
-            )
+        //
+        // work/83 F2.1 anchored `path_match`'s `*.pem` / `*.key` to the
+        // BASENAME instead of a whole-path `contains`, which is correct — but
+        // the loose form was the only thing scoring `server.pem.bak`, and this
+        // rule's `ends_with` never covered it either. A backed-up or rotated
+        // private key is the same private key, and nothing else scores it:
+        // the taint filter's source list carries no `.pem`/`.key` entry, so a
+        // read of one registers no taint. One CLOSED backup suffix is stripped
+        // before the extension test (see `strip_backup_suffix`) so the
+        // coverage the anchoring removed is restored precisely, without
+        // reopening the `/p/.pem-notes/a.js` false positive that the anchoring
+        // fixed.
+        let key_name = crate::paths::strip_backup_suffix(&file_name_lc);
+        if key_name.ends_with(".pem")
+            || key_name.ends_with(".key")
+            || key_name.ends_with(".p12")
+            || key_name.ends_with(".pfx")
+            || matches!(key_name, "id_rsa" | "id_ed25519" | "id_dsa" | "id_ecdsa")
         {
             hits.push(HeuristicHit {
                 rule_id: "key-material-file",
@@ -588,37 +672,96 @@ impl SensitivePathHeuristicFilter {
                 message: format!("{op} access to environment file"),
             });
         }
-        // PR 69 Change 5: the substring-token rule is the broadest
-        // heuristic on the books — it catches any filename containing
-        // "secret"/"credential"/"token"/"passwd"/"apikey"/"auth". Inside
-        // a public npm dependency tree (`node_modules/`) those words
-        // appear in legitimate library filenames (`tokenize.js`,
-        // `tokenTypes.js`, etc.) and the heuristic mass-misfires.
+        // A STRUCTURED credential file — the filename's whole shape is a
+        // credential-store convention (`secrets.yaml`, `credentials.json`,
+        // `service-account-credentials.json`), not an incidental word.
         //
-        // Carveout: suppress ONLY this rule when the path resolves to
-        // something inside a `/node_modules/` component. Every other
-        // rule above (.env, key/cert files, browser credential files,
-        // OS secret stores, credential directories) is unaffected.
+        // This exists because the two de-weightings work/83 applied to the
+        // weak filename signal COMPOSED: `path_match`'s `*secrets*` went
+        // 3.0 -> 1.5 *and* a `-1.5` meta-rule subtracted again, landing a
+        // READ of `/proj/deploy/secrets.yaml` on 2.80 — and `route_decision`
+        // routes on `score > allow_threshold`, so 2.80 is ALLOWED. A
+        // Kubernetes Secret manifest and a GCP service-account key were
+        // readable with no prompt and nothing compensated: content scanning
+        // never sees file bytes on a read, only syscall arguments.
         //
-        // Canonicalisation defeats the symlink-evasion
-        // `~/.ssh/x → /tmp/proj/node_modules/x` because the canonical
-        // destination of such a symlink is *outside* `node_modules/`,
-        // so the matching key/cert / credential-dir rules still fire.
-        // When canonicalisation fails (path doesn't exist yet) we fall
-        // back to matching the raw normalized path — this is fail-safe
-        // because the only thing the carveout does is suppress a score.
-        // Carveouts (mirror `grith_supervisor::syscall_map::is_sensitive_path`):
-        // suppress this weakest substring rule inside a dependency tree
-        // (`node_modules/`) or for a programming-language source file — a class
-        // named `AccessToken.php` / `OAuth2Client.ts` is code, not a credential.
-        // The strong rules above (.env, key/cert files, credential dirs) are
-        // unaffected and still fire regardless of extension.
-        let in_node_modules = path_contains_node_modules(path);
-        if !in_node_modules
+        // The fix separates the classes rather than re-tuning one weight.
+        // `bin/with-secrets` (the recorded false positive) keeps the weak
+        // 2.8 and stays allowed; a credential FILE gets its own hit here.
+        // Because `evaluate_path` returns the MAXIMUM hit, this replaces
+        // `secretish-filename` instead of summing with it — the duplicated
+        // filename evidence is removed structurally, which is why the two
+        // `*-filename-single-signal` meta-rules and the two weak
+        // `path_match` globs could be deleted outright.
+        //
+        // Not gated by the dependency-tree / generated-output carveout, for
+        // the same reason `.env` and `*.pem` are not: a real credential store
+        // planted under `node_modules/` must still score. The cost is a
+        // vendored test fixture literally named `credentials.json`.
+        if crate::paths::is_structured_credential_filename(&file_name_lc) {
+            hits.push(HeuristicHit {
+                rule_id: "credential-file-shape",
+                score: if destructive { 4.0 } else { 3.5 },
+                severity: Severity::Error,
+                message: format!("{op} access to a credential file"),
+            });
+        }
+
+        // The weakest rule on the books: a filename that merely *looks*
+        // credential-ish. work/83 M1 — it was a raw `contains` over
+        // ["secret","credential","token","passwd","apikey","auth"], which
+        // matched `authority`, `authorize`, `AUTHORS`, every documentation
+        // page about tokens, and every rustc incremental hash that happened to
+        // end in "auth" (`773v9mxq3ohs6twiwt1rzauth.o`). 831 of one morning's
+        // 1,986 supervisor prompts came from this one rule.
+        //
+        // Four narrowings, each with its compensating control named:
+        //
+        //  1. WHOLE-TOKEN matching (`paths::name_has_sensitive_token`). The
+        //     name is attacker-chosen and never load-bearing: a real
+        //     credential store is identified by `credential-directory`,
+        //     `key-material-file`, `env-file-heuristic`, `os-secret-store`,
+        //     the path-match rules and `is_credential_store_path` — all
+        //     path/extension-based, none of them relying on this rule.
+        //  2. Source-code extensions (unchanged, PR 69): `AccessToken.php` is
+        //     a class, not a credential.
+        //  3. Documentation / assets / build artifacts
+        //     (`is_non_credential_artifact_filename`) and numbered or
+        //     migrations-rooted SQL (`is_migration_sql_filename`). A credential
+        //     pasted into `notes.md` or an `.svg` is still caught by
+        //     `secret_scan`'s 1,620 CONTENT patterns and by `dlp_gate` on
+        //     egress — neither consults this rule.
+        //  4. Dependency trees, widened from `node_modules/` to every vendored
+        //     root (`paths::is_dependency_tree_path`). A package chooses its
+        //     own filenames, so the name carries no authority there;
+        //     content/flow/egress/destruction/volume filters are untouched
+        //     inside a dependency tree.
+        //
+        // The SCORES are deliberately unchanged (read 2.8, write/delete 3.5).
+        // work/83 F1.3 proposed dropping the write score to 2.5 so the rule
+        // could not QUEUE alone; that is wrong, because `route_decision`
+        // (scoring.rs) routes on `score > allow_threshold`, so a composite of
+        // exactly 3.0 ALLOWS. At 2.5 a credential write lands on 2.5 + 0.5 =
+        // 3.0 and is auto-allowed — silently demoting `auth.json`,
+        // `secrets.yaml` and `service-account-credentials.json` writes from
+        // QUEUE to ALLOW. The four carveouts above already remove every
+        // recorded false positive without touching the score, so the drop
+        // bought nothing and cost a real detection.
+        //
+        // `file_name` (case preserved) rather than `file_name_lc` is passed to
+        // the token check: camelCase is a token boundary, so `AccessToken.bin`
+        // still splits into `access` + `token`.
+        //
+        // Condition order is deliberate: the pure-string tests run first and
+        // `is_dependency_tree_path` last, because that one can issue a
+        // `realpath(3)` and every other condition is cheaper. During an
+        // `npm install` burst almost every path is inside a dependency tree,
+        // so testing it first would have paid for a syscall on every write.
+        if crate::paths::name_has_sensitive_token(file_name)
             && !is_source_code_filename(&file_name_lc)
-            && ["secret", "credential", "token", "passwd", "apikey", "auth"]
-                .iter()
-                .any(|kw| file_name_lc.contains(kw))
+            && !crate::paths::is_non_credential_artifact_filename(&file_name_lc)
+            && !crate::paths::is_migration_sql_filename(&file_name_lc, &path_lc)
+            && !crate::paths::is_name_opaque_tree(path)
         {
             hits.push(HeuristicHit {
                 rule_id: "secretish-filename",
@@ -666,7 +809,7 @@ impl SensitivePathHeuristicFilter {
 
         let mut worst: Option<FilterResult> = None;
         for (path, op) in candidates {
-            let result = self.evaluate_path(&path, op);
+            let result = self.evaluate_path(&path, op, false);
             let better = match &worst {
                 Some(current) => result.score > current.score,
                 None => true,
@@ -699,18 +842,27 @@ fn is_source_code_filename(file_name_lc: &str) -> bool {
     SOURCE_EXTS.iter().any(|ext| file_name_lc.ends_with(ext))
 }
 
-/// PR 69 Change 5: returns true if the symlink-resolved canonical path
-/// contains `/node_modules/` as a path component. Falls back to the raw
-/// normalized path when canonicalisation fails (path doesn't exist yet),
-/// which is fail-safe because the only effect is suppressing a heuristic
-/// score; the other sensitive-path rules above still fire.
-fn path_contains_node_modules(path: &str) -> bool {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        if let Some(s) = canonical.to_str() {
-            return s.replace('\\', "/").contains("/node_modules/");
-        }
-    }
-    normalize_path_for_match(path).contains("/node_modules/")
+/// work/83 F8: does the directory holding `path` look like a copied-out
+/// Chromium profile?
+///
+/// The markers are files Chromium always writes into a profile directory and
+/// that are NOT themselves in the generic-name list, so this can never be
+/// circular. Probed only when a generic name matched outside a known profile
+/// root — a rare path, so the filesystem hit is not on the hot path.
+fn has_sibling_chromium_marker(path: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "Login Data",
+        "Preferences",
+        "Secure Preferences",
+        "History",
+        "Bookmarks",
+        "Favicons",
+        "Top Sites",
+    ];
+    let Some(dir) = std::path::Path::new(path).parent() else {
+        return false;
+    };
+    MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
 fn normalized_file_name(path_lc: &str) -> String {
@@ -1299,6 +1451,308 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert!(result.matched);
         assert_eq!(result.rule_id, "browser-session-data");
+    }
+
+    /// work/83 M1: the recorded false positives. Each of these produced a
+    /// modal prompt from `secretish-filename` alone.
+    #[tokio::test]
+    async fn recorded_keyword_false_positives_no_longer_fire() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let cases = [
+            // Token boundaries: "authority" / "authorize" / a base36 hash.
+            ToolCallType::FileWrite {
+                path: "/p/web/public/hero-zero-ambient-authority-1600x900.svg".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileRead {
+                path: "/p/src/app/api/device/authorize/route.ts".into(),
+            },
+            ToolCallType::FileRead {
+                path: "/p/target/debug/incremental/773v9mxq3ohs6twiwt1rzauth.o".into(),
+            },
+            ToolCallType::FileRead {
+                path: "/p/target/debug/incremental/debug_secretscan-32x74bbezc6gl".into(),
+            },
+            // Documentation carveout.
+            ToolCallType::FileWrite {
+                path: "/p/docs/concepts/canary-tokens.mdx".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileWrite {
+                path: "/p/docs/pro/authentication.mdx".into(),
+                content_hash: String::new(),
+            },
+            // Numbered schema migration.
+            ToolCallType::FileWrite {
+                path: "/p/packages/db/migrations/0016_better_auth_admin_two_factor.sql".into(),
+                content_hash: String::new(),
+            },
+            // Dependency tree, widened past node_modules/.
+            ToolCallType::FileWrite {
+                path: "/p/node_modules/aws-sdk/lib/credentials/sso_credentials.js".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileWrite {
+                path: "/p/vendor/github.com/aws/credentials/provider.go".into(),
+                content_hash: String::new(),
+            },
+        ];
+        for call in cases {
+            let result = filter.evaluate(&make_ctx(call.clone())).await.unwrap();
+            assert!(
+                !result.matched || result.rule_id != "secretish-filename",
+                "{call:?} must not fire secretish-filename (got {})",
+                result.rule_id
+            );
+        }
+    }
+
+    /// The rule must still fire on the shapes it exists for, at the scores it
+    /// has always had. A WRITE must stay ABOVE the 3.0 allow boundary on its
+    /// own: `route_decision` routes on `score > allow_threshold`, so 3.5 + the
+    /// +0.5 write baseline = 4.0 QUEUEs, while the 2.5 that work/83 F1.3
+    /// proposed would have landed on exactly 3.0 and been ALLOWED.
+    #[tokio::test]
+    async fn secretish_filename_still_fires_and_a_credential_write_still_queues() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for path in [
+            "/p/config/api_token.txt",
+            "/p/auth.json",
+            "/p/bin/with-secrets",
+            "/p/downloads/AccessToken.bin",
+            "/p/backups/secrets_dump.sql",
+        ] {
+            let read = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert!(read.matched, "{path} must still fire on read");
+            assert_eq!(read.rule_id, "secretish-filename", "{path}");
+            assert_eq!(read.score, 2.8, "{path} read score");
+
+            let write = filter
+                .evaluate(&make_ctx(ToolCallType::FileWrite {
+                    path: path.into(),
+                    content_hash: String::new(),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(write.rule_id, "secretish-filename", "{path}");
+            assert_eq!(write.score, 3.5, "{path} write score");
+            assert!(
+                write.score + 0.5 > 3.0,
+                "{path}: rule score plus the +0.5 write baseline must exceed the \
+                 allow boundary — routing is `> allow_threshold`, so exactly 3.0 allows"
+            );
+        }
+    }
+
+    /// work/83 finding 1: a STRUCTURED credential filename is a different,
+    /// stronger class than an incidental credential-ish word, and it is priced
+    /// exactly once.
+    ///
+    /// The regression this pins: `path_match`'s weak `*secrets*` glob was
+    /// de-weighted 3.0 -> 1.5 AND a `-1.5` meta-rule subtracted again, so a
+    /// READ of `secrets.yaml` composed to 2.80 — and `route_decision` routes on
+    /// `score > allow_threshold`, so 2.80 ALLOWS. Nothing compensated: content
+    /// scanning never sees file bytes on a read, only syscall arguments.
+    #[tokio::test]
+    async fn structured_credential_filenames_outrank_the_weak_name_rule() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for path in [
+            "/p/deploy/secrets.yaml",
+            "/p/deploy/secrets.yml",
+            "/p/deploy/secrets.json",
+            "/p/config/credentials.json",
+            "/p/service-account-credentials.json",
+            "/p/gcp_credentials.json",
+        ] {
+            let read = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert_eq!(read.rule_id, "credential-file-shape", "{path}");
+            // A READ carries a 0.0 operation-risk baseline, so this rule alone
+            // has to clear the boundary — and `> 3.0` is the real bar.
+            assert!(read.score > 3.0, "{path}: read score {}", read.score);
+
+            let write = filter
+                .evaluate(&make_ctx(ToolCallType::FileWrite {
+                    path: path.into(),
+                    content_hash: String::new(),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(write.rule_id, "credential-file-shape", "{path}");
+            assert!(write.score > 3.0, "{path}: write score {}", write.score);
+        }
+
+        // Incidental names keep the weak rule and stay below the boundary on a
+        // read — `bin/with-secrets` is the recorded false positive and must not
+        // come back.
+        for path in ["/p/apps/web/bin/with-secrets", "/p/my-secrets.txt"] {
+            let read = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert_eq!(read.rule_id, "secretish-filename", "{path}");
+            assert!(read.score <= 3.0, "{path}: read score {}", read.score);
+        }
+    }
+
+    /// work/83 M8: `mkdir node_modules/cookies` (the npm package `cookies`, a
+    /// Koa/Next dependency) scored +4.0 and prompted. Generic browser names
+    /// need location evidence on a READ or a `mkdir`; distinctive ones still
+    /// fire anywhere.
+    #[tokio::test]
+    async fn generic_browser_names_need_location_evidence() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for path in [
+            "/p/node_modules/cookies",
+            "/p/src/wallet",
+            "/p/build/local state",
+        ] {
+            let result = filter
+                .evaluate(&make_ctx(ToolCallType::DirCreate { path: path.into() }))
+                .await
+                .unwrap();
+            assert!(
+                !result.matched || result.rule_id != "browser-session-data",
+                "{path} must not fire browser-session-data"
+            );
+        }
+
+        // work/83 finding 4: a freshly COPIED-OUT generic name has neither a
+        // profile path nor Chromium siblings yet, so requiring location
+        // evidence on a WRITE or DELETE silenced the whole copy-out chain —
+        // `is_sensitive_path` has never covered browser profile paths, so the
+        // READ half is already noise-suppressed at the supervisor.
+        for path in [
+            "/home/dan/Downloads/Cookies",
+            "/home/dan/Downloads/Web Data",
+            "/home/dan/wallet",
+        ] {
+            for call in [
+                ToolCallType::FileWrite {
+                    path: path.into(),
+                    content_hash: String::new(),
+                },
+                ToolCallType::FileDelete { path: path.into() },
+            ] {
+                let result = filter.evaluate(&make_ctx(call)).await.unwrap();
+                assert_eq!(result.rule_id, "browser-session-data", "{path}");
+                assert!(result.score >= 4.0, "{path}: score {}", result.score);
+            }
+            // The read half keeps the location requirement.
+            let read = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert!(
+                !read.matched || read.rule_id != "browser-session-data",
+                "{path}: a READ still needs location evidence"
+            );
+        }
+        // The dependency / generated-output carveout still holds on a write —
+        // npm unpacking `node_modules/koa/lib/cookies` must stay silent.
+        for path in ["/p/node_modules/koa/lib/cookies", "/p/dist/wallet"] {
+            let result = filter
+                .evaluate(&make_ctx(ToolCallType::FileWrite {
+                    path: path.into(),
+                    content_hash: String::new(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                !result.matched || result.rule_id != "browser-session-data",
+                "{path} must stay carved on a write"
+            );
+        }
+
+        // Distinctive names keep firing outside a profile — a `Login Data` or
+        // `key4.db` sitting in ~/Downloads is a copied credential store.
+        for path in [
+            "/home/dan/Downloads/Login Data",
+            "/home/dan/Downloads/key4.db",
+            "/home/dan/Downloads/logins.json",
+        ] {
+            let result = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert!(result.matched, "{path} must fire");
+            assert_eq!(result.rule_id, "browser-session-data", "{path}");
+        }
+    }
+
+    /// work/83 F2.1 fallout: anchoring `path_match`'s `*.pem` / `*.key` to the
+    /// basename removed the only rule that scored a backed-up private key.
+    /// `key-material-file` now strips one closed backup suffix, so the
+    /// coverage is restored here rather than by re-loosening the glob.
+    #[tokio::test]
+    async fn backed_up_key_material_is_still_key_material() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for path in [
+            "/p/certs/server.pem.bak",
+            "/p/certs/tls.key.old",
+            "/p/certs/server.pem~",
+            "/p/certs/store.p12.save",
+            "/p/keys/id_rsa.orig",
+        ] {
+            let read = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert!(read.matched, "{path} must still be key material");
+            assert_eq!(read.rule_id, "key-material-file", "{path}");
+            assert_eq!(read.score, 4.0, "{path}");
+        }
+        // The suffix list is closed: an ordinary compound source name whose
+        // last suffix is NOT a backup marker keeps scoring nothing, which is
+        // what stops this from re-opening the false positive the anchoring
+        // fixed.
+        for path in ["/p/src/i18n.key.ts", "/p/src/schema.pem.rs", "/p/notes.bak"] {
+            let read = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead { path: path.into() }))
+                .await
+                .unwrap();
+            assert!(
+                !read.matched || read.rule_id != "key-material-file",
+                "{path} must not be key material (got {})",
+                read.rule_id
+            );
+        }
+    }
+
+    /// A generic name recovers its score when the directory looks like a
+    /// copied-out Chromium profile (a sibling marker file is present).
+    #[tokio::test]
+    async fn generic_browser_name_fires_next_to_a_chromium_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cookies = dir.path().join("Cookies");
+        std::fs::write(&cookies, b"x").expect("write Cookies");
+
+        let filter = SensitivePathHeuristicFilter::new();
+        let call = |p: &std::path::Path| {
+            make_ctx(ToolCallType::FileRead {
+                path: p.to_string_lossy().into_owned(),
+            })
+        };
+
+        // No marker yet: not enough evidence.
+        let before = filter.evaluate(&call(&cookies)).await.unwrap();
+        assert!(
+            !before.matched || before.rule_id != "browser-session-data",
+            "a lone Cookies file is not enough evidence"
+        );
+
+        std::fs::write(dir.path().join("Login Data"), b"x").expect("write marker");
+        let after = filter.evaluate(&call(&cookies)).await.unwrap();
+        assert!(
+            after.matched,
+            "sibling Chromium marker must restore the rule"
+        );
+        assert_eq!(after.rule_id, "browser-session-data");
     }
 
     #[tokio::test]

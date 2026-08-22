@@ -227,6 +227,58 @@ dbus_message_inspection = true
 # Set a positive value in CI, where nobody is watching the warning.
 authority_lost_terminate_after_seconds = 0
 
+[supervisor.trust]
+# How far this session's project trust reaches. `${PROJECT_DIR}` in a profile's
+# routine_paths expands to the LAUNCH DIRECTORY only, so in a multi-worktree
+# layout the sibling worktrees of the repository you are working on get no
+# trust at all — measured 24.9% of calls prompting there against 0.32% under
+# the launch directory, and one `git worktree remove` producing 692 bulk-delete
+# prompts.
+#
+# Trust every git worktree of the launch repository. `git worktree list`
+# reports the main worktree too, so launching from a subdirectory also trusts
+# the repository root (a tool working in `repo/frontend/` stops prompting on
+# every read of `../package.json`). Resolved once, at session start, and never
+# re-read: a re-read would let the supervised tool widen its own trust with
+# `git worktree add`.
+#
+# git's worktree list is built from files inside the repository, which the
+# supervised tool can write, so a reported worktree is only trusted when it
+# also sits inside the directory the repository itself lives in, carries git's
+# own back-pointer to this repository, and is not a credential or personal-data
+# directory. A repository checked out directly into your home directory gets no
+# linked-worktree trust at all (its "enclosing directory" would be all of
+# $HOME) — declare additional_project_roots for that layout. Set this to false
+# if you want project trust to reach nothing but the launch directory.
+include_linked_worktrees = true
+# Extra project roots to trust, for layouts git cannot infer — a worktree of a
+# DIFFERENT repository parked alongside this one, or a non-git sibling
+# checkout. `${HOME}`, `${PROJECT_DIR}` and `~` expand as in routine_paths.
+# Every root is canonicalised, and `/`, your home directory and any ancestor of
+# it are refused. At most 32 roots are trusted per session.
+#
+# Trust here is project-derived, never literal: credential stores (~/.ssh,
+# ~/.aws, .npmrc, …) inside a trusted root still go to the security proxy.
+additional_project_roots = []
+# Make the workspace a wall instead of a trusted island. With this on, a file
+# read or write whose target is outside the workspace (the launch directory,
+# its linked git worktrees, and additional_project_roots above) is DENIED
+# rather than scored — including the read-only opens that
+# noise_reduction.ignore_read_only waves through today. Your other projects,
+# the rest of your home directory, mounted media: none of them are readable.
+#
+# What stays reachable, because the tool cannot run otherwise: system runtime
+# paths for READS only (/usr, /lib, /bin, /etc, …), grith's noise paths
+# (/proc, /sys, the terminal), and the paths the tool's own profile declares
+# as routine (~/.claude, ~/.nvm/versions/**, /tmp/<tool>-*, …).
+#
+# This only ever removes access. It cannot allow anything the proxy would
+# otherwise block — a read of /etc/shadow is still denied by the filters.
+# Filesystem only: network and process spawn are unaffected.
+#
+# Per session: `grith exec --workspace-only -- <tool>`.
+restrict_to_workspace = false
+
 [supervisor.platform]
 linux_mechanism = "ptrace"
 macos_mechanism = "endpoint-security"

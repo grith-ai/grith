@@ -3,7 +3,9 @@
 
 //! Shared SQLite row-to-record deserialization used by storage and query modules.
 
-use crate::types::{AuditRecord, FilterResultSummary, ProxyActionSummary, RecordType};
+use crate::types::{
+    AuditAnalyticsMetadata, AuditRecord, FilterResultSummary, ProxyActionSummary, RecordType,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::types::ValueRef;
 use std::collections::HashMap;
@@ -199,5 +201,11 @@ pub(crate) fn row_to_record(
             .flatten()
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(crate::types::LEGACY_HASH_VERSION),
+        analytics_metadata: row
+            .get::<_, Option<String>>("analytics_metadata")
+            .ok()
+            .flatten()
+            .map(|json| serde_json::from_str::<AuditAnalyticsMetadata>(&json))
+            .transpose()?,
     })
 }

@@ -79,6 +79,27 @@ pub struct ScopedAllowRequest {
     pub persist: bool,
 }
 
+/// A directory-scoped, operation-specific *refusal* requested by a reviewer.
+///
+/// The mirror image of [`ScopedAllowRequest`], and deliberately a separate
+/// type rather than a mode flag on that one: a struct that could mean either
+/// "allow this subtree" or "block this subtree" depending on a bool is one
+/// mis-defaulted field away from inverting a security decision.
+///
+/// Session-only, like every scoped rule today; there is no `persist` field
+/// because there is no persistence flow to opt into yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedDenyRequest {
+    /// Directory whose subtree should be blocked.
+    pub directory: String,
+    /// Block file reads and directory listings.
+    pub read: bool,
+    /// Block file writes, appends, and directory creation.
+    pub write: bool,
+    /// Block file deletion and rename removal from the directory.
+    pub delete: bool,
+}
+
 /// Structured action returned by an interactive permission reviewer.
 ///
 /// Existing actions continue to be stored as their legacy string values.
@@ -95,6 +116,9 @@ pub enum PermissionReviewAction {
     ApproveAndLearn,
     /// Allow the current request and add session-scoped directory rules.
     ScopedAllow(ScopedAllowRequest),
+    /// Deny the current request and add session-scoped directory refusals, so
+    /// every later call into that subtree is blocked without a prompt.
+    ScopedDeny(ScopedDenyRequest),
     /// Deny the request and terminate the supervised process.
     DenyAndTerminate,
 }
@@ -115,7 +139,7 @@ impl PermissionReviewAction {
             Self::Deny => "deny".to_string(),
             Self::ApproveAndLearn => "approve_and_learn".to_string(),
             Self::DenyAndTerminate => "deny_and_terminate".to_string(),
-            Self::ScopedAllow(_) => serde_json::to_string(self)
+            Self::ScopedAllow(_) | Self::ScopedDeny(_) => serde_json::to_string(self)
                 .expect("PermissionReviewAction serialization cannot fail"),
         }
     }
@@ -325,6 +349,27 @@ mod tests {
             PermissionReviewAction::from_storage_value(&stored),
             Some(action)
         );
+    }
+
+    #[test]
+    fn scoped_deny_round_trips_and_never_reads_as_approval() {
+        let action = PermissionReviewAction::ScopedDeny(ScopedDenyRequest {
+            directory: "/home/dev/.ssh/".to_string(),
+            read: true,
+            write: true,
+            delete: true,
+        });
+
+        let stored = action.to_storage_value();
+        assert!(stored.starts_with('{'));
+        assert_eq!(
+            PermissionReviewAction::from_storage_value(&stored),
+            Some(action.clone())
+        );
+        // The one property every caller depends on: a block is a denial. The
+        // supervisor routes on `is_approved`, so a `true` here would let a
+        // refusal resume the syscall it was installed to stop.
+        assert!(!action.is_approved());
     }
 
     #[test]

@@ -4,10 +4,87 @@
 //! Core audit data types shared across the crate.
 
 use chrono::{DateTime, Utc};
+use grith_analytics::contract::{
+    Category, CompletenessTier, DestinationKind, RecordClass, ResolutionStatus, SecurityEventType,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Configuration facts that cannot be reconstructed after a policy/profile
+/// changes. Producers attach this envelope while handling the event; the
+/// analytics adapter never mines free-form arguments or current config files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditConfigVersion {
+    pub profile_id: String,
+    pub profile_version: String,
+    pub config_hash: String,
+    pub policy_version: String,
+    pub auto_allow_threshold_micros: i64,
+    pub auto_deny_threshold_micros: i64,
+    pub queue_policy: String,
+    pub team_default_config_version: String,
+}
+
+/// Exact pricing provenance captured with an LLM accounting event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLlmPricing {
+    pub cost_micros: u64,
+    pub price_source: String,
+    pub pricing_version: String,
+}
+
+/// Privacy-safe destination identity. Raw URLs, hosts, ports and Unix socket
+/// paths are deliberately not representable in the analytics envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditDestinationMetadata {
+    pub kind: DestinationKind,
+    pub destination_hmac: String,
+    pub hmac_key_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_display_label: Option<String>,
+}
+
+/// Mutable security-workflow facts captured separately from the immutable
+/// initial policy verdict used by headline analytics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSecurityMetadata {
+    pub event_type: SecurityEventType,
+    pub event_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<ResolutionStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement_outcome_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_count: Option<u64>,
+}
+
+/// Prospective, operand-free analytics metadata persisted with an audit row.
+///
+/// Rows that predate this envelope remain valid audit evidence, but strict
+/// cloud producers must reject them rather than inventing historic profile,
+/// configuration, pricing or destination facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditAnalyticsMetadata {
+    pub metadata_version: u16,
+    pub completeness: CompletenessTier,
+    pub record_class: RecordClass,
+    pub category: Category,
+    pub config: AuditConfigVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_set_version: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_pricing: Option<AuditLlmPricing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<AuditDestinationMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<AuditSecurityMetadata>,
+}
 
 /// A complete audit record for a single proxy evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +253,9 @@ pub struct AuditRecord {
     ///   action and `prev_hash`; every other field could be rewritten
     ///   while verification stayed green.
     /// * `2` — [`AuditRecord::compute_record_hash_v2`], covering every
-    ///   persisted evidence field.
+    ///   persisted evidence field that existed before analytics-v2.
+    /// * `3` — v2's frozen canonical digest plus every field in the
+    ///   prospective analytics metadata envelope.
     ///
     /// Rows written before this field existed deserialize (and read back
     /// from a NULL column) as `1`, so archived history keeps verifying
@@ -184,6 +263,11 @@ pub struct AuditRecord {
     /// [`CURRENT_HASH_VERSION`].
     #[serde(default = "default_hash_version")]
     pub hash_version: u8,
+
+    /// Safe analytics dimensions captured at event time. Kept optional so
+    /// v1/v2 databases and cold archives continue to deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analytics_metadata: Option<AuditAnalyticsMetadata>,
 }
 
 fn default_source() -> String {
@@ -191,13 +275,80 @@ fn default_source() -> String {
 }
 
 /// Canonical form used for records written by this build.
-pub const CURRENT_HASH_VERSION: u8 = 2;
+pub const CURRENT_HASH_VERSION: u8 = 3;
+
+/// Frozen full-record canonical form used before analytics metadata existed.
+pub const HASH_VERSION_V2: u8 = 2;
 
 /// Canonical form assumed for rows that predate `hash_version`.
 pub const LEGACY_HASH_VERSION: u8 = 1;
 
 fn default_hash_version() -> u8 {
     LEGACY_HASH_VERSION
+}
+
+const fn completeness_name(value: CompletenessTier) -> &'static str {
+    match value {
+        CompletenessTier::Decisions => "decisions",
+        CompletenessTier::Spawns => "spawns",
+        CompletenessTier::Io => "io",
+        CompletenessTier::All => "all",
+    }
+}
+
+const fn record_class_name(value: RecordClass) -> &'static str {
+    match value {
+        RecordClass::Decision => "decision",
+        RecordClass::RoutineSpawn => "routine_spawn",
+        RecordClass::RoutineIo => "routine_io",
+        RecordClass::Noise => "noise",
+        RecordClass::LlmUsage => "llm_usage",
+        RecordClass::System => "system",
+    }
+}
+
+const fn category_name(value: Category) -> &'static str {
+    match value {
+        Category::FileRead => "file_read",
+        Category::FileMutation => "file_mutation",
+        Category::Process => "process",
+        Category::NetworkEgress => "network_egress",
+        Category::NetworkListen => "network_listen",
+        Category::CrossProcess => "cross_process",
+        Category::Namespace => "namespace",
+        Category::Llm => "llm",
+        Category::System => "system",
+        Category::Other => "other",
+    }
+}
+
+const fn destination_kind_name(value: DestinationKind) -> &'static str {
+    match value {
+        DestinationKind::Domain => "domain",
+        DestinationKind::HostPort => "host_port",
+        DestinationKind::UrlOrigin => "url_origin",
+        DestinationKind::UnixSocketClass => "unix_socket_class",
+        DestinationKind::Other => "other",
+    }
+}
+
+const fn security_event_type_name(value: SecurityEventType) -> &'static str {
+    match value {
+        SecurityEventType::Queue => "queue",
+        SecurityEventType::Deny => "deny",
+        SecurityEventType::Canary => "canary",
+        SecurityEventType::Gap => "gap",
+    }
+}
+
+const fn resolution_status_name(value: ResolutionStatus) -> &'static str {
+    match value {
+        ResolutionStatus::Pending => "pending",
+        ResolutionStatus::Approved => "approved",
+        ResolutionStatus::Denied => "denied",
+        ResolutionStatus::Expired => "expired",
+        ResolutionStatus::Escalated => "escalated",
+    }
 }
 
 /// Classification of an audit row by what it carries.
@@ -590,6 +741,7 @@ impl AuditRecord {
             clamp_profile_entry: None,
             record_type: RecordType::Full,
             hash_version: CURRENT_HASH_VERSION,
+            analytics_metadata: None,
         }
     }
 
@@ -650,6 +802,7 @@ impl AuditRecord {
             clamp_profile_entry: None,
             record_type: RecordType::Compact,
             hash_version: CURRENT_HASH_VERSION,
+            analytics_metadata: None,
         }
     }
 
@@ -712,7 +865,8 @@ impl AuditRecord {
     pub fn compute_record_hash(&self) -> String {
         match self.hash_version {
             LEGACY_HASH_VERSION => self.compute_record_hash_v1(),
-            CURRENT_HASH_VERSION => self.compute_record_hash_v2(),
+            HASH_VERSION_V2 => self.compute_record_hash_v2(),
+            CURRENT_HASH_VERSION => self.compute_record_hash_v3(),
             other => format!("UNSUPPORTED_HASH_VERSION:{other}"),
         }
     }
@@ -845,6 +999,118 @@ impl AuditRecord {
         c.text("hash_version", &self.hash_version.to_string());
 
         sha256_hex(c.finish().as_bytes())
+    }
+
+    /// Analytics-aware canonical form.
+    ///
+    /// The first value is the digest of the byte-for-byte frozen v2 encoder
+    /// over this record. The metadata is then encoded field-by-field with the
+    /// same length-prefixed primitive; the hash never depends on JSON object
+    /// ordering or serde's incidental formatting.
+    fn compute_record_hash_v3(&self) -> String {
+        let mut c = Canonical::new("grith-audit-record-v3");
+        c.text("v2_canonical_digest", &self.compute_record_hash_v2());
+        match &self.analytics_metadata {
+            None => c.absent("analytics_metadata"),
+            Some(metadata) => {
+                c.text("analytics_metadata.present", "1");
+                c.text("metadata_version", &metadata.metadata_version.to_string());
+                c.text("completeness", completeness_name(metadata.completeness));
+                c.text("record_class", record_class_name(metadata.record_class));
+                c.text("category", category_name(metadata.category));
+                c.text("config.profile_id", &metadata.config.profile_id);
+                c.text("config.profile_version", &metadata.config.profile_version);
+                c.text("config.config_hash", &metadata.config.config_hash);
+                c.text("config.policy_version", &metadata.config.policy_version);
+                c.text(
+                    "config.auto_allow_threshold_micros",
+                    &metadata.config.auto_allow_threshold_micros.to_string(),
+                );
+                c.text(
+                    "config.auto_deny_threshold_micros",
+                    &metadata.config.auto_deny_threshold_micros.to_string(),
+                );
+                c.text("config.queue_policy", &metadata.config.queue_policy);
+                c.text(
+                    "config.team_default_config_version",
+                    &metadata.config.team_default_config_version,
+                );
+                c.opt_text(
+                    "filter_set_version",
+                    metadata
+                        .filter_set_version
+                        .map(|v| v.to_string())
+                        .as_deref(),
+                );
+                match &metadata.llm_pricing {
+                    None => c.absent("llm_pricing"),
+                    Some(pricing) => {
+                        c.text("llm_pricing.present", "1");
+                        c.text("llm_pricing.cost_micros", &pricing.cost_micros.to_string());
+                        c.text("llm_pricing.price_source", &pricing.price_source);
+                        c.text("llm_pricing.pricing_version", &pricing.pricing_version);
+                    }
+                }
+                match &metadata.destination {
+                    None => c.absent("destination"),
+                    Some(destination) => {
+                        c.text("destination.present", "1");
+                        c.text("destination.kind", destination_kind_name(destination.kind));
+                        c.text("destination.hmac", &destination.destination_hmac);
+                        c.text(
+                            "destination.key_version",
+                            &destination.hmac_key_version.to_string(),
+                        );
+                        c.opt_text(
+                            "destination.approved_display_label",
+                            destination.approved_display_label.as_deref(),
+                        );
+                    }
+                }
+                match &metadata.security {
+                    None => c.absent("security"),
+                    Some(security) => {
+                        c.text("security.present", "1");
+                        c.text(
+                            "security.event_type",
+                            security_event_type_name(security.event_type),
+                        );
+                        c.text(
+                            "security.event_revision",
+                            &security.event_revision.to_string(),
+                        );
+                        c.opt_text(
+                            "security.resolution_status",
+                            security.resolution_status.map(resolution_status_name),
+                        );
+                        c.opt_text(
+                            "security.resolved_at",
+                            security.resolved_at.map(|v| v.to_rfc3339()).as_deref(),
+                        );
+                        c.opt_text(
+                            "security.resolution_code",
+                            security.resolution_code.as_deref(),
+                        );
+                        c.opt_text(
+                            "security.enforcement_outcome_code",
+                            security.enforcement_outcome_code.as_deref(),
+                        );
+                        c.opt_text(
+                            "security.gap_count",
+                            security.gap_count.map(|v| v.to_string()).as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+        sha256_hex(c.finish().as_bytes())
+    }
+
+    /// Attach the complete prospective analytics context before persistence.
+    #[must_use]
+    pub fn with_analytics_metadata(mut self, metadata: AuditAnalyticsMetadata) -> Self {
+        self.analytics_metadata = Some(metadata);
+        self
     }
 
     /// Set the correlation ID linking this event to a source→sink chain.

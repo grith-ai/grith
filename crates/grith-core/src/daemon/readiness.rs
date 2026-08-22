@@ -486,7 +486,20 @@ pub(crate) fn restart_identified_daemon_with_probe(port: u16, probe: PortProbe) 
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
-        if wait_for_port_release(port, STOP_TIMEOUT) {
+        // Port release is NOT process exit. Graceful shutdown closes the
+        // listener first and only releases the audit writer lock at process
+        // exit, after connection drain and the final audit sync flush — so a
+        // daemon that wedges mid-drain frees the port immediately and then
+        // holds the lock indefinitely. Waiting on the port alone is how
+        // `restart` came to report "Stopped the running daemon" while the old
+        // process was still alive, leaving the successor to time out on the
+        // lock and the operator with a daemon that "did not become ready".
+        // The successor must observe the PROCESS gone before we claim a stop.
+        //
+        // The exit wait outlasts the daemon's own SHUTDOWN_DRAIN_BUDGET (8s),
+        // so a healthy drain always completes inside it; only a genuinely
+        // wedged process meets the SIGKILL below.
+        if wait_for_port_release(port, STOP_TIMEOUT) && wait_for_pid_exit(pid, DRAIN_EXIT_WAIT) {
             let _ = super::pid::remove_dashboard_pid();
             return Ok(());
         }
@@ -494,13 +507,16 @@ pub(crate) fn restart_identified_daemon_with_probe(port: u16, probe: PortProbe) 
         tracing::warn!(
             event = "daemon_restart_escalated_sigkill",
             pid,
-            "daemon did not release the port after SIGTERM; escalating to SIGKILL"
+            "daemon did not exit after SIGTERM; escalating to SIGKILL"
         );
         // SAFETY: same positively identified PID as above.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
-        if wait_for_port_release(port, STOP_TIMEOUT) {
+        // SIGKILL cannot be blocked or drained around: the process is gone as
+        // soon as the kernel reaps it, and the kernel releases the writer
+        // lock with it. The short wait here is only for the reap.
+        if wait_for_port_release(port, STOP_TIMEOUT) && wait_for_pid_exit(pid, STOP_TIMEOUT) {
             let _ = super::pid::remove_dashboard_pid();
             return Ok(());
         }
@@ -515,6 +531,40 @@ pub(crate) fn restart_identified_daemon_with_probe(port: u16, probe: PortProbe) 
         // let the caller tell the user to restart explicitly.
         let _ = pid;
         Err(())
+    }
+}
+
+/// How long a restart lets the old daemon drain after its port frees before
+/// concluding it is wedged. Outlasts the daemon's own 8-second shutdown drain
+/// budget so a healthy exit is never SIGKILLed mid-drain.
+const DRAIN_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll until the process is gone, or `timeout` passes.
+///
+/// `kill(pid, 0)` distinguishes "exists" (0), "exists but unsignallable"
+/// (EPERM — still alive) and "gone" (ESRCH). Non-Unix builds cannot check, so
+/// they report the process gone and rely on the port probe alone, which
+/// matches this module's pre-existing behaviour there.
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    #[cfg(unix)]
+    {
+        let alive = |pid: u32| {
+            let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        };
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(READY_POLL);
+        }
+        !alive(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, timeout);
+        true
     }
 }
 
@@ -535,6 +585,34 @@ pub(crate) fn wait_for_port_release(port: u16, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The restart wedge this pins: port release is not process exit, so the
+    /// exit wait must actually track the PROCESS — alive while it runs, done
+    /// when it is reaped.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_pid_exit_tracks_the_process_not_the_clock() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        assert!(
+            !wait_for_pid_exit(pid, Duration::from_millis(300)),
+            "a live process must not be reported exited"
+        );
+
+        child.kill().expect("kill sleep");
+        // Reap it so the pid does not linger as a zombie: kill(pid, 0)
+        // succeeds on a zombie, which is correct (the writer lock is already
+        // released) but would make this assertion racy.
+        let _ = child.wait();
+        assert!(
+            wait_for_pid_exit(pid, Duration::from_secs(2)),
+            "a dead process must be reported exited"
+        );
+    }
 
     #[test]
     fn every_variant_names_a_remedy() {

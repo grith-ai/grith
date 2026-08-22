@@ -3,6 +3,7 @@
 
 //! Daemon IPC client for thin grith sessions.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -304,6 +305,30 @@ impl DaemonClient {
             self.http
                 .post(format!("{}/api/ipc/audit/ingest", self.base_url))
                 .json(&serde_json::json!({ "record": record })),
+        )
+        .await
+    }
+
+    /// Send a bounded audit batch to the daemon-owned writer. The server
+    /// commits the entire vector in one chain transaction; callers must split
+    /// larger collections at 256 records.
+    pub async fn ingest_audit_batch(
+        &self,
+        records: &[AuditRecord],
+    ) -> Result<(), DaemonClientError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if records.len() > grith_audit::analytics::MAX_AUDIT_IPC_BATCH {
+            return Err(DaemonClientError::Parse(format!(
+                "audit batch exceeds maximum of {} records",
+                grith_audit::analytics::MAX_AUDIT_IPC_BATCH
+            )));
+        }
+        self.request_empty(
+            self.http
+                .post(format!("{}/api/ipc/audit/ingest-batch", self.base_url))
+                .json(&serde_json::json!({ "records": records })),
         )
         .await
     }
@@ -859,23 +884,165 @@ fn parse_evaluate_response(body: &serde_json::Value) -> Result<ProxyDecision, Da
 }
 
 /// Remote audit sink for daemon-owned audit storage.
+///
+/// [`AuditSink::log`](grith_supervisor::AuditSink::log) buffers into a bounded
+/// queue drained by a background flusher task that POSTs batches through
+/// [`DaemonClient::ingest_audit_batch`] — at routine/all completeness a
+/// per-record awaited POST from the supervisor event loop would cost one HTTP
+/// round-trip per intercepted syscall observation. Security-critical records
+/// keep per-record durability via
+/// [`AuditSink::log_required`](grith_supervisor::AuditSink::log_required).
 pub struct RemoteAuditSink {
     client: DaemonClient,
+    tx: tokio::sync::mpsc::Sender<RemoteSinkMessage>,
+    /// Cumulative records dropped on a full buffer or a failed batch send,
+    /// mirroring the local sink's overflow accounting (surfaced in the
+    /// session-end summary via `dropped_count`).
+    dropped: Arc<AtomicU64>,
 }
 
+enum RemoteSinkMessage {
+    Record(Box<AuditRecord>),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Records buffered between the supervisor loop and the flusher task.
+const REMOTE_SINK_BUFFER: usize = 4096;
+
+/// Time the flusher waits to fill a batch before sending what it has.
+const REMOTE_SINK_LINGER: Duration = Duration::from_millis(50);
+
 impl RemoteAuditSink {
+    /// Must be called from within a tokio runtime (spawns the flusher task).
     pub fn new(client: DaemonClient) -> Self {
-        Self { client }
+        let (tx, rx) = tokio::sync::mpsc::channel(REMOTE_SINK_BUFFER);
+        let dropped = Arc::new(AtomicU64::new(0));
+        tokio::spawn(remote_sink_flusher(
+            rx,
+            client.clone(),
+            Arc::clone(&dropped),
+        ));
+        Self {
+            client,
+            tx,
+            dropped,
+        }
     }
+}
+
+/// Drain the sink's buffer, folding records into batches of at most
+/// [`grith_audit::analytics::MAX_AUDIT_IPC_BATCH`] with a short linger, and
+/// POST each batch once with a single retry. Exits when every sender has
+/// dropped, sending any partial batch first.
+async fn remote_sink_flusher(
+    mut rx: tokio::sync::mpsc::Receiver<RemoteSinkMessage>,
+    client: DaemonClient,
+    dropped: Arc<AtomicU64>,
+) {
+    let max_batch = grith_audit::analytics::MAX_AUDIT_IPC_BATCH;
+    let mut batch: Vec<AuditRecord> = Vec::with_capacity(max_batch);
+    while let Some(message) = rx.recv().await {
+        // Acks for flush requests observed this round; sent only after the
+        // batch (everything enqueued before the request) has been handed off.
+        let mut acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        match message {
+            RemoteSinkMessage::Record(record) => batch.push(*record),
+            RemoteSinkMessage::Flush(ack) => {
+                let _ = ack.send(());
+                continue;
+            }
+        }
+        let deadline = Instant::now() + REMOTE_SINK_LINGER;
+        while batch.len() < max_batch {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(RemoteSinkMessage::Record(record))) => batch.push(*record),
+                Ok(Some(RemoteSinkMessage::Flush(ack))) => {
+                    acks.push(ack);
+                    break;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        send_remote_batch(&client, &mut batch, &dropped).await;
+        for ack in acks {
+            let _ = ack.send(());
+        }
+    }
+    send_remote_batch(&client, &mut batch, &dropped).await;
+}
+
+async fn send_remote_batch(
+    client: &DaemonClient,
+    batch: &mut Vec<AuditRecord>,
+    dropped: &AtomicU64,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let first_error = match client.ingest_audit_batch(batch).await {
+        Ok(()) => {
+            batch.clear();
+            return;
+        }
+        Err(error) => error,
+    };
+    if let Err(retry_error) = client.ingest_audit_batch(batch).await {
+        dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        tracing::error!(
+            error = %retry_error,
+            first_error = %first_error,
+            count = batch.len(),
+            "remote audit batch failed after retry; records dropped"
+        );
+    }
+    batch.clear();
 }
 
 #[async_trait]
 impl grith_supervisor::AuditSink for RemoteAuditSink {
     async fn log(&self, record: AuditRecord) -> std::result::Result<(), String> {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self
+            .tx
+            .try_send(RemoteSinkMessage::Record(Box::new(record)))
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                Err(format!(
+                    "remote audit buffer full ({REMOTE_SINK_BUFFER} records); \
+                     record dropped ({count} dropped total)"
+                ))
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Err("remote audit flusher task exited; record dropped".to_string())
+            }
+        }
+    }
+
+    async fn log_required(&self, record: AuditRecord) -> std::result::Result<(), String> {
+        // Required records keep per-record durability: committed to the daemon
+        // before the caller proceeds, never behind the lossy batch buffer.
         self.client
             .ingest_audit(&record)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    async fn flush(&self) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(RemoteSinkMessage::Flush(ack_tx)).await.is_ok() {
+            let _ = ack_rx.await;
+        }
     }
 }
 

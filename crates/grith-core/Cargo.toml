@@ -20,6 +20,7 @@ grith-cli = { path = "../grith-cli" }
 grith-server = { path = "../grith-server" }
 grith-llm = { path = "../grith-llm" }
 grith-audit = { path = "../grith-audit" }
+grith-analytics = { path = "../grith-analytics" }
 grith-proxy = { path = "../grith-proxy" }
 grith-digest = { path = "../grith-digest" }
 grith-supervisor = { path = "../grith-supervisor" }

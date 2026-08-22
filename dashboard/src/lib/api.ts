@@ -7,7 +7,6 @@
  */
 
 import type {
-  AnalyticsSummaryResponse,
   AuditExportFormat,
   AuditListResponse,
   AuditQuery,
@@ -23,6 +22,8 @@ import type {
   HealthResponse,
   InventoryResponse,
   ListenerRewritesResponse,
+  LocalFreeAnalyticsResponse,
+  LocalProAnalyticsResponse,
   NotificationEvent,
   Policy,
   PolicyListResponse,
@@ -96,6 +97,15 @@ export class ApiError extends Error {
 
   get isFeatureGated(): boolean {
     return this.code === "FEATURE_GATED";
+  }
+
+  /**
+   * True when analytics cannot be served because the process that owns the
+   * audit database predates the local analytics projection (503 from
+   * /api/analytics/v2/*). Restarting the daemon resolves it.
+   */
+  get isAnalyticsUnavailable(): boolean {
+    return this.code === "ANALYTICS_UNAVAILABLE";
   }
 
   /** True when the request was rejected by the dashboard CSRF / token guard. */
@@ -500,11 +510,25 @@ export function rotateCanary(
 }
 
 // ---------------------------------------------------------------------------
-// Analytics (Pro)
+// Analytics v2 — explicit tiered contracts backed by the local projection
 // ---------------------------------------------------------------------------
 
-export function getAnalyticsSummary(): Promise<AnalyticsSummaryResponse> {
-  return request<AnalyticsSummaryResponse>("/api/analytics/summary");
+/**
+ * The Free analytics contract: 7-day decision summary, chain health, recent
+ * queue/deny events, freshness. A first-class server response — never a
+ * client-side mask over Pro data.
+ */
+export function getAnalyticsV2Free(): Promise<LocalFreeAnalyticsResponse> {
+  return request<LocalFreeAnalyticsResponse>("/api/analytics/v2/free");
+}
+
+/**
+ * The Pro analytics contract: 30/90-day rollup rows for every family plus
+ * security events. Feature-gated server-side; call only when the Free
+ * response reports `pro_available`.
+ */
+export function getAnalyticsV2Pro(): Promise<LocalProAnalyticsResponse> {
+  return request<LocalProAnalyticsResponse>("/api/analytics/v2/pro");
 }
 
 // ---------------------------------------------------------------------------

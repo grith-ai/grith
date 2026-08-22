@@ -8,6 +8,108 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.0] - 2026-08-22
+
+### Added
+
+- **Team analytics, rebuilt end to end.** grith now keeps a privacy-preserving
+  analytics projection alongside the local audit log: hourly/daily rollups of
+  decisions, scores, filters, sessions, model usage and cost — never commands,
+  file paths, prompts or file contents. The local dashboard gained a tiered
+  Analytics page built on it, and paid plans sync the same aggregates to the
+  team dashboard at grith.ai every 30 seconds, per registered device, with
+  byte-exact retry and acknowledgement tracking. Cloud sync is part of the
+  paid plan and turns on automatically once you are signed in; manage it with
+  the new `grith analytics status | enable | disable` commands, and turn it
+  off any time. Cloud coverage is strictly prospective: nothing recorded
+  before your consent is ever uploaded, and each machine registers as a named
+  device you can revoke from the team dashboard.
+- **`grith audit rebuild-analytics`** rebuilds the local analytics projection
+  from the audit database and cold archives.
+
+### Changed
+
+- **The raw audit-record cloud sync is retired.** Earlier versions uploaded
+  every synced audit record to grith.ai; the analytics rollups above replace
+  it entirely, and the server route is gone. `grith pro sync` still pulls
+  team policies, configs and provider keys on demand — it just no longer
+  uploads audit records (and the online dashboard no longer shows a raw
+  "audit log"; it shows Security events and rollup analytics instead).
+  Older grith versions keep retrying the removed route harmlessly, but
+  their local audit retention waits on acknowledgements that will never
+  come — update to this version to resume normal pruning.
+
+### Previously unreleased (0.2.5 follow-ups)
+
+### Fixed
+
+- **A secret-shaped token in a command line no longer re-scores every later
+  syscall from that process.** Supervisor calls carry the calling process's
+  argv for attribution, and the secret scanner scanned it on every call —
+  so one token in one command line became a permanent +3.5 rider on that
+  process's file and socket operations, already priced at its own spawn.
+  Under containment the rider pushed an ordinary session-bus connect to 6.0
+  and prompted. The scanner now strips the attribution argv before
+  scanning; a spawn's own argv, and everything else in the call, is scored
+  exactly as before.
+
+### Added
+
+- **Headless-browser test runs stop prompting for the browser's own
+  scratch.** Spinning up Chrome to test a web app answered 57 prompts for
+  `/dev/shm/.com.google.Chrome.*` shared-memory segments and the `/tmp`
+  singleton dirs — random-named files the browser creates on every page
+  load. The Chromium-family templates join the toolchain scratch prefixes:
+  file I/O only; the browser spawn, its egress, and its D-Bus traffic stay
+  scored.
+
+- **Read-only D-Bus probes stop prompting.** The same run prompted for
+  Chrome asking the bluez object tree what Bluetooth adapters exist, asking
+  the notification server what it supports, and asking whether the
+  screensaver is active. Those cannot make a peer act and are now curated:
+  `ObjectManager.GetManagedObjects`, `Notifications.GetCapabilities` /
+  `GetServerInformation`, `ScreenSaver.GetActive`. What still prompts is
+  deliberate: `Notify` (a supervised tool posting notifications could spoof
+  a grith prompt), `CloseNotification` (or dismiss one), `Inhibit`, and
+  everything on `org.freedesktop.systemd1` — including read-only members,
+  because that exclusion is wholesale and `StartTransientUnit` is the
+  supervision escape itself. The desktop portal gains a per-interface carve
+  for the same reason: `portal.Settings` reads (the theme query every GTK,
+  Electron and Chromium process makes) and `portal.Secret.RetrieveSecret`
+  (the portal spelling of the already-curated Secret Service) pass, while
+  `Flatpak.Spawn` and `OpenURI` — the portal members that run things —
+  still escalate. `gio open <url>` — how a supervised tool hands a link to
+  your browser — stops prompting for gvfs's read-only mount queries
+  (`MountTracker.ListMountableInfo`/`LookupMount`, matched by interface
+  because gvfsd answers on a unique bus name) while `MountLocation` and the
+  `StartServiceByName` bus activation it leads to still ask, correctly:
+  launching an unsupervised URL handler is worth one question.
+
+- **Approving a docker command now covers its whole family for the session.**
+  One measured session answered 14 prompts for the same
+  `docker compose exec -T web php -r '…'` differing only in the PHP payload,
+  and two more for `logs --tail=8` vs `--tail=25` — the approval stuck to
+  the exact argv, and agent-generated argv never repeats exactly. Approvals
+  for a curated set of docker shapes now stick to the command's *identity*
+  instead: an in-container `exec` is keyed on the service and the flags that
+  change what the payload may do (`--user`, `--privileged`) with the payload
+  itself covered; read-only verbs (`ps`, `logs`, …) ignore display flags;
+  compose lifecycle verbs (`up`, `restart`, …) ignore orchestration flags.
+  The prompt says what an approval will cover before you make it.
+
+  The curation errs closed: an unrecognised flag, verb, or binary falls back
+  to exact-argv matching — `docker run` in particular is never family-keyed,
+  because its flags (mounts, privilege) ARE its authority. A different
+  compose file, project, daemon, user, or service is a different family.
+
+- **`mktemp` scratch files no longer prompt.** `/tmp/tmp.*` — mktemp's
+  default template, which agent-generated shell uses constantly — joins the
+  toolchain scratch prefixes in the default profile. One session answered 28
+  prompts for these. Trust here grants file I/O only; anything staged there
+  is still scored at spawn and at egress.
+
 ### Changed
 
 - **D-Bus access is now decided per method call, not per connection.** Every
@@ -50,6 +152,38 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
   exactly.
 
 ### Added
+
+- **Block a directory from the permission prompt.** Every action on the
+  prompt widened access - approve, always-allow, scope a directory - so an
+  operator watching a tool walk somewhere it should not go had one option
+  per call, and the prompt came back on the next file. `[b] Block dir...`
+  opens the scope editor pointing the other way: pick a directory and the
+  operations to refuse, and every later call into that subtree is denied
+  for the rest of the session without asking again. `ctrl-b` switches an
+  open editor between allowing and blocking.
+
+  Blocking is the safe direction, so it accepts directories that granting
+  refuses - your home directory, `~/.ssh` - and refuses the ones granting
+  never needed to think about: `/usr`, `/lib`, `/etc` and the other trees
+  the supervised tool cannot start without. Blocking those does not protect
+  anything, it just ends the session at the next library load, so the
+  editor says so instead of letting you do it.
+
+- **`grith exec --workspace-only` fences a session to its project.** File
+  reads and writes outside the workspace are denied rather than scored -
+  including the read-only opens `[supervisor.noise_reduction]
+  ignore_read_only` waves through today. The workspace is the directory you
+  launched from, its linked git worktrees, and anything in
+  `[supervisor.trust] additional_project_roots`; your other projects, the
+  rest of your home directory and mounted media are not in it.
+
+  System runtime paths stay readable and the paths your tool's profile
+  declares routine keep working, or the tool could not run at all. The mode
+  only ever removes access - it cannot allow anything the filters would
+  have blocked, so a read of `/etc/shadow` is still denied. Also available
+  as `[supervisor.trust] restrict_to_workspace`; the flag turns it on for
+  one session and there is no flag to turn it off, so a configured boundary
+  cannot be argued away on the command line.
 
 - **`grith exec` now tells you when a new version is out.** The update
   prompt only ever ran on the REPL and `grith run`, because it reads a

@@ -195,7 +195,32 @@ pub async fn run_agent_loop(
                 response.usage.prompt_tokens,
                 response.usage.completion_tokens,
                 cost_usd,
-            );
+            )
+            .with_analytics_metadata(grith_audit::AuditAnalyticsMetadata {
+                metadata_version: 1,
+                completeness: grith_analytics::contract::CompletenessTier::Decisions,
+                record_class: grith_analytics::contract::RecordClass::LlmUsage,
+                category: grith_analytics::contract::Category::Llm,
+                config: grith_audit::AuditConfigVersion {
+                    profile_id: "agent".into(),
+                    profile_version: "agent-v1".into(),
+                    config_hash: grith_audit::types::sha256_hex(b"grith-agent-llm-v1"),
+                    policy_version: "llm-accounting-v1".into(),
+                    auto_allow_threshold_micros: 0,
+                    auto_deny_threshold_micros: 0,
+                    queue_policy: "not-applicable".into(),
+                    team_default_config_version: "standalone-local-v1".into(),
+                },
+                filter_set_version: None,
+                llm_pricing: Some(grith_audit::AuditLlmPricing {
+                    cost_micros: grith_analytics::normalize::cost_usd_to_micros(cost_usd)
+                        .unwrap_or_default(),
+                    price_source: "grith-llm-static-table".into(),
+                    pricing_version: env!("CARGO_PKG_VERSION").into(),
+                }),
+                destination: None,
+                security: None,
+            });
             // B12 #78: route the cost record to the audit owner when this
             // process is a Reader instead of dropping it against a read-only
             // handle. Unlike an enforcement record this is Allow-only cost

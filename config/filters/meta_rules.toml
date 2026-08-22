@@ -67,3 +67,12 @@ metadata_flag = "exfil_shape"
 [[meta_rules.conditions]]
 filter = "taint"
 matched = true
+
+# work/83 finding 1: the two `*-filename-single-signal` meta-rules that used to
+# live here are gone. They subtracted 1.5 from a composite that had ALREADY been
+# de-weighted by 1.5 in paths.toml, and the two subtractions composed: a READ of
+# `/proj/deploy/secrets.yaml` landed on 2.80, which `route_decision` ALLOWS
+# (it routes on `score > allow_threshold`). The duplicated filename evidence is
+# now removed at the source — the weak `*credentials*` / `*secrets*` path-match
+# globs are deleted and `sensitive_path` prices a credential filename exactly
+# once — so there is nothing left to collapse.

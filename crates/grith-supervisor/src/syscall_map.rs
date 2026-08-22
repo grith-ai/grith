@@ -430,6 +430,95 @@ pub fn is_credential_store_path(path: &str) -> bool {
     is_cross_process_secret_proc_path(path)
 }
 
+/// High-value secrets that live INSIDE a project tree by design, and that
+/// project-derived trust must therefore not short-circuit.
+///
+/// [`is_credential_store_path`] is the set that must never be covered no
+/// matter where a session was launched; this is the small extension work/80
+/// left out and the work/83 review measured a cost for. Every entry is a file
+/// whose CONTENT is the secret, whose name is not chosen by chance, and which
+/// the proxy already scores well past the queue threshold on a read:
+///
+/// | path | proxy composite | rules |
+/// |---|---:|---|
+/// | `<root>/config/master.key` | 8.00 | `path-match:key-files` + `key-material-file` |
+/// | `<root>/.env`, `<root>/.env.local` | 6.00 | `path-match:env-file` + `env-file-heuristic` |
+/// | `<root>/terraform.tfstate` | 4.00 | `path-match:terraform-state` |
+/// | `<root>/certs/client.p12` | 4.00 | `key-material-file` |
+///
+/// `.env` additionally restores the taint-superset invariant (research doc
+/// §5.1 #4) that work/80 used to justify adding `.netrc`/`.npmrc`/`id_rsa` to
+/// the store core: `.env` is the FIRST entry in the taint filter's sensitive-
+/// source list, so a read that never reaches the proxy registers no taint and
+/// the later `curl -d @.env` cannot be scored as exfiltration. Leaving it out
+/// while adding the other taint sources was an inconsistency, not a decision.
+///
+/// **Deliberately NOT here**, with the measurement that decided it — a read
+/// of one of these under project trust stays short-circuited:
+///
+///  * `*.pem` / `*.key` in general. Every such file in this workspace is a
+///    false positive: a public AWS RDS CA bundle (`rds-global-bundle.pem`,
+///    scored 8.00) and two TLS test fixtures inside a vendored gem
+///    (`dhparam.pem`, `client.key`, 8.00 each) — 3 of 3. `master.key` is
+///    carved out by exact name because it is a Rails credential, not a
+///    fixture.
+///  * The substring-keyword rule (`secret`/`token`/`credential`/`apikey` in a
+///    filename). `config/secrets.toml` — grith's own config file — scores
+///    5.80 on it. That is the 1,573-prompt flood work/83 exists to remove;
+///    routing it back through the proxy from the supervisor would undo the
+///    point of the series.
+///  * `.bash_history` / `.zsh_history`: they live in `$HOME`, which work/80's
+///    dangerous-root refusal already keeps project trust away from.
+///
+/// Committed dotenv TEMPLATES are excluded, mirroring the `exclude` lists on
+/// the proxy's `env-file` / `env-file-variants` rules (they hold placeholders,
+/// not secrets, and score 0.00). The mirror is the one place this predicate
+/// can drift, and it drifts safely in only one direction: guarding a name the
+/// proxy would allow costs an evaluation, while EXCLUDING a name the proxy
+/// would score costs a missed evaluation — so keep this list no wider than
+/// `config/filters/paths.toml`.
+const DOTENV_TEMPLATE_NAMES: &[&str] = &[
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    ".env.dist",
+    ".env.defaults",
+];
+
+pub fn is_high_value_project_secret(path: &str) -> bool {
+    let path_lc = path.replace('\\', "/").to_lowercase();
+    let file_name = path_lc
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()
+        .unwrap_or_default();
+
+    if DOTENV_TEMPLATE_NAMES.contains(&file_name) {
+        return false;
+    }
+
+    file_name == ".env"
+        || file_name.starts_with(".env.")
+        // Rails: decrypts config/credentials.yml.enc.
+        || file_name == "master.key"
+        // Terraform state holds provider credentials and resource secrets in
+        // plaintext; a real state file IS the secret.
+        || file_name.ends_with(".tfstate")
+        || file_name.ends_with(".tfstate.backup")
+        // Packaged key material — a bundle, not a certificate.
+        || file_name.ends_with(".p12")
+        || file_name.ends_with(".pfx")
+}
+
+/// The set project-derived (`projdir:`-marked) trust must never short-circuit:
+/// credential stores plus the in-project high-value secrets above.
+///
+/// Narrower than [`is_sensitive_path`] on purpose — see
+/// [`is_high_value_project_secret`] for what is left out and why.
+pub fn is_project_trust_guarded_path(path: &str) -> bool {
+    is_credential_store_path(path) || is_high_value_project_secret(path)
+}
+
 /// Check if a path targets a security-sensitive location that should always
 /// be evaluated by the proxy, even when `ignore_read_only` noise reduction
 /// is enabled.
@@ -463,6 +552,20 @@ pub fn is_sensitive_path(path: &str) -> bool {
         return true;
     }
 
+    // Terraform state. The shipped `terraform-state` path rule scores a READ
+    // of `*.tfstate` at 4.0 and a real state file holds provider credentials
+    // and resource secrets in plaintext, so this gate has to hold it for the
+    // proxy to ever see one. It is also what makes the entry in
+    // [`is_high_value_project_secret`] reachable on a read: the
+    // `ignore_read_only` fast path's FIRST clause is `!is_sensitive_path`, and
+    // it returns before the project-trust guard is consulted — a guarded path
+    // that is not sensitive is silently auto-allowed. Keep the two sets in
+    // that order: `is_project_trust_guarded_path` must stay a SUBSET of this
+    // one, pinned by `project_trust_guard_is_a_subset_of_sensitive`.
+    if file_name.ends_with(".tfstate") || file_name.ends_with(".tfstate.backup") {
+        return true;
+    }
+
     // Credential / history files (read-then-exfil sources). This gate is what
     // the `ignore_read_only` fast-path consults: a read-only open is allowed
     // BEFORE the proxy UNLESS this returns true. So every file the taint filter
@@ -480,27 +583,53 @@ pub fn is_sensitive_path(path: &str) -> bool {
     // (Cross-process /proc secret paths — research doc §5.1 #1 — are part
     // of is_credential_store_path above.)
 
-    // Substring-keyword rule: a filename merely *containing* a
-    // credential-ish word. This is the broadest, weakest signal and the
-    // biggest false-positive source. Two carveouts keep it from mass-
-    // misfiring on ordinary code:
+    // Name-keyword rule: a filename that merely *looks* credential-ish. This
+    // is the broadest, weakest signal and the biggest false-positive source.
     //
-    //   * `node_modules/` (PR 69 Change 5) — library filenames like
-    //     `tokenize.js` / `tokenTypes.js`.
-    //   * Source-code files — a class/module file whose NAME contains
-    //     "token"/"auth"/etc. (`AccessToken.php`, `RefreshToken.ts`,
-    //     `OAuth2Client.java`, `Tokenizer.go`) is code, not a credential
-    //     store. Real secrets live in `.env` / key files / credential dirs
-    //     (handled above, regardless of this carveout) — not in a `.php`
-    //     source file's *name*. Without this, an AI assistant reading a
-    //     vendored OAuth/SDK library floods the operator with prompts.
+    // work/83 T6: this used to be a hand-maintained substring match kept "in
+    // sync" with the proxy heuristic by comment alone, and the two had already
+    // drifted (the proxy carried "passwd" and "auth"; this did not). The token
+    // predicate now comes from `grith_proxy::paths`, which the proxy filter
+    // also calls, so `authority` / `authorize` / `AUTHORS` and rustc's
+    // incremental hashes stop matching while `auth.json` and `api-token.txt`
+    // keep matching.
     //
-    // The strong rules above (.env, key/cert files, credential dirs, system
-    // stores, /proc cross-process) are unaffected by both carveouts.
-    if ["secret", "credential", "token", "apikey"]
-        .iter()
-        .any(|kw| file_name.contains(kw))
-        && !path_contains_node_modules(&path_lc)
+    // What this gate is NOT allowed to borrow from the proxy is the proxy's
+    // SCORE suppressions. It decides whether a read-only open is EVALUATED at
+    // all (`ignore_read_only`), and a call that is never evaluated registers no
+    // TAINT — so a suppression here is strictly stronger than a suppression in
+    // the filters, and breaks the research-doc §5.1 #4 superset invariant that
+    // this function exists to preserve. work/83 briefly applied
+    // `is_name_opaque_tree` and `is_non_credential_artifact_filename` here:
+    // `/p/target/x/credentials.json`, `/p/gems/token.txt`, `/p/vendor/x/credentials`
+    // and `/p/notes/credentials.md` became invisible, even though the taint
+    // filter's sensitive-source list classifies every one of them as a
+    // credential read. Both predicates are deliberately absent now — the proxy
+    // still scores those paths 0.0, which removes the PROMPT while keeping the
+    // read visible and taintable, and that is the whole of the false-positive
+    // argument.
+    //
+    // The one carveout that stays is the source-extension one, which predates
+    // work/83: a `.php`/`.ts`/`.go` module named `AccessToken.php` is code, and
+    // an assistant reading a vendored OAuth SDK would otherwise pay a proxy
+    // round-trip per file.
+    //
+    // NOTE: `file_name` here is lowercased, so camelCase is not available as a
+    // token boundary. That only ever makes this gate WIDER than the proxy's
+    // (`AccessToken.bin` reaches the proxy and is scored there), which is the
+    // safe direction for a noise gate.
+    //
+    // `/etc/passwd` and `/etc/group` are world-readable databases that every
+    // process reads through getpwnam/getgrnam; the actual secrets live in
+    // `/etc/shadow`, which `is_credential_store_path` already returns true for.
+    // They are named here because "passwd" IS a sensitive token — without this
+    // guard the token rule would newly flag them and undo the long-standing
+    // decision documented in `is_credential_store_path` and `is_noise_path`.
+    let world_readable_user_db =
+        path_lc.starts_with("/etc/passwd") || path_lc.starts_with("/etc/group");
+
+    if !world_readable_user_db
+        && grith_proxy::paths::name_has_sensitive_token(file_name)
         && !is_source_code_filename(file_name)
     {
         return true;
@@ -523,22 +652,6 @@ fn is_source_code_filename(file_name: &str) -> bool {
         ".d", ".pas",
     ];
     SOURCE_EXTS.iter().any(|ext| file_name.ends_with(ext))
-}
-
-/// PR 69 Change 5: returns true if the symlink-resolved canonical path
-/// contains `/node_modules/` as a path component. Falls back to the raw
-/// path when canonicalisation fails — fail-safe because the carveout
-/// only suppresses one boolean rule; everything else still fires.
-fn path_contains_node_modules(path_lc: &str) -> bool {
-    if let Ok(canonical) = std::fs::canonicalize(path_lc) {
-        if let Some(s) = canonical.to_str() {
-            return s
-                .replace('\\', "/")
-                .to_lowercase()
-                .contains("/node_modules/");
-        }
-    }
-    path_lc.contains("/node_modules/")
 }
 
 #[cfg(test)]
@@ -1237,6 +1350,91 @@ mod tests {
     /// derived session trust must NEVER cover — versus the weaker name-based
     /// signals that project trust may still noise-allow inside a real
     /// project tree.
+    /// work/83 review finding 2: project-derived trust short-circuited every
+    /// in-project secret whose name is not a credential STORE. The guarded set
+    /// is widened to the files whose CONTENT is the secret — measured at the
+    /// proxy on a read: `config/master.key` 8.00, `.env`/`.env.local` 6.00,
+    /// `terraform.tfstate` 4.00, `certs/client.p12` 4.00.
+    ///
+    /// It is NOT widened to `is_sensitive_path`. Every path in the second
+    /// list is one work/80 deliberately left covered, and the measurement
+    /// behind that decision still holds: all three `*.pem`/`*.key` files in
+    /// this workspace are false positives (a public AWS CA bundle and two
+    /// vendored TLS test fixtures, 8.00 each), and grith's own
+    /// `config/secrets.toml` scores 5.80 on the keyword rule alone.
+    /// Every path the guard covers, shared with
+    /// [`project_trust_guard_is_a_subset_of_sensitive`] so the two invariants
+    /// can never be pinned on different sets.
+    const GUARDED_IN_PROJECT_SECRETS: &[&str] = &[
+        "/home/u/proj/.env",
+        "/home/u/proj/.env.local",
+        "/home/u/proj/.env.production",
+        "/home/u/proj/config/master.key",
+        "/home/u/proj/terraform.tfstate",
+        "/home/u/proj/terraform.tfstate.backup",
+        "/home/u/proj/certs/client.p12",
+        "/home/u/proj/certs/bundle.PFX",
+    ];
+
+    #[test]
+    fn project_trust_guard_covers_in_project_secrets_only() {
+        for p in GUARDED_IN_PROJECT_SECRETS.iter().copied() {
+            assert!(
+                is_high_value_project_secret(p),
+                "{p} must be guarded against project trust"
+            );
+            assert!(is_project_trust_guarded_path(p));
+            assert!(
+                !is_credential_store_path(p),
+                "{p} is an in-project secret, not a credential store — the two \
+                 sets stay distinct so work/80's other callers are unaffected"
+            );
+        }
+
+        for p in [
+            // Committed templates hold placeholders; the proxy scores them
+            // 0.00, so guarding them would cost an evaluation per read and
+            // never a prompt.
+            "/home/u/proj/.env.example",
+            "/home/u/proj/.env.sample",
+            "/home/u/proj/.env.template",
+            // The weak name signals work/80 left to project trust.
+            "/home/u/proj/tls/server.pem",
+            "/home/u/proj/deploy.key",
+            "/home/u/proj/config/secrets.toml",
+            "/home/u/proj/src/auth/token_store.rs",
+            "/home/u/proj/src/main.rs",
+        ] {
+            assert!(
+                !is_high_value_project_secret(p),
+                "{p} must stay covered by project trust"
+            );
+        }
+    }
+
+    /// The guarded set must be a SUBSET of the sensitive set, over the whole
+    /// list rather than a hand-picked sample.
+    ///
+    /// The `ignore_read_only` fast path in `event_handler` reads
+    /// `if !is_sensitive_path(path) || session_trusted || !file_exists` — the
+    /// first clause returns BEFORE the project-trust guard on `session_trusted`
+    /// is consulted, so a path this guard covers but `is_sensitive_path` does
+    /// not is auto-allowed on a read and the guard is dead. `*.tfstate` was
+    /// exactly that: guarded by work/83's finding-2 fix, not sensitive, and so
+    /// still served by the fast path with `total_queued: 0`. Pinned as a
+    /// property so the next addition to `is_high_value_project_secret` cannot
+    /// repeat it.
+    #[test]
+    fn project_trust_guard_is_a_subset_of_sensitive() {
+        for p in GUARDED_IN_PROJECT_SECRETS.iter().copied() {
+            assert!(
+                is_sensitive_path(p),
+                "{p} is guarded against project trust but not sensitive — the \
+                 read-only fast path would auto-allow it before the guard runs"
+            );
+        }
+    }
+
     #[test]
     fn credential_store_core_is_narrower_than_sensitive() {
         // Strong: stores.
@@ -1294,6 +1492,71 @@ mod tests {
         // /etc/passwd is world-readable, not sensitive
         assert!(!is_sensitive_path("/etc/passwd"));
         assert!(is_sensitive_path("/etc/sudoers"));
+    }
+
+    /// work/83 T6: the supervisor's noise gate and the proxy's scoring rule
+    /// now share `grith_proxy::paths`, so a name that stops being scored also
+    /// stops blocking read-only noise suppression — and vice versa.
+    #[test]
+    fn keyword_gate_is_token_based_but_never_borrows_a_score_suppression() {
+        // Coincidental substrings no longer hold a read out of noise
+        // suppression. Each of these produced modal prompts (work/83 §2.2).
+        // Note every one is a TOKEN miss, not a location or extension
+        // carveout — this gate decides visibility, so it may only narrow on
+        // "the name is not credential-ish".
+        for p in [
+            "/p/web/public/hero-zero-ambient-authority-1600x900.svg",
+            "/p/target/debug/incremental/773v9mxq3ohs6twiwt1rzauth.o",
+            "/p/node_modules/acorn/dist/tokenizer.js",
+            "/p/AUTHORS",
+        ] {
+            assert!(!is_sensitive_path(p), "{p} must not be name-sensitive");
+        }
+        // Real credential-shaped names still reach the proxy.
+        for p in [
+            "/p/auth.json",
+            "/p/deploy/secrets.yaml",
+            "/p/config/api-token.txt",
+            "/p/service-account-credentials.json",
+            "/p/bin/with-secrets",
+        ] {
+            assert!(is_sensitive_path(p), "{p} must stay name-sensitive");
+        }
+        // The regression this pins: a credential-NAMED read inside a
+        // dependency tree, a generated-output tree, or with a documentation /
+        // asset extension is still SEEN. The proxy scores it 0.0 — which is
+        // what removes the prompt — but the taint filter classifies every one
+        // of these as a sensitive source, and a call that is never evaluated
+        // registers no taint.
+        for p in [
+            "/p/target/x/credentials.json",
+            "/p/target/debug/build/x/secrets.yaml",
+            "/p/gems/token.txt",
+            "/p/vendor/x/credentials",
+            "/p/notes/credentials.md",
+            "/p/notes/api-token.pdf",
+            "/p/node_modules/aws-sdk/clients/secrets.json",
+            "/p/dist/tokens.json",
+        ] {
+            assert!(
+                is_sensitive_path(p),
+                "{p}: a score suppression must not become a visibility suppression"
+            );
+        }
+        // The strong classes are untouched by every carveout: a credential
+        // store inside a dependency tree, and key material with an artifact
+        // extension, both still reach the proxy.
+        for p in [
+            "/p/node_modules/evil/.env",
+            "/p/node_modules/evil/id_rsa",
+            "/p/target/debug/build/x/.npmrc",
+            "/home/u/.aws/credentials",
+        ] {
+            assert!(
+                is_sensitive_path(p),
+                "{p} must stay sensitive via a strong rule"
+            );
+        }
     }
 
     #[test]

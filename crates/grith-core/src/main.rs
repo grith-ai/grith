@@ -7,6 +7,7 @@
 //! dispatches to the appropriate subcommand or interactive REPL.
 
 mod agent;
+mod analytics_sync;
 mod browser;
 mod commands;
 mod config;
@@ -111,6 +112,14 @@ enum Command {
         #[arg(long)]
         allow_queued: bool,
 
+        /// Restrict file access to the workspace: the directory grith exec was
+        /// launched in, its linked git worktrees, and any configured
+        /// additional_project_roots. Reads and writes anywhere else are denied
+        /// instead of scored. System runtime paths stay readable and the
+        /// profile's routine paths still work, or the tool could not run.
+        #[arg(long)]
+        workspace_only: bool,
+
         /// The command and arguments to supervise (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -130,6 +139,11 @@ enum Command {
     Pro {
         #[command(subcommand)]
         action: ProAction,
+    },
+    /// Manage cloud analytics sync for this machine
+    Analytics {
+        #[command(subcommand)]
+        action: AnalyticsAction,
     },
     /// Manage notification channels
     Notifications {
@@ -196,6 +210,12 @@ enum AuditAction {
     /// database. A manual maintenance op (never automatic); requires that no
     /// daemon is running and the chain is not quarantined.
     Compact {
+        /// Proceed without the interactive confirmation prompt (for scripts).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rebuild the analytics projection from the audit database and cold archives
+    RebuildAnalytics {
         /// Proceed without the interactive confirmation prompt (for scripts).
         #[arg(long)]
         yes: bool,
@@ -308,6 +328,20 @@ enum SupervisorAction {
         /// Session ID (UUID)
         session_id: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum AnalyticsAction {
+    /// Show cloud analytics sync status for this machine
+    Status,
+    /// Turn on cloud analytics sync (records your consent)
+    Enable {
+        /// Skip the interactive confirmation prompt (for scripts)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Turn off cloud analytics sync on this machine
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -740,6 +774,7 @@ fn main() -> anyhow::Result<()> {
                     syscall_log,
                     trace_syscalls_jsonl,
                     allow_queued,
+                    workspace_only,
                     command,
                 }) => {
                     return commands::exec::cmd_exec_thin(
@@ -750,6 +785,7 @@ fn main() -> anyhow::Result<()> {
                         syscall_log,
                         trace_syscalls_jsonl,
                         allow_queued,
+                        workspace_only,
                         command,
                         project_override.as_deref(),
                         cli.config.as_deref(),
@@ -797,7 +833,16 @@ fn main() -> anyhow::Result<()> {
     } else {
         daemon::StartOptions::default()
     };
-    let init_result = daemon::Daemon::start(cfg, start_options)?;
+    // The detached daemon child's stderr is on /dev/null, so a fatal startup
+    // error here — most often "another process still owns the audit database,
+    // held by pid N" — would otherwise vanish, leaving the spawner to report
+    // only "did not become ready". Record it where the spawner can print it.
+    let dashboard_child = std::env::var_os("GRITH_DASHBOARD_CHILD").is_some();
+    let init_result = daemon::Daemon::start(cfg, start_options).inspect_err(|e| {
+        if dashboard_child {
+            daemon::last_error::record(&e.to_string());
+        }
+    })?;
 
     for warning in &init_result.warnings {
         tracing::warn!("{warning}");
@@ -816,7 +861,11 @@ fn main() -> anyhow::Result<()> {
         // user-invoked case background-spawned and returned in the early match
         // above. Run the server in the foreground (this process's stdout is
         // /dev/null, redirected by the parent that spawned it).
-        return commands::dashboard::cmd_dashboard_start(&daemon);
+        return commands::dashboard::cmd_dashboard_start(&daemon).inspect_err(|e| {
+            if dashboard_child {
+                daemon::last_error::record(&format!("{e:#}"));
+            }
+        });
     }
 
     // Auto-start the dashboard for commands that benefit from web UI monitoring.
@@ -905,23 +954,24 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        let (license_handle, sync_handle, mut notification_handles) = runtime.block_on(async {
+        let (license_handle, mut notification_handles) = runtime.block_on(async {
             let license_handle = daemon.spawn_license_revalidation();
             // Re-apply the license gate immediately on SIGHUP (sent by
             // `grith pro login`/`refresh` after writing a new license), so a
             // fresh upgrade takes effect without a 24h wait or restart. The
             // task detaches and self-terminates on the shutdown broadcast.
             let _regate_handle = daemon.spawn_license_regate_on_sighup();
-            let sync_handle = if daemon.config.general.audit_sync {
-                daemon.spawn_audit_sync()
-            } else {
-                tracing::info!("audit sync disabled by configuration");
-                tokio::spawn(async {})
-            };
+            // Cloud analytics upload worker — owner only (one uploader per
+            // audit database); it self-gates on entitlement + consent. This
+            // replaced the raw audit-record sync, which was retired with the
+            // server's /sync route.
+            if daemon.audit_role.can_write() {
+                let _analytics_handle = daemon.spawn_analytics_upload();
+            }
             let notification_handles = daemon
                 .notification_dispatcher
                 .spawn_background_tasks(daemon.subscribe_shutdown());
-            (license_handle, sync_handle, notification_handles)
+            (license_handle, notification_handles)
         });
 
         tracing::info!(address = %addr, "dashboard available at http://{}", addr);
@@ -968,9 +1018,6 @@ fn main() -> anyhow::Result<()> {
         runtime.block_on(async {
             if let Err(e) = license_handle.await {
                 tracing::warn!(error = %e, "license revalidation task panicked");
-            }
-            if let Err(e) = sync_handle.await {
-                tracing::warn!(error = %e, "audit sync task panicked");
             }
             for handle in notification_handles.drain(..) {
                 if let Err(e) = handle.await {
@@ -1023,6 +1070,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Supervisor { action }) => {
             commands::supervisor::cmd_supervisor(&daemon, action)
         }
+        Some(Command::Analytics { action }) => commands::analytics::cmd_analytics(&daemon, action),
         Some(Command::Notifications { action }) => {
             commands::notifications::cmd_notifications(&daemon, action)
         }
@@ -1390,6 +1438,12 @@ fn to_runtime_supervisor_config_with_audit(
             deny_self_seccomp_notify: core.coverage.deny_self_seccomp_notify,
             observe_self_seccomp_filter: core.coverage.observe_self_seccomp_filter,
         },
+        // work/83 F4: map core TrustConfig -> supervisor TrustConfig.
+        trust: grith_supervisor::config::TrustConfig {
+            include_linked_worktrees: core.trust.include_linked_worktrees,
+            additional_project_roots: core.trust.additional_project_roots.clone(),
+            restrict_to_workspace: core.trust.restrict_to_workspace,
+        },
         audit_completeness: match audit.completeness {
             config::AuditCompleteness::Decisions => {
                 grith_supervisor::config::AuditCompletenessLevel::Decisions
@@ -1415,6 +1469,23 @@ mod session_summary_tests {
     use grith_audit::CorrelationTracker;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// work/83 F4: `grith exec` builds its supervisor config through
+    /// `to_runtime_supervisor_config_with_audit`, so this is the mapping that
+    /// decides whether the operator's trust settings reach a live session.
+    #[test]
+    fn to_runtime_supervisor_config_maps_trust() {
+        let mut core = crate::config::SupervisorCoreConfig::default();
+        core.trust.include_linked_worktrees = false;
+        core.trust.additional_project_roots = vec!["/srv/other-repo".to_string()];
+
+        let mapped = crate::to_runtime_supervisor_config(&core);
+        assert!(!mapped.trust.include_linked_worktrees);
+        assert_eq!(
+            mapped.trust.additional_project_roots,
+            vec!["/srv/other-repo"]
+        );
+    }
 
     #[test]
     fn to_runtime_supervisor_config_maps_dns_inspection() {
@@ -1467,6 +1538,7 @@ mod session_summary_tests {
             syscall_log: None,
             trace_syscalls_jsonl: None,
             allow_queued: false,
+            workspace_only: false,
             command: vec!["echo".to_string(), "hi".to_string()],
         };
         let config = super::Command::Config { action: None };
@@ -1488,6 +1560,7 @@ mod session_summary_tests {
             syscall_log: None,
             trace_syscalls_jsonl: None,
             allow_queued: false,
+            workspace_only: false,
             command: vec!["echo".to_string(), "hi".to_string()],
         };
         let config = super::Command::Config { action: None };
@@ -1509,6 +1582,7 @@ mod session_summary_tests {
             syscall_log: None,
             trace_syscalls_jsonl: None,
             allow_queued: false,
+            workspace_only: false,
             command: vec!["echo".to_string(), "hi".to_string()],
         };
 
@@ -1855,6 +1929,7 @@ mod profile_refresh_tests {
             syscall_log: None,
             trace_syscalls_jsonl: None,
             allow_queued: false,
+            workspace_only: false,
             command: vec!["echo".into()],
         };
         assert!(command_supports_profile_refresh(Some(&cmd)));
@@ -1963,6 +2038,7 @@ mod onboarding_gate_tests {
             syscall_log: None,
             trace_syscalls_jsonl: None,
             allow_queued: false,
+            workspace_only: false,
             command: command.into_iter().map(String::from).collect(),
         }
     }

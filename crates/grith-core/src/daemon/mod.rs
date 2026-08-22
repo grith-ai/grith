@@ -13,6 +13,7 @@ pub(crate) mod config_loader;
 mod filter_registry;
 mod health;
 pub mod identity;
+pub mod last_error;
 mod notifications;
 pub(crate) mod pid;
 pub mod readiness;
@@ -123,15 +124,6 @@ impl ChainStatus {
     pub fn is_writable(&self) -> bool {
         !matches!(self, Self::Quarantined { .. })
     }
-}
-
-/// Whether cloud sync has credentials to transmit with.
-///
-/// Mirrors the check `background::flush_audit_batch` makes before sending
-/// anything: without stored credentials sync is inert, so no row will ever
-/// be acknowledged and sync-safe retention has nothing to wait for.
-fn has_sync_credentials() -> bool {
-    matches!(crate::license::load_credentials(), Ok(Some(_)))
 }
 
 /// Detect an active segment that restarted at sequence 1 while cold
@@ -820,16 +812,6 @@ impl Daemon {
             // Sync only transmits with credentials (see
             // `background::flush_audit_batch`), so no credentials means no
             // acknowledgement is coming and there is nothing to protect.
-            let audit_sync = config.general.audit_sync;
-            // One-time startup note reflecting the state at boot. The loop
-            // below re-evaluates credentials every pass (B12 #73), so a later
-            // login or logout re-arms or relaxes the guard without a restart.
-            if audit_sync && !has_sync_credentials() {
-                tracing::info!(
-                    "audit sync is enabled but no account is signed in; retention will \
-                     prune on age alone until an account signs in"
-                );
-            }
             std::thread::Builder::new()
                 .name("grith-audit-retention".into())
                 .spawn(move || loop {
@@ -837,15 +819,12 @@ impl Daemon {
                     else {
                         return;
                     };
-                    // B12 #73: recompute the sync guard on every pass.
-                    // `has_sync_credentials()` reads the on-disk credential
-                    // state, which changes when the user logs in or out during
-                    // the daemon's lifetime. Freezing it at startup meant a
-                    // user who signed in after boot kept pruning on age alone —
-                    // deleting rows the server had not yet acknowledged — while
-                    // a user who signed out kept the guard on and stalled
-                    // retention (the unbounded-growth mode H-19 addressed).
-                    let respect_sync_state = audit_sync && has_sync_credentials();
+                    // The raw record-level cloud sync was retired with the
+                    // server's /sync route, so no acknowledgement-based prune
+                    // guard applies any more: retention prunes on age alone.
+                    // Analytics uploads are day-snapshot based and survive
+                    // pruning via the local projection's own coverage gate.
+                    let respect_sync_state = false;
                     let outcome = match storage.lock() {
                         Ok(mut s) => grith_audit::retention::prune_and_archive(
                             &mut s,
@@ -868,6 +847,22 @@ impl Daemon {
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "audit retention failed"),
+                    }
+
+                    // The local analytics projection has its own 90-day
+                    // retention, independent of the raw window above. Without
+                    // this call it would grow without bound.
+                    if let Ok(mut s) = storage.lock() {
+                        match s.prune_analytics_projection(chrono::Utc::now()) {
+                            Ok(0) => {}
+                            Ok(rows) => tracing::info!(
+                                rows,
+                                "analytics projection retention: pruned past 90 days"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "analytics projection retention failed");
+                            }
+                        }
                     }
 
                     // H-19: bound the physical footprint on the same
@@ -901,6 +896,37 @@ impl Daemon {
                     ));
                 })
                 .map_err(|e| Error::Config(format!("failed to spawn retention thread: {e}")))?;
+        }
+
+        // Background analytics materialization (owner only). Producers only
+        // append source events and mark days dirty; this worker does the day
+        // aggregation in bounded slices so (a) an upgrade over a large
+        // existing database converges without a dashboard read ever holding
+        // the storage mutex for the whole backlog, and (b) the writer thread
+        // never carries O(day) aggregation work. Route handlers still run a
+        // small bounded catch-up per read for steady-state freshness.
+        if audit_role.can_write() {
+            let storage = Arc::clone(&audit_storage);
+            std::thread::Builder::new()
+                .name("grith-analytics-catchup".into())
+                .spawn(move || loop {
+                    let progressed = match storage.lock() {
+                        Ok(mut s) => match s.catch_up_analytics_bounded(4, 8) {
+                            Ok((records, days)) => records >= 4 * 512 || days >= 8,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "analytics catch-up slice failed");
+                                false
+                            }
+                        },
+                        Err(_) => return,
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(if progressed {
+                        50
+                    } else {
+                        30_000
+                    }));
+                })
+                .map_err(|e| Error::Config(format!("failed to spawn analytics thread: {e}")))?;
         }
 
         // 5. Initialize security proxy

@@ -126,13 +126,26 @@ pub(super) fn destructive_target(call_type: &ToolCallType) -> Option<&str> {
 }
 
 /// True when `target` is a *valuable out-of-tree* path that should count toward
-/// the signal: an absolute path that is NOT under the session working root, NOT
-/// under any profile routine/scratch root, and NOT under an ephemeral system
-/// root (temp / cache / pseudo-filesystem). Relative paths can't be classified
-/// and never count.
+/// the signal: an absolute path that is NOT under the session working root or
+/// any of the session's other trusted workspace roots, NOT under any profile
+/// routine/scratch root, and NOT under an ephemeral system root (temp / cache
+/// / pseudo-filesystem). Relative paths can't be classified and never count.
+///
+/// `workspace_roots` (work/83 F4) are the launch repository's linked git
+/// worktrees plus operator-declared project roots. They are passed separately
+/// from `routine_roots` rather than folded into it because `routine_roots` is
+/// the session's `routine_exec_roots` — the *executable* provenance roots that
+/// PR 4's routine-spawn signal, the PR 6 namespace carveout and the
+/// routine-agent connect check all read. Appending trees there to fix a
+/// deletion-count false positive would silently widen three unrelated spawn
+/// and namespace decisions. Semantically they belong here anyway: a linked
+/// worktree is part of the session's working set, which is what the in-tree
+/// test is about. Deleting a whole worktree is exactly the operation that
+/// produced 692 escalations of `FileDelete` calls scored 1.0.
 pub(super) fn is_valuable_out_of_tree(
     target: &str,
     working_root: Option<&Path>,
+    workspace_roots: &[String],
     routine_roots: &[String],
     scratch_roots: &[String],
 ) -> bool {
@@ -143,6 +156,9 @@ pub(super) fn is_valuable_out_of_tree(
         if path_under(target, &root.to_string_lossy()) {
             return false;
         }
+    }
+    if workspace_roots.iter().any(|r| path_under(target, r)) {
+        return false;
     }
     if routine_roots.iter().any(|r| path_under(target, r)) {
         return false;
@@ -256,13 +272,20 @@ pub(super) fn maybe_escalate(
     decision: &mut ProxyDecision,
     call_type: &ToolCallType,
     working_root: Option<&Path>,
+    workspace_roots: &[String],
     routine_roots: &[String],
     scratch_roots: &[String],
     tracker: &Mutex<MassDestructionTracker>,
     now: Instant,
 ) -> Option<usize> {
     let target = destructive_target(call_type)?;
-    if !is_valuable_out_of_tree(target, working_root, routine_roots, scratch_roots) {
+    if !is_valuable_out_of_tree(
+        target,
+        working_root,
+        workspace_roots,
+        routine_roots,
+        scratch_roots,
+    ) {
         return None;
     }
     let count = tracker.lock().ok()?.record(target.into(), now)?;
@@ -320,6 +343,7 @@ mod tests {
         assert!(!is_valuable_out_of_tree(
             "/home/u/project/src/main.rs",
             Some(working),
+            &[],
             &routine,
             &scratch
         ));
@@ -328,6 +352,7 @@ mod tests {
         assert!(is_valuable_out_of_tree(
             "/home/u/project-old/data.db",
             Some(working),
+            &[],
             &routine,
             &scratch
         ));
@@ -335,6 +360,7 @@ mod tests {
         assert!(!is_valuable_out_of_tree(
             "/usr/lib/node/x.js",
             Some(working),
+            &[],
             &routine,
             &scratch
         ));
@@ -342,6 +368,7 @@ mod tests {
         assert!(!is_valuable_out_of_tree(
             "/home/u/project/.cache/blob",
             Some(working),
+            &[],
             &routine,
             &scratch
         ));
@@ -350,6 +377,7 @@ mod tests {
             assert!(!is_valuable_out_of_tree(
                 p,
                 Some(working),
+                &[],
                 &routine,
                 &scratch
             ));
@@ -358,6 +386,7 @@ mod tests {
         assert!(!is_valuable_out_of_tree(
             "relative/x",
             Some(working),
+            &[],
             &routine,
             &scratch
         ));
@@ -369,6 +398,7 @@ mod tests {
         assert!(is_valuable_out_of_tree(
             "/home/u/Documents/taxes.pdf",
             Some(working),
+            &[],
             &[],
             &[]
         ));
@@ -389,7 +419,7 @@ mod tests {
             "/home/u/proj/.next/cache/webpack/chunk.js",
         ] {
             assert!(
-                !is_valuable_out_of_tree(p, Some(working), &[], &[]),
+                !is_valuable_out_of_tree(p, Some(working), &[], &[], &[]),
                 "build artifact counted as valuable: {p}"
             );
         }
@@ -408,10 +438,105 @@ mod tests {
             "/home/u/proj/.gitlab/objects/data.db",
         ] {
             assert!(
-                is_valuable_out_of_tree(p, Some(working), &[], &[]),
+                is_valuable_out_of_tree(p, Some(working), &[], &[], &[]),
                 "look-alike wrongly exempted: {p}"
             );
         }
+    }
+
+    /// work/83 F4: the 2026-08-20 incident shape. `git worktree remove` on a
+    /// sibling worktree of the launch repository produced 692 escalations of
+    /// `FileDelete` calls that individually scored 1.0, because the worktree
+    /// sat outside the launch cwd and every deletion in it looked like a
+    /// spree. A resolved workspace root makes those deletions in-tree —
+    /// while a delete outside every trusted root still counts, so the signal
+    /// is narrowed to the session's real working set, not disabled.
+    #[test]
+    fn deletions_inside_a_trusted_worktree_never_count() {
+        let working = Path::new("/home/u/proj");
+        let workspace = vec!["/home/u/worktrees/analytics-local".to_string()];
+
+        for p in [
+            "/home/u/worktrees/analytics-local/work/todos/a.md",
+            "/home/u/worktrees/analytics-local/src/main.rs",
+            "/home/u/worktrees/analytics-local",
+        ] {
+            assert!(
+                !is_valuable_out_of_tree(p, Some(working), &workspace, &[], &[]),
+                "deletion inside a trusted worktree must not count: {p}"
+            );
+        }
+
+        // The user's own files are untouched by the widening.
+        assert!(is_valuable_out_of_tree(
+            "/home/u/Documents/taxes.pdf",
+            Some(working),
+            &workspace,
+            &[],
+            &[]
+        ));
+        // Boundary safety: a sibling directory that merely shares the prefix
+        // is NOT inside the trusted worktree.
+        assert!(is_valuable_out_of_tree(
+            "/home/u/worktrees/analytics-local-backup/data.db",
+            Some(working),
+            &workspace,
+            &[],
+            &[]
+        ));
+    }
+
+    /// End-to-end through `maybe_escalate`: a bulk delete inside a trusted
+    /// worktree does not mass-escalate, while a bulk delete of `~/Documents`
+    /// still does.
+    #[test]
+    fn bulk_delete_escalates_outside_the_workspace_only() {
+        let working = Path::new("/home/u/proj");
+        let workspace = vec!["/home/u/worktrees/wt".to_string()];
+        let now = Instant::now();
+        let run = |paths: Vec<String>| {
+            let tracker = Mutex::new(MassDestructionTracker::new(WINDOW, 3));
+            let mut escalations = 0;
+            for path in paths {
+                let mut d = ProxyDecision {
+                    action: ProxyAction::Allow,
+                    composite_score: 1.0,
+                    filter_results: vec![],
+                    decision_reason: "allowed".into(),
+                    evaluation_time: Duration::from_millis(1),
+                };
+                if maybe_escalate(
+                    &mut d,
+                    &delete(&path),
+                    Some(working),
+                    &workspace,
+                    &[],
+                    &[],
+                    &tracker,
+                    now,
+                )
+                .is_some()
+                {
+                    escalations += 1;
+                }
+            }
+            escalations
+        };
+
+        assert_eq!(
+            run((0..10)
+                .map(|i| format!("/home/u/worktrees/wt/work/todos/{i}.md"))
+                .collect()),
+            0,
+            "removing a trusted worktree must not mass-escalate"
+        );
+        assert!(
+            run((0..10)
+                .map(|i| format!("/home/u/Documents/{i}.pdf"))
+                .collect())
+                > 0,
+            "a spree through the user's documents must still escalate"
+        );
     }
 
     #[test]
@@ -442,6 +567,7 @@ mod tests {
                 &mut d,
                 &delete(path),
                 Some(working),
+                &[],
                 &[],
                 &[],
                 &tracker,

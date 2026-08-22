@@ -354,6 +354,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             severity: "critical".into(),
             message: "Access to SSH private key".into(),
             exclude: vec![],
+            weak_name_signal: false,
         },
         PathRule {
             id: "ssh-dir".into(),
@@ -368,6 +369,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             severity: "warning".into(),
             message: "Access to SSH directory".into(),
             exclude: vec![],
+            weak_name_signal: false,
         },
         PathRule {
             id: "env-file".into(),
@@ -377,6 +379,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             severity: "warning".into(),
             message: "Access to environment file".into(),
             exclude: vec![],
+            weak_name_signal: false,
         },
         PathRule {
             id: "pem-files".into(),
@@ -386,6 +389,7 @@ pub fn default_path_rules() -> Vec<PathRule> {
             severity: "error".into(),
             message: "Access to PEM file".into(),
             exclude: vec![],
+            weak_name_signal: false,
         },
     ]
 }

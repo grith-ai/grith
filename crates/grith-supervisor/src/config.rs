@@ -162,6 +162,11 @@ pub struct SupervisorConfig {
     /// rollout of syscall-coverage expansion. See [`CoverageConfig`].
     pub coverage: CoverageConfig,
 
+    /// work/83 F4: how far this session's project trust reaches beyond the
+    /// launch cwd. See [`TrustConfig`].
+    #[serde(default)]
+    pub trust: TrustConfig,
+
     /// Audit-completeness tier. Controls whether session-allowed,
     /// routine-I/O, and noise-path short-circuits emit compact audit
     /// rows. Mirrors `grith_core::config::AuditCompleteness` to avoid
@@ -280,6 +285,58 @@ impl AuditCompletenessLevel {
     }
 }
 
+/// work/83 F4: how far a session's project-derived trust reaches.
+///
+/// Mirrors `grith_core::config::TrustConfig` so the supervisor owns its own
+/// type without depending on `grith-core` (the same reason [`CoverageConfig`]
+/// is mirrored).
+///
+/// `${PROJECT_DIR}` expands to the launch cwd only, so in a multi-worktree
+/// layout the sibling worktrees of the very repository being worked on get no
+/// trust at all: 0.32% of calls QUEUEd under the launch cwd against 24.9% in
+/// sibling worktrees over one measured morning, plus 692 mass-destruction
+/// escalations from a single `git worktree remove`.
+///
+/// Both keys widen trust, so both are resolved ONCE at session start by
+/// [`crate::profiles::resolve_workspace_roots`] and never re-read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrustConfig {
+    /// Extend project trust to every git worktree of the launch repository —
+    /// the MAIN one included, so launching from a subdirectory also trusts the
+    /// repository root. **Default on.** Dangerous roots are still refused.
+    pub include_linked_worktrees: bool,
+    /// Operator-declared extra project roots, for layouts git cannot infer
+    /// (a linked worktree of a *different* repository, a non-git sibling
+    /// checkout). Expanded like `routine_paths`; dangerous roots refused.
+    pub additional_project_roots: Vec<String>,
+    /// work/85: make the workspace a wall rather than a trusted island.
+    ///
+    /// When on, a file operation whose target lies outside the workspace is
+    /// denied instead of scored — including the read-only opens
+    /// `ignore_read_only` waves through today. Runtime data (`/usr`, `/lib`,
+    /// `/etc`, …) stays readable and the profile's declared routine paths
+    /// stay usable, or the supervised tool could not run at all; everything
+    /// else — `$HOME` outside the workspace, other repositories, `/mnt`,
+    /// `/media` — is refused.
+    ///
+    /// Subtractive only: it can never allow a call the pipeline would have
+    /// blocked. **Default off** — it is a deliberate posture, not a
+    /// compatibility default. Filesystem only; network and spawn are
+    /// unaffected.
+    pub restrict_to_workspace: bool,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self {
+            include_linked_worktrees: true,
+            additional_project_roots: Vec::new(),
+            restrict_to_workspace: false,
+        }
+    }
+}
+
 /// PR 6 Phase F: per-category coverage feature flags.
 ///
 /// Mirrors `grith_core::config::CoverageConfig` so the supervisor
@@ -368,6 +425,7 @@ impl Default for SupervisorConfig {
             trace_syscalls_jsonl_file: None,
             reputation_config: grith_proxy::reputation::ReputationConfig::default(),
             coverage: CoverageConfig::default(),
+            trust: TrustConfig::default(),
             audit_completeness: AuditCompletenessLevel::default(),
             pty_ownership_enforce: false,
             enforce_authority_delegating_spawn: true,
@@ -823,6 +881,7 @@ mod tests {
             trace_syscalls_jsonl_file: None,
             reputation_config: grith_proxy::reputation::ReputationConfig::default(),
             coverage: CoverageConfig::default(),
+            trust: TrustConfig::default(),
             audit_completeness: AuditCompletenessLevel::default(),
             pty_ownership_enforce: false,
             enforce_authority_delegating_spawn: false,

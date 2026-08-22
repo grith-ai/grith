@@ -1635,7 +1635,11 @@ impl PtraceSupervisor {
         crate::connected_dns_proxy::ConnectedDnsRouteId(route_id.0)
     }
 
-    async fn release_connected_route(
+    /// Not `async`: releasing a route is a synchronous call into the proxy's
+    /// control plane. Rust 1.98's `clippy::unused_async_trait_impl` refuses an
+    /// `async fn` with no `.await` in it, and every caller is already on an
+    /// async task, so dropping the `async` costs them nothing.
+    fn release_connected_route(
         &self,
         route_id: super::dns_socket_tracker::DnsRouteId,
     ) -> Result<()> {
@@ -1655,12 +1659,14 @@ impl PtraceSupervisor {
             })
     }
 
-    async fn release_connected_routes(
+    /// Synchronous for the same reason as [`Self::release_connected_route`],
+    /// which it loops over.
+    fn release_connected_routes(
         &self,
         route_ids: impl IntoIterator<Item = super::dns_socket_tracker::DnsRouteId>,
     ) -> Result<()> {
         for route_id in route_ids {
-            self.release_connected_route(route_id).await?;
+            self.release_connected_route(route_id)?;
         }
         Ok(())
     }
@@ -1959,7 +1965,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     self.pending_child_initial_stops.clear();
                     self.seccomp_tracees.clear();
                     let released = self.dns_tracker.clear();
-                    self.release_connected_routes(released).await?;
+                    self.release_connected_routes(released)?;
                     self.pending_dns_recv_exit.clear();
                     self.pending_dns_connect_exit.clear();
                     self.pending_udp_connect_exit.clear();
@@ -2749,7 +2755,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 })
                                 .collect();
                             let released = self.dns_tracker.retain_fds(tgid, &live_fds);
-                            self.release_connected_routes(released).await?;
+                            self.release_connected_routes(released)?;
                             // B13 (exec-survival residual): a connected non-loopback
                             // datagram socket the OLD image opened survives execve
                             // unless it was FD_CLOEXEC — the tracker was just pruned
@@ -2877,7 +2883,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             }
                             if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id)
                             {
-                                self.release_connected_route(route_id).await?;
+                                self.release_connected_route(route_id)?;
                             }
                             self.resume_tracee(pid, None)?;
                             continue;
@@ -2962,10 +2968,10 @@ impl SyscallInterceptor for PtraceSupervisor {
                             ));
                         }
                         if let Some(route_id) = transition.released_route {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                         if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                         trace!(
                             tgid = pending.tgid,
@@ -2996,7 +3002,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 None => self.dns_tracker.disconnect_socket(pending.socket_id),
                             };
                             if let Some(route_id) = released {
-                                self.release_connected_route(route_id).await?;
+                                self.release_connected_route(route_id)?;
                             }
                             // B13: once this socket is pointed at a
                             // non-loopback peer, a plain write(2) on it is an
@@ -3018,7 +3024,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             }
                         }
                         if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                         self.resume_tracee(pid, None)?;
                         continue;
@@ -3079,7 +3085,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if let Some(route_id) =
                             self.dns_tracker.release_socket_hold(pending.socket_id)
                         {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                         self.resume_tracee(pid, None)?;
                         continue;
@@ -3101,7 +3107,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                     pending.socket_type,
                                 );
                                 if let Some(route_id) = released {
-                                    self.release_connected_route(route_id).await?;
+                                    self.release_connected_route(route_id)?;
                                 }
                             }
                         }
@@ -3126,7 +3132,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                                 if let Some(route_id) =
                                     self.dns_tracker.release_socket_hold(socket_id)
                                 {
-                                    self.release_connected_route(route_id).await?;
+                                    self.release_connected_route(route_id)?;
                                 }
                             }
                             record_event(self, pid_u32, "fd-lifecycle-exit:tracee-gone");
@@ -3164,12 +3170,12 @@ impl SyscallInterceptor for PtraceSupervisor {
                             | super::FdLifecyclePending::Dup { .. } => Vec::new(),
                         };
                         if !released.is_empty() {
-                            self.release_connected_routes(released).await?;
+                            self.release_connected_routes(released)?;
                         }
                         if let Some(socket_id) = held_source {
                             if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id)
                             {
-                                self.release_connected_route(route_id).await?;
+                                self.release_connected_route(route_id)?;
                             }
                         }
                         // B13: a closed fd cannot be written to, so nothing
@@ -3834,7 +3840,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if let Some(route_id) =
                             self.dns_tracker.release_socket_hold(pending.socket_id)
                         {
-                            let _ = self.release_connected_route(route_id).await;
+                            let _ = self.release_connected_route(route_id);
                         }
                     }
                     self.pending_socket_exit.remove(&pid_u32);
@@ -3956,7 +3962,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if let Some(route_id) =
                             self.dns_tracker.release_socket_hold(pending.socket_id)
                         {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                     }
                     if let Some(pending) = self.pending_dns_connect_exit.remove(&pid_u32) {
@@ -3964,7 +3970,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             let _ = control.release_route(pending.route.route_id);
                         }
                         if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                         return Err(self.terminate_after_dns_redirect_failure(
                             pending.tgid,
@@ -3975,7 +3981,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     }
                     if let Some(pending) = self.pending_udp_connect_exit.remove(&pid_u32) {
                         if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                     }
                     self.pending_dns_query.remove(&pid_u32);
@@ -3985,7 +3991,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if let Some(socket_id) = pending.held_socket() {
                             if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id)
                             {
-                                self.release_connected_route(route_id).await?;
+                                self.release_connected_route(route_id)?;
                             }
                         }
                     }
@@ -3993,7 +3999,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     let tgid_still_live = self.tid_tgids.values().any(|tgid| *tgid == exited_tgid);
                     if !tgid_still_live {
                         let released = self.dns_tracker.remove_process(exited_tgid);
-                        self.release_connected_routes(released).await?;
+                        self.release_connected_routes(released)?;
                     }
                     info!(pid = pid_u32, exit_code = code, "supervised process exited");
 
@@ -4043,7 +4049,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if let Some(route_id) =
                             self.dns_tracker.release_socket_hold(pending.socket_id)
                         {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                     }
                     if let Some(pending) = self.pending_dns_connect_exit.remove(&pid_u32) {
@@ -4051,7 +4057,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                             let _ = control.release_route(pending.route.route_id);
                         }
                         if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                         return Err(self.terminate_after_dns_redirect_failure(
                             pending.tgid,
@@ -4062,7 +4068,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     }
                     if let Some(pending) = self.pending_udp_connect_exit.remove(&pid_u32) {
                         if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                            self.release_connected_route(route_id).await?;
+                            self.release_connected_route(route_id)?;
                         }
                     }
                     self.pending_dns_query.remove(&pid_u32);
@@ -4072,7 +4078,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                         if let Some(socket_id) = pending.held_socket() {
                             if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id)
                             {
-                                self.release_connected_route(route_id).await?;
+                                self.release_connected_route(route_id)?;
                             }
                         }
                     }
@@ -4080,7 +4086,7 @@ impl SyscallInterceptor for PtraceSupervisor {
                     let tgid_still_live = self.tid_tgids.values().any(|tgid| *tgid == exited_tgid);
                     if !tgid_still_live {
                         let released = self.dns_tracker.remove_process(exited_tgid);
-                        self.release_connected_routes(released).await?;
+                        self.release_connected_routes(released)?;
                     }
                     warn!(
                         pid = pid_u32,
@@ -4285,17 +4291,17 @@ impl SyscallInterceptor for PtraceSupervisor {
                     })?;
             }
             if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                self.release_connected_route(route_id).await?;
+                self.release_connected_route(route_id)?;
             }
         }
         if let Some(pending) = self.pending_udp_connect_exit.remove(&pid) {
             if let Some(route_id) = self.dns_tracker.unpin_socket(pending.socket_id) {
-                self.release_connected_route(route_id).await?;
+                self.release_connected_route(route_id)?;
             }
         }
         if let Some(pending) = self.pending_dns_recv_exit.remove(&pid) {
             if let Some(route_id) = self.dns_tracker.release_socket_hold(pending.socket_id) {
-                self.release_connected_route(route_id).await?;
+                self.release_connected_route(route_id)?;
             }
         }
         self.pending_dns_query.remove(&pid);
@@ -4305,7 +4311,7 @@ impl SyscallInterceptor for PtraceSupervisor {
         if let Some(pending) = self.pending_fd_exit.remove(&pid) {
             if let Some(socket_id) = pending.held_socket() {
                 if let Some(route_id) = self.dns_tracker.release_socket_hold(socket_id) {
-                    self.release_connected_route(route_id).await?;
+                    self.release_connected_route(route_id)?;
                 }
             }
         }
@@ -4383,7 +4389,7 @@ impl SyscallInterceptor for PtraceSupervisor {
             self.tid_tgids.clear();
             let released = self.dns_tracker.clear();
             for route_id in released {
-                if let Err(error) = self.release_connected_route(route_id).await {
+                if let Err(error) = self.release_connected_route(route_id) {
                     warn!(
                         route_id = route_id.0,
                         error = %error,
@@ -4405,7 +4411,7 @@ impl SyscallInterceptor for PtraceSupervisor {
             }
         }
         let released = self.dns_tracker.clear();
-        self.release_connected_routes(released).await?;
+        self.release_connected_routes(released)?;
         Ok(())
     }
 

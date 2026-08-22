@@ -206,7 +206,7 @@ fn parse_proc_udp_local(contents: &str, inode: u64, family: i32) -> Option<Socke
             }
             libc::AF_INET6 if raw_ip.len() == 32 => {
                 let mut octets = [0u8; 16];
-                for (index, chunk) in raw_ip.as_bytes().chunks_exact(8).enumerate() {
+                for (index, chunk) in raw_ip.as_bytes().as_chunks::<8>().0.iter().enumerate() {
                     let text = std::str::from_utf8(chunk).ok()?;
                     let value = u32::from_str_radix(text, 16).ok()?;
                     octets[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());

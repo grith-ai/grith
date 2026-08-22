@@ -212,8 +212,27 @@ fn compile_individual_patterns(patterns: Vec<SecretPattern>) -> Vec<CompiledPatt
 }
 
 /// Extract text content from the context for scanning.
+///
+/// The arguments bag is scanned with the ATTRIBUTION argv stripped first.
+/// Supervisor events carry the calling process's full command line
+/// (`process_args`) and its parent's (`parent_process_args`) so the operator
+/// can see who made a call — but that argv already had its secret scan at its
+/// own `ProcessSpawn`/`ShellExec`, where it is the call's content. Left in,
+/// a secret-shaped token in one command line re-fires on EVERY later syscall
+/// the process makes: one measured session had a +3.5 rider on a session-bus
+/// `connect(2)` — nothing secret crossing the socket — which containment's
+/// +2.0 then pushed over the queue threshold. Price the argv once, at the
+/// spawn that is made of it.
 fn extract_scannable_text(ctx: &ToolCallContext) -> String {
-    let args_text = ctx.arguments.to_string();
+    let args_text = match &ctx.arguments {
+        serde_json::Value::Object(map) => {
+            let mut scrubbed = map.clone();
+            scrubbed.remove("process_args");
+            scrubbed.remove("parent_process_args");
+            serde_json::Value::Object(scrubbed).to_string()
+        }
+        other => other.to_string(),
+    };
 
     match &ctx.call_type {
         ToolCallType::ShellExec { command, args }
@@ -438,6 +457,65 @@ mod tests {
         let mut ctx = ToolCallContext::new("test", call_type, Uuid::new_v4());
         ctx.arguments = args;
         ctx
+    }
+
+    /// The 2026-08-21 rider: a secret-shaped token in the ATTRIBUTION argv
+    /// must not score a later, unrelated syscall from that process — it was
+    /// priced at its own spawn. The same token as the CALL's own content
+    /// (spawn argv, file path bag) must still fire.
+    #[tokio::test]
+    async fn attribution_argv_never_scores_but_call_content_still_does() {
+        let filter = SecretScanFilter::new(load_real_patterns());
+        let secret =
+            "AKIA0000000000EXAMPL0 aws_secret_access_key=abcdEFGH1234abcdEFGH1234abcdEFGH1234abcd";
+
+        // A bus connect whose arguments carry the connecting process's argv,
+        // exactly as `supervisor_event_arguments` builds them.
+        let connect = make_ctx_with_args(
+            ToolCallType::NetConnect {
+                address: "unix:/run/user/1000/bus".into(),
+                port: 0,
+            },
+            serde_json::json!({
+                "pid": 4242,
+                "process": "node",
+                "process_args": ["node", "-e", secret],
+                "parent_process": "bash",
+                "parent_process_args": ["bash", "-c", secret],
+                "address": "unix:/run/user/1000/bus",
+                "port": 0,
+            }),
+        );
+        let result = filter.evaluate(&connect).await.unwrap();
+        assert!(
+            !result.matched,
+            "attribution argv must not re-score a connect: {:?}",
+            result.message
+        );
+
+        // The same token where the argv IS the call: still fires.
+        let spawn = make_ctx(ToolCallType::ProcessSpawn {
+            command: "/usr/bin/node".into(),
+            args: vec!["node".into(), "-e".into(), secret.into()],
+        });
+        let result = filter.evaluate(&spawn).await.unwrap();
+        assert!(result.matched, "the spawn's own argv must still be scanned");
+
+        // And a non-argv secret in the bag (e.g. written content) on a
+        // non-spawn call: still fires — only the two attribution keys are
+        // scrubbed, nothing else.
+        let write = make_ctx_with_args(
+            ToolCallType::FileWrite {
+                path: "/tmp/out".into(),
+                content_hash: String::new(),
+            },
+            serde_json::json!({ "content_preview": secret }),
+        );
+        let result = filter.evaluate(&write).await.unwrap();
+        assert!(
+            result.matched,
+            "non-attribution bag content must still be scanned"
+        );
     }
 
     fn make_ctx(call_type: ToolCallType) -> ToolCallContext {

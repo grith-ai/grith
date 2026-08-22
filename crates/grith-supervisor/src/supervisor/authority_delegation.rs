@@ -94,6 +94,181 @@ pub(crate) fn is_control_injection_socket(address: &str) -> bool {
         || (path.starts_with("/run/user/") && path.ends_with("/bus")) // session D-Bus
 }
 
+/// True when `address` is an X11 or Wayland **display** socket specifically —
+/// the subset of [`is_control_injection_socket`] where a curated argv-level
+/// classifier can tell routine desktop use from session control.
+///
+/// tmux, screen and the session bus are deliberately excluded: those are
+/// command-execution channels with no equivalent classifier, so a connect there
+/// stays escalated regardless of who is connecting.
+pub(crate) fn is_display_socket(address: &str) -> bool {
+    let path = address
+        .strip_prefix("unix:")
+        .unwrap_or(address)
+        .to_ascii_lowercase();
+    let path = path.strip_prefix('@').unwrap_or(&path);
+    path.contains("/.x11-unix/")
+        // Wayland compositors listen on `$XDG_RUNTIME_DIR/wayland-<n>`.
+        || (path.starts_with("/run/user/")
+            && path
+                .rsplit('/')
+                .next()
+                .is_some_and(|leaf| leaf.starts_with("wayland-")))
+}
+
+/// Which direction a clipboard tool moves data, since only one direction is
+/// routine.
+///
+/// Writing the selection is not control injection: nothing happens until the
+/// operator chooses to paste. READING it exfiltrates whatever they last copied,
+/// which is very often a password — so a read shape keeps escalating and is not
+/// carved here.
+///
+/// The polarity is per-binary because the two X11 tools disagree: `xclip`
+/// defaults to WRITING (it reads stdin into the selection) and `-o`/`-out`
+/// switches it to reading, while `xsel` defaults to READING and needs
+/// `-i`/`--input`/`--append` to write. Encoding one shared default would have
+/// silently carved every `xsel` read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClipboardDirection {
+    /// Only ever writes the selection; any invocation is routine.
+    AlwaysWrites,
+    /// Only ever reads it; never carved, listed so the registry is exhaustive
+    /// and a reader can see the read tools were considered.
+    AlwaysReads,
+    /// Writes unless one of these flags appears (`xclip`).
+    WritesUnless(&'static [&'static str]),
+    /// Reads unless one of these flags appears (`xsel`).
+    ReadsUnless(&'static [&'static str]),
+}
+
+/// Curated clipboard tools that cannot synthesise input.
+///
+/// CURATION POLICY: security-relevant. Changes gated on security-team review,
+/// same as [`INPUT_INJECTION_BINARIES`] above — and for the same reason, from
+/// the other side. That registry exists because X11/Wayland connects are
+/// deliberately de-scored to local IPC (routine desktop tooling touches those
+/// sockets constantly) and input synthesis is the operation that turns desktop
+/// access into control of the operator's session.
+///
+/// This registry completes that design. Without it the connect-level check
+/// escalates EVERY display-socket connect, so `xclip -selection clipboard`
+/// prompted once per session per socket despite being exactly the routine
+/// tooling the de-scoring was written to accommodate — and a denial left the
+/// clipboard broken for the rest of the session.
+///
+/// Entry criteria, all required: the tool moves selection data only, has no
+/// input-synthesis mode in any invocation, and is not a general-purpose X11
+/// client that happens to touch the clipboard. `xdotool` is excluded even
+/// though `xdotool type` can paste — it is in [`INPUT_INJECTION_BINARIES`].
+const DESKTOP_ROUTINE_BINARIES: &[(&str, ClipboardDirection)] = &[
+    ("xclip", ClipboardDirection::WritesUnless(&["-o", "-out"])),
+    (
+        "xsel",
+        ClipboardDirection::ReadsUnless(&["-i", "--input", "-a", "--append", "-c", "--clear"]),
+    ),
+    ("wl-copy", ClipboardDirection::AlwaysWrites),
+    ("wl-paste", ClipboardDirection::AlwaysReads),
+    ("pbcopy", ClipboardDirection::AlwaysWrites),
+    ("pbpaste", ClipboardDirection::AlwaysReads),
+];
+
+/// System binary roots a carved clipboard tool must live under.
+///
+/// The carveout is keyed on the CANONICAL path, not the basename, because a
+/// basename-keyed carveout is itself a bypass: `cp /usr/bin/xdotool ./xclip`
+/// would otherwise buy silent X11 access. (CLAUDE.md already records
+/// basename-keying as a known weakness of the delegating registry; this one
+/// does not repeat it.) Requiring a system root additionally means a tool the
+/// supervised agent dropped in its own tree cannot claim the carveout even
+/// under the right name.
+const SYSTEM_BINARY_ROOTS: &[&str] = &[
+    "/usr/bin/",
+    "/bin/",
+    "/usr/local/bin/",
+    "/usr/sbin/",
+    "/sbin/",
+    // Nix stores every binary under a hashed store path; Homebrew on Linux
+    // uses its own prefix. Both are root-owned package roots, same trust shape
+    // as /usr/bin.
+    "/nix/store/",
+    "/home/linuxbrew/.linuxbrew/bin/",
+    "/opt/homebrew/bin/",
+];
+
+/// Whether a connect to a display socket by `pid` is routine clipboard use and
+/// may skip control-socket escalation.
+///
+/// Every condition must hold:
+///   1. the address is an X11/Wayland **display** socket (not tmux/screen/bus);
+///   2. `/proc/<pid>/exe` canonicalises — failure means no carveout, fail closed;
+///   3. the canonical path sits under a [`SYSTEM_BINARY_ROOTS`] prefix;
+///   4. its basename is in [`DESKTOP_ROUTINE_BINARIES`];
+///   5. the argv moves data TOWARD the selection, not out of it.
+///
+/// What an attacker must now do, versus before: previously nothing — the
+/// escalation was unconditional on the socket, so this is strictly a carveout,
+/// not a widening of anything. To abuse it they must get code running as one of
+/// six curated binaries installed at a root-owned system path, in a write-only
+/// invocation, which grants them the ability to put data INTO the operator's
+/// clipboard and nothing else. Reading the clipboard, synthesising input, and
+/// every unknown binary on the socket all still escalate.
+pub(super) fn is_routine_desktop_connect(address: &str, pid: u32) -> bool {
+    if !is_display_socket(address) {
+        return false;
+    }
+    let Ok(canonical) = std::fs::canonicalize(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Some(path) = canonical.to_str() else {
+        return false;
+    };
+    if !SYSTEM_BINARY_ROOTS.iter().any(|r| path.starts_with(r)) {
+        return false;
+    }
+    let name = basename(path);
+    let Some((_, direction)) = DESKTOP_ROUTINE_BINARIES.iter().find(|(b, _)| *b == name) else {
+        return false;
+    };
+    // argv comes from the kernel for a process we have stopped at a syscall —
+    // the same trust shape as the `/proc/<pid>/exe` read above, and read here
+    // rather than threaded through the call sites so neither syscall is issued
+    // for a connect that is not a display socket in the first place.
+    let Some(argv) = read_proc_cmdline(pid) else {
+        return false;
+    };
+    clipboard_invocation_writes(*direction, &argv)
+}
+
+/// A process's argv from `/proc/<pid>/cmdline` (NUL-separated). `None` when the
+/// process is gone or the file is unreadable — the caller fails closed.
+fn read_proc_cmdline(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|c| !c.is_empty())
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect(),
+    )
+}
+
+/// True when this invocation moves data toward the selection.
+///
+/// Flags are matched over the whole argv (a clipboard tool takes no positional
+/// subcommand) and exactly, so `-output-file` cannot read as `-o`.
+fn clipboard_invocation_writes(direction: ClipboardDirection, argv: &[String]) -> bool {
+    let has = |flags: &[&str]| argv.iter().skip(1).any(|a| flags.contains(&a.as_str()));
+    match direction {
+        ClipboardDirection::AlwaysWrites => true,
+        ClipboardDirection::AlwaysReads => false,
+        ClipboardDirection::WritesUnless(read_flags) => !has(read_flags),
+        ClipboardDirection::ReadsUnless(write_flags) => has(write_flags),
+    }
+}
+
 /// Curated authority-delegating binary basenames. A `const` slice (rather than
 /// the old inline `matches!`) so [`AuthorityDelegatingPins`] can resolve each
 /// one on `$PATH` at session start (and hash it on first need). Security-relevant — see the
@@ -979,6 +1154,15 @@ pub(super) fn maybe_escalate_spawn_full(
         "authority-delegating spawn queued for review: `{display}` runs its effect in a privileged \
          or unsupervised peer, outside supervision"
     );
+    // When a curated command family applies, the approval will stick for the
+    // whole family — say so on the prompt, so the reviewer knows the grant
+    // they are making before they make it.
+    if let Some(family) = super::spawn_families::spawn_family(command, args) {
+        decision.decision_reason = format!(
+            "{}; approving covers {}",
+            decision.decision_reason, family.label
+        );
+    }
     true
 }
 
@@ -2262,5 +2446,145 @@ mod tests {
         );
         assert!(matches!(denied.action, ProxyAction::Deny { .. }));
         assert_eq!(denied.decision_reason, "denied");
+    }
+}
+
+#[cfg(test)]
+mod work84_clipboard_tests {
+    use super::*;
+
+    const X11: &str = "unix:@/tmp/.X11-unix/X1";
+    const WAYLAND: &str = "unix:/run/user/1000/wayland-0";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The carveout is scoped to display sockets. tmux, screen and the session
+    /// bus are command-execution channels with no argv-level classifier, so a
+    /// connect there must stay escalated no matter who is connecting.
+    #[test]
+    fn only_display_sockets_are_eligible() {
+        assert!(is_display_socket(X11));
+        assert!(is_display_socket("unix:/tmp/.X11-unix/X0"));
+        assert!(is_display_socket(WAYLAND));
+        for other in [
+            "unix:/run/user/1000/bus",
+            "unix:/tmp/tmux-1000/default",
+            "unix:/var/run/screen/S-dan/1234.pts-0",
+            "unix:/run/docker.sock",
+        ] {
+            assert!(!is_display_socket(other), "{other} must not be eligible");
+            assert!(
+                is_control_injection_socket(other) || other.contains("docker"),
+                "{other} sanity: still a control socket where it was one before"
+            );
+        }
+    }
+
+    /// Writing the selection is routine; reading it exfiltrates whatever the
+    /// operator last copied. The two X11 tools have OPPOSITE defaults, which is
+    /// why direction is per-binary rather than one shared rule.
+    #[test]
+    fn direction_is_per_binary_because_the_defaults_disagree() {
+        use ClipboardDirection::*;
+        let xclip = WritesUnless(&["-o", "-out"]);
+        // `xclip` with no output flag reads stdin INTO the selection.
+        assert!(clipboard_invocation_writes(
+            xclip,
+            &argv(&["xclip", "-selection", "clipboard"])
+        ));
+        assert!(!clipboard_invocation_writes(
+            xclip,
+            &argv(&["xclip", "-o", "-selection", "clipboard"])
+        ));
+        assert!(!clipboard_invocation_writes(
+            xclip,
+            &argv(&["xclip", "-out"])
+        ));
+
+        // `xsel` defaults the other way: no flag means print the selection.
+        let xsel = ReadsUnless(&["-i", "--input", "-a", "--append", "-c", "--clear"]);
+        assert!(!clipboard_invocation_writes(
+            xsel,
+            &argv(&["xsel", "--clipboard"])
+        ));
+        assert!(clipboard_invocation_writes(
+            xsel,
+            &argv(&["xsel", "--clipboard", "-i"])
+        ));
+
+        assert!(clipboard_invocation_writes(
+            AlwaysWrites,
+            &argv(&["wl-copy"])
+        ));
+        assert!(!clipboard_invocation_writes(
+            AlwaysReads,
+            &argv(&["wl-paste"])
+        ));
+    }
+
+    /// Flags match exactly, so a longer flag that merely starts with a read
+    /// flag cannot switch the direction.
+    #[test]
+    fn flag_matching_is_exact() {
+        let xclip = ClipboardDirection::WritesUnless(&["-o", "-out"]);
+        assert!(clipboard_invocation_writes(
+            xclip,
+            &argv(&["xclip", "-outfile", "/tmp/x"])
+        ));
+    }
+
+    /// The whole point of keying on the canonical path: a copy of an
+    /// input-synthesis tool renamed `xclip` must not inherit the carveout.
+    /// Exercised against the live process, which is neither a clipboard tool
+    /// nor at a system binary root.
+    #[test]
+    fn a_non_system_binary_never_qualifies() {
+        let me = std::process::id();
+        assert!(
+            !is_routine_desktop_connect(X11, me),
+            "the test binary is not a curated clipboard tool at a system path"
+        );
+    }
+
+    /// Fail closed: a pid with no `/proc` entry cannot resolve an exe, so it
+    /// gets no carveout.
+    #[test]
+    fn an_unresolvable_pid_fails_closed() {
+        assert!(!is_routine_desktop_connect(X11, u32::MAX));
+    }
+
+    /// A non-display socket is refused before any `/proc` read is attempted —
+    /// the ordering that keeps this off the hot path.
+    #[test]
+    fn a_non_display_socket_short_circuits() {
+        assert!(!is_routine_desktop_connect(
+            "unix:/run/user/1000/bus",
+            u32::MAX
+        ));
+        assert!(!is_routine_desktop_connect(
+            "unix:/tmp/tmux-1000/default",
+            u32::MAX
+        ));
+    }
+
+    /// The registry is closed and every entry is a selection-only tool. An
+    /// input-synthesis binary must never appear here, and `xdotool` in
+    /// particular lives in INPUT_INJECTION_BINARIES instead.
+    #[test]
+    fn the_registry_excludes_every_input_synthesis_tool() {
+        for (name, _) in DESKTOP_ROUTINE_BINARIES {
+            assert!(
+                !INPUT_INJECTION_BINARIES.iter().any(|(b, _)| b == name),
+                "{name} is in both registries"
+            );
+        }
+        for injector in ["xdotool", "xte", "ydotool", "dotool", "wtype"] {
+            assert!(
+                !DESKTOP_ROUTINE_BINARIES.iter().any(|(b, _)| *b == injector),
+                "{injector} must not be carved as routine"
+            );
+        }
     }
 }

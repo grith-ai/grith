@@ -40,8 +40,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+use grith_analytics::contract::{Category, CompletenessTier, RecordClass, SecurityEventType};
 use grith_audit::types::{AuditRecord, ProxyActionSummary};
 use grith_audit::AuditStorage;
+use grith_audit::{AuditAnalyticsMetadata, AuditConfigVersion, AuditSecurityMetadata};
 use uuid::Uuid;
 
 /// Channel capacity between the hot path and the writer thread. Sized
@@ -82,6 +84,12 @@ pub trait AuditSink: Send + Sync {
     fn dropped_count(&self) -> u64 {
         0
     }
+
+    /// Drain any buffered records and await their durable handoff. Called at
+    /// session end so exec teardown does not lose a buffered tail. Default
+    /// no-op for sinks that hand off synchronously (or on their own thread,
+    /// which outlives the session).
+    async fn flush(&self) {}
 }
 
 /// Audit sink backed by the daemon-owned shared [`AuditStorage`] with
@@ -101,7 +109,19 @@ pub struct StorageAuditSink {
 }
 
 impl StorageAuditSink {
+    /// Construct with the conservative floor tier for gap markers. For callers
+    /// without supervisor-config access; sessions that know their configured
+    /// `audit_completeness` should use [`Self::with_completeness`].
     pub fn new(storage: Arc<Mutex<AuditStorage>>) -> Self {
+        Self::with_completeness(storage, CompletenessTier::Decisions)
+    }
+
+    /// Construct with the session's configured completeness tier, stamped on
+    /// the gap markers this sink writes when it sheds load.
+    pub fn with_completeness(
+        storage: Arc<Mutex<AuditStorage>>,
+        completeness: CompletenessTier,
+    ) -> Self {
         let (tx, rx) = bounded::<AuditRecord>(CHANNEL_CAPACITY);
         let overflow_count = Arc::new(AtomicU64::new(0));
 
@@ -110,7 +130,7 @@ impl StorageAuditSink {
             .spawn({
                 let writer_storage = Arc::clone(&storage);
                 let writer_overflow = Arc::clone(&overflow_count);
-                move || writer_loop(rx, writer_storage, writer_overflow)
+                move || writer_loop(rx, writer_storage, writer_overflow, completeness)
             })
             .expect("spawn grith-audit-writer thread");
 
@@ -168,6 +188,7 @@ fn writer_loop(
     rx: Receiver<AuditRecord>,
     storage: Arc<Mutex<AuditStorage>>,
     overflow_count: Arc<AtomicU64>,
+    completeness: CompletenessTier,
 ) {
     let mut batch: Vec<AuditRecord> = Vec::with_capacity(BATCH_MAX);
     // B-CORE-2: drops already reflected by a persisted gap marker. Reconciled
@@ -205,7 +226,10 @@ fn writer_loop(
         let real_batch_len = batch.len();
         let dropped = overflow_count.load(Ordering::Relaxed);
         let marked = if dropped > last_marked_overflow {
-            batch.insert(0, gap_marker(dropped - last_marked_overflow, dropped));
+            batch.insert(
+                0,
+                gap_marker(dropped - last_marked_overflow, dropped, completeness),
+            );
             true
         } else {
             false
@@ -219,6 +243,19 @@ fn writer_loop(
                 Ok(()) => {
                     if marked {
                         last_marked_overflow = dropped;
+                    }
+                    // Projection work runs on the writer thread only after
+                    // the durable audit transaction. A projection failure
+                    // leaves its cursor behind for restart-safe catch-up and
+                    // never turns a successful security-record commit into a
+                    // reported audit loss.
+                    if let Err(error) = guard.materialize_analytics_tail(
+                        grith_audit::analytics::DEFAULT_MATERIALIZER_BATCH,
+                    ) {
+                        tracing::warn!(
+                            error = %error,
+                            "analytics materializer tail failed; cursor will retry"
+                        );
                     }
                 }
                 Err(e) => {
@@ -248,7 +285,11 @@ fn writer_loop(
     let dropped = overflow_count.load(Ordering::Relaxed);
     if dropped > last_marked_overflow {
         if let Ok(guard) = storage.lock() {
-            let _ = guard.insert_record(&gap_marker(dropped - last_marked_overflow, dropped));
+            let _ = guard.insert_record(&gap_marker(
+                dropped - last_marked_overflow,
+                dropped,
+                completeness,
+            ));
         }
     }
 
@@ -262,7 +303,7 @@ fn writer_loop(
 /// includes) — a verifier then sees an honest gap instead of a clean-but-
 /// incomplete chain (B-CORE-2). Session-agnostic (`Uuid::nil`): the writer
 /// batches records from every session sharing this storage.
-fn gap_marker(dropped_delta: u64, cumulative: u64) -> AuditRecord {
+fn gap_marker(dropped_delta: u64, cumulative: u64, completeness: CompletenessTier) -> AuditRecord {
     AuditRecord::new(
         Uuid::nil(),
         "grith-audit-sink".into(),
@@ -278,6 +319,34 @@ fn gap_marker(dropped_delta: u64, cumulative: u64) -> AuditRecord {
         0.0,
         Some("audit records dropped: writer could not keep up with the hot-path event rate".into()),
     )
+    .with_analytics_metadata(AuditAnalyticsMetadata {
+        metadata_version: 1,
+        completeness,
+        record_class: RecordClass::System,
+        category: Category::System,
+        config: AuditConfigVersion {
+            profile_id: "<not-applicable>".into(),
+            profile_version: "<not-applicable>".into(),
+            config_hash: grith_audit::types::sha256_hex(b"grith:audit-gap"),
+            policy_version: "<not-applicable>".into(),
+            auto_allow_threshold_micros: 0,
+            auto_deny_threshold_micros: 0,
+            queue_policy: "system".into(),
+            team_default_config_version: "<not-applicable>".into(),
+        },
+        filter_set_version: None,
+        llm_pricing: None,
+        destination: None,
+        security: Some(AuditSecurityMetadata {
+            event_type: SecurityEventType::Gap,
+            event_revision: 1,
+            resolution_status: None,
+            resolved_at: None,
+            resolution_code: None,
+            enforcement_outcome_code: Some("audit_channel_overflow".into()),
+            gap_count: Some(dropped_delta),
+        }),
+    })
 }
 
 #[cfg(test)]
