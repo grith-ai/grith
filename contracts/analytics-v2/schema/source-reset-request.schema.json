@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://grith.ai/contracts/analytics-v2/schema/source-reset-request.schema.json","title":"Analytics source reset request","$ref":"common.schema.json#/$defs/SourceResetRequest"}

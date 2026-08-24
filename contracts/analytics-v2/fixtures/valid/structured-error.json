@@ -1,0 +1,20 @@
+{
+  "case": "structured error carries code, retryability and field violations",
+  "schema": "StructuredError",
+  "valid": true,
+  "value": {
+    "error": {
+      "code": "stale_day_revision",
+      "message": "day 2026-08-19 revision 4 is not newer than accepted revision 6",
+      "retryable": false,
+      "request_id": "req-00000000000000000000000000000042",
+      "field_violations": [
+        {
+          "field": "day_snapshots[0].day_revision",
+          "rule": "must exceed the accepted revision for the active source epoch"
+        }
+      ],
+      "server_time": "2026-08-20T12:00:00.000000Z"
+    }
+  }
+}

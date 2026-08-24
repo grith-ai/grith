@@ -1,0 +1,23 @@
+{
+  "case": "actor identifiers are opaque non-empty strings, not UUID-only or numbers",
+  "schema": "RegistrationResponse",
+  "valid": false,
+  "value": {
+    "protocol_version": 2,
+    "schema_version": 1,
+    "device_id": "00000000-0000-4000-8000-000000000001",
+    "actor_user_id": 42,
+    "team_id": "00000000-0000-4000-8000-000000000005",
+    "source_epoch": "00000000-0000-4000-8000-000000000002",
+    "coverage_start": "2026-08-20T10:00:00.000000Z",
+    "credential_version": 1,
+    "device_secret": "test-only-device-secret-not-for-production-00000001",
+    "runtime_lease_expires_at": "2026-08-20T10:01:30.000000Z",
+    "destination_policy": {
+      "mode": "clear_label",
+      "key_version": 1,
+      "effective_at": "2026-08-20T10:00:00.000000Z"
+    },
+    "server_time": "2026-08-20T10:00:00.000000Z"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "case": "security projection rejects command content",
+  "schema": "SecurityEvent",
+  "valid": false,
+  "value": {
+    "event_id": "00000000-0000-4000-8000-000000000011",
+    "event_revision": 1,
+    "occurred_at": "2026-08-20T10:15:00.000000Z",
+    "event_type": "deny",
+    "initial_verdict": "deny",
+    "project": "grith",
+    "profile_id": "codex",
+    "supervised_tool": "codex",
+    "category": "process",
+    "top_filter_ids": [],
+    "command": "rm -rf example"
+  }
+}

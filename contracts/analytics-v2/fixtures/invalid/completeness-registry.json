@@ -1,0 +1,17 @@
+{
+  "case": "full is not a completeness tier",
+  "schema": "RequestContext",
+  "valid": false,
+  "value": {
+    "protocol_version": 2,
+    "schema_version": 1,
+    "device_id": "00000000-0000-4000-8000-000000000001",
+    "source_epoch": "00000000-0000-4000-8000-000000000002",
+    "request_seq": 1,
+    "runtime_instance_id": "00000000-0000-4000-8000-000000000003",
+    "generated_at": "2026-08-20T10:00:00.000000Z",
+    "client_version": "0.2.5",
+    "materializer_version": 1,
+    "completeness": "full"
+  }
+}

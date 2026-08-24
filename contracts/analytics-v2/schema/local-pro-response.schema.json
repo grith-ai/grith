@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://grith.ai/contracts/analytics-v2/schema/local-pro-response.schema.json","title":"Explicit Pro local analytics response","$ref":"common.schema.json#/$defs/LocalProResponse"}

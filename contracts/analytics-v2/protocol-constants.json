@@ -1,0 +1,83 @@
+{
+  "protocol_version": 2,
+  "schema_version": 1,
+  "materializer_version": 1,
+  "request": {
+    "max_bytes": 8388608,
+    "max_day_snapshots": 1,
+    "event_only_allowed": true,
+    "max_config_versions": 64,
+    "max_security_events": 500,
+    "max_rollup_rows_total": 50000,
+    "max_usage_rows": 20000,
+    "max_filter_rows": 10000,
+    "max_session_rows": 10000,
+    "max_llm_rows": 5000,
+    "max_destination_rows": 5000
+  },
+  "labels_utf8_bytes": {
+    "project": 128,
+    "profile": 64,
+    "tool": 64,
+    "provider": 32,
+    "model": 128,
+    "filter_id": 64,
+    "destination_id": 128
+  },
+  "rate_limits": {
+    "device_requests_per_minute": 6,
+    "device_burst": 12,
+    "team_requests_per_minute": 300,
+    "team_burst": 600
+  },
+  "devices": {
+    "per_seat": 2,
+    "maximum_seats": 25,
+    "maximum_per_team": 50,
+    "runtime_instance_lease_seconds": 90,
+    "heartbeat_interval_seconds": 30,
+    "stale_after_seconds": 60
+  },
+  "freshness": {
+    "snapshot_interval_seconds": 30,
+    "cloud_visibility_p95_seconds": 60
+  },
+  "score": {
+    "scale": 1000000,
+    "minimum_micros": -100000000,
+    "maximum_micros": 100000000,
+    "aggregate_sum_minimum_micros": -9007199254740991,
+    "aggregate_sum_maximum_micros": 9007199254740991,
+    "aggregate_sum_constraint": "abs(score_sum_micros) <= event_count * 100000000 using overflow-safe arithmetic",
+    "histogram_version": 1,
+    "histogram_bins": 30,
+    "histogram_minimum_micros": 0,
+    "histogram_maximum_micros": 15000000,
+    "histogram_bin_width_micros": 500000,
+    "out_of_histogram_range": "clamp"
+  },
+  "money": {
+    "scale": 1000000,
+    "currency": "USD",
+    "rounding": "nearest_integer_half_away_from_zero",
+    "maximum_micros": 9007199254740991
+  },
+  "windows_days": {
+    "free": 7,
+    "pro_short": 30,
+    "pro_long": 90,
+    "export_maximum": 90
+  },
+  "free_recent_queue_deny_limit": 20,
+  "archive_active_bytes_per_team": 268435456000,
+  "retention_days": {
+    "postgres_rollups": 90,
+    "security_events": 90,
+    "active_s3_projection": 90,
+    "superseded_s3_revision": 7,
+    "pro_local_projection": 90,
+    "local_active_audit": 30,
+    "lapse_reactivation": 30,
+    "local_cold_archive": null
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "case": "complete snapshot with all rollup families",
+  "schema": "SnapshotRequest",
+  "valid": true,
+  "value": {
+    "protocol_version": 2,
+    "schema_version": 1,
+    "device_id": "00000000-0000-4000-8000-000000000001",
+    "source_epoch": "00000000-0000-4000-8000-000000000002",
+    "request_seq": 9,
+    "runtime_instance_id": "00000000-0000-4000-8000-000000000003",
+    "generated_at": "2026-08-20T11:15:30.000000Z",
+    "client_version": "0.2.5",
+    "materializer_version": 1,
+    "completeness": "all",
+    "config_versions": [
+      {
+        "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "profile_id": "codex",
+        "profile_version": "1",
+        "policy_version": "2026-08-20",
+        "auto_allow_threshold_micros": 2000000,
+        "auto_deny_threshold_micros": 8000000,
+        "queue_policy": "interactive",
+        "team_default_config_version": "2026-08-20",
+        "first_seen_at": "2026-08-20T10:15:00.000000Z",
+        "last_seen_at": "2026-08-20T11:15:00.000000Z"
+      }
+    ],
+    "day_snapshots": [
+      {
+        "day": "2026-08-20",
+        "day_revision": 4,
+        "read_model_generation": 1,
+        "state": "partial",
+        "source_event_count": 2,
+        "first_event_at": "2026-08-20T10:15:00.000000Z",
+        "last_event_at": "2026-08-20T11:15:00.000000Z",
+        "first_chain_sequence": 1,
+        "last_chain_sequence": 2,
+        "last_chain_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "usage_rows": [
+          {
+            "bucket_start": "2026-08-20T10:00:00.000000Z",
+            "project": "grith",
+            "profile_id": "codex",
+            "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "supervised_tool": "codex",
+            "record_class": "decision",
+            "category": "file_read",
+            "verdict": "deny",
+            "score_bin_version": 1,
+            "score_bucket": 0,
+            "event_count": 1,
+            "score_sum_micros": -100000000,
+            "first_event_at": "2026-08-20T10:15:00.000000Z",
+            "last_event_at": "2026-08-20T10:15:00.000000Z"
+          },
+          {
+            "bucket_start": "2026-08-20T11:00:00.000000Z",
+            "project": "grith",
+            "profile_id": "codex",
+            "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "supervised_tool": "codex",
+            "record_class": "llm_usage",
+            "category": "llm",
+            "verdict": null,
+            "score_bin_version": 1,
+            "score_bucket": null,
+            "event_count": 1,
+            "score_sum_micros": 0,
+            "first_event_at": "2026-08-20T11:15:00.000000Z",
+            "last_event_at": "2026-08-20T11:15:00.000000Z"
+          }
+        ],
+        "filter_rows": [
+          {
+            "day": "2026-08-20",
+            "project": "grith",
+            "profile_id": "codex",
+            "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "filter_set_version": 1,
+            "filter_id": "secret-scan",
+            "evaluated_events": 1,
+            "triggered_events": 1,
+            "denied_evaluated_events": 1,
+            "denied_positive_contributions": 1
+          }
+        ],
+        "session_rows": [
+          {
+            "day": "2026-08-20",
+            "session_id": "00000000-0000-4000-8000-000000000010",
+            "project": "grith",
+            "profile_id": "codex",
+            "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "supervised_tool": "codex",
+            "first_event_at": "2026-08-20T10:15:00.000000Z",
+            "last_event_at": "2026-08-20T11:15:00.000000Z",
+            "decision_count": 1,
+            "queue_count": 0,
+            "deny_count": 1,
+            "llm_calls": 1,
+            "prompt_tokens": 100,
+            "completion_tokens": 25,
+            "cost_micros": 1250
+          }
+        ],
+        "llm_rows": [
+          {
+            "day": "2026-08-20",
+            "project": "grith",
+            "provider": "openai",
+            "model": "gpt-5",
+            "currency": "USD",
+            "price_source": "openai-list-price",
+            "pricing_version": "2026-08-01",
+            "calls": 1,
+            "prompt_tokens": 100,
+            "completion_tokens": 25,
+            "cost_micros": 1250
+          }
+        ],
+        "destination_rows": [
+          {
+            "day": "2026-08-20",
+            "kind": "url_origin",
+            "destination_hmac": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "hmac_key_version": 1,
+            "verdict": "deny",
+            "event_count": 1,
+            "first_event_at": "2026-08-20T10:15:00.000000Z",
+            "last_event_at": "2026-08-20T10:15:00.000000Z"
+          }
+        ],
+        "row_checksum_sha256": "02690949a0af88153ad624fb63ab18d09b92d3bc0701e040fe966c82b407064d"
+      }
+    ],
+    "security_events": [
+      {
+        "event_id": "00000000-0000-4000-8000-000000000011",
+        "event_revision": 2,
+        "occurred_at": "2026-08-20T10:15:00.000000Z",
+        "event_type": "deny",
+        "initial_verdict": "deny",
+        "resolution": {
+          "status": "denied",
+          "resolved_at": "2026-08-20T10:16:00.000000Z",
+          "resolution_code": "policy_confirmed"
+        },
+        "session_id": "00000000-0000-4000-8000-000000000010",
+        "project": "grith",
+        "profile_id": "codex",
+        "supervised_tool": "codex",
+        "category": "file_read",
+        "score_micros": -100000000,
+        "top_filter_ids": ["secret-scan"],
+        "enforcement_outcome_code": "blocked",
+        "chain_sequence": 1,
+        "chain_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    ]
+  }
+}

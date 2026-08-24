@@ -1,0 +1,10 @@
+{
+  "case": "rejected is not a resolution status",
+  "schema": "SecurityResolution",
+  "valid": false,
+  "value": {
+    "status": "rejected",
+    "resolved_at": "2026-08-20T10:16:00.000000Z",
+    "resolution_code": "policy_confirmed"
+  }
+}

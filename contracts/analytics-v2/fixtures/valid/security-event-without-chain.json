@@ -1,0 +1,17 @@
+{
+  "case": "chain-less security event omits chain fields instead of writing null",
+  "schema": "SecurityEvent",
+  "valid": true,
+  "value": {
+    "event_id": "00000000-0000-4000-8000-000000000021",
+    "event_revision": 1,
+    "occurred_at": "2026-08-20T10:15:00.123456Z",
+    "event_type": "gap",
+    "project": "<unknown>",
+    "profile_id": "<not-applicable>",
+    "supervised_tool": "<unknown>",
+    "category": "system",
+    "top_filter_ids": [],
+    "gap_count": 17
+  }
+}

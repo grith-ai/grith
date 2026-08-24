@@ -1,0 +1,1306 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grith.ai/contracts/analytics-v2/schema/common.schema.json",
+  "title": "Grith analytics-v2 common types",
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "UtcDay": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "NonNegativeSafeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "PositiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "ScoreMicros": {
+      "type": "integer",
+      "minimum": -100000000,
+      "maximum": 100000000
+    },
+    "CostMicros": {
+      "$ref": "#/$defs/NonNegativeSafeInteger"
+    },
+    "ProjectLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "x-maxUtf8Bytes": 128
+    },
+    "ProfileLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "x-maxUtf8Bytes": 64
+    },
+    "ToolLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "x-maxUtf8Bytes": 64
+    },
+    "ProviderLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "x-maxUtf8Bytes": 32
+    },
+    "ModelLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "x-maxUtf8Bytes": 128
+    },
+    "FilterId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "x-maxUtf8Bytes": 64
+    },
+    "RecordClass": {
+      "enum": ["decision", "routine_spawn", "routine_io", "noise", "llm_usage", "system"]
+    },
+    "Category": {
+      "enum": [
+        "file_read",
+        "file_mutation",
+        "process",
+        "network_egress",
+        "network_listen",
+        "cross_process",
+        "namespace",
+        "llm",
+        "system",
+        "other"
+      ]
+    },
+    "Verdict": {
+      "enum": ["allow", "queue", "deny"]
+    },
+    "Completeness": {
+      "enum": ["decisions", "spawns", "io", "all"]
+    },
+    "DeviceSyncStatus": {
+      "enum": [
+        "current",
+        "stale",
+        "offline",
+        "sync_disabled",
+        "entitlement_expired",
+        "quota_rejected",
+        "revoked",
+        "gap"
+      ]
+    },
+    "RequestContext": {
+      "type": "object",
+      "properties": {
+        "protocol_version": { "const": 2 },
+        "schema_version": { "const": 1 },
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "request_seq": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "runtime_instance_id": { "$ref": "#/$defs/Uuid" },
+        "generated_at": { "$ref": "#/$defs/Timestamp" },
+        "client_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "x-maxUtf8Bytes": 32
+        },
+        "materializer_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "completeness": { "$ref": "#/$defs/Completeness" }
+      },
+      "required": [
+        "protocol_version",
+        "schema_version",
+        "device_id",
+        "source_epoch",
+        "request_seq",
+        "runtime_instance_id",
+        "generated_at",
+        "client_version",
+        "materializer_version",
+        "completeness"
+      ]
+    },
+    "ConsentReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "consent_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": ["consent_version", "accepted_at"]
+    },
+    "DestinationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["team_hmac", "clear_label"] },
+        "key_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "team_hmac_key_base64": {
+          "type": "string",
+          "minLength": 43,
+          "maxLength": 44,
+          "contentEncoding": "base64"
+        },
+        "effective_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": ["mode", "key_version", "team_hmac_key_base64", "effective_at"]
+    },
+    "ConfigVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "config_hash": { "$ref": "#/$defs/Sha256" },
+        "profile_id": { "$ref": "#/$defs/ProfileLabel" },
+        "profile_version": { "$ref": "#/$defs/ProfileLabel" },
+        "policy_version": { "$ref": "#/$defs/ProfileLabel" },
+        "auto_allow_threshold_micros": { "$ref": "#/$defs/ScoreMicros" },
+        "auto_deny_threshold_micros": { "$ref": "#/$defs/ScoreMicros" },
+        "queue_policy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "x-maxUtf8Bytes": 64
+        },
+        "team_default_config_version": { "$ref": "#/$defs/ProfileLabel" },
+        "first_seen_at": { "$ref": "#/$defs/Timestamp" },
+        "last_seen_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "config_hash",
+        "profile_id",
+        "profile_version",
+        "policy_version",
+        "auto_allow_threshold_micros",
+        "auto_deny_threshold_micros",
+        "queue_policy",
+        "team_default_config_version",
+        "first_seen_at",
+        "last_seen_at"
+      ]
+    },
+    "SecurityResolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["pending", "approved", "denied", "expired", "escalated"] },
+        "resolved_at": { "$ref": "#/$defs/Timestamp" },
+        "resolution_code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"
+        }
+      },
+      "required": ["status"]
+    },
+    "SecurityEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Uuid" },
+        "event_revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "occurred_at": { "$ref": "#/$defs/Timestamp" },
+        "event_type": { "enum": ["queue", "deny", "canary", "gap"] },
+        "initial_verdict": { "$ref": "#/$defs/Verdict" },
+        "resolution": { "$ref": "#/$defs/SecurityResolution" },
+        "session_id": { "$ref": "#/$defs/Uuid" },
+        "project": { "$ref": "#/$defs/ProjectLabel" },
+        "profile_id": { "$ref": "#/$defs/ProfileLabel" },
+        "supervised_tool": { "$ref": "#/$defs/ToolLabel" },
+        "category": { "$ref": "#/$defs/Category" },
+        "score_micros": { "$ref": "#/$defs/ScoreMicros" },
+        "top_filter_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/FilterId" },
+          "x-canonicalOrder": "ascending UTF-8 bytes"
+        },
+        "enforcement_outcome_code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"
+        },
+        "gap_count": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "chain_sequence": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "chain_hash": { "$ref": "#/$defs/Sha256" }
+      },
+      "required": [
+        "event_id",
+        "event_revision",
+        "occurred_at",
+        "event_type",
+        "project",
+        "profile_id",
+        "supervised_tool",
+        "category",
+        "top_filter_ids"
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "event_type": { "enum": ["queue", "deny"] } } },
+          "then": { "required": ["initial_verdict"] }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "gap" } } },
+          "then": { "required": ["gap_count"] }
+        }
+      ]
+    },
+    "UsageRollupRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bucket_start": { "$ref": "#/$defs/Timestamp" },
+        "project": { "$ref": "#/$defs/ProjectLabel" },
+        "profile_id": { "$ref": "#/$defs/ProfileLabel" },
+        "config_hash": { "$ref": "#/$defs/Sha256" },
+        "supervised_tool": { "$ref": "#/$defs/ToolLabel" },
+        "record_class": { "$ref": "#/$defs/RecordClass" },
+        "category": { "$ref": "#/$defs/Category" },
+        "verdict": { "oneOf": [{ "$ref": "#/$defs/Verdict" }, { "type": "null" }] },
+        "score_bin_version": { "const": 1 },
+        "score_bucket": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0, "maximum": 29 },
+            { "type": "null" }
+          ]
+        },
+        "event_count": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "score_sum_micros": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991,
+          "x-constraint": "abs(score_sum_micros) <= event_count * 100000000; validate with overflow-safe arithmetic"
+        },
+        "first_event_at": { "$ref": "#/$defs/Timestamp" },
+        "last_event_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "bucket_start",
+        "project",
+        "profile_id",
+        "config_hash",
+        "supervised_tool",
+        "record_class",
+        "category",
+        "verdict",
+        "score_bin_version",
+        "score_bucket",
+        "event_count",
+        "score_sum_micros",
+        "first_event_at",
+        "last_event_at"
+      ]
+    },
+    "FilterRollupRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "project": { "$ref": "#/$defs/ProjectLabel" },
+        "profile_id": { "$ref": "#/$defs/ProfileLabel" },
+        "config_hash": { "$ref": "#/$defs/Sha256" },
+        "filter_set_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "filter_id": { "$ref": "#/$defs/FilterId" },
+        "evaluated_events": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "triggered_events": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "denied_evaluated_events": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "denied_positive_contributions": { "$ref": "#/$defs/NonNegativeSafeInteger" }
+      },
+      "required": [
+        "day",
+        "project",
+        "profile_id",
+        "config_hash",
+        "filter_set_version",
+        "filter_id",
+        "evaluated_events",
+        "triggered_events",
+        "denied_evaluated_events",
+        "denied_positive_contributions"
+      ]
+    },
+    "SessionDayRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "session_id": { "$ref": "#/$defs/Uuid" },
+        "project": { "$ref": "#/$defs/ProjectLabel" },
+        "profile_id": { "$ref": "#/$defs/ProfileLabel" },
+        "config_hash": { "$ref": "#/$defs/Sha256" },
+        "supervised_tool": { "$ref": "#/$defs/ToolLabel" },
+        "first_event_at": { "$ref": "#/$defs/Timestamp" },
+        "last_event_at": { "$ref": "#/$defs/Timestamp" },
+        "decision_count": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "queue_count": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "deny_count": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "llm_calls": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "prompt_tokens": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "completion_tokens": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "cost_micros": { "$ref": "#/$defs/CostMicros" }
+      },
+      "required": [
+        "day",
+        "session_id",
+        "project",
+        "profile_id",
+        "config_hash",
+        "supervised_tool",
+        "first_event_at",
+        "last_event_at",
+        "decision_count",
+        "queue_count",
+        "deny_count",
+        "llm_calls",
+        "prompt_tokens",
+        "completion_tokens",
+        "cost_micros"
+      ]
+    },
+    "LlmRollupRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "project": { "$ref": "#/$defs/ProjectLabel" },
+        "provider": { "$ref": "#/$defs/ProviderLabel" },
+        "model": { "$ref": "#/$defs/ModelLabel" },
+        "currency": { "const": "USD" },
+        "price_source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "x-maxUtf8Bytes": 64
+        },
+        "pricing_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "x-maxUtf8Bytes": 64
+        },
+        "calls": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "prompt_tokens": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "completion_tokens": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "cost_micros": { "$ref": "#/$defs/CostMicros" }
+      },
+      "required": [
+        "day",
+        "project",
+        "provider",
+        "model",
+        "currency",
+        "price_source",
+        "pricing_version",
+        "calls",
+        "prompt_tokens",
+        "completion_tokens",
+        "cost_micros"
+      ]
+    },
+    "DestinationRollupRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "kind": { "enum": ["domain", "host_port", "url_origin", "unix_socket_class", "other"] },
+        "destination_hmac": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "hmac_key_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "approved_display_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "x-maxUtf8Bytes": 128
+        },
+        "verdict": { "$ref": "#/$defs/Verdict" },
+        "event_count": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "first_event_at": { "$ref": "#/$defs/Timestamp" },
+        "last_event_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "day",
+        "kind",
+        "destination_hmac",
+        "hmac_key_version",
+        "verdict",
+        "event_count",
+        "first_event_at",
+        "last_event_at"
+      ]
+    },
+    "DaySnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "day_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "read_model_generation": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "state": { "enum": ["partial", "final"] },
+        "source_event_count": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "first_event_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "last_event_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "first_chain_sequence": {
+          "oneOf": [{ "$ref": "#/$defs/NonNegativeSafeInteger" }, { "type": "null" }]
+        },
+        "last_chain_sequence": {
+          "oneOf": [{ "$ref": "#/$defs/NonNegativeSafeInteger" }, { "type": "null" }]
+        },
+        "last_chain_hash": {
+          "oneOf": [{ "$ref": "#/$defs/Sha256" }, { "type": "null" }]
+        },
+        "usage_rows": {
+          "type": "array",
+          "maxItems": 20000,
+          "items": { "$ref": "#/$defs/UsageRollupRow" },
+          "x-canonicalOrder": "usage-v1"
+        },
+        "filter_rows": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/FilterRollupRow" },
+          "x-canonicalOrder": "filter-v1"
+        },
+        "session_rows": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/SessionDayRow" },
+          "x-canonicalOrder": "session-v1"
+        },
+        "llm_rows": {
+          "type": "array",
+          "maxItems": 5000,
+          "items": { "$ref": "#/$defs/LlmRollupRow" },
+          "x-canonicalOrder": "llm-v1"
+        },
+        "destination_rows": {
+          "type": "array",
+          "maxItems": 5000,
+          "items": { "$ref": "#/$defs/DestinationRollupRow" },
+          "x-canonicalOrder": "destination-v1"
+        },
+        "row_checksum_sha256": { "$ref": "#/$defs/Sha256" }
+      },
+      "required": [
+        "day",
+        "day_revision",
+        "read_model_generation",
+        "state",
+        "source_event_count",
+        "first_event_at",
+        "last_event_at",
+        "first_chain_sequence",
+        "last_chain_sequence",
+        "last_chain_hash",
+        "usage_rows",
+        "filter_rows",
+        "session_rows",
+        "llm_rows",
+        "destination_rows",
+        "row_checksum_sha256"
+      ],
+      "x-maxRollupRowsAcrossFamilies": 50000
+    },
+    "ArchiveDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "day_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "archive_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "projection_schema_version": { "const": 1 },
+        "materializer_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "row_checksum_sha256": { "$ref": "#/$defs/Sha256" },
+        "content_sha256": { "$ref": "#/$defs/Sha256" },
+        "byte_size": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "row_count": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "min_event_at": { "$ref": "#/$defs/Timestamp" },
+        "max_event_at": { "$ref": "#/$defs/Timestamp" },
+        "first_chain_sequence": {
+          "oneOf": [{ "$ref": "#/$defs/NonNegativeSafeInteger" }, { "type": "null" }]
+        },
+        "last_chain_sequence": {
+          "oneOf": [{ "$ref": "#/$defs/NonNegativeSafeInteger" }, { "type": "null" }]
+        },
+        "last_chain_hash": {
+          "oneOf": [{ "$ref": "#/$defs/Sha256" }, { "type": "null" }]
+        }
+      },
+      "required": [
+        "day",
+        "day_revision",
+        "archive_revision",
+        "projection_schema_version",
+        "materializer_version",
+        "row_checksum_sha256",
+        "content_sha256",
+        "byte_size",
+        "row_count",
+        "min_event_at",
+        "max_event_at",
+        "first_chain_sequence",
+        "last_chain_sequence",
+        "last_chain_hash"
+      ]
+    },
+    "RegistrationRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "const": 2 },
+        "schema_version": { "const": 1 },
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "runtime_instance_id": { "$ref": "#/$defs/Uuid" },
+        "device_display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "x-maxUtf8Bytes": 64
+        },
+        "client_version": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "materializer_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "completeness": { "$ref": "#/$defs/Completeness" },
+        "coverage_start": { "$ref": "#/$defs/Timestamp" },
+        "baseline_chain_sequence": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "baseline_chain_hash": { "$ref": "#/$defs/Sha256" },
+        "audit_database_generation": { "$ref": "#/$defs/Uuid" },
+        "consent": { "$ref": "#/$defs/ConsentReceipt" },
+        "signing_public_key": {
+          "type": "string",
+          "minLength": 43,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "protocol_version",
+        "schema_version",
+        "source_epoch",
+        "runtime_instance_id",
+        "device_display_name",
+        "client_version",
+        "materializer_version",
+        "completeness",
+        "coverage_start",
+        "baseline_chain_sequence",
+        "audit_database_generation",
+        "consent"
+      ]
+    },
+    "RegistrationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "const": 2 },
+        "schema_version": { "const": 1 },
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "actor_user_id": { "type": "string", "minLength": 1, "maxLength": 128, "x-maxUtf8Bytes": 128 },
+        "team_id": { "$ref": "#/$defs/Uuid" },
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "coverage_start": { "$ref": "#/$defs/Timestamp" },
+        "credential_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "device_secret": { "type": "string", "minLength": 43, "maxLength": 128 },
+        "runtime_lease_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "destination_policy": { "$ref": "#/$defs/DestinationPolicy" },
+        "server_time": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "protocol_version",
+        "schema_version",
+        "device_id",
+        "actor_user_id",
+        "team_id",
+        "source_epoch",
+        "coverage_start",
+        "credential_version",
+        "device_secret",
+        "runtime_lease_expires_at",
+        "destination_policy",
+        "server_time"
+      ]
+    },
+    "CredentialRotationRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "current_credential_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["current_credential_version", "reason"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CredentialRotationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "credential_version": { "type": "integer", "minimum": 2, "maximum": 65535 },
+        "device_secret": { "type": "string", "minLength": 43, "maxLength": 128 },
+        "previous_secret_valid_until": { "$ref": "#/$defs/Timestamp" },
+        "server_time": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "device_id",
+        "credential_version",
+        "device_secret",
+        "previous_secret_valid_until",
+        "server_time"
+      ]
+    },
+    "DeviceRevocationRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "reason": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["reason"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DeviceRevocationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "revoked_at": { "$ref": "#/$defs/Timestamp" },
+        "future_uploads_accepted": { "const": false },
+        "server_time": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": ["device_id", "revoked_at", "future_uploads_accepted", "server_time"]
+    },
+    "HeartbeatRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "sync_enabled": { "type": "boolean" },
+            "latest_local_event_at": { "$ref": "#/$defs/Timestamp" },
+            "materialized_through_sequence": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+            "materialized_through_hash": { "$ref": "#/$defs/Sha256" },
+            "dirty_day_count": { "type": "integer", "minimum": 0, "maximum": 366 },
+            "oldest_dirty_day": {
+              "oneOf": [{ "$ref": "#/$defs/UtcDay" }, { "type": "null" }]
+            },
+            "unacknowledged_security_events": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "unacknowledged_archive_days": { "type": "integer", "minimum": 0, "maximum": 366 },
+            "dropped_event_count": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+            "audit_database_generation": { "$ref": "#/$defs/Uuid" }
+          },
+          "required": [
+            "sync_enabled",
+            "materialized_through_sequence",
+            "dirty_day_count",
+            "oldest_dirty_day",
+            "unacknowledged_security_events",
+            "unacknowledged_archive_days",
+            "dropped_event_count",
+            "audit_database_generation"
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "HeartbeatResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "status": { "$ref": "#/$defs/DeviceSyncStatus" },
+        "runtime_lease_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "next_heartbeat_seconds": { "const": 30 },
+        "server_time": { "$ref": "#/$defs/Timestamp" },
+        "destination_policy": { "$ref": "#/$defs/DestinationPolicy" }
+      },
+      "required": [
+        "device_id",
+        "status",
+        "runtime_lease_expires_at",
+        "next_heartbeat_seconds",
+        "server_time"
+      ]
+    },
+    "SnapshotRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "config_versions": {
+              "type": "array",
+              "maxItems": 64,
+              "items": { "$ref": "#/$defs/ConfigVersion" },
+              "x-canonicalOrder": "config_hash ascending"
+            },
+            "day_snapshots": {
+              "type": "array",
+              "maxItems": 1,
+              "items": { "$ref": "#/$defs/DaySnapshot" }
+            },
+            "security_events": {
+              "type": "array",
+              "maxItems": 500,
+              "items": { "$ref": "#/$defs/SecurityEvent" },
+              "x-canonicalOrder": "event_id then event_revision ascending"
+            }
+          },
+          "required": ["config_versions", "day_snapshots", "security_events"],
+          "anyOf": [
+            { "properties": { "day_snapshots": { "minItems": 1 } } },
+            { "properties": { "security_events": { "minItems": 1 } } }
+          ]
+        }
+      ],
+      "unevaluatedProperties": false,
+      "x-maxRequestBytes": 8388608
+    },
+    "AcceptedDay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "day_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "read_model_generation": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "row_checksum_sha256": { "$ref": "#/$defs/Sha256" },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": ["day", "day_revision", "read_model_generation", "row_checksum_sha256", "accepted_at"]
+    },
+    "SecurityEventAcknowledgement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Uuid" },
+        "event_revision": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": ["event_id", "event_revision", "accepted_at"]
+    },
+    "SnapshotResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "accepted_request_seq": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "request_digest_sha256": { "$ref": "#/$defs/Sha256" },
+        "accepted_days": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/AcceptedDay" }
+        },
+        "security_event_acknowledgements": {
+          "type": "array",
+          "maxItems": 500,
+          "items": { "$ref": "#/$defs/SecurityEventAcknowledgement" }
+        },
+        "server_time": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "device_id",
+        "source_epoch",
+        "accepted_request_seq",
+        "request_digest_sha256",
+        "accepted_days",
+        "security_event_acknowledgements",
+        "server_time"
+      ]
+    },
+    "StateQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" }
+      },
+      "required": ["device_id"]
+    },
+    "SourceEpochState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "coverage_start": { "$ref": "#/$defs/Timestamp" },
+        "coverage_end": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "baseline_chain_sequence": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "baseline_chain_hash": {
+          "oneOf": [{ "$ref": "#/$defs/Sha256" }, { "type": "null" }]
+        },
+        "audit_database_generation": { "$ref": "#/$defs/Uuid" },
+        "active": { "type": "boolean" }
+      },
+      "required": [
+        "source_epoch",
+        "coverage_start",
+        "coverage_end",
+        "baseline_chain_sequence",
+        "baseline_chain_hash",
+        "audit_database_generation",
+        "active"
+      ]
+    },
+    "DayState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "accepted_day_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "read_model_generation": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "row_checksum_sha256": { "$ref": "#/$defs/Sha256" },
+        "accepted_at": { "$ref": "#/$defs/Timestamp" },
+        "active_archive_revision": {
+          "oneOf": [{ "$ref": "#/$defs/PositiveSafeInteger" }, { "type": "null" }]
+        },
+        "active_archive_day_revision": {
+          "oneOf": [{ "$ref": "#/$defs/PositiveSafeInteger" }, { "type": "null" }]
+        }
+      },
+      "required": [
+        "source_epoch",
+        "day",
+        "accepted_day_revision",
+        "read_model_generation",
+        "row_checksum_sha256",
+        "accepted_at",
+        "active_archive_revision",
+        "active_archive_day_revision"
+      ]
+    },
+    "StateResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "actor_user_id": { "type": "string", "minLength": 1, "maxLength": 128, "x-maxUtf8Bytes": 128 },
+        "team_id": { "$ref": "#/$defs/Uuid" },
+        "status": { "$ref": "#/$defs/DeviceSyncStatus" },
+        "active_source_epoch": { "$ref": "#/$defs/Uuid" },
+        "last_accepted_request_seq": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "latest_local_event_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "latest_snapshot_accepted_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "latest_archive_day": {
+          "oneOf": [{ "$ref": "#/$defs/UtcDay" }, { "type": "null" }]
+        },
+        "last_contact_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "source_epochs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/SourceEpochState" },
+          "x-noOverlappingCoverage": true
+        },
+        "days": {
+          "type": "array",
+          "maxItems": 366,
+          "items": { "$ref": "#/$defs/DayState" }
+        },
+        "server_time": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "device_id",
+        "actor_user_id",
+        "team_id",
+        "status",
+        "active_source_epoch",
+        "last_accepted_request_seq",
+        "latest_local_event_at",
+        "latest_snapshot_accepted_at",
+        "latest_archive_day",
+        "last_contact_at",
+        "source_epochs",
+        "days",
+        "server_time"
+      ]
+    },
+    "SourceResetRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "closing_source_epoch": { "$ref": "#/$defs/Uuid" },
+            "closing_coverage_end": { "$ref": "#/$defs/Timestamp" },
+            "new_source_epoch": { "$ref": "#/$defs/Uuid" },
+            "new_coverage_start": { "$ref": "#/$defs/Timestamp" },
+            "new_baseline_chain_sequence": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+            "new_baseline_chain_hash": {
+              "oneOf": [{ "$ref": "#/$defs/Sha256" }, { "type": "null" }]
+            },
+            "new_audit_database_generation": { "$ref": "#/$defs/Uuid" },
+            "reason": {
+              "enum": [
+                "local_projection_lost",
+                "audit_history_lost",
+                "audit_database_generation_changed",
+                "manual_reset"
+              ]
+            },
+            "lost_event_count": {
+              "oneOf": [{ "$ref": "#/$defs/NonNegativeSafeInteger" }, { "type": "null" }]
+            }
+          },
+          "required": [
+            "closing_source_epoch",
+            "closing_coverage_end",
+            "new_source_epoch",
+            "new_coverage_start",
+            "new_baseline_chain_sequence",
+            "new_baseline_chain_hash",
+            "new_audit_database_generation",
+            "reason",
+            "lost_event_count"
+          ]
+        }
+      ],
+      "unevaluatedProperties": false,
+      "x-coverageRule": "closing_coverage_end <= new_coverage_start"
+    },
+    "SourceResetResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "closed_source_epoch": { "$ref": "#/$defs/Uuid" },
+        "closed_coverage_end": { "$ref": "#/$defs/Timestamp" },
+        "active_source_epoch": { "$ref": "#/$defs/Uuid" },
+        "active_coverage_start": { "$ref": "#/$defs/Timestamp" },
+        "gap_recorded": { "type": "boolean" },
+        "server_time": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "device_id",
+        "closed_source_epoch",
+        "closed_coverage_end",
+        "active_source_epoch",
+        "active_coverage_start",
+        "gap_recorded",
+        "server_time"
+      ]
+    },
+    "ArchivePresignRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "archive": { "$ref": "#/$defs/ArchiveDeclaration" }
+          },
+          "required": ["archive"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "HeaderValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "value": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      },
+      "required": ["name", "value"]
+    },
+    "ArchivePresignResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "day_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "archive_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "object_key": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "upload_url": { "type": "string", "format": "uri", "maxLength": 4096 },
+        "required_headers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/HeaderValue" }
+        },
+        "expires_at": { "$ref": "#/$defs/Timestamp" }
+      },
+      "required": [
+        "device_id",
+        "source_epoch",
+        "day",
+        "day_revision",
+        "archive_revision",
+        "object_key",
+        "upload_url",
+        "required_headers",
+        "expires_at"
+      ]
+    },
+    "ArchiveFinalizeRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/RequestContext" },
+        {
+          "type": "object",
+          "properties": {
+            "archive": { "$ref": "#/$defs/ArchiveDeclaration" },
+            "object_key": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "object_etag": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "device_signature": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "signing_key_version": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "required": ["archive", "object_key", "object_etag"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ArchiveFinalizeResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "manifest_id": { "$ref": "#/$defs/Uuid" },
+        "device_id": { "$ref": "#/$defs/Uuid" },
+        "source_epoch": { "$ref": "#/$defs/Uuid" },
+        "day": { "$ref": "#/$defs/UtcDay" },
+        "day_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "active_archive_revision": { "$ref": "#/$defs/PositiveSafeInteger" },
+        "content_sha256": { "$ref": "#/$defs/Sha256" },
+        "verified_at": { "$ref": "#/$defs/Timestamp" },
+        "superseded_archive_revision": {
+          "oneOf": [{ "$ref": "#/$defs/PositiveSafeInteger" }, { "type": "null" }]
+        }
+      },
+      "required": [
+        "manifest_id",
+        "device_id",
+        "source_epoch",
+        "day",
+        "day_revision",
+        "active_archive_revision",
+        "content_sha256",
+        "verified_at",
+        "superseded_archive_revision"
+      ]
+    },
+    "StructuredError": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_request",
+                "request_too_large",
+                "unsupported_protocol_version",
+                "unsupported_schema_version",
+                "authentication_required",
+                "device_binding_mismatch",
+                "device_revoked",
+                "device_limit_exceeded",
+                "runtime_instance_conflict",
+                "entitlement_required",
+                "consent_required",
+                "rate_limited",
+                "quota_exceeded",
+                "request_seq_digest_conflict",
+                "source_epoch_not_active",
+                "source_reset_required",
+                "coverage_overlap",
+                "stale_day_revision",
+                "day_revision_digest_conflict",
+                "rollup_rows_total_exceeded",
+                "security_event_revision_conflict",
+                "archive_day_revision_mismatch",
+                "archive_checksum_mismatch",
+                "archive_not_found",
+                "internal_error"
+              ]
+            },
+            "message": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "retryable": { "type": "boolean" },
+            "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "field_violations": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "field": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "rule": { "type": "string", "minLength": 1, "maxLength": 256 }
+                },
+                "required": ["field", "rule"]
+              }
+            },
+            "server_time": { "$ref": "#/$defs/Timestamp" }
+          },
+          "required": ["code", "message", "retryable", "request_id", "field_violations", "server_time"]
+        }
+      },
+      "required": ["error"]
+    },
+    "UtcWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start_day": { "$ref": "#/$defs/UtcDay" },
+        "end_day": { "$ref": "#/$defs/UtcDay" },
+        "current_day_partial": { "type": "boolean" }
+      },
+      "required": ["start_day", "end_day", "current_day_partial"]
+    },
+    "VerdictCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "total": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "allow": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "queue": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "deny": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "allow_rate_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "queue_rate_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "deny_rate_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      },
+      "required": ["total", "allow", "queue", "deny", "allow_rate_ppm", "queue_rate_ppm", "deny_rate_ppm"]
+    },
+    "LocalFreshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "materialized_through_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "materialized_through_sequence": { "$ref": "#/$defs/NonNegativeSafeInteger" },
+        "dirty_day_count": { "type": "integer", "minimum": 0, "maximum": 366 },
+        "rebuilding": { "type": "boolean" },
+        "gap_count": { "$ref": "#/$defs/NonNegativeSafeInteger" }
+      },
+      "required": ["materialized_through_at", "materialized_through_sequence", "dirty_day_count", "rebuilding", "gap_count"]
+    },
+    "LocalFreeResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "const": 2 },
+        "schema_version": { "const": 1 },
+        "access": { "const": "free" },
+        "window": { "$ref": "#/$defs/UtcWindow" },
+        "decisions": { "$ref": "#/$defs/VerdictCounts" },
+        "chain_health": { "enum": ["healthy", "gap", "broken", "quarantined", "unknown"] },
+        "latest_audit_record_at": {
+          "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "recent_queue_and_deny": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/SecurityEvent" }
+        },
+        "freshness": { "$ref": "#/$defs/LocalFreshness" },
+        "pro_available": { "type": "boolean" }
+      },
+      "required": [
+        "protocol_version",
+        "schema_version",
+        "access",
+        "window",
+        "decisions",
+        "chain_health",
+        "latest_audit_record_at",
+        "recent_queue_and_deny",
+        "freshness",
+        "pro_available"
+      ]
+    },
+    "LocalProResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": { "const": 2 },
+        "schema_version": { "const": 1 },
+        "access": { "const": "pro" },
+        "generated_at": { "$ref": "#/$defs/Timestamp" },
+        "windows": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/UtcWindow" }
+        },
+        "usage_rows": { "type": "array", "maxItems": 20000, "items": { "$ref": "#/$defs/UsageRollupRow" } },
+        "filter_rows": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/$defs/FilterRollupRow" } },
+        "session_rows": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/$defs/SessionDayRow" } },
+        "llm_rows": { "type": "array", "maxItems": 5000, "items": { "$ref": "#/$defs/LlmRollupRow" } },
+        "destination_rows": { "type": "array", "maxItems": 5000, "items": { "$ref": "#/$defs/DestinationRollupRow" } },
+        "security_events": { "type": "array", "maxItems": 500, "items": { "$ref": "#/$defs/SecurityEvent" } },
+        "freshness": { "$ref": "#/$defs/LocalFreshness" },
+        "export_formats": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["json", "csv"] }
+        },
+        "export_max_days": { "const": 90 },
+        "truncated": { "type": "boolean" }
+      },
+      "required": [
+        "protocol_version",
+        "schema_version",
+        "access",
+        "generated_at",
+        "windows",
+        "usage_rows",
+        "filter_rows",
+        "session_rows",
+        "llm_rows",
+        "destination_rows",
+        "security_events",
+        "freshness",
+        "export_formats",
+        "export_max_days",
+        "truncated"
+      ]
+    }
+  }
+}

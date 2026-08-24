@@ -1,0 +1,22 @@
+{
+  "case": "aggregate score sum cannot exceed count times the individual bound",
+  "schema": "UsageRollupRow",
+  "semantic": "score_sum_bound",
+  "valid": false,
+  "value": {
+    "bucket_start": "2026-08-20T10:00:00.000000Z",
+    "project": "grith",
+    "profile_id": "codex",
+    "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "supervised_tool": "codex",
+    "record_class": "decision",
+    "category": "file_read",
+    "verdict": "deny",
+    "score_bin_version": 1,
+    "score_bucket": 29,
+    "event_count": 1,
+    "score_sum_micros": 100000001,
+    "first_event_at": "2026-08-20T10:15:00.000000Z",
+    "last_event_at": "2026-08-20T10:15:00.000000Z"
+  }
+}

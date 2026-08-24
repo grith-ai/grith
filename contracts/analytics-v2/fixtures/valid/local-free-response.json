@@ -1,0 +1,35 @@
+{
+  "case": "free response contains only the frozen minimal panels",
+  "schema": "LocalFreeResponse",
+  "valid": true,
+  "value": {
+    "protocol_version": 2,
+    "schema_version": 1,
+    "access": "free",
+    "window": {
+      "start_day": "2026-08-14",
+      "end_day": "2026-08-20",
+      "current_day_partial": true
+    },
+    "decisions": {
+      "total": 10,
+      "allow": 7,
+      "queue": 2,
+      "deny": 1,
+      "allow_rate_ppm": 700000,
+      "queue_rate_ppm": 200000,
+      "deny_rate_ppm": 100000
+    },
+    "chain_health": "healthy",
+    "latest_audit_record_at": "2026-08-20T10:15:00.000000Z",
+    "recent_queue_and_deny": [],
+    "freshness": {
+      "materialized_through_at": "2026-08-20T10:15:00.000000Z",
+      "materialized_through_sequence": 42,
+      "dirty_day_count": 1,
+      "rebuilding": false,
+      "gap_count": 0
+    },
+    "pro_available": true
+  }
+}

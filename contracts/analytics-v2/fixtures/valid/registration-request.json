@@ -1,0 +1,22 @@
+{
+  "case": "prospective device registration",
+  "schema": "RegistrationRequest",
+  "valid": true,
+  "value": {
+    "protocol_version": 2,
+    "schema_version": 1,
+    "source_epoch": "00000000-0000-4000-8000-000000000002",
+    "runtime_instance_id": "00000000-0000-4000-8000-000000000003",
+    "device_display_name": "Dan's workstation",
+    "client_version": "0.2.5",
+    "materializer_version": 1,
+    "completeness": "decisions",
+    "coverage_start": "2026-08-20T10:00:00.000000Z",
+    "baseline_chain_sequence": 0,
+    "audit_database_generation": "00000000-0000-4000-8000-000000000004",
+    "consent": {
+      "consent_version": 1,
+      "accepted_at": "2026-08-20T10:00:00.000000Z"
+    }
+  }
+}

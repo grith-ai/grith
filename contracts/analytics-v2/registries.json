@@ -1,0 +1,77 @@
+{
+  "registry_version": 1,
+  "record_classes": [
+    "decision",
+    "routine_spawn",
+    "routine_io",
+    "noise",
+    "llm_usage",
+    "system"
+  ],
+  "categories": [
+    "file_read",
+    "file_mutation",
+    "process",
+    "network_egress",
+    "network_listen",
+    "cross_process",
+    "namespace",
+    "llm",
+    "system",
+    "other"
+  ],
+  "verdicts": ["allow", "queue", "deny"],
+  "completeness_tiers": ["decisions", "spawns", "io", "all"],
+  "snapshot_states": ["partial", "final"],
+  "security_event_types": ["queue", "deny", "canary", "gap"],
+  "resolution_statuses": ["pending", "approved", "denied", "expired", "escalated"],
+  "destination_kinds": ["domain", "host_port", "url_origin", "unix_socket_class", "other"],
+  "device_sync_statuses": [
+    "current",
+    "stale",
+    "offline",
+    "sync_disabled",
+    "entitlement_expired",
+    "quota_rejected",
+    "revoked",
+    "gap"
+  ],
+  "filter_set": {
+    "version": 1,
+    "normalization": "trim, ASCII lowercase, underscore-to-hyphen, lower-kebab validation, sort UTF-8 bytes, unique",
+    "maximum_evaluated_ids": 64,
+    "ids": [
+      "allowlist",
+      "argument",
+      "behavioural",
+      "canary",
+      "capability",
+      "command",
+      "destructive-action",
+      "dlp-gate",
+      "egress-policy",
+      "egress-rate",
+      "operation-risk",
+      "path-match",
+      "rate-limit",
+      "reputation",
+      "secret-scan",
+      "semantic",
+      "sensitive-path-heuristic",
+      "session-containment",
+      "taint"
+    ]
+  },
+  "category_mapping_version": 1,
+  "score_bin_version": 1,
+  "pricing_registry": {
+    "version_format": "YYYY-MM-DD or provider-issued immutable identifier",
+    "required_fields": ["provider", "model", "currency", "price_source", "pricing_version"],
+    "currency": "USD",
+    "stored_unit": "micros"
+  },
+  "sentinels": {
+    "unknown": "<unknown>",
+    "not_applicable": "<not-applicable>"
+  }
+}

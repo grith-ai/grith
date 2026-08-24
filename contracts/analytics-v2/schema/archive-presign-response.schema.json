@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://grith.ai/contracts/analytics-v2/schema/archive-presign-response.schema.json","title":"Analytics archive presign response","$ref":"common.schema.json#/$defs/ArchivePresignResponse"}

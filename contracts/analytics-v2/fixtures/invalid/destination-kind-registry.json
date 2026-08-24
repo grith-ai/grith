@@ -1,0 +1,15 @@
+{
+  "case": "socket is not a destination kind",
+  "schema": "DestinationRollupRow",
+  "valid": false,
+  "value": {
+    "day": "2026-08-20",
+    "kind": "socket",
+    "destination_hmac": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "hmac_key_version": 1,
+    "verdict": "deny",
+    "event_count": 1,
+    "first_event_at": "2026-08-20T10:15:00.000000Z",
+    "last_event_at": "2026-08-20T10:15:00.000000Z"
+  }
+}

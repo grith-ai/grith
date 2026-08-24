@@ -1,0 +1,17 @@
+{
+  "case": "historical cost rows require a price source and pricing version",
+  "schema": "LlmRollupRow",
+  "valid": false,
+  "value": {
+    "day": "2026-08-20",
+    "project": "grith",
+    "provider": "openai",
+    "model": "gpt-5",
+    "currency": "USD",
+    "pricing_version": "2026-08-01",
+    "calls": 1,
+    "prompt_tokens": 100,
+    "completion_tokens": 25,
+    "cost_micros": 1250
+  }
+}
