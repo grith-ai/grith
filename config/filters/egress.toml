@@ -41,6 +41,20 @@ trusted_domains = [
   "datadoghq.com",
   "googleapis.com",
   "storage.googleapis.com",
+  # --- grith's own control plane. First-party, single-host, authenticated
+  #     endpoints: licence validation, `grith pro sync`, and audit sync
+  #     (`audit_sync = true`) all target these. Without them grith QUEUEs its
+  #     own traffic at +3.5 unknown-destination from call #1, which is already
+  #     above auto_allow_threshold, and reputation never clears it: auto-allow
+  #     needs trust >= 0.92 over >= 8 observations, which a destination that is
+  #     queued every time can never accumulate.
+  #     Residual: grith.ai also serves the unauthenticated POST /api/share
+  #     endpoint (CORS *). Its payload is aggregate-only and clamped (integers
+  #     plus a 32-char uptime and 24-char version, 60 cards/hour per source
+  #     IP hash), so the zero-auth write surface is a few KB/hour rather than
+  #     the open GET-exfil sink that keeps *.vercel.app et al. untrusted.
+  "grith.ai",
+  "api.grith.ai",
   # --- FP §5.3: LLM providers ---
   "openai.com",
   "oaiusercontent.com",   # OpenAI hosted-content transport used by Codex startup/MCP paths

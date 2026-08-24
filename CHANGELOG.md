@@ -45,6 +45,11 @@ _Nothing yet._
   wrong key were removed and re-uploaded.
 - **A device whose archive numbering drifted from the server's now
   resynchronises** instead of resending a rejected upload indefinitely.
+- **grith no longer queues its own traffic.** Licence validation, `grith pro
+  sync` and analytics sync all talk to grith.ai, which was scored as an
+  unknown destination on every call — and reputation could never clear it,
+  because a destination that is queued every time never accumulates the
+  observations auto-allow needs. Both hosts are now trusted by default.
 
 ## [0.3.0] - 2026-08-22
 
