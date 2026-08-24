@@ -221,6 +221,26 @@ pub struct ExecState {
     /// the mouse back to the terminal so plain drag-selects again — at the cost
     /// of the wheel falling back to the host's default until re-enabled.
     mouse_capture: bool,
+    /// Auto-release of host mouse capture, independent of the Ctrl+T toggle.
+    ///
+    /// Active while the child has ?1007 alternate-scroll on and no mouse
+    /// protocol of its own (Codex's exact shape). ?1007 is the child asking
+    /// the TERMINAL to translate wheel to arrow keys — which the host does
+    /// natively once nothing captures the mouse — so releasing capture gives
+    /// both what the child asked for AND permanent native drag-to-select,
+    /// no Ctrl+T needed. A child that enables a mouse protocol (Claude
+    /// Code's fullscreen renderer) re-takes capture so its clicks and its
+    /// own in-app selection keep working.
+    mouse_capture_auto_released: bool,
+    /// What we last told the host terminal (EnableMouseCapture vs Disable).
+    /// [`sync_mouse_capture`] issues escape codes only on transitions.
+    host_capture_on: bool,
+    /// OSC 52 clipboard passthrough scanner (see [`super::osc52`]): the
+    /// vt100 parser swallows OSC sequences, which silently breaks the copy
+    /// feature of children that set the clipboard via OSC 52 (Claude Code's
+    /// fullscreen renderer). Complete clipboard WRITES are re-emitted to the
+    /// host; reads are dropped.
+    osc52_scanner: super::osc52::Osc52Scanner,
 }
 
 /// State for an active permission review dialog.
@@ -277,7 +297,29 @@ impl ExecState {
             last_ctrl_c: None,
             dashboard_url: None,
             mouse_capture: true,
+            mouse_capture_auto_released: false,
+            host_capture_on: true,
+            osc52_scanner: super::osc52::Osc52Scanner::default(),
         }
+    }
+
+    /// Whether the host terminal should have mouse capture right now:
+    /// the user wants it (Ctrl+T toggle) AND the child's terminal modes
+    /// don't make it pointless (see `mouse_capture_auto_released`).
+    fn desired_host_capture(&self) -> bool {
+        self.mouse_capture && !self.mouse_capture_auto_released
+    }
+
+    /// Recompute the ?1007 auto-release from the child's current modes.
+    /// Returns true when the effective capture state changed (caller must
+    /// re-sync the host terminal).
+    fn update_mouse_capture_auto_release(&mut self) -> bool {
+        let child_has_mouse_protocol =
+            self.vterm.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+        let release = self.alternate_scroll_mode && !child_has_mouse_protocol;
+        let before = self.desired_host_capture();
+        self.mouse_capture_auto_released = release;
+        before != self.desired_host_capture()
     }
 
     fn call_count(&self) -> u64 {
@@ -399,6 +441,25 @@ fn update_private_modes(bytes: &[u8], alternate_scroll: &mut bool, focus_reporti
 
 fn csi_params_include(params: &[u8], mode: &[u8]) -> bool {
     params.split(|b| *b == b';').any(|part| part == mode)
+}
+
+/// Bring the host terminal's mouse-capture state in line with
+/// [`ExecState::desired_host_capture`], issuing escape codes only on a
+/// transition. Single choke point: the Ctrl+T toggle and the ?1007
+/// auto-release both go through here, so neither can double-enable or leak
+/// capture past the other.
+fn sync_mouse_capture(state: &mut ExecState) {
+    let want = state.desired_host_capture();
+    if want == state.host_capture_on {
+        return;
+    }
+    let mut out = io::stdout();
+    let _ = if want {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    };
+    state.host_capture_on = want;
 }
 
 /// The focus report a terminal sends for the given focus state:
@@ -631,6 +692,22 @@ fn exec_event_loop(
                     state.last_pty_activity = Instant::now();
                     let focus_reporting_was_on = state.focus_reporting_mode;
                     state.observe_pty_modes(&bytes);
+                    // OSC 52 clipboard passthrough — the vt100 parser below
+                    // swallows OSC, so scan the raw bytes and re-emit
+                    // complete clipboard WRITES to the host terminal (reads
+                    // are dropped by the scanner). Logged by length only:
+                    // the payload may itself be a secret, but the paste-
+                    // hijack surface needs a forensic trail.
+                    for seq in state.osc52_scanner.scan(&bytes) {
+                        use std::io::Write as _;
+                        dbg_log(&format!(
+                            "forwarding OSC 52 clipboard write to host ({} bytes)",
+                            seq.len()
+                        ));
+                        let mut out = io::stdout();
+                        let _ = out.write_all(&seq);
+                        let _ = out.flush();
+                    }
                     // The child just enabled ?1004 focus reporting. A real
                     // terminal reports the current focus state on enable, so
                     // do the same — Claude Code waits on this focus-in before
@@ -712,6 +789,15 @@ fn exec_event_loop(
         // not intermediate states between clear + redraw.
         // ---------------------------------------------------------------
         if had_pty_output {
+            // Re-derive the ?1007 mouse-capture auto-release from the
+            // child's (possibly just-changed) terminal modes, and tell the
+            // host terminal only on a transition. Wheel keeps working
+            // either way: captured → grith routes it; released → the host
+            // translates it to the arrow keys ?1007 asked for.
+            if state.update_mouse_capture_auto_release() {
+                sync_mouse_capture(state);
+                dirty = true;
+            }
             // Log transitions
             if entered_alt {
                 dbg_log("!! ENTERED ALTERNATE SCREEN");
@@ -990,12 +1076,11 @@ fn handle_input_event(
             //               the wheel reverts to the host default until re-enabled.
             if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 state.mouse_capture = !state.mouse_capture;
-                let mut out = io::stdout();
-                let _ = if state.mouse_capture {
-                    execute!(out, EnableMouseCapture)
-                } else {
-                    execute!(out, DisableMouseCapture)
-                };
+                // Through the single choke point: while the ?1007
+                // auto-release is active the host stays uncaptured whatever
+                // the toggle says (native selection already works live);
+                // the toggle still switches the frozen SELECT MODE banner.
+                sync_mouse_capture(state);
                 // Repaint once now so the footer reflects the new mode. When
                 // entering select mode this is the LAST paint until the user
                 // toggles back — the loop freezes repaints so a drag-selection
@@ -2025,6 +2110,61 @@ mod tests {
         let state = ExecState::new("claude".into(), "claude-code".into(), 1234, 24, 80, 17);
         assert_eq!(state.call_count(), 0);
         assert_eq!(state.allow_pct(), 100);
+    }
+
+    /// The ?1007 auto-release: a Codex-shaped child (alternate scroll on, no
+    /// mouse protocol) releases host capture so native drag-select works
+    /// full-time; a Claude-fullscreen-shaped child (own mouse protocol)
+    /// keeps capture so its clicks and in-app selection reach it.
+    #[test]
+    fn mouse_capture_auto_releases_for_alternate_scroll_only_children() {
+        let mut state = ExecState::new("codex".into(), "codex".into(), 1, 24, 80, 17);
+        assert!(state.desired_host_capture(), "default: captured");
+
+        // Codex startup: ?1007 on, no mouse protocol.
+        state.observe_pty_modes(b"\x1b[?1007h");
+        assert!(
+            state.update_mouse_capture_auto_release(),
+            "transition must be reported so the host gets re-synced"
+        );
+        assert!(!state.desired_host_capture(), "released for codex shape");
+
+        // The child then enables its own mouse protocol (Claude fullscreen
+        // does this): capture must come back so events reach it.
+        state.vterm.process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(state.update_mouse_capture_auto_release());
+        assert!(state.desired_host_capture(), "re-captured for mouse child");
+
+        // Child turns its protocol off again → released again.
+        state.vterm.process(b"\x1b[?1000l\x1b[?1006l");
+        assert!(state.update_mouse_capture_auto_release());
+        assert!(!state.desired_host_capture());
+
+        // ?1007 off with no protocol → plain child, captured again.
+        state.observe_pty_modes(b"\x1b[?1007l");
+        assert!(state.update_mouse_capture_auto_release());
+        assert!(state.desired_host_capture());
+    }
+
+    /// Ctrl+T (the user toggle) and the auto-release compose: the user's
+    /// select mode always wins toward "released", and re-enabling the toggle
+    /// under auto-release does not re-capture the host.
+    #[test]
+    fn user_toggle_composes_with_auto_release() {
+        let mut state = ExecState::new("codex".into(), "codex".into(), 1, 24, 80, 17);
+        state.observe_pty_modes(b"\x1b[?1007h");
+        state.update_mouse_capture_auto_release();
+        assert!(!state.desired_host_capture());
+
+        // User presses Ctrl+T twice (into select mode and back): effective
+        // capture stays off throughout — no flicker of re-capture.
+        state.mouse_capture = false;
+        assert!(!state.desired_host_capture());
+        state.mouse_capture = true;
+        assert!(!state.desired_host_capture());
+
+        // No transition to report if nothing effective changed.
+        assert!(!state.update_mouse_capture_auto_release());
     }
 
     #[test]

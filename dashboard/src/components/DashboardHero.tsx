@@ -10,6 +10,72 @@
 import { ShareMenu } from "@/components/ShareMenu";
 import { chartColors } from "@/lib/chartPalette";
 import type { ShareStats } from "@/lib/shareCard";
+import type { SummaryWindow } from "@/types/api";
+
+/** Selector label and headline phrasing for each window the hero offers. */
+export const HERO_WINDOWS: Array<{
+  value: SummaryWindow;
+  label: string;
+  phrase: string;
+}> = [
+  { value: "today", label: "Today", phrase: "today" },
+  { value: "7d", label: "7d", phrase: "in the last 7 days" },
+  { value: "30d", label: "30d", phrase: "in the last 30 days" },
+  { value: "all", label: "All", phrase: "under Zero Trust" },
+];
+
+export function heroWindowPhrase(window: SummaryWindow): string {
+  return HERO_WINDOWS.find((w) => w.value === window)?.phrase ?? "in the last 7 days";
+}
+
+/**
+ * Step the headline down a size as it gets longer.
+ *
+ * A bounded window keeps this from ever being the primary defence, but a busy
+ * month can still reach eight digits and the number must not wrap or overrun
+ * the stat rail beside it.
+ */
+function headlineSize(formatted: string): string {
+  if (formatted.length >= 12) return "text-3xl sm:text-4xl";
+  if (formatted.length >= 10) return "text-4xl sm:text-5xl";
+  return "text-5xl sm:text-6xl";
+}
+
+/** Segmented control scoping every number in the hero to one time window. */
+function WindowPicker({
+  value,
+  onChange,
+}: {
+  value: SummaryWindow;
+  onChange: (next: SummaryWindow) => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="Time window"
+      className="inline-flex items-center rounded-lg border border-white/10 bg-white/[0.04] p-0.5"
+    >
+      {HERO_WINDOWS.map((w) => {
+        const active = w.value === value;
+        return (
+          <button
+            key={w.value}
+            type="button"
+            onClick={() => onChange(w.value)}
+            aria-pressed={active}
+            className={`rounded-md px-2.5 py-1 font-code text-[11px] uppercase tracking-[0.08em] transition-colors ${
+              active
+                ? "bg-white/[0.10] text-white"
+                : "text-white/45 hover:text-white/75"
+            }`}
+          >
+            {w.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 interface HeroProps {
   totalEvals: number;
@@ -32,6 +98,11 @@ interface HeroProps {
   billingUrl?: string;
   /** Open the existing share menu from an explicit CLI deep link. */
   shareOnOpen?: boolean;
+  /** Time window every number in the hero is scoped to. Named `timeWindow`
+   *  rather than `window` so it cannot shadow the global inside this file. */
+  timeWindow: SummaryWindow;
+  /** Called when the operator picks a different window. */
+  onWindowChange: (next: SummaryWindow) => void;
 }
 
 function HeroMark() {
@@ -99,12 +170,17 @@ export function DashboardHero({
   planPaid = false,
   billingUrl = "/billing",
   shareOnOpen = false,
+  timeWindow,
+  onWindowChange,
 }: HeroProps) {
   const decided = allow + queue + deny;
   const pct = (n: number) => (decided > 0 ? (n / decided) * 100 : 0);
   // "Held back" = everything grith did NOT silently allow (queued for review +
   // denied) — the value proposition, surfaced as one number.
   const heldBack = queue + deny;
+
+  const windowPhrase = heroWindowPhrase(timeWindow);
+  const formattedTotal = totalEvals.toLocaleString();
 
   const shareStats: ShareStats = {
     totalEvals,
@@ -115,6 +191,7 @@ export function DashboardHero({
     uptime,
     filtersActive,
     version,
+    windowPhrase,
   };
 
   return (
@@ -194,17 +271,23 @@ export function DashboardHero({
       <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6">
         <div className="grith-fade-up" style={{ animationDelay: "120ms" }}>
           <div className="flex items-baseline gap-3">
-            <span className="font-code text-5xl sm:text-6xl font-bold text-white tabular-nums leading-none">
-              {totalEvals.toLocaleString()}
+            <span
+              className={`font-code ${headlineSize(formattedTotal)} font-bold text-white tabular-nums leading-none`}
+              title={`${formattedTotal} tool calls inspected ${windowPhrase}`}
+            >
+              {formattedTotal}
             </span>
           </div>
           <p className="text-white/55 text-sm mt-3 max-w-md">
-            tool calls inspected under Zero Trust -{" "}
+            tool calls inspected {windowPhrase} -{" "}
             <span className="text-white/90 font-medium">
               {heldBack.toLocaleString()}
             </span>{" "}
             queued for review or denied.
           </p>
+          <div className="mt-4">
+            <WindowPicker value={timeWindow} onChange={onWindowChange} />
+          </div>
         </div>
 
         {/* Secondary stat rail */}

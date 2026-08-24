@@ -24,13 +24,19 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use grith_analytics::accumulator::DayAccumulator;
+use grith_analytics::archive::{object_key, read_day_archive, write_day_archive, ArchiveIdentity};
 use grith_analytics::contract::{
+    ArchiveDeclaration, ArchiveDownloadObject, ArchiveDownloadRequest, ArchiveDownloadResponse,
+    ArchiveFinalizeRequest, ArchiveFinalizeResponse, ArchivePresignRequest, ArchivePresignResponse,
     CompletenessTier, ConsentReceipt, DestinationPolicy, HeartbeatRequest, HeartbeatResponse,
     RegistrationRequest, RegistrationResponse, RequestContext, SnapshotRequest, SnapshotResponse,
-    SourceResetReason, SourceResetRequest, SourceResetResponse, StateResponse, StructuredError,
+    SnapshotState, SourceResetReason, SourceResetRequest, SourceResetResponse, StateResponse,
+    StructuredError,
 };
 use grith_audit::AuditStorage;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -448,6 +454,64 @@ fn map_reset_reason(raw: Option<&str>) -> SourceResetReason {
 // The worker loop
 // ---------------------------------------------------------------------------
 
+/// Outcome of replaying one archived day back through the accumulator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveDayStatus {
+    Fetching,
+    /// The archive reproduced exactly the rollups the server accepted.
+    Match,
+    /// The object could not be downloaded, parsed, or replayed.
+    Unreadable,
+    /// The bytes do not hash to what the manifest declares.
+    ChecksumMismatch,
+    /// The object holds a different number of rows than the manifest declares.
+    RowCountMismatch,
+    /// The object is intact but rebuilds to different rollups — the serious
+    /// one: the archive and the read model disagree about the same day.
+    RollupMismatch,
+}
+
+impl ArchiveDayStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fetching => "fetching",
+            Self::Match => "match",
+            Self::Unreadable => "unreadable",
+            Self::ChecksumMismatch => "checksum mismatch",
+            Self::RowCountMismatch => "row count mismatch",
+            Self::RollupMismatch => "rollup mismatch",
+        }
+    }
+
+    pub const fn is_ok(self) -> bool {
+        matches!(self, Self::Match)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveDayVerification {
+    pub day: NaiveDate,
+    pub archive_revision: u64,
+    pub row_count: u64,
+    pub status: ArchiveDayStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveVerification {
+    pub days: Vec<ArchiveDayVerification>,
+}
+
+impl ArchiveVerification {
+    pub fn matched(&self) -> usize {
+        self.days.iter().filter(|day| day.status.is_ok()).count()
+    }
+
+    pub fn failed(&self) -> usize {
+        self.days.len() - self.matched()
+    }
+}
+
 /// Everything the worker needs from the daemon.
 pub struct AnalyticsSyncDeps {
     pub audit_storage: Arc<Mutex<AuditStorage>>,
@@ -497,7 +561,7 @@ pub async fn analytics_upload_task(
     }
 }
 
-struct Worker {
+pub struct Worker {
     deps: AnalyticsSyncDeps,
     client: reqwest::Client,
     runtime_instance_id: Uuid,
@@ -508,6 +572,172 @@ struct Worker {
 }
 
 impl Worker {
+    /// A worker for a one-shot command rather than the background loop: it
+    /// shares the daemon's storage and gate state but never ticks.
+    pub fn for_command(daemon: &crate::daemon::Daemon) -> Self {
+        Self {
+            deps: AnalyticsSyncDeps {
+                audit_storage: Arc::clone(&daemon.audit_storage),
+                feature_gate: Arc::clone(&daemon.feature_gate),
+                audit_sync_enabled: daemon.config.general.audit_sync,
+                completeness: completeness_tier(daemon.config.audit.completeness),
+            },
+            client: build_client().unwrap_or_else(|_| reqwest::Client::new()),
+            runtime_instance_id: Uuid::new_v4(),
+            rejected_days: HashMap::new(),
+            backoff_until: None,
+            tick_seconds: DEFAULT_TICK_SECONDS,
+        }
+    }
+
+    /// Fetch this device's archived days, replay each through the same
+    /// accumulator the edge used, and compare the result with the rollups the
+    /// server accepted.
+    ///
+    /// This is the rebuild proof (work/82 gate G5) in the form an operator can
+    /// run: if every day reports `match`, the archive really is sufficient to
+    /// reconstruct cloud analytics, because it just was.
+    pub async fn verify_archives(
+        &mut self,
+        creds: &Credentials,
+        device: &AnalyticsDevice,
+        from_day: NaiveDate,
+        to_day: NaiveDate,
+    ) -> Result<ArchiveVerification, UploadError> {
+        // The download route is a read: it writes no idempotency receipt, so
+        // it needs no durable sequence — and must not take one, because this
+        // runs from the CLI while the daemon holds the audit writer lock.
+        // Peeking keeps the command usable on a read-only handle.
+        let request_seq = {
+            let storage = self
+                .deps
+                .audit_storage
+                .lock()
+                .map_err(|_| UploadError::Transport("audit storage lock poisoned".into()))?;
+            storage.analytics_peek_request_seq().unwrap_or(1)
+        };
+        let request = ArchiveDownloadRequest {
+            context: RequestContext::v2(
+                device.device_id,
+                device.source_epoch,
+                request_seq,
+                self.runtime_instance_id,
+                Utc::now(),
+                env!("CARGO_PKG_VERSION"),
+                self.deps.completeness,
+            ),
+            from_day,
+            to_day,
+        };
+        let listing: ArchiveDownloadResponse = post_json(
+            &self.client,
+            "/api/analytics/v2/archive/download",
+            &creds.api_key,
+            Some(&device.device_secret),
+            &request,
+        )
+        .await?;
+
+        let mut verification = ArchiveVerification::default();
+        for object in &listing.objects {
+            let outcome = self.verify_one_archive(object).await;
+            verification.days.push(outcome);
+        }
+        Ok(verification)
+    }
+
+    async fn verify_one_archive(&self, object: &ArchiveDownloadObject) -> ArchiveDayVerification {
+        let mut outcome = ArchiveDayVerification {
+            day: object.day,
+            archive_revision: object.archive_revision,
+            row_count: object.row_count,
+            status: ArchiveDayStatus::Fetching,
+            detail: None,
+        };
+
+        let bytes = match self.client.get(&object.download_url).send().await {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    outcome.status = ArchiveDayStatus::Unreadable;
+                    outcome.detail = Some(error.to_string());
+                    return outcome;
+                }
+            },
+            Ok(response) => {
+                outcome.status = ArchiveDayStatus::Unreadable;
+                outcome.detail = Some(format!("download returned {}", response.status()));
+                return outcome;
+            }
+            Err(error) => {
+                outcome.status = ArchiveDayStatus::Unreadable;
+                outcome.detail = Some(error.to_string());
+                return outcome;
+            }
+        };
+
+        // The object must be the bytes the manifest describes before anything
+        // is derived from it: a rebuild that trusts a corrupted object would
+        // produce confident, wrong numbers.
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != object.content_sha256 {
+            outcome.status = ArchiveDayStatus::ChecksumMismatch;
+            outcome.detail = Some(format!(
+                "object hashes to {actual}, manifest declares {}",
+                object.content_sha256
+            ));
+            return outcome;
+        }
+
+        let events = match read_day_archive(&bytes) {
+            Ok(events) => events,
+            Err(error) => {
+                outcome.status = ArchiveDayStatus::Unreadable;
+                outcome.detail = Some(error.to_string());
+                return outcome;
+            }
+        };
+        if events.len() as u64 != object.row_count {
+            outcome.status = ArchiveDayStatus::RowCountMismatch;
+            outcome.detail = Some(format!(
+                "object holds {} rows, manifest declares {}",
+                events.len(),
+                object.row_count
+            ));
+            return outcome;
+        }
+
+        // Replay through the SAME accumulator the edge used. Anything else
+        // would be a second implementation of the frozen semantics.
+        let mut accumulator = DayAccumulator::new(object.day);
+        for event in &events {
+            if let Err(error) = accumulator.ingest(event) {
+                outcome.status = ArchiveDayStatus::Unreadable;
+                outcome.detail = Some(format!("replay rejected an archived event: {error}"));
+                return outcome;
+            }
+        }
+        let snapshot = match accumulator.snapshot(object.day_revision, 1, SnapshotState::Final) {
+            Ok((snapshot, _)) => snapshot,
+            Err(error) => {
+                outcome.status = ArchiveDayStatus::Unreadable;
+                outcome.detail = Some(error.to_string());
+                return outcome;
+            }
+        };
+
+        if snapshot.row_checksum_sha256 == object.row_checksum_sha256 {
+            outcome.status = ArchiveDayStatus::Match;
+        } else {
+            outcome.status = ArchiveDayStatus::RollupMismatch;
+            outcome.detail = Some(format!(
+                "rebuilt rollups hash to {}, the server accepted {}",
+                snapshot.row_checksum_sha256, object.row_checksum_sha256
+            ));
+        }
+        outcome
+    }
+
     async fn tick(&mut self) {
         let Ok(Some(creds)) = load_credentials() else {
             self.tick_seconds = IDLE_TICK_SECONDS;
@@ -584,6 +814,10 @@ impl Worker {
             return;
         }
         self.upload_once(&creds, &device).await;
+        // Archive at most one sealed day per tick, after the snapshot
+        // queue: current security events must never be starved by
+        // historical archive traffic.
+        self.archive_once(&creds, &device).await;
     }
 
     /// One-shot courtesy signal: when uploads stop but a registered device
@@ -881,7 +1115,7 @@ impl Worker {
             oldest_dirty_day: stats.oldest_pending_day,
             unacknowledged_security_events: stats.unacked_security_events.min(u64::from(u32::MAX))
                 as u32,
-            unacknowledged_archive_days: 0,
+            unacknowledged_archive_days: stats.unacked_archive_days.min(u64::from(u16::MAX)) as u16,
             dropped_event_count: stats.gap_count,
             audit_database_generation: stats.audit_database_generation,
         })
@@ -1006,6 +1240,306 @@ impl Worker {
             Err(error) => {
                 self.handle_upload_failure(creds, device, &prepared, error)
                     .await;
+            }
+        }
+    }
+
+    /// Build, upload and activate the archive object for one sealed day.
+    ///
+    /// Sealed + server-accepted only: the object binds to the exact
+    /// `day_revision` and `row_checksum_sha256` the server accepted, so a
+    /// day still in flight has nothing stable to archive. The whole
+    /// sequence is idempotent — a retry rebuilds byte-identical content,
+    /// reuses the content-addressed key, and re-finalizes the same
+    /// revision.
+    async fn archive_once(&mut self, creds: &Credentials, device: &AnalyticsDevice) {
+        let today = Utc::now().date_naive();
+        let epoch = device.source_epoch;
+        let Some(candidate) = ({
+            let storage = match self.deps.audit_storage.lock() {
+                Ok(storage) => storage,
+                Err(_) => return,
+            };
+            match storage.analytics_archivable_days(epoch, today, 4) {
+                Ok(days) => days
+                    .into_iter()
+                    .find(|day| !self.rejected_days.contains_key(&(epoch, day.day))),
+                Err(error) => {
+                    tracing::warn!(error = %error, "analytics archive: cannot list sealed days");
+                    None
+                }
+            }
+        }) else {
+            return;
+        };
+
+        let built = {
+            let mut storage = match self.deps.audit_storage.lock() {
+                Ok(storage) => storage,
+                Err(_) => return,
+            };
+            let snapshot = match storage.analytics_build_day_snapshot(epoch, candidate.day) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(error = %error, day = %candidate.day, "analytics archive: day rebuild failed");
+                    return;
+                }
+            };
+            let (events, configs) = match storage.analytics_day_export(epoch, candidate.day) {
+                Ok(export) => export,
+                Err(error) => {
+                    tracing::warn!(error = %error, day = %candidate.day, "analytics archive: export failed");
+                    return;
+                }
+            };
+            let identity = ArchiveIdentity {
+                team_id: device.team_id,
+                actor_user_id: device.actor_user_id.clone(),
+                device_id: device.device_id,
+                source_epoch: epoch,
+                day: candidate.day,
+            };
+            let object = match write_day_archive(&identity, &events, &configs) {
+                Ok(object) => object,
+                Err(error) => {
+                    // A day whose configuration versions are unrecoverable
+                    // can never produce a complete archive object, so retrying
+                    // it hourly forever would only bury the log. Record the
+                    // gap and take it out of the queue. Any other build
+                    // failure is quarantined for an hour and retried.
+                    if matches!(
+                        error,
+                        grith_analytics::archive::ArchiveError::MissingConfig { .. }
+                    ) {
+                        let _ = storage.analytics_mark_day_unarchivable(
+                            epoch,
+                            candidate.day,
+                            "configuration versions for this day are no longer available",
+                        );
+                    } else {
+                        tracing::error!(error = %error, day = %candidate.day, "analytics archive: object build failed");
+                        self.rejected_days.insert(
+                            (epoch, candidate.day),
+                            Instant::now() + REJECTED_DAY_BACKOFF,
+                        );
+                    }
+                    return;
+                }
+            };
+            let revision = storage
+                .analytics_next_archive_revision(epoch, candidate.day)
+                .unwrap_or(1);
+            if let Err(error) = storage.analytics_record_archive_built(
+                epoch,
+                candidate.day,
+                candidate.day_revision,
+                revision,
+                &object.content_sha256,
+            ) {
+                tracing::warn!(error = %error, "analytics archive: could not record build state");
+                return;
+            }
+            (snapshot, object, revision)
+        };
+        let (snapshot, object, revision) = built;
+
+        let declaration = ArchiveDeclaration {
+            day: candidate.day,
+            day_revision: candidate.day_revision,
+            archive_revision: revision,
+            projection_schema_version: grith_analytics::limits::SCHEMA_VERSION,
+            materializer_version: grith_analytics::limits::MATERIALIZER_VERSION,
+            row_checksum_sha256: snapshot.row_checksum_sha256.clone(),
+            content_sha256: object.content_sha256.clone(),
+            byte_size: object.byte_size,
+            row_count: object.row_count,
+            min_event_at: object.min_event_at,
+            max_event_at: object.max_event_at,
+            first_chain_sequence: object.first_chain_sequence,
+            last_chain_sequence: object.last_chain_sequence,
+            last_chain_hash: object.last_chain_hash.clone(),
+        };
+
+        // 1. Presign. The server re-derives the key; ours is a check that
+        //    both sides agree on the content-addressed identity.
+        let request_seq = {
+            let mut storage = match self.deps.audit_storage.lock() {
+                Ok(storage) => storage,
+                Err(_) => return,
+            };
+            match storage.analytics_allocate_request_seq() {
+                Ok(seq) => seq,
+                Err(error) => {
+                    tracing::warn!(error = %error, "analytics archive: sequence allocation failed");
+                    return;
+                }
+            }
+        };
+        let presign = ArchivePresignRequest {
+            context: RequestContext::v2(
+                device.device_id,
+                epoch,
+                request_seq,
+                self.runtime_instance_id,
+                Utc::now(),
+                env!("CARGO_PKG_VERSION"),
+                self.deps.completeness,
+            ),
+            archive: declaration.clone(),
+        };
+        let presigned: ArchivePresignResponse = match post_json(
+            &self.client,
+            "/api/analytics/v2/archive/presign",
+            &creds.api_key,
+            Some(&device.device_secret),
+            &presign,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.handle_archive_failure(&error, epoch, candidate.day, device);
+                return;
+            }
+        };
+        let expected_key = object_key(
+            &ArchiveIdentity {
+                team_id: device.team_id,
+                actor_user_id: device.actor_user_id.clone(),
+                device_id: device.device_id,
+                source_epoch: epoch,
+                day: candidate.day,
+            },
+            presigned.archive_revision,
+            &object.content_sha256,
+        );
+        if presigned.object_key != expected_key {
+            tracing::error!(
+                server_key = %presigned.object_key,
+                local_key = %expected_key,
+                "analytics archive: object key disagreement; refusing to upload"
+            );
+            return;
+        }
+
+        // 2. Upload the exact bytes the declaration describes.
+        let mut put = self.client.put(&presigned.upload_url).body(object.bytes);
+        for header in &presigned.required_headers {
+            put = put.header(header.name.as_str(), header.value.as_str());
+        }
+        let etag = match put.send().await {
+            Ok(response) if response.status().is_success() => response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), "analytics archive: upload rejected");
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "analytics archive: upload failed; will retry");
+                return;
+            }
+        };
+
+        // 3. Finalize: the server verifies the object and activates the
+        //    manifest revision transactionally.
+        let finalize_seq = {
+            let mut storage = match self.deps.audit_storage.lock() {
+                Ok(storage) => storage,
+                Err(_) => return,
+            };
+            storage
+                .analytics_allocate_request_seq()
+                .unwrap_or(request_seq)
+        };
+        let finalize = ArchiveFinalizeRequest {
+            context: RequestContext::v2(
+                device.device_id,
+                epoch,
+                finalize_seq,
+                self.runtime_instance_id,
+                Utc::now(),
+                env!("CARGO_PKG_VERSION"),
+                self.deps.completeness,
+            ),
+            archive: declaration,
+            object_key: presigned.object_key,
+            object_etag: etag,
+            device_signature: None,
+            signing_key_version: None,
+        };
+        match post_json::<_, ArchiveFinalizeResponse>(
+            &self.client,
+            "/api/analytics/v2/archive/finalize",
+            &creds.api_key,
+            Some(&device.device_secret),
+            &finalize,
+        )
+        .await
+        {
+            Ok(response) => {
+                if let Ok(mut storage) = self.deps.audit_storage.lock() {
+                    if let Err(error) = storage.analytics_record_archive_ack(
+                        epoch,
+                        candidate.day,
+                        response.active_archive_revision,
+                    ) {
+                        tracing::warn!(error = %error, "analytics archive: ack bookkeeping failed");
+                    }
+                }
+                tracing::debug!(
+                    day = %candidate.day,
+                    revision = response.active_archive_revision,
+                    rows = object.row_count,
+                    "analytics day archived"
+                );
+            }
+            Err(error) => self.handle_archive_failure(&error, epoch, candidate.day, device),
+        }
+    }
+
+    /// Archive-specific error routing. A malformed declaration is a
+    /// permanent rejection for the day; everything else retries.
+    fn handle_archive_failure(
+        &mut self,
+        error: &UploadError,
+        epoch: Uuid,
+        day: NaiveDate,
+        device: &AnalyticsDevice,
+    ) {
+        match error.code() {
+            // The server sequences archive revisions strictly and names the
+            // expected one when it refuses. A local counter that has run
+            // ahead — manifests removed server-side, or a restored backup —
+            // otherwise re-sends the same rejected revision forever, so adopt
+            // what the server asked for and try again next tick.
+            "invalid_request" if expected_archive_revision(error).is_some() => {
+                let expected = expected_archive_revision(error).unwrap_or(1);
+                tracing::warn!(
+                    %day,
+                    expected,
+                    "analytics archive revision was out of step; adopting the server's"
+                );
+                if let Ok(mut storage) = self.deps.audit_storage.lock() {
+                    let _ = storage.analytics_adopt_archive_revision(epoch, day, expected);
+                }
+            }
+            "invalid_request" | "payload_violation" | "request_too_large" => {
+                tracing::error!(error = %error, %day, "server rejected an analytics archive");
+                self.rejected_days
+                    .insert((epoch, day), Instant::now() + REJECTED_DAY_BACKOFF);
+            }
+            "stale_day_revision" | "source_epoch_not_active" => {
+                tracing::debug!(error = %error, %day, "analytics archive superseded; will rebuild");
+            }
+            _ => {
+                let mut updated = device.clone();
+                self.handle_device_error(error, &mut updated);
+                tracing::warn!(error = %error, %day, "analytics archive failed; will retry");
             }
         }
     }
@@ -1277,6 +1811,39 @@ mod tests {
     }
 
     #[test]
+    fn the_servers_expected_archive_revision_is_recovered_from_its_rejection() {
+        // Exactly what production returns when a device's counter runs ahead
+        // of the manifests the server holds.
+        let rejection = UploadError::Api {
+            status: 400,
+            code: "invalid_request".into(),
+            message: "the next archive revision for 2026-07-06 is 1 \
+                      (archive.archive_revision: must be 1)"
+                .into(),
+        };
+        assert_eq!(expected_archive_revision(&rejection), Some(1));
+
+        let higher = UploadError::Api {
+            status: 400,
+            code: "invalid_request".into(),
+            message: "the next archive revision for 2026-07-06 is 7".into(),
+        };
+        assert_eq!(expected_archive_revision(&higher), Some(7));
+
+        // Unrelated rejections must not be mistaken for a revision hint.
+        let other = UploadError::Api {
+            status: 400,
+            code: "invalid_request".into(),
+            message: "object_key does not match the declared archive".into(),
+        };
+        assert_eq!(expected_archive_revision(&other), None);
+        assert_eq!(
+            expected_archive_revision(&UploadError::Transport("timeout".into())),
+            None
+        );
+    }
+
+    #[test]
     fn consent_authorisation_requires_enabled_and_current_version() {
         let consent = AnalyticsConsent {
             consent_version: CONSENT_VERSION,
@@ -1315,4 +1882,24 @@ mod tests {
             SourceResetReason::LocalProjectionLost
         );
     }
+}
+
+/// Recover the archive revision the server says comes next from its
+/// structured rejection. The violation reads `must be <n>`; the message
+/// carries the same number as a fallback for older servers.
+fn expected_archive_revision(error: &UploadError) -> Option<u64> {
+    let UploadError::Api { code, message, .. } = error else {
+        return None;
+    };
+    if code != "invalid_request" || !message.contains("archive revision") {
+        return None;
+    }
+    message
+        .split_whitespace()
+        .filter_map(|word| {
+            word.trim_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .ok()
+        })
+        .next_back()
 }

@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     api_error, default_limit, parse_uuid_or_400, DEFAULT_EXPORT_LIMIT, EXFIL_STATS_RECENT_COUNT,
@@ -161,6 +161,113 @@ pub(crate) async fn list_audit(
             )
             .into_response(),
         }
+    }
+}
+
+/// Trailing window the hero aggregates over.
+///
+/// A bounded window is the point: the all-time figure grows without limit both
+/// on screen ("1,238,543 tool calls" stops meaning anything and eventually
+/// stops fitting) and in query cost (it is inherently O(rows), while a fixed
+/// window is not). `All` stays available but is never the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum SummaryWindow {
+    Today,
+    #[serde(rename = "7d")]
+    Week,
+    #[serde(rename = "30d")]
+    Month,
+    All,
+}
+
+impl SummaryWindow {
+    /// Unknown values fall back to the dashboard default rather than 400ing —
+    /// a stale tab holding an old window name should still render.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("today") => Self::Today,
+            Some("30d") => Self::Month,
+            Some("all") => Self::All,
+            _ => Self::Week,
+        }
+    }
+
+    /// Cutoff for the window, or `None` for all time.
+    ///
+    /// `Today` is midnight **UTC**, matching how audit timestamps are stored;
+    /// deriving it from the browser's local midnight would make the count
+    /// disagree with the rows the audit page lists beside it.
+    fn since(self, now: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::{Duration, TimeZone};
+        match self {
+            Self::Today => chrono::Utc
+                .from_local_datetime(&now.date_naive().and_hms_opt(0, 0, 0)?)
+                .single(),
+            Self::Week => Some(now - Duration::days(7)),
+            Self::Month => Some(now - Duration::days(30)),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct SummaryParams {
+    /// `today` | `7d` | `30d` | `all`. Defaults to `7d`.
+    #[serde(default)]
+    window: Option<String>,
+    /// Mirrors `/api/audit`'s `include` so the hero and the list below it
+    /// count the same rows.
+    #[serde(default)]
+    include: Option<String>,
+}
+
+/// Aggregate allow / queue / deny counts for one window.
+///
+/// The dashboard hero used to build these client-side from whatever 500
+/// records it had fetched, while the headline came from a whole-database
+/// count — so the breakdown and the total described different populations.
+/// One query, one window, one consistent set of numbers.
+pub(crate) async fn audit_summary(
+    State(state): State<AppState>,
+    Query(params): Query<SummaryParams>,
+) -> impl IntoResponse {
+    let storage = match state.audit_storage.lock().map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("lock poisoned: {e}"),
+            "LOCK_ERROR",
+        )
+        .into_response()
+    }) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = enforce_chain_integrity(&storage) {
+        return resp;
+    }
+
+    let window = SummaryWindow::parse(params.window.as_deref());
+    let since = window.since(chrono::Utc::now());
+    let include_compact = matches!(params.include.as_deref(), Some("all"));
+
+    match storage.decision_summary(since, include_compact) {
+        Ok(summary) => Json(serde_json::json!({
+            "window": window,
+            "since": since.map(|t| t.to_rfc3339()),
+            "total": summary.total,
+            "allow": summary.allow,
+            "queue": summary.queue,
+            "deny": summary.deny,
+            "include": if include_compact { "all" } else { "full" },
+        }))
+        .into_response(),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e.to_string(),
+            "AUDIT_ERROR",
+        )
+        .into_response(),
     }
 }
 

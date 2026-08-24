@@ -114,10 +114,19 @@ mod tests {
             .collect();
         assert_eq!(members, ["Hello", "Introspect", "StartTransientUnit"]);
 
+        // The body parse must see the real unit name on real traffic — this
+        // is what the StartTransientUnit scope/service split keys on, and
+        // this capture is the one fixture not written against our own
+        // encoder.
+        assert_eq!(
+            decoded.messages[2].body_first_string.as_deref(),
+            Some("evil.service")
+        );
+
         // The two GDBus issues on its own account must not prompt...
         assert_eq!(classify(&decoded.messages[0]), Verdict::Allow);
         assert_eq!(classify(&decoded.messages[1]), Verdict::Allow);
-        // ...and the escape must.
+        // ...and the escape (a .service transient unit) must.
         match classify(&decoded.messages[2]) {
             Verdict::Escalate { description } => {
                 assert!(description.contains("StartTransientUnit"), "{description}");

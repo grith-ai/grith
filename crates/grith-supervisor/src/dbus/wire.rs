@@ -111,6 +111,18 @@ pub(crate) struct DbusMessage {
     pub(crate) interface: Option<String>,
     /// Header field 3 — the method or signal name.
     pub(crate) member: Option<String>,
+    /// Header field 8 — the body's type signature (e.g. `ssa(sv)a(sa(sv))`).
+    pub(crate) signature: Option<String>,
+    /// The first body argument, decoded only when the signature says it is a
+    /// string (`s…`) and the body parses cleanly. Best-effort by design: a
+    /// body that fails to decode leaves this `None` and MUST NOT error the
+    /// stream — framing never depends on the body, and the policy layer
+    /// treats `None` as "could not inspect" (fail toward escalation).
+    ///
+    /// This exists for exactly one consumer: the `StartTransientUnit`
+    /// scope-vs-service distinction in [`super::policy`], where the first
+    /// argument is the unit name.
+    pub(crate) body_first_string: Option<String>,
 }
 
 impl DbusMessage {
@@ -317,6 +329,12 @@ fn read_header_fields(
                 }
                 next
             }
+            // Field 8 — SIGNATURE: the body's type string, `g`-encoded.
+            (8, b'g') => {
+                let (value, next) = read_string(buf, after_sig, little_endian, 1)?;
+                out.signature = Some(value);
+                next
+            }
             _ => skip_simple_value(buf, after_sig, little_endian, sig_byte)?,
         };
         if next <= off {
@@ -375,6 +393,22 @@ fn read_message(buf: &[u8]) -> Result<Option<(DbusMessage, usize)>, WireError> {
         little_endian,
         &mut message,
     )?;
+    // Best-effort first-body-argument decode when the signature says it is a
+    // string. `body_start` is 8-aligned, so the string's u32 length prefix is
+    // correctly aligned at offset 0 of the body. Bounded to this message's own
+    // bytes so a bad length cannot read into the next message, and any parse
+    // failure just leaves the field `None` — the body is never load-bearing
+    // for framing, and the policy layer fails toward escalation without it.
+    if body_len > 0
+        && message
+            .signature
+            .as_deref()
+            .is_some_and(|sig| sig.as_bytes().first() == Some(&b's'))
+    {
+        message.body_first_string = read_string(&buf[..total], body_start, little_endian, 4)
+            .ok()
+            .map(|(value, _)| value);
+    }
     Ok(Some((message, total)))
 }
 
@@ -660,7 +694,7 @@ mod tests {
             destination: Some("org.freedesktop.systemd1".into()),
             interface: Some("org.freedesktop.systemd1.Manager".into()),
             member: Some("StartTransientUnit".into()),
-            path: None,
+            ..DbusMessage::default()
         };
         assert_eq!(
             m.describe(),

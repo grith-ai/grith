@@ -43,7 +43,16 @@
 //!   rationale). Everything else on the portal escalates.
 //! * `org.freedesktop.systemd1`, `org.freedesktop.login1`,
 //!   `org.freedesktop.PolicyKit1` and the container managers — the escape
-//!   itself. Never allowlist.
+//!   itself. Never allowlist wholesale. Two narrow exceptions are carved
+//!   below with their own rationale: `Manager.GetUnit` (a pure lookup that
+//!   cannot make the manager act) and `Manager.StartTransientUnit` **only
+//!   when the unit name in the message body ends in `.scope`** — a scope
+//!   unit cannot carry `ExecStart`; it moves ALREADY-RUNNING pids into a
+//!   cgroup, so the executing process is always a ptrace descendant of the
+//!   caller (this is why `systemd-run --scope CMD` runs CMD as its own
+//!   supervised child). The `.service` form — where the manager forks the
+//!   process *outside* the supervised tree — still escalates, as does any
+//!   `StartTransientUnit` whose body cannot be inspected.
 
 use super::wire::{DbusMessage, MessageType};
 
@@ -167,10 +176,51 @@ fn destination_allows(destination: &str, interface: &str, member: &str) -> bool 
         "org.freedesktop.portal.Desktop" => match interface {
             "org.freedesktop.portal.Settings" => matches!(member, "Read" | "ReadAll"),
             "org.freedesktop.portal.Secret" => member == "RetrieveSecret",
+            // Host-app self-registration with the portal registry — Chromium
+            // and Electron call this on every launch to associate their app
+            // id with the connection. Registering an id delegates nothing by
+            // itself; it only influences how the portal attributes LATER
+            // requests, and every portal method that could act on that
+            // attribution (`Flatpak.Spawn`, `OpenURI`, screen capture, …)
+            // still escalates through this table.
+            "org.freedesktop.host.portal.Registry" => member == "Register",
             _ => false,
         },
+        // systemd's manager is the escape surface and stays excluded — with
+        // one read-only member: `GetUnit` maps a unit name to an object path
+        // (or a NoSuchUnit error). It cannot start, stop, or modify anything;
+        // the same contract as the `Properties.Get` reads allowed against any
+        // destination, and it discloses less than the already-allowlisted bus
+        // daemon `ListNames`. Chromium calls it on every launch right after
+        // its scope registration. `LoadUnit` is deliberately absent — it
+        // makes the manager load a unit file from disk.
+        "org.freedesktop.systemd1" => {
+            interface == "org.freedesktop.systemd1.Manager" && member == "GetUnit"
+        }
         _ => false,
     }
+}
+
+/// The one body-dependent rule: `Manager.StartTransientUnit` addressed to
+/// systemd, when the unit NAME (the call's first argument) ends in `.scope`.
+///
+/// A transient scope cannot carry `ExecStart` — systemd rejects it — so the
+/// call can only place pids that ALREADY exist into a cgroup. The executing
+/// process is therefore always a child of the (supervised) caller: this is
+/// the mechanism behind Chromium's per-launch self-registration
+/// (`app-…-chrome-<pid>.scope`) and `systemd-run --scope`, where systemd-run
+/// forks the command itself and stays inside the ptrace tree. The escape this
+/// table exists to catch is the `.service` form, where the USER MANAGER forks
+/// the process outside supervision — that form, and any call whose body could
+/// not be decoded (`body_first_string == None`), still escalates.
+fn is_scope_only_transient_unit(message: &DbusMessage) -> bool {
+    message.destination.as_deref() == Some("org.freedesktop.systemd1")
+        && message.interface.as_deref() == Some("org.freedesktop.systemd1.Manager")
+        && message.member.as_deref() == Some("StartTransientUnit")
+        && message
+            .body_first_string
+            .as_deref()
+            .is_some_and(|unit| unit.ends_with(".scope"))
 }
 
 /// Decide what to do with one decoded message.
@@ -213,6 +263,9 @@ pub(crate) fn classify(message: &DbusMessage) -> Verdict {
     {
         return Verdict::Allow;
     }
+    if is_scope_only_transient_unit(message) {
+        return Verdict::Allow;
+    }
     escalate()
 }
 
@@ -226,7 +279,7 @@ mod tests {
             destination: Some(destination.into()),
             interface: Some(interface.into()),
             member: Some(member.into()),
-            path: None,
+            ..DbusMessage::default()
         }
     }
 
@@ -276,8 +329,86 @@ mod tests {
             Verdict::Escalate { description } => {
                 assert!(description.contains("StartTransientUnit"), "{description}");
             }
-            Verdict::Allow => panic!("StartTransientUnit must never be allowed"),
+            Verdict::Allow => {
+                panic!("StartTransientUnit without an inspectable body must never be allowed")
+            }
         }
+    }
+
+    fn transient_unit_call(unit_name: Option<&str>) -> DbusMessage {
+        let mut message = call(
+            "org.freedesktop.systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StartTransientUnit",
+        );
+        message.signature = Some("ssa(sv)a(sa(sv))".into());
+        message.body_first_string = unit_name.map(String::from);
+        message
+    }
+
+    /// The scope-vs-service split on `StartTransientUnit`.
+    ///
+    /// A `.scope` unit cannot carry `ExecStart` — it only places pids that
+    /// already exist (Chromium's own, `systemd-run --scope`'s own child) into
+    /// a cgroup, so the executing process stays a supervised descendant.
+    /// Every other unit type is the escape (the user manager forks the
+    /// process outside the ptrace tree) and must keep escalating, as must a
+    /// call whose body could not be decoded: `None` means "could not
+    /// inspect", never "assume benign".
+    #[test]
+    fn transient_scope_units_allow_but_every_other_form_escalates() {
+        assert_eq!(
+            classify(&transient_unit_call(Some("app-glib-chrome-1234.scope"))),
+            Verdict::Allow,
+            "a transient .scope cannot execute anything outside the tree"
+        );
+        for unit in [
+            Some("evil.service"),
+            Some("evil.timer"),
+            Some("evil.socket"),
+            // A name CONTAINING but not ENDING in .scope is not a scope.
+            Some("evil.scope.service"),
+            None,
+        ] {
+            assert!(
+                matches!(
+                    classify(&transient_unit_call(unit)),
+                    Verdict::Escalate { .. }
+                ),
+                "StartTransientUnit({unit:?}) must escalate"
+            );
+        }
+    }
+
+    /// `Manager.GetUnit` is a pure name → object-path lookup: it cannot make
+    /// the manager act, and it discloses less than the already-allowlisted
+    /// bus daemon `ListNames`. Chromium calls it on every launch.
+    #[test]
+    fn systemd_get_unit_lookup_is_allowed() {
+        assert_eq!(
+            classify(&call(
+                "org.freedesktop.systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "GetUnit",
+            )),
+            Verdict::Allow
+        );
+    }
+
+    /// Host-app portal registration (Chromium/Electron per launch). The id it
+    /// registers only shapes how the portal attributes LATER requests, and
+    /// every portal method that could act on that attribution still
+    /// escalates through this table.
+    #[test]
+    fn host_portal_registry_register_is_allowed() {
+        assert_eq!(
+            classify(&call(
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.host.portal.Registry",
+                "Register",
+            )),
+            Verdict::Allow
+        );
     }
 
     /// The Chrome-session additions: read-only probes pass, and the members
@@ -374,11 +505,18 @@ mod tests {
                 "org.freedesktop.ScreenSaver",
                 "Inhibit",
             ),
-            // Read-only member, but the systemd1 exclusion is wholesale.
+            // systemd1 members that make the manager ACT (or load state from
+            // disk) stay excluded; only the pure `GetUnit` lookup is carved,
+            // asserted in `systemd_get_unit_lookup_is_allowed`.
             (
                 "org.freedesktop.systemd1",
                 "org.freedesktop.systemd1.Manager",
-                "GetUnit",
+                "LoadUnit",
+            ),
+            (
+                "org.freedesktop.systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartUnit",
             ),
             // Actually mounting something (with the network auth flow that
             // can involve) is an action, not a description.
@@ -476,7 +614,7 @@ mod tests {
             destination: Some("org.freedesktop.DBus".into()),
             interface: None,
             member: Some("Hello".into()),
-            path: None,
+            ..DbusMessage::default()
         };
         assert!(matches!(classify(&message), Verdict::Escalate { .. }));
     }

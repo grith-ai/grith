@@ -34,7 +34,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.88"
@@ -166,3 +166,15 @@ unnecessary_get_then_check = "allow"
 wildcard_in_or_patterns = "allow"
 items_after_test_module = "allow"
 manual_is_multiple_of = "allow"
+
+# CI runners ship ~14 GB of free disk, and a full-workspace debug build with
+# complete DWARF was already close to that before the analytics archive
+# added the arrow/parquet tree (work/82 Plan 5) — `cargo test --workspace`
+# then failed with "No space left on device" rather than a test failure.
+# Line-tables are enough for a panic backtrace, and cut the target
+# directory by roughly half.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

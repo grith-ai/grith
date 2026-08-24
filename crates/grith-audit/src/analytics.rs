@@ -403,8 +403,11 @@ fn legacy_record_class(record: &AuditRecord) -> RecordClass {
     }
 }
 
+/// Re-exported from the contract crate so the adapter and the archive
+/// exporter cannot drift: the exporter resolves exactly this hash to its
+/// explicitly-unknown configuration instead of failing closed.
 fn legacy_unknown_config_hash() -> String {
-    hex::encode(Sha256::digest(b"grith-analytics-v2:unknown-config"))
+    grith_analytics::archive::unknown_config_hash()
 }
 
 fn canonical_audit_filter_id(raw: &str) -> String {
@@ -543,6 +546,11 @@ pub struct AnalyticsSyncStats {
     pub pending_upload_days: u64,
     pub oldest_pending_day: Option<NaiveDate>,
     pub unacked_security_events: u64,
+    /// Sealed, server-accepted days whose archive object has not been
+    /// activated at their current revision. Surfaces archive backlog in the
+    /// team dashboard's freshness view; distinct from `pending_upload_days`,
+    /// because a rollup acknowledgement is not an archive acknowledgement.
+    pub unacked_archive_days: u64,
     pub gap_count: u64,
 }
 
@@ -1414,6 +1422,224 @@ impl AuditStorage {
         Ok(())
     }
 
+    /// A sealed day ready for archive: the day is materialized (not dirty),
+    /// its snapshot was accepted by the server at this revision, and the
+    /// archive has not been built for that revision yet.
+    ///
+    /// Sealed means the day is complete and past: today is still partial, so
+    /// archiving it would immediately be superseded. A late record reopens
+    /// the day, bumps its revision, and this returns it again.
+    pub fn analytics_archivable_days(
+        &self,
+        source_epoch: Uuid,
+        today: NaiveDate,
+        limit: usize,
+    ) -> Result<Vec<PendingUploadDay>> {
+        let mut statement = self.connection().prepare(
+            "SELECT day, day_revision FROM analytics_day_state
+             WHERE source_epoch = ?1 AND dirty = 0 AND day < ?2
+               AND snapshot_ack_revision IS NOT NULL
+               AND snapshot_ack_revision >= day_revision
+               AND archive_state <> 'unarchivable'
+               AND (archive_ack_revision IS NULL OR archive_day_revision IS NULL
+                    OR archive_day_revision < day_revision)
+             ORDER BY day ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![source_epoch.to_string(), today.to_string(), limit as i64],
+            |row| {
+                let day: String = row.get(0)?;
+                Ok(PendingUploadDay {
+                    source_epoch,
+                    day: parse_day_sql(day)?,
+                    day_revision: row.get::<_, i64>(1)?.max(0) as u64,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Every operand-free event the archive object for one day must carry,
+    /// in insertion order (the writer re-sorts into the frozen order), plus
+    /// the configuration versions those events reference.
+    pub fn analytics_day_export(
+        &self,
+        source_epoch: Uuid,
+        day: NaiveDate,
+    ) -> Result<(Vec<AnalyticsEvent>, BTreeMap<String, ConfigVersion>)> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(
+            "SELECT event_json FROM analytics_source_events
+             WHERE source_epoch = ?1 AND day = ?2
+             ORDER BY occurred_at ASC, event_id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![source_epoch.to_string(), day.to_string()], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let mut events: Vec<AnalyticsEvent> = Vec::new();
+        let mut wanted: BTreeSet<String> = BTreeSet::new();
+        for row in rows {
+            let event: AnalyticsEvent = serde_json::from_str(&row?)?;
+            wanted.insert(event.config_hash.clone());
+            events.push(event);
+        }
+
+        let mut configs = BTreeMap::new();
+        let mut config_statement = connection
+            .prepare("SELECT config_json FROM analytics_config_versions WHERE config_hash = ?1")?;
+        for hash in wanted {
+            let json: Option<String> = config_statement
+                .query_row(params![hash], |row| row.get(0))
+                .optional()?;
+            if let Some(json) = json {
+                let config: ConfigVersion = serde_json::from_str(&json)?;
+                configs.insert(config.config_hash.clone(), config);
+            }
+        }
+        Ok((events, configs))
+    }
+
+    /// Record that an archive object was built for a day (pre-upload), so a
+    /// crash between build and finalize does not lose the content identity
+    /// the presigned key was minted for.
+    pub fn analytics_record_archive_built(
+        &mut self,
+        source_epoch: Uuid,
+        day: NaiveDate,
+        day_revision: u64,
+        revision: u64,
+        content_sha256: &str,
+    ) -> Result<()> {
+        self.connection().execute(
+            "UPDATE analytics_day_state SET
+                archive_revision = ?3,
+                archive_day_revision = ?4,
+                archive_content_sha256 = ?5,
+                archive_state = 'uploading',
+                updated_at = ?6
+             WHERE source_epoch = ?1 AND day = ?2",
+            params![
+                source_epoch.to_string(),
+                day.to_string(),
+                revision as i64,
+                day_revision as i64,
+                content_sha256,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a day as permanently unarchivable: the projection can no longer
+    /// produce a complete archive object for it (its configuration versions
+    /// were lost before this fix, and the audit records that could re-derive
+    /// them have aged out). The day stays queryable locally; it leaves the
+    /// archive queue instead of failing on every pass forever.
+    ///
+    /// This is a recorded gap, not a silent skip — the cloud archive simply
+    /// has no object for that day, which is the honest outcome.
+    pub fn analytics_mark_day_unarchivable(
+        &mut self,
+        source_epoch: Uuid,
+        day: NaiveDate,
+        reason: &str,
+    ) -> Result<()> {
+        tracing::warn!(
+            %day,
+            reason,
+            "analytics day cannot be archived; recording a permanent gap"
+        );
+        self.connection().execute(
+            "UPDATE analytics_day_state SET
+                archive_state = 'unarchivable',
+                updated_at = ?3
+             WHERE source_epoch = ?1 AND day = ?2",
+            params![
+                source_epoch.to_string(),
+                day.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Adopt the archive revision the server says comes next for a day.
+    ///
+    /// The server sequences archive revisions strictly (`next = max + 1`) and
+    /// names the expected value when it refuses one. A device whose local
+    /// counter has run ahead — its manifests were removed server-side, or a
+    /// restored backup carries a higher number — would otherwise re-send the
+    /// same rejected revision forever. Setting the counter to `expected - 1`
+    /// makes the next attempt ask for exactly what the server wants.
+    pub fn analytics_adopt_archive_revision(
+        &mut self,
+        source_epoch: Uuid,
+        day: NaiveDate,
+        expected_next: u64,
+    ) -> Result<()> {
+        self.connection().execute(
+            "UPDATE analytics_day_state SET
+                archive_revision = ?3,
+                archive_state = 'not_built',
+                updated_at = ?4
+             WHERE source_epoch = ?1 AND day = ?2",
+            params![
+                source_epoch.to_string(),
+                day.to_string(),
+                expected_next.saturating_sub(1) as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a server archive activation. Acknowledgement is per archive
+    /// revision and is NOT the same as the rollup acknowledgement: local
+    /// pruning of the forensic chain must not read one as the other.
+    pub fn analytics_record_archive_ack(
+        &mut self,
+        source_epoch: Uuid,
+        day: NaiveDate,
+        revision: u64,
+    ) -> Result<()> {
+        self.connection().execute(
+            "UPDATE analytics_day_state SET
+                archive_ack_revision = MAX(COALESCE(archive_ack_revision, 0), ?3),
+                archive_state = 'active',
+                updated_at = ?4
+             WHERE source_epoch = ?1 AND day = ?2",
+            params![
+                source_epoch.to_string(),
+                day.to_string(),
+                revision as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The next archive revision for a day: one past whatever was built
+    /// last, so a correction never overwrites an activated object.
+    pub fn analytics_next_archive_revision(
+        &self,
+        source_epoch: Uuid,
+        day: NaiveDate,
+    ) -> Result<u64> {
+        let current: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT archive_revision FROM analytics_day_state
+                 WHERE source_epoch = ?1 AND day = ?2",
+                params![source_epoch.to_string(), day.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(current.unwrap_or(0).max(0) as u64 + 1)
+    }
+
     /// The recorded reset reason for a source epoch, when it has one (the
     /// initial epoch does not). Best-effort: absence and read errors both
     /// read as "unknown".
@@ -1454,6 +1680,18 @@ impl AuditStorage {
                 params![epoch],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
+        let unacked_archive_days: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM analytics_day_state
+             WHERE source_epoch = ?1 AND dirty = 0
+               AND day < ?2
+               AND snapshot_ack_revision IS NOT NULL
+               AND snapshot_ack_revision >= day_revision
+               AND archive_state <> 'unarchivable'
+               AND (archive_ack_revision IS NULL OR archive_day_revision IS NULL
+                    OR archive_day_revision < day_revision)",
+            params![epoch, Utc::now().date_naive().to_string()],
+            |row| row.get(0),
+        )?;
         let unacked_security_events: i64 = connection.query_row(
             "SELECT COUNT(*) FROM analytics_security_events
              WHERE source_epoch = ?1
@@ -1470,6 +1708,7 @@ impl AuditStorage {
             pending_upload_days: pending_upload_days.max(0) as u64,
             oldest_pending_day: oldest_pending_day.map(parse_day_sql).transpose()?,
             unacked_security_events: unacked_security_events.max(0) as u64,
+            unacked_archive_days: unacked_archive_days.max(0) as u64,
             gap_count: gap_count.max(0) as u64,
         })
     }
@@ -2214,9 +2453,15 @@ fn replace_family<T: Serialize>(
 }
 
 fn clear_projection(tx: &Transaction<'_>) -> Result<()> {
+    // analytics_config_versions is deliberately NOT cleared. Its rows are
+    // content-addressed and immutable, and they are re-derived only by the
+    // tail materializer from audit records. A rebuild replays SOURCE EVENTS,
+    // which it keeps — so clearing configs orphaned every retained day whose
+    // audit rows had already aged out of the 30-day forensic window, and the
+    // day archive (which must carry the effective thresholds) could never be
+    // built for it again.
     for table in [
         "analytics_source_events",
-        "analytics_config_versions",
         "analytics_usage_hourly",
         "analytics_filter_daily",
         "analytics_session_day",
@@ -2226,6 +2471,15 @@ fn clear_projection(tx: &Transaction<'_>) -> Result<()> {
     ] {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
+    // A day previously marked unarchivable gets another chance: a rebuild
+    // replays audit records, which is exactly what re-derives the
+    // configuration versions whose absence made it unarchivable. If they are
+    // still unavailable afterwards the export marks it again.
+    tx.execute(
+        "UPDATE analytics_day_state SET archive_state = 'not_built'
+         WHERE archive_state = 'unarchivable'",
+        [],
+    )?;
     // Day state survives a rebuild on purpose: day_revision must stay
     // monotonic within a source epoch (a server that accepted revision 5
     // rejects a post-rebuild revision 1 as stale forever), and the snapshot/
@@ -2949,6 +3203,276 @@ mod tests {
     }
 
     #[test]
+    fn archivable_days_require_a_sealed_accepted_day_and_track_revisions() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let today = Utc::now();
+        let yesterday = today - Duration::days(1);
+        storage
+            .insert_record(&record(yesterday, ProxyActionSummary::Allow))
+            .unwrap();
+        storage
+            .insert_record(&record(today, ProxyActionSummary::Queue))
+            .unwrap();
+        storage.catch_up_analytics().unwrap();
+        let epoch = storage
+            .analytics_projection_identity()
+            .unwrap()
+            .source_epoch;
+        let day = yesterday.date_naive();
+
+        // Not yet accepted by the server: nothing to archive.
+        assert!(storage
+            .analytics_archivable_days(epoch, today.date_naive(), 10)
+            .unwrap()
+            .is_empty());
+
+        let pending = storage.analytics_upload_pending_days(epoch, 10).unwrap();
+        let accepted = pending.iter().find(|row| row.day == day).unwrap();
+        storage
+            .analytics_record_day_ack(epoch, day, accepted.day_revision)
+            .unwrap();
+
+        // Accepted and sealed (today is still partial and never listed).
+        let archivable = storage
+            .analytics_archivable_days(epoch, today.date_naive(), 10)
+            .unwrap();
+        assert_eq!(archivable.len(), 1);
+        assert_eq!(archivable[0].day, day);
+        // The heartbeat's archive backlog tracks the same sealed days.
+        assert_eq!(
+            storage.analytics_sync_stats().unwrap().unacked_archive_days,
+            1
+        );
+
+        assert_eq!(
+            storage.analytics_next_archive_revision(epoch, day).unwrap(),
+            1
+        );
+        storage
+            .analytics_record_archive_built(epoch, day, accepted.day_revision, 1, &"a".repeat(64))
+            .unwrap();
+        storage.analytics_record_archive_ack(epoch, day, 1).unwrap();
+        assert_eq!(
+            storage.analytics_sync_stats().unwrap().unacked_archive_days,
+            0
+        );
+        assert!(storage
+            .analytics_archivable_days(epoch, today.date_naive(), 10)
+            .unwrap()
+            .is_empty());
+        // A correction writes a higher revision, never an overwrite.
+        assert_eq!(
+            storage.analytics_next_archive_revision(epoch, day).unwrap(),
+            2
+        );
+
+        // A late record reopens the day: it needs archiving again.
+        storage
+            .insert_record(&record(yesterday, ProxyActionSummary::Deny))
+            .unwrap();
+        storage.catch_up_analytics().unwrap();
+        let reopened = storage.analytics_upload_pending_days(epoch, 10).unwrap();
+        let row = reopened.iter().find(|row| row.day == day).unwrap();
+        storage
+            .analytics_record_day_ack(epoch, day, row.day_revision)
+            .unwrap();
+        let archivable = storage
+            .analytics_archivable_days(epoch, today.date_naive(), 10)
+            .unwrap();
+        assert_eq!(archivable.len(), 1);
+        assert_eq!(archivable[0].day_revision, row.day_revision);
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_config_versions_its_days_still_reference() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let at = Utc::now() - Duration::days(1);
+        storage
+            .insert_record(&record(at, ProxyActionSummary::Allow))
+            .unwrap();
+        storage.catch_up_analytics().unwrap();
+        let epoch = storage
+            .analytics_projection_identity()
+            .unwrap()
+            .source_epoch;
+        let before: i64 = storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM analytics_config_versions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(before > 0);
+
+        // A rebuild replays SOURCE EVENTS. Audit records are pruned at 30
+        // days while source events live 90, so a rebuild that cleared the
+        // content-addressed config rows could never re-derive them — and the
+        // day archive, which must carry the effective thresholds, could never
+        // be built again.
+        let cold = tempfile::tempdir().unwrap();
+        storage
+            .rebuild_analytics_from_active_and_cold(cold.path())
+            .unwrap();
+        let after: i64 = storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM analytics_config_versions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "configs must survive a rebuild");
+
+        let (events, configs) = storage
+            .analytics_day_export(epoch, at.date_naive())
+            .unwrap();
+        for event in &events {
+            assert!(configs.contains_key(&event.config_hash));
+        }
+    }
+
+    #[test]
+    fn a_rebuild_gives_an_unarchivable_day_another_chance() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let today = Utc::now();
+        let yesterday = today - Duration::days(1);
+        storage
+            .insert_record(&record(yesterday, ProxyActionSummary::Allow))
+            .unwrap();
+        storage.catch_up_analytics().unwrap();
+        let epoch = storage
+            .analytics_projection_identity()
+            .unwrap()
+            .source_epoch;
+        let day = yesterday.date_naive();
+        let pending = storage.analytics_upload_pending_days(epoch, 10).unwrap();
+        let accepted = pending.iter().find(|row| row.day == day).unwrap();
+        storage
+            .analytics_record_day_ack(epoch, day, accepted.day_revision)
+            .unwrap();
+        storage
+            .analytics_mark_day_unarchivable(epoch, day, "configs unavailable")
+            .unwrap();
+        assert!(storage
+            .analytics_archivable_days(epoch, today.date_naive(), 10)
+            .unwrap()
+            .is_empty());
+
+        // The audit records are still inside the forensic window, so a
+        // rebuild re-derives the configs the export needs. The day must be
+        // eligible again rather than staying permanently excluded.
+        let cold = tempfile::tempdir().unwrap();
+        storage
+            .rebuild_analytics_from_active_and_cold(cold.path())
+            .unwrap();
+        let rebuilt = storage.analytics_upload_pending_days(epoch, 10).unwrap();
+        let row = rebuilt.iter().find(|row| row.day == day).unwrap();
+        storage
+            .analytics_record_day_ack(epoch, day, row.day_revision)
+            .unwrap();
+        assert_eq!(
+            storage
+                .analytics_archivable_days(epoch, today.date_naive(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unarchivable_day_leaves_the_queue_and_the_backlog_count() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let today = Utc::now();
+        let yesterday = today - Duration::days(1);
+        storage
+            .insert_record(&record(yesterday, ProxyActionSummary::Allow))
+            .unwrap();
+        storage.catch_up_analytics().unwrap();
+        let epoch = storage
+            .analytics_projection_identity()
+            .unwrap()
+            .source_epoch;
+        let day = yesterday.date_naive();
+        let pending = storage.analytics_upload_pending_days(epoch, 10).unwrap();
+        let accepted = pending.iter().find(|row| row.day == day).unwrap();
+        storage
+            .analytics_record_day_ack(epoch, day, accepted.day_revision)
+            .unwrap();
+        assert_eq!(
+            storage
+                .analytics_archivable_days(epoch, today.date_naive(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage.analytics_sync_stats().unwrap().unacked_archive_days,
+            1
+        );
+
+        storage
+            .analytics_mark_day_unarchivable(epoch, day, "configs unavailable")
+            .unwrap();
+
+        // Recorded as a permanent gap: out of the queue, out of the backlog,
+        // and never retried on every pass forever.
+        assert!(storage
+            .analytics_archivable_days(epoch, today.date_naive(), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage.analytics_sync_stats().unwrap().unacked_archive_days,
+            0
+        );
+    }
+
+    #[test]
+    fn day_export_yields_operand_free_events_with_their_configs() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let at = Utc::now();
+        storage
+            .insert_batch(&[
+                record(at, ProxyActionSummary::Allow),
+                record(at, ProxyActionSummary::Deny),
+            ])
+            .unwrap();
+        storage.catch_up_analytics().unwrap();
+        let epoch = storage
+            .analytics_projection_identity()
+            .unwrap()
+            .source_epoch;
+
+        let (events, configs) = storage
+            .analytics_day_export(epoch, at.date_naive())
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(!configs.is_empty());
+        for event in &events {
+            assert!(configs.contains_key(&event.config_hash));
+        }
+        // The projection never carried operands; the archive cannot either.
+        let json = serde_json::to_string(&events).unwrap();
+        assert!(!json.contains("must/not/reach"));
+
+        // The writer accepts exactly this pair.
+        let object = grith_analytics::archive::write_day_archive(
+            &grith_analytics::archive::ArchiveIdentity {
+                team_id: Uuid::from_u128(1),
+                actor_user_id: "user".into(),
+                device_id: Uuid::from_u128(2),
+                source_epoch: epoch,
+                day: at.date_naive(),
+            },
+            &events,
+            &configs,
+        )
+        .unwrap();
+        assert_eq!(object.row_count, 2);
+        assert_eq!(object.content_sha256.len(), 64);
+    }
+
+    #[test]
     fn upload_pending_days_respect_acks_and_dirty_state() {
         let mut storage = AuditStorage::open_in_memory().unwrap();
         let today = Utc::now();
@@ -3166,6 +3690,8 @@ mod tests {
         assert_eq!(stats.pending_upload_days, 1);
         assert_eq!(stats.oldest_pending_day, Some(at.date_naive()));
         assert_eq!(stats.unacked_security_events, 1);
+        // Today is still partial, so it is not archivable and not backlog.
+        assert_eq!(stats.unacked_archive_days, 0);
         assert_eq!(stats.gap_count, 0);
         assert_eq!(stats.materialized_through_sequence, 1);
         assert!(stats.latest_local_event_at.is_some());

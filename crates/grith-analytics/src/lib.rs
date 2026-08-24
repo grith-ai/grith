@@ -8,6 +8,8 @@
 //! accumulator, while adapters own persistence and transport concerns.
 
 pub mod accumulator;
+#[cfg(feature = "archive")]
+pub mod archive;
 pub mod contract;
 pub mod limits;
 pub mod normalize;

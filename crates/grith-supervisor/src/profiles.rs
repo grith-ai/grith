@@ -168,9 +168,10 @@ pub struct SupervisorProfile {
 /// normal operation. See [`SupervisorProfile::local_listener_policy`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalListenerEntry {
-    /// Port the tool binds. `0` means "any ephemeral port" — used for
-    /// dynamically-allocated MCP / IPC sockets that the tool requests
-    /// the kernel pick.
+    /// Port the tool binds, matched exactly. `0` matches binds that pass
+    /// literal port 0 — the kernel-assigned-ephemeral idiom used by
+    /// dynamically-allocated MCP / IPC sockets. It is NOT an any-port
+    /// wildcard: a fixed-port bind needs its own entry.
     pub port: u16,
     /// Address family the entry covers.
     #[serde(default)]
@@ -720,8 +721,12 @@ impl SupervisorProfile {
             }
         }
 
+        // Loopback-only listen addresses seed the `listen:` namespace
+        // (portless form = any port on that address). They used to seed
+        // `net:{addr}`, which NetListen keys no longer consult — and which
+        // also (wrongly) auto-allowed CONNECTS to the same address string.
         for addr in &self.routine_listen_addresses {
-            allowed.insert(format!("net:{addr}"));
+            allowed.insert(format!("listen:{addr}"));
         }
 
         for dest in &self.routine_destinations {
@@ -3379,7 +3384,12 @@ routine_destinations = ["openai.com"]
             "codex MCP transport entry must set allow_clamp = true so the supervisor \
              rewrites the wildcard bind to loopback"
         );
-        assert_eq!(mcp_entry.family, ListenerFamily::V4);
+        assert_eq!(
+            mcp_entry.family,
+            ListenerFamily::Any,
+            "family must cover both `0.0.0.0:0` and `[::]:0` — the v4-only \
+             entry left the v6 form of the same ephemeral idiom prompting"
+        );
     }
 
     #[test]

@@ -334,6 +334,16 @@ enum SupervisorAction {
 pub enum AnalyticsAction {
     /// Show cloud analytics sync status for this machine
     Status,
+    /// Rebuild archived days from cloud storage and check they still match
+    /// the analytics the server accepted
+    VerifyArchives {
+        /// First UTC day to check (YYYY-MM-DD). Defaults to 30 days ago.
+        #[arg(long)]
+        from: Option<String>,
+        /// Last UTC day to check (YYYY-MM-DD). Defaults to yesterday.
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Turn on cloud analytics sync (records your consent)
     Enable {
         /// Skip the interactive confirmation prompt (for scripts)

@@ -178,6 +178,25 @@ export interface AuditListResponse {
   limit?: number;
 }
 
+/// Trailing window the dashboard hero aggregates over. Bounded windows keep
+/// both the displayed figure and the query cost from growing without limit;
+/// "all" stays available but is never the default.
+export type SummaryWindow = "today" | "7d" | "30d" | "all";
+
+/// Response of `GET /api/audit/summary`. All four counts describe the same
+/// window of the same table, so the headline and the verdict breakdown can
+/// never disagree.
+export interface AuditSummaryResponse {
+  window: SummaryWindow;
+  /// RFC3339 cutoff, or null for "all".
+  since: string | null;
+  total: number;
+  allow: number;
+  queue: number;
+  deny: number;
+  include: "full" | "all";
+}
+
 export interface AuditQuery {
   session_id?: string;
   time_from?: string;

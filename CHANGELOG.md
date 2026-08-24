@@ -10,6 +10,42 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 _Nothing yet._
 
+## [0.3.1] - 2026-08-24
+
+### Added
+
+- **Your archived analytics can be checked, not just trusted.**
+  `grith analytics verify-archives` downloads the days this machine has
+  archived, confirms each file is byte-for-byte what was declared, rebuilds
+  the numbers from it, and reports whether they still match what the
+  dashboard shows. A day that disagrees is named rather than buried, and the
+  command exits non-zero so it can run as a check.
+- **Daily analytics archives.** Once a UTC day closes, paid plans upload that
+  day's analytics as a single file — one row per operation, the same fields
+  as the dashboard rollups and none of the excluded content — to encrypted
+  private storage, kept for 90 days. What the archive contains is now stated
+  in the consent summary before sync turns itself on.
+
+### Fixed
+
+- **Fewer permission prompts from ordinary desktop work.** Chromium asked
+  three D-Bus questions on every launch and kernel-assigned ephemeral port
+  binds looked like new listeners; both are now recognised. Copying from the
+  exec TUI also works the way terminals expect, including drag-select.
+- **The dashboard no longer rescans the audit log on every poll**, which had
+  made a large database slow to open and slow to refresh.
+- **Analytics days that could never be archived are no longer retried
+  forever.** A day whose configuration history had aged out is recorded as a
+  gap once, and a rebuild gives it another chance rather than excluding it
+  permanently. Routine records with no configuration to describe — DNS
+  lookups and similar — no longer make an ordinary day unarchivable at all.
+- **Archive uploads are encrypted with the key we manage.** They were
+  landing under Amazon's default key, which does not carry the key policy and
+  audit trail the managed key exists for. Objects already stored under the
+  wrong key were removed and re-uploaded.
+- **A device whose archive numbering drifted from the server's now
+  resynchronises** instead of resending a rejected upload indefinitely.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added

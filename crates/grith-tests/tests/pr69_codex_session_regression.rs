@@ -63,12 +63,15 @@ fn ctx(call_type: ToolCallType) -> ToolCallContext {
 
 // ---------------------------------------------------------------------------
 // Recorded shape 1: NetListen 0.0.0.0:0 with no listener policy
-// Before PR 69: operation-risk +4.0 + egress-policy +5.0 = 9.0 → DENY
-// After  PR 69: operation-risk +0.5 + egress-policy +5.0 = 5.5 → QUEUE
+// Before PR 69:            operation-risk +4.0 + egress-policy +5.0 = 9.0 → DENY
+// After  PR 69:            operation-risk +0.5 + egress-policy +5.0 = 5.5 → QUEUE
+// After ephemeral carveout: operation-risk +0.5 + egress-policy +0.5 = 1.0 → ALLOW
+// (port 0 = kernel-assigned; the client-socket idiom UDP sockets use, which
+// never call listen(2) — see the `ephemeral-port-bind` rule.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn netlisten_wildcard_undeclared_queues_not_denies() {
+async fn netlisten_wildcard_undeclared_ephemeral_allows_audited() {
     let proxy = daemon_like_proxy();
     let mut c = ctx(ToolCallType::NetListen {
         address: "0.0.0.0".into(),
@@ -78,8 +81,39 @@ async fn netlisten_wildcard_undeclared_queues_not_denies() {
 
     let decision = proxy.evaluate(&c).await;
     assert!(
+        matches!(decision.action, ProxyAction::Allow),
+        "ephemeral wildcard bind must ALLOW, got {:?} (composite={})",
+        decision.action,
+        decision.composite_score
+    );
+    // Still audited — egress-policy fires the ephemeral rule, not nothing.
+    let egress_rule = decision
+        .filter_results
+        .iter()
+        .find(|r| r.matched && r.filter_name == "egress-policy")
+        .expect("egress-policy must fire (audited, not silent)");
+    assert_eq!(egress_rule.rule_id, "ephemeral-port-bind");
+    assert!(egress_rule.score <= 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// A FIXED-port wildcard bind is a real reachable-service declaration and
+// must keep queueing — the ephemeral carveout is port-0 only.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn netlisten_wildcard_undeclared_fixed_port_queues_not_denies() {
+    let proxy = daemon_like_proxy();
+    let mut c = ctx(ToolCallType::NetListen {
+        address: "0.0.0.0".into(),
+        port: 3124,
+    });
+    c.listener_policy_match = None;
+
+    let decision = proxy.evaluate(&c).await;
+    assert!(
         matches!(decision.action, ProxyAction::Queue { .. }),
-        "wildcard-undeclared must QUEUE, got {:?} (composite={})",
+        "fixed-port wildcard-undeclared must QUEUE, got {:?} (composite={})",
         decision.action,
         decision.composite_score
     );

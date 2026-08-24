@@ -120,6 +120,32 @@ function mockFetchSuccess() {
           }),
       });
     }
+    if (url.includes("/api/audit/summary")) {
+      const window = new URL(url, "http://localhost").searchParams.get("window");
+      // Distinct totals per window so a test can prove the hero re-queries
+      // and re-renders when the operator switches.
+      const byWindow: Record<string, number> = {
+        today: 11,
+        "7d": 2222,
+        "30d": 33333,
+        all: 444444,
+      };
+      const total = byWindow[window ?? "7d"] ?? 2222;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({
+            window: window ?? "7d",
+            since: window === "all" ? null : "2024-01-01T00:00:00+00:00",
+            total,
+            allow: total - 2,
+            queue: 1,
+            deny: 1,
+            include: "full",
+          }),
+      });
+    }
     if (url.includes("/api/audit")) {
       return Promise.resolve({
         ok: true,
@@ -195,6 +221,9 @@ describe("DashboardPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     window.history.replaceState({}, "", "/");
+    // The hero window is remembered in localStorage; don't leak one test's
+    // choice into the next.
+    localStorage.clear();
   });
 
   it("renders the hero with live status and uptime", async () => {
@@ -210,6 +239,53 @@ describe("DashboardPage", () => {
     expect(screen.getByText("Zero Trust for AI Agents")).toBeTruthy();
     // Uptime surfaced in the hero legend ("uptime 1h 1m").
     expect(screen.getByText(/1h 1m/)).toBeTruthy();
+  });
+
+  it("scopes the hero to the default 7-day window and re-queries on switch", async () => {
+    mockFetchSuccess();
+    render(<DashboardPage />);
+
+    // Headline and copy both describe the same window.
+    await waitFor(() => {
+      expect(screen.getByText("2,222")).toBeTruthy();
+    });
+    expect(screen.getByText(/in the last 7 days/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Today" }));
+    await waitFor(() => {
+      expect(screen.getByText("11")).toBeTruthy();
+    });
+    expect(screen.getByText(/inspected today/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "All" }));
+    await waitFor(() => {
+      expect(screen.getByText("444,444")).toBeTruthy();
+    });
+    expect(screen.getByText(/under Zero Trust -/)).toBeTruthy();
+  });
+
+  it("remembers the chosen hero window across mounts", async () => {
+    mockFetchSuccess();
+    const first = render(<DashboardPage />);
+    await waitFor(() => expect(screen.getByText("2,222")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "30d" }));
+    await waitFor(() => expect(screen.getByText("33,333")).toBeTruthy());
+    first.unmount();
+
+    render(<DashboardPage />);
+    await waitFor(() => {
+      expect(screen.getByText("33,333")).toBeTruthy();
+    });
+  });
+
+  it("headline total and verdict breakdown come from the same window", async () => {
+    mockFetchSuccess();
+    render(<DashboardPage />);
+
+    // The old hero mixed a whole-database headline with a breakdown tallied
+    // from the fetched page of records; 2,222 = 2,220 allowed + 1 + 1.
+    await waitFor(() => expect(screen.getByText("2,222")).toBeTruthy());
+    expect(screen.getByText("2,220")).toBeTruthy();
   });
 
   it("shows error on API failure", async () => {

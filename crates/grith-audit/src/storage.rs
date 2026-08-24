@@ -5,16 +5,19 @@
 
 use crate::error::Result;
 use crate::record_parser::row_to_record;
-use crate::types::{ArchiveBoundary, AuditRecord, ChainVerification, SegmentHistory};
-use chrono::Utc;
+use crate::types::{
+    ArchiveBoundary, AuditRecord, ChainVerification, DecisionSummary, SegmentHistory,
+};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{
     params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Persisted high-water mark for incremental chain verification.
@@ -56,6 +59,16 @@ pub struct AuditStorage {
     /// Memoised result of the most recent chain verification.
     /// Invalidated on every write path; refilled on next `cached_verify_chain`.
     verify_cache: Mutex<Option<ChainVerification>>,
+    /// Short-TTL memo for [`AuditStorage::decision_summary`], keyed by
+    /// `(window cutoff as a unix timestamp, include_compact)`.
+    ///
+    /// Deliberately time-based rather than invalidated on write. The dashboard
+    /// hero polls every 5 seconds and every open tab polls independently, so
+    /// without this a busy machine recomputes the same aggregate several times
+    /// a second. A [`SUMMARY_CACHE_TTL`]-second-stale headline is invisible
+    /// next to a 5-second refresh, and the ceiling on recomputes no longer
+    /// depends on how many dashboards are watching.
+    summary_cache: Mutex<HashMap<(Option<i64>, bool), (Instant, DecisionSummary)>>,
     /// Whether the partial UNIQUE index on `chain_sequence` is active.
     ///
     /// Legacy databases that already contain duplicate sequences (the
@@ -108,6 +121,13 @@ fn is_unique_sequence_violation(e: &crate::error::Error) -> bool {
                 && msg.contains("chain_sequence")
     )
 }
+
+/// How long a [`AuditStorage::decision_summary`] result stays reusable.
+///
+/// Two seconds is well under the dashboard's 5-second poll, so the hero never
+/// visibly lags, while a burst of concurrent pollers collapses onto a single
+/// scan.
+const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Upper bound on the WAL file after a checkpoint, in bytes.
 ///
@@ -220,6 +240,7 @@ impl AuditStorage {
             max_size_bytes: 100 * 1024 * 1024, // 100 MB
             max_rotations: 5,
             verify_cache: Mutex::new(None),
+            summary_cache: Mutex::new(HashMap::new()),
             unique_sequence_index: AtomicBool::new(false),
             quarantine: None,
             read_only: false,
@@ -265,6 +286,7 @@ impl AuditStorage {
             max_size_bytes: 100 * 1024 * 1024,
             max_rotations: 5,
             verify_cache: Mutex::new(None),
+            summary_cache: Mutex::new(HashMap::new()),
             // A read-only opener cannot run the index-detection migration
             // (it writes), so it conservatively reports "no unique index".
             unique_sequence_index: AtomicBool::new(false),
@@ -283,6 +305,7 @@ impl AuditStorage {
             max_size_bytes: 100 * 1024 * 1024,
             max_rotations: 5,
             verify_cache: Mutex::new(None),
+            summary_cache: Mutex::new(HashMap::new()),
             unique_sequence_index: AtomicBool::new(false),
             quarantine: None,
             read_only: false,
@@ -497,7 +520,11 @@ impl AuditStorage {
         // Create indexes after migration ensures the columns exist.
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_audit_synced ON audit_log(synced_at);
-             CREATE INDEX IF NOT EXISTS idx_audit_chain_seq ON audit_log(chain_sequence);",
+             CREATE INDEX IF NOT EXISTS idx_audit_chain_seq ON audit_log(chain_sequence);
+             CREATE INDEX IF NOT EXISTS idx_audit_compact ON audit_log(record_type)
+               WHERE record_type = 'compact';
+             CREATE INDEX IF NOT EXISTS idx_audit_ts_action
+               ON audit_log(timestamp, proxy_action, record_type);",
         )?;
         // B12 item 4: a second writer racing the chain used to be able to
         // derive the same sequence twice (the 2026-07 fork incident). The
@@ -856,15 +883,11 @@ impl AuditStorage {
                 "ALTER TABLE audit_log ADD COLUMN record_type TEXT NOT NULL DEFAULT 'full'",
                 [],
             )?;
-            // Index by record_type so compact-vs-full filtering doesn't
-            // table-scan once volume picks up under completeness = "io" or
-            // "all". WHERE clause keeps the index small (full rows are the
-            // common case and benefit from idx_audit_timestamp instead).
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_audit_compact ON audit_log(record_type) \
-                 WHERE record_type = 'compact'",
-                [],
-            )?;
+            // `idx_audit_compact` is created unconditionally by
+            // `init_schema` right after this migration runs, so that
+            // `count_filtered`'s covering-index path is guaranteed to exist
+            // on every database rather than only on ones that happened to
+            // take this branch.
         }
 
         Ok(())
@@ -1116,8 +1139,13 @@ impl AuditStorage {
     /// Recent records, optionally including compact rows.
     ///
     /// When `include_compact` is false (the default audit-page view) only
-    /// rows with `record_type = 'full'` are returned. When true, both
-    /// full and compact rows interleave by timestamp.
+    /// full proxy-decision rows are returned. When true, both full and
+    /// compact rows interleave by timestamp.
+    ///
+    /// The predicate is `record_type <> 'compact'` rather than
+    /// `= 'full'` so it selects exactly the set
+    /// [`RecordType::from_str_lenient`] folds to `Full`, and so it agrees
+    /// with [`AuditStorage::count_filtered`] row for row.
     pub fn get_recent_filtered(
         &self,
         limit: usize,
@@ -1126,7 +1154,7 @@ impl AuditStorage {
         let sql = if include_compact {
             "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?1"
         } else {
-            "SELECT * FROM audit_log WHERE record_type = 'full' \
+            "SELECT * FROM audit_log WHERE record_type <> 'compact' \
              ORDER BY timestamp DESC LIMIT ?1"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -1155,7 +1183,7 @@ impl AuditStorage {
         let sql = if include_compact {
             "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         } else {
-            "SELECT * FROM audit_log WHERE record_type = 'full' \
+            "SELECT * FROM audit_log WHERE record_type <> 'compact' \
              ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -1170,14 +1198,126 @@ impl AuditStorage {
     }
 
     /// Total record count, optionally including compact rows.
+    ///
+    /// The non-compact branch is deliberately expressed as a subtraction of
+    /// two covering-index counts rather than the obvious
+    /// `WHERE record_type = 'full'`. `idx_audit_compact` is a *partial*
+    /// index on `record_type = 'compact'`, so it cannot serve a `= 'full'`
+    /// predicate and SQLite fell back to a full scan of the `audit_log`
+    /// b-tree: ~0.7s and ~2.5 GB of page reads on a 1.2M-row database.
+    /// `/api/audit` calls this on every request and the dashboard polls that
+    /// route every 3-5 seconds, so an idle daemon with a dashboard tab open
+    /// sat at ~25% of a core re-scanning the whole table forever.
+    ///
+    /// Both halves below are covering-index scans (`idx_audit_chain_seq` and
+    /// `idx_audit_compact`), ~40ms combined. The result is identical:
+    /// `record_type` is `NOT NULL DEFAULT 'full'` and the only values ever
+    /// written are `'full'` / `'compact'`, and anything else would be folded
+    /// to `Full` by [`RecordType::from_str_lenient`] on read — which is the
+    /// same set `get_recent_filtered` / `get_page_filtered` select.
     pub fn count_filtered(&self, include_compact: bool) -> Result<usize> {
-        let sql = if include_compact {
-            "SELECT COUNT(*) FROM audit_log"
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))?;
+        if include_compact {
+            return Ok(total as usize);
+        }
+        let compact: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE record_type = 'compact'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total - compact).max(0) as usize)
+    }
+
+    /// Allow / queue / deny counts over an optional trailing time window.
+    ///
+    /// `since = None` means all time. This is what the dashboard hero reads:
+    /// one query producing one internally consistent set of numbers, rather
+    /// than the old split where the headline was a whole-database count and
+    /// the verdict breakdown was derived from whatever 500 records the page
+    /// happened to have fetched.
+    ///
+    /// **Cost.** Conditional `SUM`s rather than `GROUP BY proxy_action`,
+    /// specifically so SQLite picks the composite `idx_audit_ts_action`
+    /// covering index and never touches the table heap. A `GROUP BY` makes the
+    /// planner prefer `idx_audit_action` (it satisfies the grouping order for
+    /// free) and then fetch every candidate row — 0.65s and 2.5 GB of page
+    /// reads on a 1.2M-record database. As a covering range scan the same
+    /// window costs ~3ms for a day and ~110ms for a week, reading only the
+    /// index. A *bounded* window is what keeps this flat as the database
+    /// grows; `since = None` is inherently O(rows) and is why the hero does
+    /// not default to it.
+    ///
+    /// Cutoffs are formatted with second precision and compared with `>=`.
+    /// Timestamps are stored as `DateTime<Utc>::to_rfc3339()`, so the column
+    /// is lexicographically ordered, and both same-second shapes land on the
+    /// correct side: a row with a fractional part sorts after the cutoff
+    /// (`'.'` > `'+'`), and a row without one compares equal.
+    pub fn decision_summary(
+        &self,
+        since: Option<DateTime<Utc>>,
+        include_compact: bool,
+    ) -> Result<DecisionSummary> {
+        let key = (since.map(|t| t.timestamp()), include_compact);
+        if let Ok(cache) = self.summary_cache.lock() {
+            if let Some((at, cached)) = cache.get(&key) {
+                if at.elapsed() < SUMMARY_CACHE_TTL {
+                    return Ok(*cached);
+                }
+            }
+        }
+
+        let mut predicates: Vec<&str> = Vec::new();
+        if since.is_some() {
+            predicates.push("timestamp >= ?1");
+        }
+        if !include_compact {
+            predicates.push("record_type <> 'compact'");
+        }
+        let where_clause = if predicates.is_empty() {
+            String::new()
         } else {
-            "SELECT COUNT(*) FROM audit_log WHERE record_type = 'full'"
+            format!(" WHERE {}", predicates.join(" AND "))
         };
-        let count: i64 = self.conn.query_row(sql, [], |row| row.get(0))?;
-        Ok(count as usize)
+        // Exact verdict comparison, not `lower(proxy_action)`: a row whose
+        // verdict was rewritten to a non-canonical spelling is a tamper the
+        // chain verifier already reports, and folding it here would hide it
+        // while making `total` and the breakdown disagree.
+        let sql = format!(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(proxy_action = 'allow'), 0), \
+             COALESCE(SUM(proxy_action = 'queue'), 0), \
+             COALESCE(SUM(proxy_action = 'deny'), 0) \
+             FROM audit_log{where_clause}"
+        );
+
+        let row = |row: &rusqlite::Row<'_>| {
+            Ok(DecisionSummary {
+                total: row.get::<_, i64>(0)?.max(0) as usize,
+                allow: row.get::<_, i64>(1)?.max(0) as usize,
+                queue: row.get::<_, i64>(2)?.max(0) as usize,
+                deny: row.get::<_, i64>(3)?.max(0) as usize,
+            })
+        };
+        let summary = match since {
+            Some(cutoff) => self.conn.query_row(
+                &sql,
+                params![cutoff.to_rfc3339_opts(SecondsFormat::Secs, false)],
+                row,
+            )?,
+            None => self.conn.query_row(&sql, [], row)?,
+        };
+
+        if let Ok(mut cache) = self.summary_cache.lock() {
+            // Bounded by the handful of windows the UI offers; the sweep only
+            // matters if a caller ever passes arbitrary cutoffs.
+            if cache.len() > 32 {
+                cache.retain(|_, (at, _)| at.elapsed() < SUMMARY_CACHE_TTL);
+            }
+            cache.insert(key, (Instant::now(), summary));
+        }
+        Ok(summary)
     }
 
     /// Get all records for a session.
@@ -1630,10 +1770,17 @@ impl AuditStorage {
         seed_prev_hash: Option<String>,
         already_verified: usize,
     ) -> Result<ChainVerification> {
-        let total_count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))?;
-        if total_count == 0 {
+        // Emptiness only, so probe for a single row rather than counting.
+        // `COUNT(*)` here was a covering-index scan of the whole table — 16 MB
+        // of page reads on a 1.2M-record database — paid on every incremental
+        // verify, which every `/api/audit*` request triggers whenever a write
+        // has invalidated the verification cache.
+        let has_rows: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit_log LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_rows {
             return Ok(ChainVerification::Empty);
         }
 
@@ -1969,16 +2116,39 @@ impl AuditStorage {
                  AND chain_sequence <= ?1",
             params![max_sequence],
         )?;
-        let ckpt = ChainCheckpoint {
-            last_verified_sequence: max_sequence,
-            last_verified_record_hash: head_hash.clone(),
-        };
-        let value = serde_json::to_string(&ckpt)?;
-        tx.execute(
-            "INSERT INTO chain_metadata (key, value) VALUES ('verified_head', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![value],
-        )?;
+        // The `verified_head` checkpoint may only ever move FORWARD. Pruning
+        // a prefix says nothing about the suffix above it, so an existing
+        // checkpoint that already covers more of the chain than
+        // `max_sequence` stays exactly where it is.
+        //
+        // Overwriting it unconditionally is what made every daemon restart
+        // pay for a from-scratch chain verify: the startup retention pass
+        // archives a handful of sequences, rewound `verified_head` from the
+        // real head down to the archive boundary, and the first `/api/audit`
+        // request then re-hashed the whole surviving segment inline — 27
+        // seconds on a 1.2M-record database, long enough for the dashboard to
+        // time the request out and report the daemon as stopped.
+        let existing_verified: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM chain_metadata WHERE key = 'verified_head'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|raw| serde_json::from_str::<ChainCheckpoint>(&raw).ok())
+            .map(|c| c.last_verified_sequence);
+        if existing_verified.is_none_or(|seq| seq < max_sequence) {
+            let ckpt = ChainCheckpoint {
+                last_verified_sequence: max_sequence,
+                last_verified_record_hash: head_hash.clone(),
+            };
+            let value = serde_json::to_string(&ckpt)?;
+            tx.execute(
+                "INSERT INTO chain_metadata (key, value) VALUES ('verified_head', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![value],
+            )?;
+        }
 
         // work/74 Phase 6: write the DURABLE boundary anchor in the same
         // transaction as the delete that creates it. The `verified_head`
@@ -2290,6 +2460,251 @@ mod tests {
         let got = storage.get_by_id(&batched_id).unwrap();
         assert_eq!(got.decision_reason.as_deref(), Some("routine destination"));
         assert_eq!(got.enforcement_outcome.as_deref(), Some("allowed"));
+    }
+
+    /// The hero's numbers must agree with the rows they claim to describe,
+    /// inside the window and outside it.
+    #[test]
+    fn decision_summary_counts_only_the_requested_window() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        let push = |action: ProxyActionSummary, at: DateTime<Utc>| {
+            let mut r = make_record();
+            r.proxy_action = action;
+            r.timestamp = at;
+            storage.insert_record(&r).unwrap();
+        };
+        // Inside a 1-hour window.
+        push(
+            ProxyActionSummary::Allow,
+            now - chrono::Duration::minutes(5),
+        );
+        push(
+            ProxyActionSummary::Allow,
+            now - chrono::Duration::minutes(4),
+        );
+        push(
+            ProxyActionSummary::Queue,
+            now - chrono::Duration::minutes(3),
+        );
+        push(ProxyActionSummary::Deny, now - chrono::Duration::minutes(2));
+        // Outside it.
+        push(ProxyActionSummary::Deny, now - chrono::Duration::hours(9));
+        push(ProxyActionSummary::Queue, now - chrono::Duration::hours(9));
+
+        let hour = storage
+            .decision_summary(Some(now - chrono::Duration::hours(1)), false)
+            .unwrap();
+        assert_eq!(
+            hour,
+            DecisionSummary {
+                total: 4,
+                allow: 2,
+                queue: 1,
+                deny: 1
+            }
+        );
+
+        let all = storage.decision_summary(None, false).unwrap();
+        assert_eq!(
+            all,
+            DecisionSummary {
+                total: 6,
+                allow: 2,
+                queue: 2,
+                deny: 2
+            }
+        );
+        assert_eq!(all.total, storage.count_filtered(false).unwrap());
+    }
+
+    /// Compact short-circuit rows are excluded unless asked for, exactly as
+    /// they are by the list query the hero sits above.
+    #[test]
+    fn decision_summary_honours_the_compact_filter() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+        storage.insert_record(&make_record()).unwrap();
+        let mut compact = make_record();
+        compact.record_type = crate::types::RecordType::Compact;
+        storage.insert_record(&compact).unwrap();
+
+        assert_eq!(storage.decision_summary(None, false).unwrap().total, 1);
+        assert_eq!(storage.decision_summary(None, true).unwrap().total, 2);
+    }
+
+    /// The whole point of the conditional-`SUM` shape is that SQLite serves
+    /// the window from `idx_audit_ts_action` without touching the table. A
+    /// `GROUP BY proxy_action` here would silently switch the planner to
+    /// `idx_audit_action` plus a row fetch per candidate — the 2.5 GB-per-
+    /// request regression this replaced. Pin the plan.
+    #[test]
+    fn decision_summary_is_served_by_the_covering_index() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+        storage.insert_record(&make_record()).unwrap();
+
+        let plan: String = storage
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*), \
+                 COALESCE(SUM(proxy_action = 'allow'), 0), \
+                 COALESCE(SUM(proxy_action = 'queue'), 0), \
+                 COALESCE(SUM(proxy_action = 'deny'), 0) \
+                 FROM audit_log WHERE timestamp >= ?1 AND record_type <> 'compact'",
+                params!["2020-01-01T00:00:00+00:00"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("COVERING INDEX idx_audit_ts_action"),
+            "window aggregate must stay covering-index only, got: {plan}"
+        );
+    }
+
+    /// Timestamps are RFC3339 text compared lexicographically, and
+    /// `to_rfc3339()` omits the fractional part when it is zero. Both shapes
+    /// must land on the correct side of a second-precision cutoff.
+    #[test]
+    fn decision_summary_window_boundary_handles_both_timestamp_shapes() {
+        use chrono::TimeZone;
+        let storage = AuditStorage::open_in_memory().unwrap();
+        let cutoff = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+
+        let mut on_the_second = make_record();
+        on_the_second.timestamp = cutoff;
+        storage.insert_record(&on_the_second).unwrap();
+        assert!(
+            !on_the_second.timestamp.to_rfc3339().contains('.'),
+            "precondition: a zero-nanosecond timestamp serialises without a fraction"
+        );
+
+        let mut just_after = make_record();
+        just_after.timestamp = cutoff + chrono::Duration::nanoseconds(1);
+        storage.insert_record(&just_after).unwrap();
+        assert!(just_after.timestamp.to_rfc3339().contains('.'));
+
+        let mut just_before = make_record();
+        just_before.timestamp = cutoff - chrono::Duration::nanoseconds(1);
+        storage.insert_record(&just_before).unwrap();
+
+        assert_eq!(
+            storage.decision_summary(Some(cutoff), false).unwrap().total,
+            2
+        );
+    }
+
+    /// A retention prune must never rewind the `verified_head` checkpoint.
+    ///
+    /// The startup retention pass archives a small prefix; before this was
+    /// fixed it also reset the checkpoint from the real chain head down to
+    /// that prefix's last sequence, so the next chain verification re-hashed
+    /// the entire surviving segment. On the operator's 1.2M-record database
+    /// that ran inline inside the first `/api/audit` request for 27 seconds
+    /// after every daemon restart.
+    #[test]
+    fn delete_prefix_never_rewinds_the_verified_head_checkpoint() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        for _ in 0..6 {
+            storage.insert_record(&make_record()).unwrap();
+        }
+
+        // Verify the whole chain so the checkpoint sits at the head.
+        assert!(matches!(
+            storage.incremental_verify_chain().unwrap(),
+            ChainVerification::Valid { .. }
+        ));
+        let head = storage
+            .load_chain_checkpoint()
+            .unwrap()
+            .expect("verify should have written a checkpoint")
+            .last_verified_sequence;
+        assert_eq!(head, 6);
+
+        // Archive the first two records, as the startup retention pass does.
+        assert_eq!(storage.delete_prefix(2).unwrap(), 2);
+
+        let after = storage
+            .load_chain_checkpoint()
+            .unwrap()
+            .expect("prune must not drop the checkpoint")
+            .last_verified_sequence;
+        assert_eq!(
+            after, head,
+            "prune of a prefix below the verified head must leave it alone"
+        );
+        assert!(matches!(
+            storage.incremental_verify_chain().unwrap(),
+            ChainVerification::Valid { .. }
+        ));
+    }
+
+    /// The flip side: with no checkpoint (or one below the prune point) the
+    /// prune still has to seed one, otherwise the next verify has no anchor
+    /// for a segment that no longer starts at sequence 1.
+    #[test]
+    fn delete_prefix_seeds_the_checkpoint_when_it_is_missing_or_behind() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        for _ in 0..6 {
+            storage.insert_record(&make_record()).unwrap();
+        }
+        assert!(storage.load_chain_checkpoint().unwrap().is_none());
+
+        assert_eq!(storage.delete_prefix(2).unwrap(), 2);
+
+        assert_eq!(
+            storage
+                .load_chain_checkpoint()
+                .unwrap()
+                .expect("prune must seed a checkpoint when none exists")
+                .last_verified_sequence,
+            2
+        );
+        assert!(matches!(
+            storage.incremental_verify_chain().unwrap(),
+            ChainVerification::Valid { .. }
+        ));
+    }
+
+    /// `count_filtered(false)` must agree with `get_recent_filtered(_, false)`
+    /// row for row. It is implemented as `COUNT(*) - COUNT(compact)` so it can
+    /// ride two covering indexes instead of table-scanning `audit_log` on
+    /// every `/api/audit` request; this pins that the rewrite kept the same
+    /// answer, including when a legacy row carries a non-canonical
+    /// `record_type` (which `RecordType::from_str_lenient` folds to `Full`).
+    #[test]
+    fn count_filtered_matches_the_rows_the_list_query_returns() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+
+        for _ in 0..3 {
+            storage.insert_record(&make_record()).unwrap();
+        }
+        let mut compact = make_record();
+        compact.record_type = crate::types::RecordType::Compact;
+        storage.insert_record(&compact).unwrap();
+
+        // A hand-written / older row with an unrecognised tag: read back as
+        // Full, so both the list and the count must include it.
+        let legacy = make_record();
+        let legacy_id = legacy.id;
+        storage.insert_record(&legacy).unwrap();
+        storage
+            .conn
+            .execute(
+                "UPDATE audit_log SET record_type = 'legacy' WHERE id = ?1",
+                params![legacy_id.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(storage.count_filtered(false).unwrap(), 4);
+        assert_eq!(storage.count_filtered(true).unwrap(), 5);
+        assert_eq!(
+            storage.get_recent_filtered(100, false).unwrap().len(),
+            storage.count_filtered(false).unwrap()
+        );
+        assert_eq!(
+            storage.get_recent_filtered(100, true).unwrap().len(),
+            storage.count_filtered(true).unwrap()
+        );
     }
 
     /// H-16: batch-inserted compact records used to silently take the

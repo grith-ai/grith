@@ -557,7 +557,11 @@ routine_listen_addresses = []
 # profile (`namespace_users`, `routine_exec_roots`, …) would otherwise be
 # scoped under the listener entry by TOML's table-header rules.
 local_listener_policy = [
-    { port = 0, family = "v4", desc = "Codex MCP transport — kernel-assigned localhost port", allow_clamp = true },
+    # `port = 0` matches exactly the kernel-assigned-ephemeral binds (the
+    # tool passes literal port 0) — it is not an any-port wildcard. `family
+    # = "any"` covers the v6 form of the same idiom (`[::]:0`), which the
+    # old "v4" entry left prompting.
+    { port = 0, family = "any", desc = "Codex MCP transport — kernel-assigned localhost port", allow_clamp = true },
 ]
 
 # PR 6 Phase C: namespace_users — binaries Codex's bootstrap legitimately

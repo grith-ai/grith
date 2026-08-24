@@ -1,16 +1,19 @@
 import { useEffect, useState } from "react";
 import type {
   AuditRecord,
+  AuditSummaryResponse,
   ExfilStatsResponse,
   HealthResponse,
   ProxyStatusResponse,
   SessionSummary,
+  SummaryWindow,
 } from "@/types/api";
 import {
   getHealth,
   getProxyStatus,
   getExfilStats,
   getAuditRecords,
+  getAuditSummary,
   getSessions,
 } from "@/lib/api";
 import { InteractiveScoreScatter } from "@/components/charts/InteractiveScoreScatter";
@@ -186,24 +189,32 @@ function formatUptime(seconds: number): string {
 }
 
 /** Compute decision counts from audit records. */
-function computeStats(records: AuditRecord[], dbTotal: number) {
-  let allow = 0;
-  let queue = 0;
-  let deny = 0;
-  for (const r of records) {
-    switch (r.proxy_action) {
-      case "allow":
-        allow++;
-        break;
-      case "queue":
-        queue++;
-        break;
-      case "deny":
-        deny++;
-        break;
-    }
+/** localStorage key remembering the operator's chosen hero window. */
+const HERO_WINDOW_KEY = "grith-hero-window";
+
+const HERO_WINDOW_VALUES: SummaryWindow[] = ["today", "7d", "30d", "all"];
+
+/**
+ * Default to the last 7 days: large enough to look substantial on a quiet
+ * morning, recent enough to reflect current usage, and — unlike all-time —
+ * bounded in both display width and query cost as the audit database grows.
+ */
+function readHeroWindow(): SummaryWindow {
+  try {
+    const stored = localStorage.getItem(HERO_WINDOW_KEY) as SummaryWindow | null;
+    if (stored && HERO_WINDOW_VALUES.includes(stored)) return stored;
+  } catch {
+    // Private windows and blocked site data throw on access; fall through.
   }
-  return { dbTotal, allow, queue, deny };
+  return "7d";
+}
+
+function persistHeroWindow(next: SummaryWindow): void {
+  try {
+    localStorage.setItem(HERO_WINDOW_KEY, next);
+  } catch {
+    // Non-fatal: the choice just won't survive a reload.
+  }
 }
 
 /** Derive per-session stats from audit records. */
@@ -309,12 +320,12 @@ export function DashboardPage() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [proxy, setProxy] = useState<ProxyStatusResponse | null>(null);
   const [exfil, setExfil] = useState<ExfilStatsResponse | null>(null);
-  const [auditStats, setAuditStats] = useState<{
-    dbTotal: number;
-    allow: number;
-    queue: number;
-    deny: number;
-  } | null>(null);
+  // Server-aggregated hero figures. Previously the headline was a
+  // whole-database count while allow/queue/deny were tallied from whatever
+  // records this page had fetched — two different populations in one panel.
+  // One windowed query now supplies all four.
+  const [summary, setSummary] = useState<AuditSummaryResponse | null>(null);
+  const [heroWindow, setHeroWindow] = useState<SummaryWindow>(readHeroWindow);
   const [auditSessions, setAuditSessions] = useState<AuditSession[]>([]);
   const [auditRecords, setAuditRecords] = useState<AuditRecord[]>([]);
   // Currently-live supervisor sessions (registry) — carry project name, cwd,
@@ -337,15 +348,16 @@ export function DashboardPage() {
         getExfilStats(),
         getAuditRecords({ limit: 500, offset: 0 }),
         getSessions(),
+        getAuditSummary(heroWindow),
       ]);
 
-      const [h, p, e, audit, sessions] = results;
+      const [h, p, e, audit, sessions, heroSummary] = results;
 
       if (h.status === "fulfilled") setHealth(h.value);
       if (p.status === "fulfilled") setProxy(p.value);
       if (e.status === "fulfilled") setExfil(e.value);
+      if (heroSummary.status === "fulfilled") setSummary(heroSummary.value);
       if (audit.status === "fulfilled") {
-        setAuditStats(computeStats(audit.value.records, audit.value.total));
         setAuditSessions(deriveSessionsFromAudit(audit.value.records));
         setAuditRecords(audit.value.records);
       }
@@ -358,7 +370,7 @@ export function DashboardPage() {
         setHealth(null);
         setProxy(null);
         setExfil(null);
-        setAuditStats(null);
+        setSummary(null);
         setAuditSessions([]);
         setLiveSessions([]);
         setError("grith daemon has stopped. Restart with grith exec or grith run.");
@@ -369,14 +381,15 @@ export function DashboardPage() {
     void load();
     const interval = setInterval(() => void load(), 5_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [heroWindow]);
 
-  // Prefer audit-derived stats (real data from thin client evaluations)
-  // over proxy in-memory counters (only counts in-process evaluations).
-  const totalEvals = auditStats?.dbTotal ?? proxy?.total_evaluations ?? 0;
-  const allowCount = auditStats?.allow ?? proxy?.allow_count ?? 0;
-  const queueCount = auditStats?.queue ?? proxy?.queue_count ?? 0;
-  const denyCount = auditStats?.deny ?? proxy?.deny_count ?? 0;
+  // Prefer the audit summary (durable, covers thin-client evaluations) over
+  // the proxy's in-memory counters, which reset with the daemon and only see
+  // in-process work.
+  const totalEvals = summary?.total ?? proxy?.total_evaluations ?? 0;
+  const allowCount = summary?.allow ?? proxy?.allow_count ?? 0;
+  const queueCount = summary?.queue ?? proxy?.queue_count ?? 0;
+  const denyCount = summary?.deny ?? proxy?.deny_count ?? 0;
   const filtersActive = proxy?.filters.filter((f) => f.is_ready).length ?? 0;
   const displaySessions = mergeSessions(auditSessions, liveSessions);
   // session_id → human project label, for naming Live Decisions rows by
@@ -408,7 +421,12 @@ export function DashboardPage() {
         planLabel={PlanLabel(tierState.tierKey)}
         planPaid={tierState.isPaid}
         billingUrl={tierState.billingUrl}
-        shareOnOpen={shareRequested && (auditStats !== null || proxy !== null)}
+        shareOnOpen={shareRequested && (summary !== null || proxy !== null)}
+        timeWindow={heroWindow}
+        onWindowChange={(next) => {
+          setHeroWindow(next);
+          persistHeroWindow(next);
+        }}
       />
 
       {/* Persistent upgrade banner — hidden only for Enterprise. */}

@@ -412,6 +412,25 @@ impl std::fmt::Display for ProxyActionSummary {
     }
 }
 
+/// Aggregate allow / queue / deny counts over a time window.
+///
+/// Powers the dashboard hero, which must show one internally consistent set
+/// of numbers: `total` and the three verdict counts always describe the same
+/// window of the same table. (`total` can exceed `allow + queue + deny` if a
+/// row carries a non-canonical `proxy_action` — the chain verifier reports
+/// that as tampering rather than this aggregate silently absorbing it.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionSummary {
+    /// Rows in the window, whatever their verdict.
+    pub total: usize,
+    /// Rows the proxy allowed.
+    pub allow: usize,
+    /// Rows the proxy queued for review.
+    pub queue: usize,
+    /// Rows the proxy denied.
+    pub deny: usize,
+}
+
 /// Compact form of FilterResult for storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterResultSummary {

@@ -936,6 +936,42 @@ impl SecurityFilter for EgressPolicyFilter {
                 let is_wildcard = is_wildcard_bind_address(address);
                 if !is_loopback {
                     let policy_match = ctx.listener_policy_match.as_ref();
+                    // Ephemeral-port carveout: `bind(<non-loopback>, port 0)`
+                    // asks the kernel to assign the port. Nothing external can
+                    // rendezvous with a port it cannot know, and the shape is
+                    // the universal client-socket source-selection idiom —
+                    // `UdpSocket::bind(0.0.0.0:0)` + `connect()` for DNS and
+                    // similar clients, which never call `listen(2)` at all, so
+                    // no later syscall can disambiguate them. Scored (audited)
+                    // at +0.5 rather than silently allowed; fixed-port binds
+                    // keep the full +5.0 below. A DECLARED entry still wins in
+                    // both directions: `allow_clamp = true` clamps the bind to
+                    // loopback (stricter), `allow_clamp = false` says the
+                    // operator wants the prompt (also stricter) — this arm
+                    // only replaces the *undeclared* heuristic.
+                    let declared = policy_match.is_some();
+                    // IP binds only: a unix-domain "listener" also carries
+                    // port 0, but its address is the socket PATH — fully
+                    // known, immediately reachable, and possibly privileged
+                    // (`/var/run/docker.sock`). The kernel-assigned-port
+                    // argument does not apply there.
+                    let is_ip_bind = address.parse::<std::net::IpAddr>().is_ok();
+                    if *port == 0 && !declared && is_ip_bind {
+                        // Early return mirrors the clamp arm: a bind source
+                        // address is not an outbound destination, so
+                        // `evaluate_destination` / `evaluate_unusual_port`
+                        // must not re-score it.
+                        return Ok(FilterResult::matched(
+                            "egress-policy",
+                            "ephemeral-port-bind",
+                            0.5,
+                            severity_for(0.5),
+                            format!(
+                                "Kernel-assigned ephemeral port bind \
+                                 (client-socket idiom): {address}:0"
+                            ),
+                        ));
+                    }
                     let (rule_id, msg) = if is_wildcard {
                         match policy_match {
                             Some(m) if m.allow_clamp => {
@@ -2692,6 +2728,7 @@ mod tests {
     //   Wildcard declared,    → no listener-policy score (Phase D clamps).
     //     allow_clamp = true
     //   Specific iface        → "specific-iface-bind", +5.0.
+    //   Undeclared, port 0    → "ephemeral-port-bind", +0.5 (client idiom).
 
     #[tokio::test]
     async fn wildcard_bind_undeclared_scores_five() {
@@ -2735,6 +2772,73 @@ mod tests {
         );
         let result = filter.evaluate(&ctx).await.unwrap();
         assert_eq!(result.rule_id, "wildcard-bind-undeclared");
+    }
+
+    /// `bind(0.0.0.0, port 0)` is the client-socket source-selection idiom
+    /// (UDP DNS clients, TCP ephemeral transports). The kernel assigns the
+    /// port, so nothing external can rendezvous with it — score low, audited,
+    /// instead of prompting. This was 47 QUEUE prompts in a month from
+    /// grith's own DNS-proxy test suite running under `grith exec`.
+    #[tokio::test]
+    async fn ephemeral_port_wildcard_bind_scores_low() {
+        let filter = EgressPolicyFilter::with_defaults();
+        for addr in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let ctx = make_ctx_with_profile(
+                ToolCallType::NetListen {
+                    address: addr.into(),
+                    port: 0,
+                },
+                "anything",
+            );
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert!(result.matched, "{addr}:0 must still be audited");
+            assert_eq!(result.rule_id, "ephemeral-port-bind", "addr={addr}");
+            assert!(
+                result.score <= 0.5,
+                "{addr}:0 must score at most 0.5, got {}",
+                result.score
+            );
+        }
+    }
+
+    /// The same kernel-assigned-port reasoning covers a specific non-loopback
+    /// interface: binding an iface with port 0 selects a source address, it
+    /// does not stand up a reachable service.
+    #[tokio::test]
+    async fn ephemeral_port_specific_iface_bind_scores_low() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let ctx = make_ctx_with_profile(
+            ToolCallType::NetListen {
+                address: "192.168.68.112".into(),
+                port: 0,
+            },
+            "anything",
+        );
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "ephemeral-port-bind");
+        assert!(result.score <= 0.5);
+    }
+
+    /// A DECLARED port-0 entry with allow_clamp = false is the operator
+    /// explicitly asking for the prompt — the ephemeral heuristic must not
+    /// override a declaration in either direction.
+    #[tokio::test]
+    async fn declared_no_clamp_port_zero_still_queues() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let mut ctx = make_ctx_with_profile(
+            ToolCallType::NetListen {
+                address: "0.0.0.0".into(),
+                port: 0,
+            },
+            "anything",
+        );
+        ctx.listener_policy_match = Some(crate::types::ListenerPolicyMatch {
+            allow_clamp: false,
+            desc: "surface these".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "wildcard-bind-declared-no-clamp");
+        assert!(result.score >= 5.0);
     }
 
     #[tokio::test]

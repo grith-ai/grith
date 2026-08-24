@@ -11,7 +11,7 @@ description = "Audit logging system for grith"
 workspace = true
 
 [dependencies]
-grith-analytics = { path = "../grith-analytics" }
+grith-analytics = { path = "../grith-analytics", features = ["archive"] }
 rusqlite.workspace = true
 tokio.workspace = true
 serde.workspace = true

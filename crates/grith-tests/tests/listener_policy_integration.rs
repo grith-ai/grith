@@ -271,16 +271,17 @@ async fn ipv6_wildcard_declared_with_clamp_no_listener_policy_score() {
 }
 
 // ---------------------------------------------------------------------------
-// Default-port (port=0) policy entries match any-port wildcard binds
-// when allow_clamp=true.
+// The egress filter trusts whatever ListenerPolicyMatch the supervisor
+// attached, whatever the bind's port. (Policy matching itself is exact-port
+// now — a `port = 0` entry no longer matches fixed-port binds — but that is
+// decided supervisor-side in `match_listener_policy`; this test pins the
+// filter's behaviour GIVEN a match.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn declared_clamp_any_port_silences_arbitrary_port_bind() {
-    // Simulate a profile that declares `port = 0` (any ephemeral) with
-    // allow_clamp = true. The supervisor would have built a
-    // ListenerPolicyMatch with allow_clamp=true regardless of the
-    // tracee's chosen port; the egress filter only cares about the
+async fn declared_clamp_match_silences_bind_regardless_of_port() {
+    // The supervisor decided this (port, family) matched a declared entry
+    // with allow_clamp = true; the egress filter only cares about the
     // ListenerPolicyMatch on the context.
     let proxy = proxy_with_egress();
     let mut ctx = netlisten_ctx("0.0.0.0", 51234);

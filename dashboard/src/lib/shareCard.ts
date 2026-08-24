@@ -17,6 +17,8 @@ export interface ShareStats {
   uptime: string;
   filtersActive: number;
   version?: string;
+  /** Window the figures describe, e.g. "in the last 7 days". */
+  windowPhrase?: string;
 }
 
 import { chartColors, withAlpha } from "@/lib/chartPalette";
@@ -141,7 +143,7 @@ function drawCard(ctx: CanvasRenderingContext2D, s: ShareStats) {
   ctx.font = `400 25px ${FONT_BODY}`;
   const held = (s.queue + s.deny).toLocaleString();
   ctx.fillText(
-    `tool calls inspected under Zero Trust - ${held} queued or denied`,
+    `tool calls inspected ${s.windowPhrase ?? "under Zero Trust"} - ${held} queued or denied`,
     pad,
     312,
   );
@@ -280,7 +282,7 @@ export async function createShareLink(s: ShareStats): Promise<string> {
 export function shareCopy(s: ShareStats): { text: string; title: string } {
   const held = (s.queue + s.deny).toLocaleString();
   return {
-    text: `My AI agents ran ${s.totalEvals.toLocaleString()} tool calls under Zero Trust supervision with grith - ${held} queued for review or denied.`,
+    text: `My AI agents ran ${s.totalEvals.toLocaleString()} tool calls ${s.windowPhrase === "under Zero Trust" || !s.windowPhrase ? "under Zero Trust supervision" : `${s.windowPhrase} under Zero Trust supervision`} with grith - ${held} queued for review or denied.`,
     title: `grith - ${s.totalEvals.toLocaleString()} AI tool calls under Zero Trust`,
   };
 }

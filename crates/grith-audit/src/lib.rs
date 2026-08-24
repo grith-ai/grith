@@ -28,6 +28,6 @@ pub use stats::AuditStats;
 pub use storage::{AuditStorage, ForkRecord};
 pub use types::{
     AuditAnalyticsMetadata, AuditConfigVersion, AuditDestinationMetadata, AuditLlmPricing,
-    AuditRecord, AuditSecurityMetadata, ChainVerification, FilterResultSummary, ProxyActionSummary,
-    RecordType, SegmentHistory,
+    AuditRecord, AuditSecurityMetadata, ChainVerification, DecisionSummary, FilterResultSummary,
+    ProxyActionSummary, RecordType, SegmentHistory,
 };

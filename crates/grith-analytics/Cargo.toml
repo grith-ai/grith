@@ -11,8 +11,12 @@ description = "Canonical analytics-v2 contracts and deterministic edge accumulat
 workspace = true
 
 [dependencies]
+arrow-array = { version = "59.2.0", default-features = false, optional = true }
+arrow-schema = { version = "59.2.0", default-features = false, optional = true }
+bytes = { version = "1.12.1", optional = true }
 chrono.workspace = true
 hex.workspace = true
+parquet = { version = "59.2.0", default-features = false, features = ["zstd", "arrow"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -20,4 +24,12 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bytes = "1.12.1"
 jsonschema = { version = "0.33", default-features = false }
+
+[features]
+# The Parquet day-archive exporter (work/82 Plan 5). Optional so anything
+# that only needs the contract types and the accumulator does not compile
+# arrow/parquet; the daemon (grith-core, via grith-audit) turns it on.
+archive = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema", "dep:bytes"]
+bytes = ["dep:bytes"]

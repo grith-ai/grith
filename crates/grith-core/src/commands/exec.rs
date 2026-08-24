@@ -1048,7 +1048,11 @@ mod tests {
 
         let allowed = profile.build_session_allowlist();
         assert!(allowed.contains("net:api.example.com"));
-        assert!(allowed.contains("net:127.0.0.1"));
+        // routine_listen_addresses seed the `listen:` namespace (portless =
+        // any port on that address), NOT `net:` — a listen grant must not
+        // double as a connect grant.
+        assert!(allowed.contains("listen:127.0.0.1"));
+        assert!(!allowed.contains("net:127.0.0.1"));
         assert!(
             !allowed.contains("net:github.com"),
             "global egress trusted domains must not be promoted into the session allowlist"

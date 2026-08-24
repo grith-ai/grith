@@ -632,10 +632,24 @@ impl PtraceSupervisor {
                 let escalated: Vec<_> = messages
                     .into_iter()
                     .filter(|message| {
-                        matches!(
+                        let escalate = matches!(
                             crate::dbus::classify(message),
                             crate::dbus::Verdict::Escalate { .. }
-                        )
+                        );
+                        // The scope-only StartTransientUnit carve is the one
+                        // body-dependent silent allow in the policy table, so
+                        // leave a forensic marker with the unit name — a
+                        // misclassification here must be findable after the
+                        // fact without a packet capture.
+                        if !escalate && message.member.as_deref() == Some("StartTransientUnit") {
+                            tracing::info!(
+                                event = "dbus_scope_transient_allowed",
+                                unit = message.body_first_string.as_deref().unwrap_or("?"),
+                                "transient .scope unit allowed — scope units cannot \
+                                 execute outside the supervised tree"
+                            );
+                        }
+                        escalate
                     })
                     .collect();
                 if escalated.is_empty() {

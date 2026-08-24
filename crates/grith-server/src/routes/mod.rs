@@ -181,6 +181,7 @@ pub fn sensitive_read_routes() -> Router<AppState> {
         .route("/audit", get(audit::list_audit))
         .route("/audit/export", get(audit::export_audit))
         .route("/audit/exfil-stats", get(audit::exfil_stats))
+        .route("/audit/summary", get(audit::audit_summary))
         .route("/audit/:id", get(audit::get_audit))
         .route("/config", get(config::get_config))
         .route("/analytics/v2/free", get(analytics::analytics_v2_free))
@@ -550,6 +551,60 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["total"], 0);
+    }
+
+    /// `/audit/summary` must resolve as a static route, not be swallowed by
+    /// `/audit/:id` and rejected as a malformed UUID.
+    #[tokio::test]
+    async fn audit_summary_defaults_to_the_seven_day_window() {
+        let router = make_router();
+        let response = router
+            .oneshot(Request::get("/audit/summary").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["window"], "7d");
+        assert!(
+            json["since"].is_string(),
+            "a bounded window must carry a cutoff"
+        );
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["allow"], 0);
+        assert_eq!(json["queue"], 0);
+        assert_eq!(json["deny"], 0);
+    }
+
+    /// Every offered window resolves, and only `all` drops the cutoff. An
+    /// unknown value falls back to the default instead of 400ing a stale tab.
+    #[tokio::test]
+    async fn audit_summary_resolves_every_window() {
+        for (query, expected, bounded) in [
+            ("today", "today", true),
+            ("7d", "7d", true),
+            ("30d", "30d", true),
+            ("all", "all", false),
+            ("nonsense", "7d", true),
+        ] {
+            let response = make_router()
+                .oneshot(
+                    Request::get(format!("/audit/summary?window={query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "window={query}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["window"], expected, "window={query}");
+            assert_eq!(json["since"].is_string(), bounded, "window={query}");
+        }
     }
 
     #[tokio::test]

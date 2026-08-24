@@ -19,7 +19,8 @@ use std::path::Path;
 /// A single persistent learned allowlist rule.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LearnedRule {
-    /// Allowlist pattern: `ro:`, `rw:`, `exec:`, `exec-prefix:`, `net:`, or `dns:` prefixed.
+    /// Allowlist pattern: `ro:`, `rw:`, `exec:`, `exec-prefix:`, `net:`,
+    /// `listen:`, or `ipc-socket:` prefixed.
     pub pattern: String,
     /// Profile this rule applies to (e.g., "claude-code").
     pub profile: String,
@@ -87,7 +88,15 @@ pub fn validate_persisted_rule_with_scope(pattern: &str, scope: &str) -> Result<
     }
 
     // dns: rules are rejected — runtime matching only checks net: entries.
-    let valid_prefixes = ["ro:", "rw:", "exec:", "exec-prefix:", "net:", "ipc-socket:"];
+    let valid_prefixes = [
+        "ro:",
+        "rw:",
+        "exec:",
+        "exec-prefix:",
+        "net:",
+        "listen:",
+        "ipc-socket:",
+    ];
     if !valid_prefixes.iter().any(|p| pattern.starts_with(p)) {
         return Err(Error::LearnedRuleError(format!(
             "pattern must start with one of: {}. Bare filesystem paths and dns: are not persistable.",

@@ -899,6 +899,38 @@ pub struct HeaderValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveDownloadRequest {
+    #[serde(flatten)]
+    pub context: RequestContext,
+    pub from_day: NaiveDate,
+    pub to_day: NaiveDate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveDownloadObject {
+    pub day: NaiveDate,
+    pub archive_revision: u64,
+    pub object_key: String,
+    pub content_sha256: String,
+    pub byte_size: u64,
+    pub row_count: u64,
+    pub day_revision: u64,
+    pub row_checksum_sha256: String,
+    pub download_url: String,
+    #[serde(with = "crate::timestamps::ts_micros")]
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveDownloadResponse {
+    pub device_id: Uuid,
+    pub source_epoch: Uuid,
+    pub from_day: NaiveDate,
+    pub to_day: NaiveDate,
+    pub objects: Vec<ArchiveDownloadObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveFinalizeRequest {
     #[serde(flatten)]
     pub context: RequestContext,

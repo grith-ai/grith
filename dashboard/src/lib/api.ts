@@ -11,6 +11,7 @@ import type {
   AuditListResponse,
   AuditQuery,
   AuditRecord,
+  AuditSummaryResponse,
   CanaryCreateRequest,
   CanaryListResponse,
   CanaryToken,
@@ -31,6 +32,7 @@ import type {
   ProxyStatusResponse,
   SessionDetailResponse,
   SessionListResponse,
+  SummaryWindow,
   LicenseStatusResponse,
   TierResponse,
   OnboardingStatus,
@@ -337,6 +339,22 @@ export function getAuditRecords(
 
 export function getAuditRecord(id: string): Promise<AuditRecord> {
   return request<AuditRecord>(`/api/audit/${id}`);
+}
+
+/**
+ * Allow / queue / deny counts for one trailing window, aggregated server-side.
+ *
+ * The hero used to derive its breakdown from the 500 records the page had
+ * already fetched while taking its headline from a whole-database count — two
+ * different populations in one panel. This returns both from a single query.
+ */
+export function getAuditSummary(
+  window: SummaryWindow,
+  include?: "full" | "all",
+): Promise<AuditSummaryResponse> {
+  const params = new URLSearchParams({ window });
+  if (include) params.set("include", include);
+  return request<AuditSummaryResponse>(`/api/audit/summary?${params}`);
 }
 
 // ---------------------------------------------------------------------------

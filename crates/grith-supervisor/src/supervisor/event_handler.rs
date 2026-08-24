@@ -5782,7 +5782,13 @@ fn match_listener_policy(
     }
     let family = listener_family_for_address(address)?;
     let entry = policy.iter().find(|e| {
-        let port_ok = e.port == 0 || e.port == port;
+        // Exact port equality. `port = 0` in a policy entry matches only
+        // binds that pass literal port 0 (kernel-assigned ephemeral), as the
+        // entry template documents — it is NOT an any-port wildcard. The old
+        // `e.port == 0 ||` clause made the shipped codex entry (described as
+        // "kernel-assigned localhost port") silently clamp arbitrary
+        // fixed-port binds (10051, 11326, …) to loopback.
+        let port_ok = e.port == port;
         let family_ok = matches!(
             (e.family, family),
             (crate::profiles::ListenerFamily::Any, _)
@@ -5966,9 +5972,14 @@ fn session_allowlist_key(call_type: &grith_proxy::types::ToolCallType) -> Option
         ToolCallType::FileLink { link_path, .. } => Some(link_path.clone()),
         ToolCallType::OwnershipChange { target, .. }
         | ToolCallType::FilesystemMutation { target, .. } => Some(target.clone()),
-        ToolCallType::NetConnect { address, .. } | ToolCallType::NetListen { address, .. } => {
-            Some(format!("net:{address}"))
-        }
+        ToolCallType::NetConnect { address, .. } => Some(format!("net:{address}")),
+        // Listens get their own namespace, keyed by (address, port). The old
+        // shared `net:{address}` key dropped the port — an operator pressing
+        // [l] on a fixed-port listener prompt persisted `net:0.0.0.0`, a
+        // permanent all-ports wildcard-listener grant that additionally
+        // auto-allowed CONNECTS to the same address string. `listen:` entries
+        // never cross-match `net:` ones and vice versa.
+        ToolCallType::NetListen { address, port } => Some(format!("listen:{address}:{port}")),
         ToolCallType::ProcessSpawn { command, .. } => Some(format!("exec:{command}")),
         ToolCallType::DnsQuery { domain, .. } => Some(format!("dns:{domain}")),
         // Cross-process operations get an exact, per-target session key so an
@@ -6381,6 +6392,23 @@ fn is_session_allowlist_match(
         if !is_session_allowlist_match(target, allowed, &target_probe) {
             return false;
         }
+    }
+
+    // Listener grants: exact `(address, port)` match, plus profile-seeded
+    // portless `listen:<addr>` entries (from `routine_listen_addresses`)
+    // covering every port on that address. Deliberately isolated from `net:`
+    // — approving a listener must not auto-allow connects to the same
+    // address string, and subdomain matching makes no sense for a bind.
+    if key.starts_with("listen:") {
+        if allowed.contains(key) {
+            return true;
+        }
+        // `rsplit_once` splits on the LAST colon, so IPv6 addresses
+        // (`listen::::0` for `[::]:0`) resolve their port correctly.
+        return key
+            .strip_prefix("listen:")
+            .and_then(|rest| rest.rsplit_once(':'))
+            .is_some_and(|(addr, _port)| allowed.contains(&format!("listen:{addr}")));
     }
 
     // Subdomain matching for network destinations: both `net:` and `dns:`
@@ -7388,6 +7416,108 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// Listener policy entries match their port exactly: `port = 0` covers
+    /// only kernel-assigned-ephemeral binds (literal port 0), never a
+    /// fixed-port bind. The old any-port clause made the shipped codex entry
+    /// clamp arbitrary fixed ports to loopback under a description that
+    /// promised "kernel-assigned localhost port".
+    #[test]
+    fn listener_policy_port_zero_is_exact_not_any_port() {
+        let policy = vec![crate::profiles::LocalListenerEntry {
+            port: 0,
+            family: crate::profiles::ListenerFamily::Any,
+            desc: "ephemeral MCP transport".into(),
+            allow_clamp: true,
+        }];
+        assert!(
+            match_listener_policy(&policy, "0.0.0.0", 0).is_some(),
+            "literal port-0 bind must match a port-0 entry"
+        );
+        assert!(
+            match_listener_policy(&policy, "0.0.0.0", 10051).is_none(),
+            "a fixed-port bind must NOT match a port-0 entry"
+        );
+        // And the converse: a fixed-port entry matches only that port.
+        let fixed = vec![crate::profiles::LocalListenerEntry {
+            port: 41234,
+            family: crate::profiles::ListenerFamily::Any,
+            desc: "MCP server".into(),
+            allow_clamp: false,
+        }];
+        assert!(match_listener_policy(&fixed, "0.0.0.0", 41234).is_some());
+        assert!(match_listener_policy(&fixed, "0.0.0.0", 0).is_none());
+    }
+
+    /// NetListen session keys carry the port and live in their own
+    /// `listen:` namespace: an approval on one (address, port) must not
+    /// grant every port on that address, and must not cross over into
+    /// `net:` connect grants (or vice versa).
+    #[test]
+    fn listen_session_keys_are_port_scoped_and_isolated_from_net() {
+        let listen_3124 = ToolCallType::NetListen {
+            address: "0.0.0.0".into(),
+            port: 3124,
+        };
+        let key = session_allowlist_key(&listen_3124).unwrap();
+        assert_eq!(key, "listen:0.0.0.0:3124");
+
+        // Exact grant matches; a different port does not.
+        let allowed: HashSet<String> = HashSet::from([key.clone()]);
+        assert!(is_session_allowlist_match(&key, &allowed, &listen_3124));
+        let listen_3125 = ToolCallType::NetListen {
+            address: "0.0.0.0".into(),
+            port: 3125,
+        };
+        let other_key = session_allowlist_key(&listen_3125).unwrap();
+        assert!(!is_session_allowlist_match(
+            &other_key,
+            &allowed,
+            &listen_3125
+        ));
+
+        // A listen grant must not authorise a CONNECT to the same address
+        // string, and a net: connect grant must not authorise a listen.
+        let connect = ToolCallType::NetConnect {
+            address: "0.0.0.0".into(),
+            port: 3124,
+        };
+        let connect_key = session_allowlist_key(&connect).unwrap();
+        assert_eq!(connect_key, "net:0.0.0.0");
+        assert!(!is_session_allowlist_match(
+            &connect_key,
+            &allowed,
+            &connect
+        ));
+        let net_only: HashSet<String> = HashSet::from(["net:0.0.0.0".to_string()]);
+        assert!(!is_session_allowlist_match(&key, &net_only, &listen_3124));
+
+        // Profile-seeded portless `listen:<addr>` (routine_listen_addresses)
+        // covers every port on that address — including IPv6, where the
+        // port is split on the LAST colon.
+        let portless: HashSet<String> = HashSet::from(["listen:127.0.0.1".to_string()]);
+        let loopback_listen = ToolCallType::NetListen {
+            address: "127.0.0.1".into(),
+            port: 8080,
+        };
+        let loopback_key = session_allowlist_key(&loopback_listen).unwrap();
+        assert!(is_session_allowlist_match(
+            &loopback_key,
+            &portless,
+            &loopback_listen
+        ));
+        let v6_portless: HashSet<String> = HashSet::from(["listen:::1".to_string()]);
+        let v6_listen = ToolCallType::NetListen {
+            address: "::1".into(),
+            port: 8080,
+        };
+        let v6_key = session_allowlist_key(&v6_listen).unwrap();
+        assert!(is_session_allowlist_match(
+            &v6_key,
+            &v6_portless,
+            &v6_listen
+        ));
+    }
 
     #[test]
     fn syscall_kind_label_strips_fields_to_variant_name() {
