@@ -303,7 +303,7 @@ enum ProAction {
     Refresh,
     /// Remove credentials and license
     Logout,
-    /// Upload audit records to cloud and pull team policies
+    /// Pull team policies, shared configs and provider keys; push reputation data
     Sync,
     /// Open the upgrade/pricing page in the default browser
     Upgrade,
