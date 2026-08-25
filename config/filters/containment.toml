@@ -35,6 +35,14 @@ outbound_command_tokens = [
 ]
 
 # Score contributions while containment is active.
-network_score = 4.5
+#
+# network_score is deliberately below 4.0: containment must never be able to
+# reach the 8.0 auto-deny threshold on its own. An outbound connect in a
+# contained session always also carries operation-risk's net-connect baseline
+# (0.5) plus, for any destination not on the egress allowlist,
+# egress-policy's unknown-destination (3.5). At 4.5 that sum was 8.5 — a
+# silent deny with no prompt, before any evidence about the call itself was
+# weighed. 3.5 lands it on 7.5: queued for the operator instead.
+network_score = 3.5
 process_score = 4.0
 shell_score = 3.5

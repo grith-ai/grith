@@ -35,6 +35,7 @@ use crate::config::DnsProxyQueueAction;
 use crate::connected_dns_proxy::{DnsDecision, DnsDecisionRequest, DnsDecisionService};
 use crate::reviewer::DigestStore;
 
+use super::remote_eval::{self, RemoteEvalError};
 use super::session_state::SupervisorSession;
 
 /// Session fields needed by DNS policy, audit, and digest output.
@@ -77,6 +78,10 @@ pub struct ProductionDnsDecisionService {
     session: DnsDecisionSession,
     daemon_proxy_url: Option<String>,
     daemon_proxy_token: Option<Arc<Mutex<String>>>,
+    /// Where the daemon's IPC token lives, so an auth rejection can be healed
+    /// in place. `None` leaves the pre-existing behaviour: a rotated token
+    /// fails the query until some other holder of the shared token reloads it.
+    daemon_token_path: Option<std::path::PathBuf>,
     dlp_redactor: DlpRedactor,
     http_client: reqwest::Client,
     call_sequence: AtomicU64,
@@ -122,6 +127,7 @@ impl ProductionDnsDecisionService {
             session,
             daemon_proxy_url: None,
             daemon_proxy_token: None,
+            daemon_token_path: None,
             dlp_redactor: DlpRedactor::with_defaults(),
             http_client: reqwest::Client::new(),
             call_sequence: AtomicU64::new(0),
@@ -138,6 +144,18 @@ impl ProductionDnsDecisionService {
     pub fn with_daemon(mut self, url: impl Into<String>, token: Arc<Mutex<String>>) -> Self {
         self.daemon_proxy_url = Some(url.into());
         self.daemon_proxy_token = Some(token);
+        self
+    }
+
+    /// Let an IPC-token rejection heal itself by reloading `token_path`.
+    ///
+    /// Without this the DNS worker can only benefit from a reload performed by
+    /// another holder of the shared token. That is the wrong way round when
+    /// DNS is the first thing a session does after a daemon restart: the
+    /// worker fails closed on every query, and nothing it does can trigger the
+    /// reload that would fix it.
+    pub fn with_token_reload(mut self, token_path: impl Into<std::path::PathBuf>) -> Self {
+        self.daemon_token_path = Some(token_path.into());
         self
     }
 
@@ -235,12 +253,41 @@ impl ProductionDnsDecisionService {
     async fn evaluate_proxy(&self, ctx: &ToolCallContext) -> Result<ProxyDecision, String> {
         match (&self.daemon_proxy_url, &self.daemon_proxy_token) {
             (None, None) => Ok(self.proxy.evaluate(ctx).await),
-            (Some(url), Some(token)) => {
-                let token = token
+            (Some(url), Some(shared_token)) => {
+                let token = shared_token
                     .lock()
                     .map_err(|_| "daemon proxy token lock is poisoned".to_string())?
                     .clone();
-                self.remote_proxy_evaluate(url, &token, ctx).await
+                match self.remote_proxy_evaluate(url, &token, ctx).await {
+                    Ok(decision) => Ok(decision),
+                    // Stale-token fast path, mirroring the event loop: a
+                    // 401/403 from a live daemon means it restarted and
+                    // rotated its IPC token, and the current one is already on
+                    // disk. Healing here matters because a DNS query is often
+                    // the first thing a session does after a restart, and
+                    // failing closed would deny every lookup until some other
+                    // caller happened to refresh the shared token.
+                    Err(error) if error.is_auth_rejection() => {
+                        let Some(token_path) = self.daemon_token_path.as_deref() else {
+                            return Err(format!("remote DNS policy {error}"));
+                        };
+                        let Some(fresh) =
+                            remote_eval::reload_rotated_token(token_path, shared_token, &token)
+                        else {
+                            return Err(format!("remote DNS policy {error}"));
+                        };
+                        self.remote_proxy_evaluate(url, &fresh, ctx)
+                            .await
+                            .map_err(|retry_error| {
+                                tracing::warn!(
+                                    error = %retry_error,
+                                    "remote DNS policy still failed after token reload"
+                                );
+                                format!("remote DNS policy {retry_error}")
+                            })
+                    }
+                    Err(error) => Err(format!("remote DNS policy {error}")),
+                }
             }
             _ => Err("daemon proxy configuration requires both URL and token".to_string()),
         }
@@ -251,28 +298,9 @@ impl ProductionDnsDecisionService {
         base_url: &str,
         token: &str,
         ctx: &ToolCallContext,
-    ) -> Result<ProxyDecision, String> {
-        let response = self
-            .http_client
-            .post(format!("{base_url}/api/proxy/evaluate"))
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "context": ctx }))
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|error| format!("remote DNS policy request failed: {error}"))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("remote DNS policy returned {status}: {body}"));
-        }
-
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| format!("remote DNS policy response parse failed: {error}"))?;
-        parse_remote_decision(&body)
+    ) -> Result<ProxyDecision, RemoteEvalError> {
+        let body = remote_eval::post_evaluate(&self.http_client, base_url, token, ctx).await?;
+        parse_remote_decision(&body).map_err(RemoteEvalError::Parse)
     }
 
     async fn finish_decision(
@@ -940,5 +968,107 @@ mod tests {
             "evaluation_time_ms": 1.0
         });
         assert!(parse_remote_decision(&body).is_err());
+    }
+
+    /// A fake daemon that rejects every bearer token except `valid_token`,
+    /// answering 403 with the body the real IPC auth layer sends.
+    async fn spawn_fake_daemon(valid_token: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::Request;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+
+        async fn evaluate(
+            valid: axum::extract::State<&'static str>,
+            req: Request,
+        ) -> axum::response::Response {
+            let presented = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .unwrap_or_default()
+                .to_string();
+            if presented != *valid {
+                return (StatusCode::FORBIDDEN, "Invalid IPC token").into_response();
+            }
+            axum::Json(serde_json::json!({
+                "composite_score": 0.0,
+                "action": "allow",
+                "decision_reason": "healed",
+                "filter_results": [],
+                "evaluation_time_ms": 1.0
+            }))
+            .into_response()
+        }
+
+        let app = axum::Router::new()
+            .route("/api/proxy/evaluate", post(evaluate))
+            .with_state(valid_token);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Regression: a daemon restart rotates the IPC token, and a DNS query is
+    /// often the first thing a session does afterwards. The worker must reload
+    /// the token itself rather than denying every lookup until some unrelated
+    /// syscall happens to refresh the shared token.
+    #[tokio::test]
+    async fn rotated_ipc_token_is_reloaded_and_the_query_proceeds() {
+        let (url, server) = spawn_fake_daemon("rotated-token").await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("daemon.token");
+        std::fs::write(&token_path, "rotated-token\n").unwrap();
+
+        let shared = Arc::new(Mutex::new("stale-token".to_string()));
+        let service = service(
+            None,
+            Arc::new(FakeAuditSink::default()),
+            Arc::new(FakeDigestStore::default()),
+            HashSet::new(),
+        )
+        .with_daemon(url, Arc::clone(&shared))
+        .with_token_reload(token_path);
+
+        let decision = service.evaluate(request("safe.example")).await;
+
+        assert!(
+            matches!(decision, DnsDecision::Allow),
+            "a rotated token must heal in place, got {decision:?}"
+        );
+        assert_eq!(
+            shared.lock().unwrap().as_str(),
+            "rotated-token",
+            "the reload must publish the fresh token to every holder"
+        );
+        server.abort();
+    }
+
+    /// The bug this guards: with no token path configured the worker cannot
+    /// heal, and the stale token denies the query outright.
+    #[tokio::test]
+    async fn without_a_token_path_a_rotated_token_still_fails_closed() {
+        let (url, server) = spawn_fake_daemon("rotated-token").await;
+
+        let shared = Arc::new(Mutex::new("stale-token".to_string()));
+        let service = service(
+            None,
+            Arc::new(FakeAuditSink::default()),
+            Arc::new(FakeDigestStore::default()),
+            HashSet::new(),
+        )
+        .with_daemon(url, shared);
+
+        let decision = service.evaluate(request("safe.example")).await;
+
+        assert!(
+            matches!(decision, DnsDecision::InfrastructureFailure { .. }),
+            "expected fail-closed without a reload path, got {decision:?}"
+        );
+        server.abort();
     }
 }

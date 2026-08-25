@@ -47,6 +47,9 @@ use crate::syscall_map;
 
 use super::authority_delegation;
 use super::mass_destruction;
+use grith_proxy::types::CallOutcome;
+
+use super::remote_eval::{self, RemoteEvalError};
 use super::spawn_families;
 use super::{session_state::SupervisorSession, DaemonRestartConfig};
 
@@ -544,6 +547,9 @@ pub(super) struct SupervisorLoopContext<'a> {
     pub(super) daemon_proxy_token: Option<Arc<Mutex<String>>>,
     /// Optional daemon restart state for fail-closed recovery.
     pub(super) daemon_restart: Option<Arc<DaemonRestartState>>,
+    /// Final outcomes waiting to ride along with the next daemon evaluate.
+    /// Only used in daemon mode, where the filters live in the daemon.
+    pub(super) observation_outbox: Arc<remote_eval::ObservationOutbox>,
     /// Whether this session should persist its local reputation table to disk.
     pub(super) persist_local_reputation: bool,
     /// PR 4 Phase D: profile-declared routine_exec_roots, fully expanded
@@ -2738,6 +2744,19 @@ pub(super) async fn handle_syscall_event(
     if let grith_proxy::types::ToolCallType::NetListen { address, port } = &ctx.call_type {
         ctx.listener_policy_match =
             match_listener_policy(&loop_ctx.local_listener_policy, address, *port);
+        // The transport protocol the classifier already resolved for this
+        // bind (fd inode → /proc/<pid>/net/udp{,6}) was being dropped on the
+        // floor between `SyscallKind::NetBind` and `ToolCallType::NetListen`.
+        // egress-policy needs it to tell a connected UDP *client* socket from
+        // a UDP service listener. Unix binds keep `None` — `UnixSocketClass`
+        // is their classifier.
+        if let crate::interceptor::SyscallKind::NetBind { protocol, .. } = &event.kind {
+            ctx.bind_protocol = match protocol {
+                crate::interceptor::NetProtocol::Tcp => Some(grith_proxy::types::BindProtocol::Tcp),
+                crate::interceptor::NetProtocol::Udp => Some(grith_proxy::types::BindProtocol::Udp),
+                crate::interceptor::NetProtocol::Unix => None,
+            };
+        }
         if let crate::interceptor::SyscallKind::NetBind {
             sockaddr_ptr: Some(ptr),
             addrlen: Some(len),
@@ -2764,6 +2783,13 @@ pub(super) async fn handle_syscall_event(
     //
     // Note: we evaluate the proxy first anyway to get filter_results for the
     // safety ceiling check. The auto-allow only fires if no ceiling applies.
+    // The pipeline evaluates `ctx` exactly once here, so it must be observed
+    // exactly once below. EVERY path that returned before this line never
+    // entered the pipeline and has no state to commit - that is why the many
+    // early-return sites above (noise auto-allows, hard denies,
+    // ignore_read_only, batched reads, local IPC, the session-allowlist
+    // short-circuit, subtractive control) need no wiring.
+    let attempt_at = std::time::Instant::now();
     let mut decision = evaluate_proxy(loop_ctx, &ctx).await;
 
     // A scoped read of a sensitive directory must not bypass evaluation:
@@ -3233,12 +3259,17 @@ pub(super) async fn handle_syscall_event(
                     );
                 }
                 session.stats.total_allowed += 1;
+                // This arm bypasses enforce_decision, so it must close out its
+                // own evaluation. Without this, every reputation-auto-allowed
+                // egress - the calls a trusted session makes most - would stop
+                // being committed.
+                observe_proxy_outcome(loop_ctx, &ctx, CallOutcome::Executed, attempt_at);
                 return Ok(());
             }
         }
     }
 
-    enforce_decision(
+    let enforced = enforce_decision(
         interceptor,
         session,
         loop_ctx,
@@ -3250,7 +3281,24 @@ pub(super) async fn handle_syscall_event(
         kill_on_deny,
         delegation_would_enforce,
     )
-    .await?;
+    .await;
+
+    let observed = match &enforced {
+        Ok(outcome) => *outcome,
+        // enforce_decision and queue_and_wait are infallible today. If a
+        // future fallible call is added the evaluation must still be closed
+        // out, and an unknown fate commits as Denied: that can only
+        // under-count. Never fabricate an Executed.
+        Err(_) => CallOutcome::Denied,
+    };
+    // Skip when nothing evaluated the call: an unreachable daemon staged no
+    // state, so committing would invent a refusal it never scored.
+    if was_evaluated(&decision) {
+        observe_proxy_outcome(loop_ctx, &ctx, observed, attempt_at);
+    }
+    // Propagated only after observing, so an error cannot skip the commit -
+    // nor the audit record and exfil annotations below.
+    enforced?;
 
     log_exfil_annotations(session, event.pid, &decision.filter_results);
 
@@ -3411,7 +3459,7 @@ async fn enforce_decision(
     // outcome records the exact command so an identical recurrence auto-allows
     // (propagated to `queue_and_wait`).
     record_delegating_approval: bool,
-) -> Result<()> {
+) -> Result<CallOutcome> {
     match &decision.action {
         ProxyAction::Allow => {
             // PR 5 Phase D: opportunistic wildcard-to-loopback clamp.
@@ -3440,7 +3488,7 @@ async fn enforce_decision(
                     tracing::warn!(error = %de, tid, "deny after failed clamp also failed");
                 }
                 session.stats.total_denied += 1;
-                return Ok(());
+                return Ok(CallOutcome::Denied);
             }
             write_forensics_stage(
                 loop_ctx,
@@ -3483,7 +3531,7 @@ async fn enforce_decision(
                 }
             }
 
-            Ok(())
+            Ok(CallOutcome::Executed)
         }
         ProxyAction::Queue { .. } => {
             // PR 3 Phase B: failed-exec suppression (pre-stat shipping
@@ -3539,7 +3587,7 @@ async fn enforce_decision(
                         );
                     }
                     session.stats.total_allowed += 1;
-                    return Ok(());
+                    return Ok(CallOutcome::KernelRefused);
                 }
             }
 
@@ -3593,7 +3641,7 @@ async fn enforce_decision(
                         );
                     }
                     session.stats.total_allowed += 1;
-                    return Ok(());
+                    return Ok(CallOutcome::KernelRefused);
                 }
             }
 
@@ -3649,7 +3697,7 @@ async fn enforce_decision(
                     tracing::warn!(error = %e, tid, "allow (non-blocking queue) failed");
                 }
                 session.stats.total_queued += 1;
-                return Ok(());
+                return Ok(CallOutcome::ObservedOnly);
             }
 
             // In "deny" mode (a non-interactive session with no reviewer to
@@ -3696,7 +3744,7 @@ async fn enforce_decision(
                     tracing::warn!(error = %e, tid, "deny/kill (non-interactive queue) failed");
                 }
                 session.stats.total_denied += 1;
-                return Ok(());
+                return Ok(CallOutcome::Denied);
             }
             // Blocking review — logged inside queue_and_wait with the review outcome.
             queue_and_wait(
@@ -3753,7 +3801,7 @@ async fn enforce_decision(
                 )),
             );
             session.stats.total_denied += 1;
-            Ok(())
+            Ok(CallOutcome::Denied)
         }
     }
 }
@@ -3859,7 +3907,7 @@ async fn queue_and_wait(
     // records the exact command in the session allowlist so an identical
     // recurrence auto-allows instead of re-escalating.
     record_delegating_approval: bool,
-) -> Result<()> {
+) -> Result<CallOutcome> {
     let dlp_redactor = loop_ctx.dlp_redactor;
     let containment_tracker = &loop_ctx.containment_tracker;
     let config = loop_ctx.config;
@@ -3921,7 +3969,7 @@ async fn queue_and_wait(
         );
         thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
         session.stats.total_denied += 1;
-        return Ok(());
+        return Ok(CallOutcome::Denied);
     }
 
     // Control-socket answer replay: a session-lifetime memory for
@@ -3978,6 +4026,13 @@ async fn queue_and_wait(
                 approved,
                 "control-socket prompt already answered this session — replaying without a prompt"
             );
+            // One binding for both arms so the returned fate cannot drift
+            // from the branch that produced it.
+            let replayed_outcome = if approved {
+                CallOutcome::Executed
+            } else {
+                CallOutcome::Denied
+            };
             if approved {
                 thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
                 session.stats.total_allowed += 1;
@@ -3993,7 +4048,7 @@ async fn queue_and_wait(
                 thaw_and_resume(interceptor, session, tid, false, kill_on_deny).await;
                 session.stats.total_denied += 1;
             }
-            return Ok(());
+            return Ok(replayed_outcome);
         }
     }
 
@@ -4056,7 +4111,7 @@ async fn queue_and_wait(
         // counts.
         thaw_and_resume(interceptor, session, tid, true, kill_on_deny).await;
         session.stats.total_allowed += 1;
-        return Ok(());
+        return Ok(CallOutcome::Executed);
     }
 
     // Enqueue a digest item for human review.
@@ -4618,7 +4673,12 @@ async fn queue_and_wait(
         }
     }
 
-    Ok(())
+    // The match above dispatches on `outcome`; the call's fate follows it
+    // exactly. A scope-drained Approve still resumed the syscall.
+    Ok(match outcome {
+        ReviewOutcome::Approved => CallOutcome::Executed,
+        ReviewOutcome::Denied | ReviewOutcome::TimedOut => CallOutcome::Denied,
+    })
 }
 
 /// Dispatch side-effects for supervisor review actions beyond simple approve/deny.
@@ -5079,7 +5139,9 @@ async fn evaluate_proxy(
             .ok()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        match remote_proxy_evaluate(url, &current_token, ctx).await {
+        match remote_proxy_evaluate(url, &current_token, ctx, Some(&loop_ctx.observation_outbox))
+            .await
+        {
             Ok(decision) => {
                 if let Some(restart_state) = &loop_ctx.daemon_restart {
                     restart_state.note_success();
@@ -5091,12 +5153,19 @@ async fn evaluate_proxy(
                 // means the daemon restarted and rotated its IPC token — the
                 // current token is already on disk. Reload it and retry before
                 // considering a restart.
-                if is_auth_rejection(&e) {
+                if e.is_auth_rejection() {
                     if let Some(restart_state) = &loop_ctx.daemon_restart {
                         if let Some(fresh) =
                             reload_rotated_token(&restart_state.config, token, &current_token)
                         {
-                            match remote_proxy_evaluate(url, &fresh, ctx).await {
+                            match remote_proxy_evaluate(
+                                url,
+                                &fresh,
+                                ctx,
+                                Some(&loop_ctx.observation_outbox),
+                            )
+                            .await
+                            {
                                 Ok(decision) => {
                                     restart_state.note_success();
                                     return decision;
@@ -5122,7 +5191,14 @@ async fn evaluate_proxy(
                                 if let Ok(mut guard) = token.lock() {
                                     *guard = new_token.clone();
                                 }
-                                match remote_proxy_evaluate(url, &new_token, ctx).await {
+                                match remote_proxy_evaluate(
+                                    url,
+                                    &new_token,
+                                    ctx,
+                                    Some(&loop_ctx.observation_outbox),
+                                )
+                                .await
+                                {
                                     Ok(decision) => return decision,
                                     Err(retry_error) => {
                                         tracing::warn!(
@@ -5151,10 +5227,10 @@ async fn evaluate_proxy(
     loop_ctx.proxy.evaluate(ctx).await
 }
 
-fn daemon_unreachable_decision(error: String) -> grith_proxy::types::ProxyDecision {
+fn daemon_unreachable_decision(error: impl std::fmt::Display) -> grith_proxy::types::ProxyDecision {
     grith_proxy::types::ProxyDecision {
         action: grith_proxy::types::ProxyAction::Deny {
-            reason: "daemon_unreachable".to_string(),
+            reason: DAEMON_UNREACHABLE_REASON.to_string(),
         },
         composite_score: f64::INFINITY,
         filter_results: Vec::new(),
@@ -5163,38 +5239,15 @@ fn daemon_unreachable_decision(error: String) -> grith_proxy::types::ProxyDecisi
     }
 }
 
-/// Whether a remote evaluation error is the daemon rejecting our credentials
-/// (as opposed to being unreachable). Matched on the status line embedded by
-/// [`remote_proxy_evaluate`].
-fn is_auth_rejection(error: &str) -> bool {
-    error.contains("daemon returned 401") || error.contains("daemon returned 403")
-}
-
 /// Reload the IPC token from disk after an auth rejection, updating the
 /// session's shared token so every holder (including the DNS decision
-/// service) heals together. Returns the fresh token only when it differs
-/// from the one just rejected — retrying with an identical token cannot
-/// succeed.
+/// service) heals together.
 fn reload_rotated_token(
     config: &DaemonRestartConfig,
     shared: &Arc<Mutex<String>>,
     just_used: &str,
 ) -> Option<String> {
-    let fresh = std::fs::read_to_string(&config.token_path)
-        .ok()?
-        .trim()
-        .to_string();
-    if fresh.is_empty() || fresh == just_used {
-        return None;
-    }
-    if let Ok(mut guard) = shared.lock() {
-        *guard = fresh.clone();
-    }
-    tracing::info!(
-        event = "ipc_token_refreshed",
-        "daemon IPC token reloaded from disk after auth rejection"
-    );
-    Some(fresh)
+    remote_eval::reload_rotated_token(&config.token_path, shared, just_used)
 }
 
 async fn attempt_daemon_restart(
@@ -5222,34 +5275,108 @@ async fn attempt_daemon_restart(
         .map_err(|e| e.to_string())
 }
 
+/// Deny reason stamped when no proxy scored the call at all.
+///
+/// `observe_outcome` pairs with `evaluate`. When the daemon is unreachable
+/// nothing evaluated the call, so there is no staged state to commit and
+/// observing it would push a refusal into a filter that never saw the attempt
+/// - manufacturing exfil pressure out of an outage.
+pub(super) const DAEMON_UNREACHABLE_REASON: &str = "daemon_unreachable";
+
+/// Whether this decision came from an actual evaluation.
+fn was_evaluated(decision: &grith_proxy::types::ProxyDecision) -> bool {
+    !matches!(
+        &decision.action,
+        grith_proxy::types::ProxyAction::Deny { reason } if reason == DAEMON_UNREACHABLE_REASON
+    )
+}
+
+/// Send any outcomes still waiting in the outbox to the daemon.
+pub(super) async fn flush_observation_outbox(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    base_url: &str,
+    token: &str,
+) {
+    let client = reqwest::Client::new();
+    remote_eval::flush_observations(&client, base_url, token, &loop_ctx.observation_outbox).await;
+}
+
+/// Report a call's final outcome to whichever proxy actually scored it.
+///
+/// Mirrors `evaluate_proxy`'s exclusive remote/local branch. In daemon mode the
+/// LOCAL proxy is deliberately never touched: the call was scored by the
+/// daemon's `SecurityProxy`, so committing locally would advance filters that
+/// never saw it while leaving the daemon's own state permanently inert.
+fn observe_proxy_outcome(
+    loop_ctx: &SupervisorLoopContext<'_>,
+    ctx: &grith_proxy::types::ToolCallContext,
+    outcome: CallOutcome,
+    attempt_start: std::time::Instant,
+) {
+    let attempt_age = attempt_start.elapsed();
+    // Both must be set, matching `evaluate_proxy`'s own condition: a URL
+    // without a token never evaluated remotely, so its outcome belongs to the
+    // local proxy.
+    if loop_ctx.daemon_proxy_url.is_some() && loop_ctx.daemon_proxy_token.is_some() {
+        loop_ctx
+            .observation_outbox
+            .push(remote_eval::PendingObservation {
+                attempted_at: attempt_start,
+                observation: remote_eval::WireObservation {
+                    call_id: ctx.id,
+                    scope: ctx
+                        .session_scope
+                        .map(|s| s.as_uuid())
+                        .unwrap_or(ctx.session_id),
+                    session_id: ctx.session_id,
+                    call_type: ctx.call_type.clone(),
+                    // Both are read by filters at commit time; omitting them makes
+                    // the daemon's view of the call differ from the one it scored.
+                    profile_name: ctx.profile_name.clone(),
+                    arguments: ctx.arguments.clone(),
+                    outcome,
+                    // Overwritten at send time; an observation can wait in the
+                    // outbox across many calls.
+                    age_ms: 0,
+                },
+            });
+        return;
+    }
+    loop_ctx.proxy.observe_outcome(ctx, outcome, attempt_age);
+}
+
 /// Call the daemon's proxy evaluate endpoint via HTTP.
 async fn remote_proxy_evaluate(
     base_url: &str,
     token: &str,
     ctx: &grith_proxy::types::ToolCallContext,
-) -> std::result::Result<grith_proxy::types::ProxyDecision, String> {
+    outbox: Option<&remote_eval::ObservationOutbox>,
+) -> std::result::Result<grith_proxy::types::ProxyDecision, RemoteEvalError> {
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base_url}/api/proxy/evaluate"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({ "context": ctx }))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("daemon returned {status}: {body}"));
+    let batch = outbox.map(|o| o.take()).unwrap_or_default();
+    let sent = batch.len();
+    let wire = remote_eval::ObservationOutbox::to_wire(&batch);
+    match remote_eval::post_evaluate_with_observations(&client, base_url, token, ctx, wire).await {
+        Ok(body) => {
+            if sent > 0 {
+                tracing::trace!(sent, "flushed pending outcome observations to the daemon");
+            }
+            parse_daemon_decision(&body).map_err(RemoteEvalError::Parse)
+        }
+        Err(error) => {
+            // The daemon never applied them, so they must not be lost.
+            if let Some(outbox) = outbox {
+                outbox.restore(batch);
+            }
+            Err(error)
+        }
     }
+}
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("response parse failed: {e}"))?;
-
-    // Parse the response into a ProxyDecision.
+/// Read the daemon's evaluate response into a decision.
+fn parse_daemon_decision(
+    body: &serde_json::Value,
+) -> std::result::Result<grith_proxy::types::ProxyDecision, String> {
     let composite_score = body["composite_score"]
         .as_f64()
         .ok_or("missing composite_score")?;
@@ -7415,6 +7542,106 @@ mod tests {
     use grith_proxy::types::ToolCallType;
     use std::collections::{HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
+
+    /// `ToolCallType::supports_session_grant` is what the approval dialog
+    /// renders "[l] Always allow" from; `session_allowlist_key` is what
+    /// actually records the grant. If they disagree, the operator is offered
+    /// a durable answer that this function then throws away — which is how
+    /// the D-Bus prompts in supervised session 433ba7c7 (2026-08-25) came to
+    /// re-ask after every approval.
+    ///
+    /// `session_allowlist_key` ends in a `_ => None` arm and so cannot be
+    /// made exhaustive by the compiler. This test is the guard instead.
+    #[test]
+    fn session_grant_predicate_matches_the_allowlist_key() {
+        // Self, so the `/proc/<pid>/stat` read behind the CrossProcessAccess
+        // key always resolves — a dead pid legitimately yields `None` there,
+        // which would make this test flaky rather than meaningful.
+        let live_pid = std::process::id();
+        let cases = vec![
+            ToolCallType::FileRead { path: "/p".into() },
+            ToolCallType::FileWrite {
+                path: "/p".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileAppend { path: "/p".into() },
+            ToolCallType::FileDelete { path: "/p".into() },
+            ToolCallType::DirList { path: "/p".into() },
+            ToolCallType::ShellExec {
+                command: "ls".into(),
+                args: vec![],
+            },
+            ToolCallType::HttpRequest {
+                method: "GET".into(),
+                url: "https://example.test/".into(),
+            },
+            ToolCallType::FileRename {
+                old_path: "/a".into(),
+                new_path: "/b".into(),
+            },
+            ToolCallType::FileLink {
+                link_path: "/a".into(),
+                target: "/b".into(),
+                symbolic: true,
+            },
+            ToolCallType::FileChmod {
+                path: "/p".into(),
+                mode: 0o644,
+            },
+            ToolCallType::DirCreate { path: "/p".into() },
+            ToolCallType::NetConnect {
+                address: "example.test".into(),
+                port: 443,
+            },
+            ToolCallType::NetListen {
+                address: "0.0.0.0".into(),
+                port: 8080,
+            },
+            ToolCallType::ProcessSpawn {
+                command: "/bin/ls".into(),
+                args: vec![],
+            },
+            ToolCallType::DnsQuery {
+                domain: "example.test".into(),
+                query_type: "A".into(),
+            },
+            ToolCallType::OwnershipChange {
+                target: "/p".into(),
+                new_uid: 0,
+                new_gid: 0,
+            },
+            ToolCallType::FilesystemMutation {
+                op: "mount".into(),
+                source: None,
+                target: "/mnt".into(),
+                fstype: None,
+            },
+            ToolCallType::CrossProcessAccess {
+                op: "ptrace".into(),
+                target_pid: live_pid,
+            },
+            ToolCallType::NamespaceOp {
+                syscall: "unshare".into(),
+                flags: 0,
+            },
+            ToolCallType::DbusMethodCall {
+                socket: "unix:/run/user/1000/bus".into(),
+                destination: Some("org.freedesktop.systemd1".into()),
+                interface: Some("org.freedesktop.systemd1.Manager".into()),
+                member: Some("StartTransientUnit".into()),
+            },
+        ];
+        assert_eq!(cases.len(), 20, "a ToolCallType variant is not covered");
+
+        for call in cases {
+            assert_eq!(
+                session_allowlist_key(&call).is_some(),
+                call.supports_session_grant(),
+                "{call} is offered a session grant the allowlist key does not \
+                 record (or vice versa)"
+            );
+        }
+    }
     use std::time::Duration;
 
     /// Listener policy entries match their port exactly: `port = 0` covers
@@ -8703,16 +8930,22 @@ mod tests {
 
     #[test]
     fn auth_rejection_is_distinguished_from_unreachable() {
-        assert!(is_auth_rejection(
-            "daemon returned 403 Forbidden: Invalid IPC token"
-        ));
-        assert!(is_auth_rejection("daemon returned 401 Unauthorized: "));
-        assert!(!is_auth_rejection(
-            "HTTP request failed: connection refused"
-        ));
-        assert!(!is_auth_rejection(
-            "daemon returned 500 Internal Server Error"
-        ));
+        assert!(RemoteEvalError::AuthRejected {
+            status: 403,
+            body: "Invalid IPC token".into(),
+        }
+        .is_auth_rejection());
+        assert!(RemoteEvalError::AuthRejected {
+            status: 401,
+            body: String::new(),
+        }
+        .is_auth_rejection());
+        assert!(!RemoteEvalError::Transport("connection refused".into()).is_auth_rejection());
+        assert!(!RemoteEvalError::HttpStatus {
+            status: 500,
+            body: "Internal Server Error".into(),
+        }
+        .is_auth_rejection());
     }
 
     #[test]
@@ -8970,6 +9203,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
@@ -9055,6 +9289,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
@@ -9228,6 +9463,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
@@ -9486,6 +9722,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
@@ -11219,6 +11456,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
@@ -11688,6 +11926,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),
@@ -11808,6 +12047,7 @@ mod tests {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: Vec::new(),
             scratch_roots: Vec::new(),

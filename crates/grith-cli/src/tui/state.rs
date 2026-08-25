@@ -286,6 +286,17 @@ pub struct PermissionRequest {
     pub total_items: usize,
     /// Whether the exec reviewer may offer session directory scoping.
     pub scope_enabled: bool,
+    /// Whether approving this request can be remembered at all.
+    ///
+    /// D-Bus method calls (and the built-in agent's `ShellExec`/`HttpRequest`)
+    /// have no session-allowlist key, so neither `[a]` nor `[l]` can outlive
+    /// the single call. The dialog hides `[l]` and softens the `[a]` wording
+    /// when this is false — offering a grant that silently cannot be recorded
+    /// reads as grith forgetting the operator's answer.
+    ///
+    /// Defaults to `true` so a construction site that does not know stays on
+    /// today's behaviour rather than losing the option.
+    pub sticky_grant_available: bool,
 }
 
 #[cfg(test)]

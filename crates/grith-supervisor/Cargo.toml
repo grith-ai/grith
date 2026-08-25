@@ -44,3 +44,6 @@ libc.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+# Stands up a fake daemon so the IPC-token reload path can be tested against a
+# real 401/403 rather than a mocked classification.
+axum.workspace = true

@@ -141,6 +141,7 @@ mod tests {
             item_number: 1,
             total_items: 1,
             scope_enabled: false,
+            sticky_grant_available: true,
         });
         terminal
             .draw(|frame| render_digest_overlay(frame, frame.area(), &state))

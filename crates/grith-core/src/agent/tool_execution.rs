@@ -95,8 +95,14 @@ pub async fn execute_tool_call(
         )),
         spawn_provenance: None,
         listener_policy_match: None,
+        bind_protocol: None,
     };
 
+    // `grith run` is a third decision surface with its own review timeout, and
+    // one of the paths where the session-allowlist bypass does not apply - i.e.
+    // where stateful filters matter most. Wiring only the supervisor would
+    // leave them inert here.
+    let attempt_at = std::time::Instant::now();
     let decision = proxy.evaluate(&ctx).await;
 
     // Send proxy decision to TUI if active
@@ -160,6 +166,12 @@ pub async fn execute_tool_call(
             error = %e,
             "refusing to execute tool call: its audit record could not be persisted"
         );
+        // The operation is refused, so close the evaluation out as such.
+        proxy.observe_outcome(
+            &ctx,
+            grith_proxy::types::CallOutcome::Denied,
+            attempt_at.elapsed(),
+        );
         return format!(
             "Error: refusing to execute this tool call because grith could not record it \
              in the audit log ({e}). grith does not run operations it cannot audit."
@@ -194,12 +206,20 @@ pub async fn execute_tool_call(
 
     match &decision.action {
         grith_proxy::types::ProxyAction::Allow => {
+            proxy.observe_outcome(
+                &ctx,
+                grith_proxy::types::CallOutcome::Executed,
+                attempt_at.elapsed(),
+            );
             handle_allowed_call(&decision, &call_type, &tool_call.arguments, tui_tx).await
         }
         grith_proxy::types::ProxyAction::Queue { .. } => {
+            // The queue path settles its own outcome: it is the only arm whose
+            // fate is not known here, and it can resolve minutes later.
             handle_queued_call(
                 &decision,
                 &ctx,
+                attempt_at,
                 digest_queue,
                 dlp_redactor,
                 notification_dispatcher,
@@ -213,6 +233,11 @@ pub async fn execute_tool_call(
             .await
         }
         grith_proxy::types::ProxyAction::Deny { reason } => {
+            proxy.observe_outcome(
+                &ctx,
+                grith_proxy::types::CallOutcome::Denied,
+                attempt_at.elapsed(),
+            );
             handle_denied_call(&decision, reason, tui_tx)
         }
     }
@@ -269,6 +294,7 @@ async fn handle_allowed_call(
 async fn handle_queued_call(
     decision: &grith_proxy::types::ProxyDecision,
     ctx: &grith_proxy::types::ToolCallContext,
+    attempt_at: std::time::Instant,
     digest_queue: &std::sync::Arc<grith_digest::DigestQueue>,
     dlp_redactor: &grith_proxy::filters::dlp_gate::DlpRedactor,
     notification_dispatcher: &std::sync::Arc<grith_notify::NotificationDispatcher>,
@@ -357,6 +383,20 @@ async fn handle_queued_call(
         .get_by_id(&digest_item.id)
         .ok()
         .and_then(|item| item.review_action.clone());
+
+    // Settle the evaluation on the fate the human (or the timeout) chose. The
+    // commit is stamped at the ATTEMPT, not now: a review can take minutes,
+    // far longer than the windows stateful filters read.
+    proxy.observe_outcome(
+        ctx,
+        match outcome {
+            grith_digest::ReviewOutcome::Approved => grith_proxy::types::CallOutcome::Executed,
+            grith_digest::ReviewOutcome::Denied | grith_digest::ReviewOutcome::TimedOut => {
+                grith_proxy::types::CallOutcome::Denied
+            }
+        },
+        attempt_at.elapsed(),
+    );
 
     match outcome {
         grith_digest::ReviewOutcome::Approved => {

@@ -47,6 +47,51 @@ impl fmt::Display for SessionScopeKey {
     }
 }
 
+/// What actually happened to a call, once its fate was final.
+///
+/// This vocabulary describes what the KERNEL did, deliberately not what the
+/// operator's counters call it: a call handled under
+/// `InteractiveQueueAction::Log` increments `total_queued` but the syscall
+/// still ran, so it is [`CallOutcome::ObservedOnly`] here rather than a queue.
+///
+/// It exists so a stateful filter can record what happened instead of what was
+/// attempted. Recording attempts is how the egress-rate filter came to count a
+/// refused `connect()` identically to a delivered one, letting a client's retry
+/// loop inflate the very score that was refusing it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOutcome {
+    /// Resumed, and the kernel ran it. Bytes may have left the host.
+    Executed,
+    /// Ran, but under an observe-only queue policy where the operator believes
+    /// they are only watching. Volumetrically identical to
+    /// [`CallOutcome::Executed`]; kept distinct so a filter and the session's
+    /// queue counter can never silently disagree about the same call.
+    ObservedOnly,
+    /// grith refused it before the kernel ran it: auto-deny, human deny, review
+    /// timeout, headless auto-deny, a fail-closed enforcement error, or an
+    /// unknown fate. Nothing ran and nothing left the host.
+    Denied,
+    /// Allowed, but grith established before resuming that the kernel could not
+    /// honour it (a loopback connect to an unbound port, an exec of a missing
+    /// binary). Zero bytes either way, but unlike [`CallOutcome::Denied`] it is
+    /// not a policy fight, so it accrues no refusal pressure.
+    KernelRefused,
+}
+
+impl CallOutcome {
+    /// True when the call ran. The single predicate every volumetric commit
+    /// gates on, because only a call that ran can have moved data.
+    pub fn executed(self) -> bool {
+        matches!(self, Self::Executed | Self::ObservedOnly)
+    }
+
+    /// True when a final verdict stopped the call before the kernel ran it.
+    pub fn suppressed(self) -> bool {
+        matches!(self, Self::Denied | Self::KernelRefused)
+    }
+}
+
 /// Context for a single tool call being evaluated by the proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallContext {
@@ -94,6 +139,32 @@ pub struct ToolCallContext {
     /// a `NetListen` syscall; consumed by `egress_policy.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listener_policy_match: Option<ListenerPolicyMatch>,
+    /// Transport protocol of the socket a `NetListen` (`bind(2)`) call is
+    /// binding. Resolved by the supervisor from the socket fd's inode against
+    /// `/proc/<pid>/net/udp{,6}` and carried here because `ToolCallType` has
+    /// no room for it; `None` on every non-bind call and on platforms or
+    /// paths that cannot resolve it.
+    ///
+    /// A typed context field rather than an `arguments` key on purpose: on
+    /// the built-in-agent path `arguments` is verbatim model JSON, so a key
+    /// there could be planted by the model to de-score its own bind (the
+    /// same reasoning that keeps `spawn_provenance` and
+    /// `listener_policy_match` off that bag).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_protocol: Option<BindProtocol>,
+}
+
+/// Transport protocol of a `bind(2)` target, as resolved by the supervisor.
+///
+/// Only the two IP transports are modelled: unix-domain binds are already
+/// classified by [`UnixSocketClass`], and anything the supervisor cannot
+/// resolve stays `None` so filters score exactly as they did before this
+/// signal existed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindProtocol {
+    Tcp,
+    Udp,
 }
 
 /// PR 5 Phase C: structured signal from the supervisor profile's
@@ -465,6 +536,7 @@ impl ToolCallContext {
             session_scope: Some(SessionScopeKey::from_session_id(session_id)),
             spawn_provenance: None,
             listener_policy_match: None,
+            bind_protocol: None,
         }
     }
 
@@ -718,6 +790,71 @@ mod duration_ms {
 }
 
 impl ToolCallType {
+    /// Whether an operator approving this call can have that approval
+    /// remembered for the rest of the session.
+    ///
+    /// The supervisor records a session grant under a key derived from the
+    /// call — a path, a `net:`/`listen:`/`exec:` handle. Three call types
+    /// have no such key and never will:
+    ///
+    /// * `DbusMethodCall` — a D-Bus grant would have to name a (service,
+    ///   interface, member) triple, and the services that reach a prompt at
+    ///   all are the escape surface (`systemd1`, `login1`, `PolicyKit1`, the
+    ///   container managers). Those are excluded from the carveouts on
+    ///   purpose, so a durable grant is exactly what must not exist. D-Bus
+    ///   noise is fixed in `dbus/policy.rs`, never by making an approval
+    ///   stick.
+    /// * `ShellExec` / `HttpRequest` — the built-in-agent call types. The
+    ///   supervisor never emits them, and the agent path has no session
+    ///   allowlist to record into.
+    ///
+    /// The prompt uses this to decide whether to offer "[l] Always allow".
+    /// Offering it where it cannot take effect reads to the operator as
+    /// grith forgetting their answer.
+    ///
+    /// Written exhaustively so a new variant has to answer the question
+    /// rather than inherit a default; `session_allowlist_key` in
+    /// grith-supervisor is pinned to this by a test.
+    pub fn supports_session_grant(&self) -> bool {
+        match self {
+            Self::FileRead { .. }
+            | Self::FileWrite { .. }
+            | Self::FileAppend { .. }
+            | Self::FileDelete { .. }
+            | Self::DirList { .. }
+            | Self::FileRename { .. }
+            | Self::FileLink { .. }
+            | Self::FileChmod { .. }
+            | Self::DirCreate { .. }
+            | Self::NetConnect { .. }
+            | Self::NetListen { .. }
+            | Self::ProcessSpawn { .. }
+            | Self::DnsQuery { .. }
+            | Self::OwnershipChange { .. }
+            | Self::FilesystemMutation { .. }
+            | Self::CrossProcessAccess { .. }
+            | Self::NamespaceOp { .. } => true,
+            Self::ShellExec { .. } | Self::HttpRequest { .. } | Self::DbusMethodCall { .. } => {
+                false
+            }
+        }
+    }
+
+    /// The same question answered from the category name alone.
+    ///
+    /// The digest queue stores `tool_call_type` as a rendered string, so the
+    /// reviewer that builds the prompt has only the leading category — the
+    /// text before `(` in this type's `Display`. An unrecognised category
+    /// answers `true`: this flag suppresses a UI affordance, so an unknown
+    /// name must fall back to today's behaviour of showing it rather than
+    /// silently taking the operator's option away.
+    ///
+    /// Kept in step with [`Self::supports_session_grant`] by a test that
+    /// round-trips every variant through `Display`.
+    pub fn category_supports_session_grant(category: &str) -> bool {
+        !matches!(category, "ShellExec" | "HttpRequest" | "DbusMethodCall")
+    }
+
     /// Resolve `..`, `.` and symlinks in every path this call carries, so
     /// filters match on what will actually be touched rather than on the
     /// string that was requested (go-live review B3).
@@ -916,6 +1053,158 @@ mod tests {
 
     fn test_session() -> Uuid {
         Uuid::new_v4()
+    }
+
+    /// One value of every `ToolCallType` variant. Adding a variant without
+    /// adding it here fails `every_variant_is_represented` below, which is
+    /// what keeps the two session-grant predicates honest.
+    fn every_variant() -> Vec<ToolCallType> {
+        vec![
+            ToolCallType::FileRead { path: "/p".into() },
+            ToolCallType::FileWrite {
+                path: "/p".into(),
+                content_hash: String::new(),
+            },
+            ToolCallType::FileAppend { path: "/p".into() },
+            ToolCallType::FileDelete { path: "/p".into() },
+            ToolCallType::DirList { path: "/p".into() },
+            ToolCallType::ShellExec {
+                command: "ls".into(),
+                args: vec![],
+            },
+            ToolCallType::HttpRequest {
+                method: "GET".into(),
+                url: "https://example.test/".into(),
+            },
+            ToolCallType::FileRename {
+                old_path: "/a".into(),
+                new_path: "/b".into(),
+            },
+            ToolCallType::FileLink {
+                link_path: "/a".into(),
+                target: "/b".into(),
+                symbolic: true,
+            },
+            ToolCallType::FileChmod {
+                path: "/p".into(),
+                mode: 0o644,
+            },
+            ToolCallType::DirCreate { path: "/p".into() },
+            ToolCallType::NetConnect {
+                address: "example.test".into(),
+                port: 443,
+            },
+            ToolCallType::NetListen {
+                address: "0.0.0.0".into(),
+                port: 8080,
+            },
+            ToolCallType::ProcessSpawn {
+                command: "/bin/ls".into(),
+                args: vec![],
+            },
+            ToolCallType::DnsQuery {
+                domain: "example.test".into(),
+                query_type: "A".into(),
+            },
+            ToolCallType::OwnershipChange {
+                target: "/p".into(),
+                new_uid: 0,
+                new_gid: 0,
+            },
+            ToolCallType::FilesystemMutation {
+                op: "mount".into(),
+                source: None,
+                target: "/mnt".into(),
+                fstype: None,
+            },
+            ToolCallType::CrossProcessAccess {
+                op: "ptrace".into(),
+                target_pid: 1,
+            },
+            ToolCallType::NamespaceOp {
+                syscall: "unshare".into(),
+                flags: 0,
+            },
+            ToolCallType::DbusMethodCall {
+                socket: "unix:/run/user/1000/bus".into(),
+                destination: Some("org.freedesktop.systemd1".into()),
+                interface: Some("org.freedesktop.systemd1.Manager".into()),
+                member: Some("StartTransientUnit".into()),
+            },
+        ]
+    }
+
+    /// `every_variant` must stay exhaustive, or the agreement test below
+    /// silently stops covering whatever was added.
+    #[test]
+    fn every_variant_is_represented() {
+        let categories: std::collections::HashSet<String> =
+            every_variant().iter().map(category_of).collect();
+        assert_eq!(
+            categories.len(),
+            every_variant().len(),
+            "duplicate variant in the fixture: {categories:?}"
+        );
+        // Pinned so adding a variant to the enum without extending the
+        // fixture is a failing test rather than a silent coverage hole.
+        assert_eq!(
+            categories.len(),
+            20,
+            "fixture is out of date: {categories:?}"
+        );
+    }
+
+    /// The category name as the digest queue records it: the text before `(`
+    /// in `Display`.
+    fn category_of(call: &ToolCallType) -> String {
+        let rendered = call.to_string();
+        rendered
+            .find('(')
+            .map(|i| rendered[..i].to_string())
+            .unwrap_or(rendered)
+    }
+
+    /// The typed predicate and the string one must agree for every variant.
+    /// The prompt uses the string form (the queue stores a rendered call),
+    /// the supervisor uses the typed one; a disagreement means the dialog
+    /// offers "[l] Always allow" exactly where the grant is discarded.
+    #[test]
+    fn typed_and_category_session_grant_predicates_agree() {
+        for call in every_variant() {
+            let category = category_of(&call);
+            assert_eq!(
+                call.supports_session_grant(),
+                ToolCallType::category_supports_session_grant(&category),
+                "{category} disagrees between the typed and string predicates"
+            );
+        }
+    }
+
+    /// The three call types with no session-allowlist key.
+    #[test]
+    fn dbus_and_agent_call_types_have_no_session_grant() {
+        for call in every_variant() {
+            let category = category_of(&call);
+            let expected = !matches!(
+                category.as_str(),
+                "ShellExec" | "HttpRequest" | "DbusMethodCall"
+            );
+            assert_eq!(
+                call.supports_session_grant(),
+                expected,
+                "{category} changed its session-grant answer"
+            );
+        }
+    }
+
+    /// An unknown category keeps today's behaviour rather than removing an
+    /// affordance the operator expects.
+    #[test]
+    fn unknown_category_still_offers_the_grant() {
+        assert!(ToolCallType::category_supports_session_grant(
+            "SomeFutureCallType"
+        ));
+        assert!(ToolCallType::category_supports_session_grant(""));
     }
 
     #[test]

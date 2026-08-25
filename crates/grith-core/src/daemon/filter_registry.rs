@@ -16,7 +16,7 @@ use grith_proxy::filters::command::CommandFilter;
 use grith_proxy::filters::destructive_action::DestructiveActionFilter;
 use grith_proxy::filters::dlp_gate::{DlpGateFilter, DlpRedactor};
 use grith_proxy::filters::egress_policy::EgressPolicyFilter;
-use grith_proxy::filters::egress_rate::{EgressRateConfig, EgressRateFilter};
+use grith_proxy::filters::egress_rate::EgressRateFilter;
 use grith_proxy::filters::operation_risk::OperationRiskFilter;
 use grith_proxy::filters::path_match::PathMatchFilter;
 use grith_proxy::filters::rate_limit::RateLimitFilter;
@@ -173,7 +173,17 @@ pub(crate) fn build_filter_registry_with_config_result(
                 .with_risk_gated_burst(proxy_cfg.rate_limit.risk_gated_burst),
         ));
     }
-    let egress_rate_config = EgressRateConfig::default();
+    // Operator-tunable since the egress-rate knobs were plumbed through; this
+    // used to be `EgressRateConfig::default()`, so nothing an operator wrote
+    // could reach the filter.
+    let egress_rate_config = filter_cfg.egress_rate.to_proxy_config();
+    if filter_cfg.egress_rate.enabled && !filter_cfg.egress.enabled {
+        tracing::warn!(
+            "[proxy.filters.egress_rate] enabled = true has no effect while \
+             [proxy.filters.egress] enabled = false - the latter is the master \
+             switch for both egress filters"
+        );
+    }
     if egress_rate_config.enabled && filter_cfg.egress.enabled {
         registry.register(Box::new(EgressRateFilter::from_config_with_trust(
             egress_rate_config,

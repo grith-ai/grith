@@ -416,6 +416,7 @@ impl Harness {
             daemon_proxy_url: None,
             daemon_proxy_token: None,
             daemon_restart: None,
+            observation_outbox: Arc::new(Default::default()),
             persist_local_reputation: true,
             routine_exec_roots: self.routine_exec_roots.clone(),
             scratch_roots: self.scratch_roots.clone(),

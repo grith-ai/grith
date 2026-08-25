@@ -214,6 +214,7 @@ pub fn ipc_routes() -> Router<AppState> {
         .route("/reputation/reset", post(reputation_ipc::reset_reputation))
         .route("/reputation/save", post(reputation_ipc::save_reputation))
         .route("/proxy/evaluate", post(proxy_ipc::evaluate_proxy))
+        .route("/proxy/observe", post(proxy_ipc::observe_outcomes))
         .route("/proxy/status/full", get(proxy_ipc::proxy_status_full))
         .route("/ipc/audit/ingest", post(audit_ipc::ingest_audit))
         .route(

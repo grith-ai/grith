@@ -15,6 +15,7 @@ mod authority_delegation;
 mod dns_decision;
 mod event_handler;
 mod mass_destruction;
+mod remote_eval;
 mod spawn_families;
 
 // Shared with `crate::learned_rules` so `ipc-socket:` grant validation
@@ -528,6 +529,13 @@ pub async fn run_supervisor_loop(
                 ));
             };
             decision_service = decision_service.with_daemon(url, token);
+            // Let the DNS worker heal a rotated IPC token itself. Without this
+            // it can only pick up a reload performed by the event loop, which
+            // never happens when a DNS query is the first thing the session
+            // does after a daemon restart.
+            if let Some(restart) = daemon_restart.as_ref() {
+                decision_service = decision_service.with_token_reload(restart.token_path.clone());
+            }
         }
         let decision_service: Arc<dyn DnsDecisionService> = Arc::new(decision_service);
         dns_decision_service = Some(Arc::clone(&decision_service));
@@ -839,6 +847,7 @@ pub async fn run_supervisor_loop(
         daemon_proxy_url,
         daemon_proxy_token,
         daemon_restart,
+        observation_outbox: Arc::new(Default::default()),
         persist_local_reputation,
         session_sync,
         routine_exec_roots: expanded_routine_exec_roots.clone(),
@@ -1296,6 +1305,12 @@ async fn evict_session_state_on_end(
     let scope = grith_proxy::types::SessionScopeKey::from_session_id(session_id);
     let containment_triggered =
         grith_proxy::session_state::SessionStateRegistry::global().is_containment_active(scope);
+    // Flush before evicting: in daemon mode the session's last outcomes are
+    // still sitting in the outbox with no next evaluate to carry them.
+    if let (Some(url), Some(token)) = (&loop_ctx.daemon_proxy_url, &loop_ctx.daemon_proxy_token) {
+        let current = token.lock().ok().map(|t| t.clone()).unwrap_or_default();
+        event_handler::flush_observation_outbox(loop_ctx, url, &current).await;
+    }
     let removed = loop_ctx.proxy.evict_session_state(scope);
     let duration_secs = session_start.elapsed().as_secs_f64();
     // B-CORE-2 (b): surface the audit-drop count so an incomplete chain is

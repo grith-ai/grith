@@ -407,6 +407,10 @@ fn main() -> anyhow::Result<()> {
                     decision_reason: p.decision_reason,
                     context: p.context,
                     severity: p.severity,
+                    sticky_grant_available:
+                        grith_proxy::types::ToolCallType::category_supports_session_grant(
+                            &p.call_type,
+                        ),
                     call_type: p.call_type,
                     item_number: 1,
                     total_items: 1,

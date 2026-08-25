@@ -360,6 +360,9 @@ pub struct FilterGroupConfig {
     pub taint: FilterToggle,
     pub rate_limit: FilterToggle,
     pub egress: FilterToggle,
+    /// Tunable knobs for the egress-rate filter. Previously absent entirely,
+    /// so the daemon ran the struct defaults regardless of configuration.
+    pub egress_rate: EgressRateFilterConfig,
     pub session_containment: FilterToggle,
 }
 
@@ -393,6 +396,81 @@ impl BehaviouralFilterConfig {
             min_calls_for_baseline: self.min_calls_for_baseline,
             mild_deviation_score: self.mild_deviation_score,
             significant_deviation_score: self.significant_deviation_score,
+        }
+    }
+}
+
+/// Operator-tunable egress-rate filter config.
+///
+/// Mirrors `grith_proxy::filters::egress_rate::EgressRateConfig` plus the
+/// `enabled` toggle. A mirror struct rather than reusing the proxy type
+/// directly because `merge_config` round-trips every config node through
+/// `toml::Value::try_from`, which needs `Serialize`; the proxy struct derives
+/// `Deserialize` only.
+///
+/// Before this existed the daemon constructed `EgressRateConfig::default()`
+/// unconditionally, so every value here was a compile-time constant and an
+/// operator could not tune the filter that was denying them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EgressRateFilterConfig {
+    pub enabled: bool,
+    pub max_egress_per_minute: u32,
+    pub max_unique_destinations_per_minute: u32,
+    pub max_unique_ports_per_minute: u32,
+    pub burst_threshold: u32,
+    pub burst_window_seconds: u64,
+    pub cooldown_seconds: u64,
+    pub read_spike_threshold: u32,
+    pub read_window_seconds: u64,
+    pub read_then_send_egress_threshold: u32,
+    pub blocked_spread_notice_threshold: u32,
+    pub blocked_spread_warning_threshold: u32,
+    /// The blocked-spread ceiling - a hard cap, not a per-destination
+    /// increment.
+    pub blocked_spread_max_score: f64,
+}
+
+impl Default for EgressRateFilterConfig {
+    /// Pinned field-for-field to `EgressRateConfig::default()`. A divergence
+    /// here would silently change live scoring the moment the plumbing landed,
+    /// turning a wiring change into a tuning change.
+    fn default() -> Self {
+        let d = grith_proxy::filters::egress_rate::EgressRateConfig::default();
+        Self {
+            enabled: d.enabled,
+            max_egress_per_minute: d.max_egress_per_minute,
+            max_unique_destinations_per_minute: d.max_unique_destinations_per_minute,
+            max_unique_ports_per_minute: d.max_unique_ports_per_minute,
+            burst_threshold: d.burst_threshold,
+            burst_window_seconds: d.burst_window_seconds,
+            cooldown_seconds: d.cooldown_seconds,
+            read_spike_threshold: d.read_spike_threshold,
+            read_window_seconds: d.read_window_seconds,
+            read_then_send_egress_threshold: d.read_then_send_egress_threshold,
+            blocked_spread_notice_threshold: d.blocked_spread_notice_threshold,
+            blocked_spread_warning_threshold: d.blocked_spread_warning_threshold,
+            blocked_spread_max_score: d.blocked_spread_max_score,
+        }
+    }
+}
+
+impl EgressRateFilterConfig {
+    pub fn to_proxy_config(&self) -> grith_proxy::filters::egress_rate::EgressRateConfig {
+        grith_proxy::filters::egress_rate::EgressRateConfig {
+            enabled: self.enabled,
+            max_egress_per_minute: self.max_egress_per_minute,
+            max_unique_destinations_per_minute: self.max_unique_destinations_per_minute,
+            max_unique_ports_per_minute: self.max_unique_ports_per_minute,
+            burst_threshold: self.burst_threshold,
+            burst_window_seconds: self.burst_window_seconds,
+            cooldown_seconds: self.cooldown_seconds,
+            read_spike_threshold: self.read_spike_threshold,
+            read_window_seconds: self.read_window_seconds,
+            read_then_send_egress_threshold: self.read_then_send_egress_threshold,
+            blocked_spread_notice_threshold: self.blocked_spread_notice_threshold,
+            blocked_spread_warning_threshold: self.blocked_spread_warning_threshold,
+            blocked_spread_max_score: self.blocked_spread_max_score,
         }
     }
 }
@@ -1166,6 +1244,7 @@ impl Default for FilterGroupConfig {
             taint: FilterToggle { enabled: true },
             rate_limit: FilterToggle { enabled: true },
             egress: FilterToggle { enabled: true },
+            egress_rate: EgressRateFilterConfig::default(),
             session_containment: FilterToggle { enabled: true },
         }
     }
@@ -1433,7 +1512,26 @@ impl Default for EscalationConfig {
 impl GrithConfig {
     /// Load configuration with the standard precedence chain:
     /// env vars (GRITH_*) > explicit config > project .grith/config.toml > user config > required config/default.toml
+    /// Kept as the plain entry point for callers with nothing to report to:
+    /// the startup path uses [`Self::load_reporting_unknown`], but a caller
+    /// that only wants the config should not have to destructure a `Vec` it
+    /// will discard.
+    #[allow(dead_code)]
     pub fn load(config_path: Option<&Path>) -> Result<Self, crate::error::Error> {
+        Self::load_reporting_unknown(config_path).map(|(config, _)| config)
+    }
+
+    /// As [`Self::load`], but also reporting keys grith read and could not
+    /// use, per operator-editable layer.
+    ///
+    /// The embedded base config is deliberately NOT checked: an operator
+    /// cannot edit it, so warning about it would be noise they can never
+    /// clear - and it is the one layer whose keys are guaranteed to match the
+    /// binary that embeds it.
+    pub fn load_reporting_unknown(
+        config_path: Option<&Path>,
+    ) -> Result<(Self, Vec<ConfigKeyWarning>), crate::error::Error> {
+        let mut warnings = Vec::new();
         let mut config = load_required_base_config()?;
 
         // Layer 1: User config (~/.config/grith/config.toml)
@@ -1447,20 +1545,24 @@ impl GrithConfig {
         let user_declares_onboarded =
             user_config_exists && raw_config_declares_general_key(&user_config_path, "onboarded");
         if user_config_exists {
-            let user = Self::from_file(&user_config_path)?;
+            let (user, mut user_warnings) = Self::from_file_reporting_unknown(&user_config_path)?;
+            warnings.append(&mut user_warnings);
             config = merge_config(config, user);
         }
 
         // Layer 2: Project-local config (.grith/config.toml)
         let project_config = PathBuf::from(".grith/config.toml");
         if project_config.exists() {
-            let project = Self::from_file(&project_config)?;
+            let (project, mut project_warnings) =
+                Self::from_file_reporting_unknown(&project_config)?;
+            warnings.append(&mut project_warnings);
             config = merge_config(config, project);
         }
 
         // Layer 3: Explicit config file (--config flag)
         if let Some(path) = config_path {
-            let explicit = Self::from_file(path)?;
+            let (explicit, mut explicit_warnings) = Self::from_file_reporting_unknown(path)?;
+            warnings.append(&mut explicit_warnings);
             config = merge_config(config, explicit);
         }
 
@@ -1471,7 +1573,19 @@ impl GrithConfig {
         // flag must NOT trigger the first-run wizard after an upgrade.
         migrate_onboarding_flags(&mut config, user_config_exists, user_declares_onboarded);
 
-        Ok(config)
+        Ok((config, warnings))
+    }
+
+    /// Parse config from a TOML file, also reporting keys grith cannot use.
+    ///
+    /// Split from [`Self::from_file`] so every existing caller keeps its
+    /// signature; only the startup path needs the warnings.
+    pub fn from_file_reporting_unknown(
+        path: &Path,
+    ) -> Result<(Self, Vec<ConfigKeyWarning>), crate::error::Error> {
+        let config = Self::from_file(path)?;
+        let warnings = unrecognised_keys_in(path, &config);
+        Ok((config, warnings))
     }
 
     /// Parse config from a TOML file.
@@ -1843,6 +1957,153 @@ fn merge_config(base: GrithConfig, overlay: GrithConfig) -> GrithConfig {
         toml::Value::try_from(&overlay).unwrap_or(toml::Value::Table(Default::default()));
     let merged = deep_merge_toml(base_val, overlay_val);
     merged.try_into().unwrap_or(base)
+}
+
+// ---------------------------------------------------------------------------
+// Unrecognised-key reporting
+// ---------------------------------------------------------------------------
+
+/// Why a key in an operator's config file is being reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyNote {
+    /// grith has no field for this key. Usually a typo, or a key written
+    /// under the wrong table.
+    Unrecognised,
+    /// The key was real once. Naming it as removed, with what replaced it,
+    /// keeps a stale config from reading as a grith bug.
+    Removed(&'static str),
+}
+
+/// A key grith read but could not use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigKeyWarning {
+    /// The file it came from, for an operator who has several layers.
+    pub source: String,
+    /// Dotted path, e.g. `proxy.filters.taint.sensitive_paths`.
+    pub key: String,
+    pub note: KeyNote,
+}
+
+impl std::fmt::Display for ConfigKeyWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.note {
+            KeyNote::Unrecognised => write!(
+                f,
+                "{}: unrecognised key `{}` - it is being ignored",
+                self.source, self.key
+            ),
+            KeyNote::Removed(why) => write!(
+                f,
+                "{}: `{}` was removed and is being ignored ({why})",
+                self.source, self.key
+            ),
+        }
+    }
+}
+
+/// Keys that grith used to honour, with what to say about each.
+///
+/// Without this an operator whose config predates a removal is told their key
+/// is "unrecognised", which reads as grith failing to parse a valid setting
+/// rather than as their own config having aged.
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "proxy.cold_start_calls",
+        "call-count cold-start widening was removed",
+    ),
+    (
+        "proxy.cold_start_escalation_low",
+        "call-count cold-start widening was removed",
+    ),
+    (
+        "proxy.cold_start_escalation_high",
+        "call-count cold-start widening was removed",
+    ),
+];
+
+/// Tables whose KEYS are operator-chosen data rather than a fixed schema.
+///
+/// Anything at or below one of these is skipped: a severity name or a header
+/// name is not a misspelt field, and reporting them would train operators to
+/// ignore the warning.
+const FREE_FORM_TABLES: &[&str] = &[
+    "notifications.routing.severity_routes",
+    "notifications.routing.filter_overrides",
+];
+
+fn is_free_form(path: &str) -> bool {
+    FREE_FORM_TABLES
+        .iter()
+        .any(|t| path == *t || path.starts_with(&format!("{t}.")))
+}
+
+/// Collect dotted paths present in `raw` that `known` has no field for.
+///
+/// `known` is the parsed config serialised back to TOML, so it contains
+/// exactly the keys grith can actually use. Comparing paths (never values)
+/// makes this immune to defaulting, ordering and representation differences.
+///
+/// Recurses in the same shape as `deep_merge_toml`, so a key nested under a
+/// table grith does know about is still checked.
+fn collect_unrecognised(
+    raw: &toml::Value,
+    known: &toml::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    let (toml::Value::Table(raw_map), toml::Value::Table(known_map)) = (raw, known) else {
+        return;
+    };
+    for (key, raw_val) in raw_map {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if is_free_form(&path) {
+            continue;
+        }
+        match known_map.get(key) {
+            None => out.push(path),
+            Some(known_val) => collect_unrecognised(raw_val, known_val, &path, out),
+        }
+    }
+}
+
+/// Report keys in `path` that grith parsed but cannot use.
+///
+/// Returns an empty vec rather than an error when the comparison cannot be
+/// made: this is a diagnostic, and it must never be the reason a config fails
+/// to load.
+fn unrecognised_keys_in(path: &Path, parsed: &GrithConfig) -> Vec<ConfigKeyWarning> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(raw) = toml::from_str::<toml::Value>(&content) else {
+        return Vec::new();
+    };
+    let Ok(known) = toml::Value::try_from(parsed) else {
+        return Vec::new();
+    };
+
+    let mut paths = Vec::new();
+    collect_unrecognised(&raw, &known, "", &mut paths);
+    paths.sort();
+    let source = path.display().to_string();
+    paths
+        .into_iter()
+        .map(|key| {
+            let note = REMOVED_KEYS
+                .iter()
+                .find(|(removed, _)| *removed == key)
+                .map_or(KeyNote::Unrecognised, |(_, why)| KeyNote::Removed(why));
+            ConfigKeyWarning {
+                source: source.clone(),
+                key,
+                note,
+            }
+        })
+        .collect()
 }
 
 /// Recursively merge two TOML values. Tables are merged field-by-field;
@@ -2478,6 +2739,99 @@ significant_deviation_score = 4.25
     }
 
     #[test]
+    fn test_egress_rate_config_keys_wired() {
+        let toml_str = r#"
+[proxy.filters.egress_rate]
+enabled = true
+max_egress_per_minute = 17
+burst_threshold = 3
+blocked_spread_warning_threshold = 9
+blocked_spread_max_score = 1.25
+"#;
+        let config: GrithConfig = toml::from_str(toml_str).unwrap();
+        let proxy_cfg = config.proxy.filters.egress_rate.to_proxy_config();
+        assert_eq!(proxy_cfg.max_egress_per_minute, 17);
+        assert_eq!(proxy_cfg.burst_threshold, 3);
+        assert_eq!(proxy_cfg.blocked_spread_warning_threshold, 9);
+        assert_eq!(proxy_cfg.blocked_spread_max_score, 1.25);
+        // Unspecified knobs must fall back to the filter's own defaults.
+        let defaults = grith_proxy::filters::egress_rate::EgressRateConfig::default();
+        assert_eq!(proxy_cfg.read_window_seconds, defaults.read_window_seconds);
+    }
+
+    /// The mirror struct must not drift from the filter's defaults. A
+    /// divergence would silently change live scoring the moment an operator
+    /// config omitted the key.
+    #[test]
+    fn egress_rate_mirror_matches_filter_defaults() {
+        let mirror = EgressRateFilterConfig::default().to_proxy_config();
+        let actual = grith_proxy::filters::egress_rate::EgressRateConfig::default();
+        assert_eq!(mirror.enabled, actual.enabled);
+        assert_eq!(mirror.max_egress_per_minute, actual.max_egress_per_minute);
+        assert_eq!(
+            mirror.max_unique_destinations_per_minute,
+            actual.max_unique_destinations_per_minute
+        );
+        assert_eq!(
+            mirror.max_unique_ports_per_minute,
+            actual.max_unique_ports_per_minute
+        );
+        assert_eq!(mirror.burst_threshold, actual.burst_threshold);
+        assert_eq!(mirror.burst_window_seconds, actual.burst_window_seconds);
+        assert_eq!(mirror.cooldown_seconds, actual.cooldown_seconds);
+        assert_eq!(mirror.read_spike_threshold, actual.read_spike_threshold);
+        assert_eq!(mirror.read_window_seconds, actual.read_window_seconds);
+        assert_eq!(
+            mirror.read_then_send_egress_threshold,
+            actual.read_then_send_egress_threshold
+        );
+        assert_eq!(
+            mirror.blocked_spread_notice_threshold,
+            actual.blocked_spread_notice_threshold
+        );
+        assert_eq!(
+            mirror.blocked_spread_warning_threshold,
+            actual.blocked_spread_warning_threshold
+        );
+        assert_eq!(
+            mirror.blocked_spread_max_score,
+            actual.blocked_spread_max_score
+        );
+    }
+
+    /// The shipped config must equal the struct defaults, or deploying the
+    /// plumbing would itself retune the filter.
+    #[test]
+    fn shipped_egress_rate_section_matches_struct_defaults() {
+        let shipped: GrithConfig =
+            toml::from_str(include_str!("../../../config/default.toml")).expect("default.toml");
+        let shipped_cfg = shipped.proxy.filters.egress_rate.to_proxy_config();
+        let defaults = grith_proxy::filters::egress_rate::EgressRateConfig::default();
+        assert_eq!(
+            shipped_cfg.max_egress_per_minute,
+            defaults.max_egress_per_minute
+        );
+        assert_eq!(shipped_cfg.burst_threshold, defaults.burst_threshold);
+        assert_eq!(
+            shipped_cfg.burst_window_seconds,
+            defaults.burst_window_seconds
+        );
+        assert_eq!(shipped_cfg.cooldown_seconds, defaults.cooldown_seconds);
+        assert_eq!(
+            shipped_cfg.read_spike_threshold,
+            defaults.read_spike_threshold
+        );
+        assert_eq!(
+            shipped_cfg.blocked_spread_notice_threshold,
+            defaults.blocked_spread_notice_threshold
+        );
+        assert_eq!(
+            shipped_cfg.blocked_spread_max_score,
+            defaults.blocked_spread_max_score
+        );
+    }
+
+    #[test]
     fn test_validate_bad_thresholds() {
         let mut config = GrithConfig::default();
         config.proxy.auto_allow_threshold = 9.0;
@@ -2544,5 +2898,105 @@ significant_deviation_score = 4.25
         );
         assert!(!canonical.contains_key("dlp_gate"));
         assert!(!canonical.contains_key("secret_scan"));
+    }
+
+    // ── Unrecognised-key reporting ──────────────────────────────────
+
+    fn warn_keys(toml_str: &str) -> Vec<ConfigKeyWarning> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml_str).expect("write");
+        let parsed = GrithConfig::from_file(&path).expect("parse");
+        unrecognised_keys_in(&path, &parsed)
+    }
+
+    #[test]
+    fn reports_a_key_grith_has_no_field_for() {
+        let warnings = warn_keys("[general]\nlog_level = \"info\"\nnot_a_real_key = 3\n");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "general.not_a_real_key");
+        assert_eq!(warnings[0].note, KeyNote::Unrecognised);
+    }
+
+    /// The live case: numeric knobs written under a table that only carries
+    /// `enabled`. They parse without error and are discarded.
+    #[test]
+    fn reports_keys_written_under_the_wrong_table() {
+        let warnings = warn_keys(
+            "[proxy.filters.rate_limit]\nenabled = true\nnetwork_requests_per_minute = 60\n",
+        );
+        let keys: Vec<_> = warnings.iter().map(|w| w.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["proxy.filters.rate_limit.network_requests_per_minute"]
+        );
+    }
+
+    /// A stale config must not read as grith failing to parse a valid setting.
+    #[test]
+    fn removed_keys_are_named_as_removed_not_unknown() {
+        let warnings = warn_keys("[proxy]\ncold_start_calls = 0\n");
+        assert_eq!(warnings.len(), 1);
+        assert!(matches!(warnings[0].note, KeyNote::Removed(_)));
+        assert!(
+            format!("{}", warnings[0]).contains("was removed"),
+            "operator-facing text must say removed: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn valid_config_reports_nothing() {
+        let warnings =
+            warn_keys("[general]\nlog_level = \"debug\"\n\n[proxy]\nauto_deny_threshold = 9.0\n");
+        assert!(warnings.is_empty(), "unexpected: {warnings:?}");
+    }
+
+    /// Operator-chosen table keys are data, not misspelt fields. Reporting
+    /// them would train operators to ignore the warning entirely.
+    #[test]
+    fn free_form_table_keys_are_not_reported() {
+        let warnings = warn_keys(
+            "[notifications.routing.severity_routes]\ncritical = [\"telegram\"]\nanything = [\"slack\"]\n",
+        );
+        assert!(warnings.is_empty(), "unexpected: {warnings:?}");
+    }
+
+    /// THE guard. `config/default.toml` is the required base config, embedded
+    /// in the binary and loaded on every single invocation. A key here that
+    /// grith cannot use would make every run - including a fresh install -
+    /// emit a warning the operator has no way to clear.
+    #[test]
+    fn shipped_default_config_has_no_unrecognised_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("default.toml");
+        std::fs::write(&path, include_str!("../../../config/default.toml")).expect("write");
+        let parsed = GrithConfig::from_file(&path).expect("shipped default.toml must parse");
+        let warnings = unrecognised_keys_in(&path, &parsed);
+        assert!(
+            warnings.is_empty(),
+            "config/default.toml ships keys grith cannot use:\n{}",
+            warnings
+                .iter()
+                .map(|w| format!("  {}", w.key))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Sanity check on the round-trip the diff relies on: every known key must
+    /// survive serialisation, or a valid setting would be reported as unknown.
+    #[test]
+    fn round_trip_emits_every_known_key() {
+        let cfg = GrithConfig::default();
+        let value = toml::Value::try_from(&cfg).expect("serialize");
+        let table = value.as_table().expect("table");
+        for section in ["general", "proxy", "supervisor", "server", "notifications"] {
+            assert!(
+                table.contains_key(section),
+                "`{section}` vanished in the round-trip; the diff would report \
+                 every key under it as unrecognised"
+            );
+        }
     }
 }

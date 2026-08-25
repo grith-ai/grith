@@ -76,6 +76,7 @@ impl QueueReviewer for ExecTuiQueueReviewer {
             .map(|i| &item.tool_call_type[..i])
             .unwrap_or(&item.tool_call_type)
             .to_string();
+        let call_type_category_for_grant = call_type_category.clone();
 
         let req = grith_cli::tui::state::PermissionRequest {
             id: item.id,
@@ -95,6 +96,10 @@ impl QueueReviewer for ExecTuiQueueReviewer {
             item_number: 1,
             total_items: 1,
             scope_enabled: true,
+            sticky_grant_available:
+                grith_proxy::types::ToolCallType::category_supports_session_grant(
+                    &call_type_category_for_grant,
+                ),
         };
 
         // Create a response channel.
@@ -271,6 +276,7 @@ impl QueueReviewer for TerminalQueueReviewer {
             .map(|i| &item.tool_call_type[..i])
             .unwrap_or(&item.tool_call_type)
             .to_string();
+        let call_type_category_for_grant = call_type_category.clone();
 
         let req = grith_cli::tui::state::PermissionRequest {
             id: item.id,
@@ -290,6 +296,10 @@ impl QueueReviewer for TerminalQueueReviewer {
             item_number: 1,
             total_items: 1,
             scope_enabled: true,
+            sticky_grant_available:
+                grith_proxy::types::ToolCallType::category_supports_session_grant(
+                    &call_type_category_for_grant,
+                ),
         };
 
         let digest_store = self.digest_store.clone();

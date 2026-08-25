@@ -18,6 +18,112 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 pub(crate) struct EvaluateRequest {
     pub context: ToolCallContext,
+    /// Outcomes of earlier calls, piggybacked so they can be committed before
+    /// this one is scored. Defaulted so an older supervisor still works.
+    #[serde(default)]
+    pub observations: Vec<WireObservation>,
+}
+
+/// One call's final outcome, as the supervisor reports it.
+///
+/// The supervisor sends the fields a stateful filter actually reads rather
+/// than a whole `ToolCallContext`, so the daemon reconstitutes a minimal one.
+#[derive(Deserialize)]
+pub(crate) struct WireObservation {
+    pub call_id: uuid::Uuid,
+    pub scope: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub call_type: grith_proxy::types::ToolCallType,
+    /// Profile name and arguments both feed filter decisions at commit time
+    /// (profile-trusted destinations, and the unix-socket class that decides
+    /// whether a connect counts as egress at all). Defaulted so an older
+    /// supervisor still interoperates, at the cost of those two signals.
+    #[serde(default)]
+    pub profile_name: Option<String>,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+    pub outcome: grith_proxy::types::CallOutcome,
+    /// How long ago the paired evaluate ran. Sent as an age rather than a
+    /// timestamp because the two processes share no `Instant` epoch, and a
+    /// wall clock would import clock-adjustment bugs into monotonic windows.
+    pub age_ms: u64,
+}
+
+/// Call ids committed recently, so a re-sent batch cannot be applied twice.
+///
+/// The supervisor puts a batch back in its outbox whenever the POST does not
+/// return success - but a timeout or a dropped response is indistinguishable
+/// from a request that never arrived, so a batch the daemon DID apply can come
+/// back. Observations are not naturally idempotent (each pushes a timestamp),
+/// so without this a flaky link inflates exactly the counters this work exists
+/// to make honest.
+///
+/// Bounded ring: far larger than the supervisor's 256-entry outbox, so a
+/// re-send is always still covered, while the memory stays fixed.
+const APPLIED_RING_CAPACITY: usize = 4096;
+
+static RECENTLY_APPLIED: std::sync::LazyLock<
+    std::sync::Mutex<(
+        std::collections::HashSet<uuid::Uuid>,
+        std::collections::VecDeque<uuid::Uuid>,
+    )>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new((
+        std::collections::HashSet::new(),
+        std::collections::VecDeque::new(),
+    ))
+});
+
+/// Record `call_id` as applied. Returns false when it was already applied, in
+/// which case the caller must skip it.
+fn claim_call_id(call_id: uuid::Uuid) -> bool {
+    let Ok(mut guard) = RECENTLY_APPLIED.lock() else {
+        // A poisoned lock must not silently start double-committing.
+        return false;
+    };
+    let (seen, order) = &mut *guard;
+    if !seen.insert(call_id) {
+        return false;
+    }
+    order.push_back(call_id);
+    if order.len() > APPLIED_RING_CAPACITY {
+        if let Some(evicted) = order.pop_front() {
+            seen.remove(&evicted);
+        }
+    }
+    true
+}
+
+/// Commit piggybacked outcomes into the daemon's filter state.
+///
+/// Runs BEFORE the evaluate it rode in on, so call N's commit is always
+/// applied ahead of call N+1's evaluation.
+fn apply_observations(state: &AppState, observations: Vec<WireObservation>) {
+    for observation in observations {
+        if !claim_call_id(observation.call_id) {
+            tracing::trace!(
+                call_id = %observation.call_id,
+                "skipping already-applied observation (re-sent batch)"
+            );
+            continue;
+        }
+        let mut ctx = ToolCallContext::new(
+            "grith-supervisor",
+            observation.call_type,
+            observation.session_id,
+        );
+        ctx.id = observation.call_id;
+        ctx.session_scope = Some(grith_proxy::types::SessionScopeKey::from_session_id(
+            observation.scope,
+        ));
+        ctx.profile_name = observation.profile_name;
+        ctx.arguments = observation.arguments;
+        state.proxy.observe_outcome(
+            &ctx,
+            observation.outcome,
+            std::time::Duration::from_millis(observation.age_ms),
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -39,6 +145,22 @@ struct FilterResultSummary {
     message: String,
 }
 
+/// POST /api/proxy/observe
+///
+/// Commit call outcomes without evaluating anything. The supervisor
+/// piggybacks observations on `/api/proxy/evaluate` in the steady state; this
+/// exists for the flush at session end, where there is no next evaluate to
+/// ride along with and the session's last calls would otherwise never land.
+pub(crate) async fn observe_outcomes(
+    _auth: IpcAuth,
+    State(state): State<AppState>,
+    Json(observations): Json<Vec<WireObservation>>,
+) -> impl IntoResponse {
+    let applied = observations.len();
+    apply_observations(&state, observations);
+    Json(serde_json::json!({ "applied": applied }))
+}
+
 /// POST /api/proxy/evaluate
 ///
 /// Evaluate a tool call through the daemon's proxy pipeline and return the
@@ -49,6 +171,7 @@ pub(crate) async fn evaluate_proxy(
     State(state): State<AppState>,
     Json(body): Json<EvaluateRequest>,
 ) -> impl IntoResponse {
+    apply_observations(&state, body.observations);
     let mut decision: ProxyDecision = state.proxy.evaluate(&body.context).await;
     if matches!(
         decision.action,
@@ -175,6 +298,16 @@ pub(crate) async fn proxy_status_full(
         "auto_allow_threshold": config.auto_allow_threshold,
         "auto_deny_threshold": config.auto_deny_threshold,
         "call_count": state.proxy.call_count(),
+        // Evaluations that reported a final outcome, so stateful filters could
+        // commit. `call_count - observed_count` is the running total that
+        // never did. A few are by design (the proxy-test endpoint, one-shot
+        // CLI evaluations), so this is a baseline to watch for drift rather
+        // than a figure that should read zero. A climbing delta means outcome
+        // wiring has regressed and some filter has quietly stopped
+        // accumulating - which would otherwise present as "no alerts".
+        "observed_count": state.proxy.observed_count(),
+        "observed_executed": state.proxy.observed_executed(),
+        "observed_suppressed": state.proxy.observed_suppressed(),
         "filters": state.proxy.filter_info().iter().map(|f| {
             serde_json::json!({
                 "name": f.name,

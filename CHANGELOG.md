@@ -10,6 +10,54 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 _Nothing yet._
 
+## [0.3.2] - 2026-08-25
+
+### Added
+
+- **grith now tells you which settings in your config file it ignored.** Every
+  config table accepts unknown keys in silence, so a mistyped name — or one
+  written under the wrong heading — has always looked applied while doing
+  nothing. Startup now compares what you wrote against what grith actually
+  read, and names the difference. On the machine this was written on, that was
+  19 settings, including every numeric knob on the rate-limit filter.
+
+### Fixed
+
+- **Reading credentials and then using them is no longer blocked without
+  asking.** Reading a `.env` for database credentials and then connecting to
+  that database scored past the automatic-block threshold, so it never reached
+  an approval prompt — the tool saw only a permission error and told its
+  operator the machine forbade outbound connections. Two signals were charging
+  the same fact twice: reading the credentials is what makes using them look
+  like exfiltration. The workflow now reaches the queue, where a person
+  decides.
+- **Browsing under grith no longer floods you with prompts.** A supervised tool
+  that opens a browser produced one approval prompt per name it looked up:
+  browsers pick a random source port for each DNS query, and that looked like a
+  new network listener every time. Those are now recognised as ordinary client
+  sockets. An ordinary page load in a session that has read something sensitive
+  also queues for approval now, rather than being blocked with no prompt —
+  a page load always exceeds the burst threshold, so this was never a matter of
+  tuning it.
+- **A blocked destination no longer inflates its own score.** The rate signals
+  counted attempted connections, so a client retrying a refused address drove
+  its own burst counter up and re-armed the cooldown with every retry. They now
+  count only what actually ran.
+- **DNS recovers by itself after the daemon restarts.** A restart changes the
+  internal token, and the DNS path could not pick up the new one — every lookup
+  failed until some unrelated operation happened to refresh it. A session that
+  only makes network calls never produced one and stayed broken for its whole
+  life.
+- **The approval prompt no longer offers to remember an answer it cannot
+  keep.** Some requests have nowhere to record a lasting rule, but the dialog
+  still offered "Always allow" and said the target would stay allowed for the
+  session. Both now describe what actually happens: the request is asked every
+  time.
+- **`grith pro sync` describes what it does.** Its help still advertised
+  uploading audit records, which it stopped doing when that route was retired.
+  It pulls team policies, shared configs and provider keys, then pushes
+  reputation data.
+
 ## [0.3.1] - 2026-08-24
 
 ### Added

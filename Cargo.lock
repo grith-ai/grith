@@ -1408,7 +1408,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "grith-analytics"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "grith-audit"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "grith-analytics",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "grith-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "grith-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "grith-digest"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "grith-docgen"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "grith-llm"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "grith-notify"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "grith-proxy"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "grith-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1646,9 +1646,10 @@ dependencies = [
 
 [[package]]
 name = "grith-supervisor"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "crossbeam-channel",
  "dirs",
@@ -1678,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "grith-tests"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "axum",

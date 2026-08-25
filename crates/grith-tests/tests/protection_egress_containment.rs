@@ -12,7 +12,7 @@
 //! **Fidelity scope — these assert filter LOGIC, not pipeline membership:**
 //! - **Canary:** the 9.5 hit score is hardcoded (`canary.rs`); config only
 //!   toggles `enabled` and supplies tokens. Faithful to production scoring.
-//! - **Containment:** the 4.5/4.0/3.5 scores are CONFIG-LOADED in production
+//! - **Containment:** the 3.5/4.0/3.5 scores are CONFIG-LOADED in production
 //!   (`config/filters/containment.toml`); this test pins
 //!   `SessionContainmentConfig::default()`, which currently equals the shipped
 //!   TOML — guarded by `containment_default_scores_match_shipped_config` below
@@ -169,7 +169,7 @@ async fn protection_outbound_without_canary_is_allowed() {
 // ===========================================================================
 // Session containment — after a sensitive read arms containment for a session,
 // outbound operations in that session are held for review (research doc §4.2;
-// session_containment.rs rule `contained-network-egress`, network_score 4.5).
+// session_containment.rs rule `contained-network-egress`, network_score 3.5).
 // ===========================================================================
 
 #[tokio::test]
@@ -193,12 +193,18 @@ async fn protection_contained_session_queues_network_egress() {
     let score = fired(&d, "session-containment", "contained-network-egress")
         .expect("network egress under active containment must fire containment");
     assert!(
-        (score - 4.5).abs() < f64::EPSILON,
-        "contained network egress scores 4.5, got {score}"
+        (score - 3.5).abs() < f64::EPSILON,
+        "contained network egress scores 3.5, got {score}"
+    );
+    assert!(
+        score < 4.0,
+        "containment must stay below 4.0 so it can never reach auto-deny when \
+         stacked with the net-connect baseline (0.5) and an unknown \
+         destination (3.5); got {score}"
     );
     assert!(
         matches!(d.action, ProxyAction::Queue { .. }),
-        "contained egress (4.5, in 3.0–8.0) must QUEUE for review, got {:?}",
+        "contained egress (3.5, in 3.0–8.0) must QUEUE for review, got {:?}",
         d.action
     );
 }
@@ -347,22 +353,58 @@ async fn protection_contained_session_allows_local_shell() {
 
 // Drift guard (review C1): the containment scores asserted above come from
 // `SessionContainmentConfig::default()`. Production loads them from
-// `config/filters/containment.toml`. Pin the defaults so that if either the
-// default or the shipped TOML changes without the other, this fails and the
-// fidelity assumption is re-checked.
+// `config/filters/containment.toml`. This reads the SHIPPED file and compares
+// it field-by-field with the default, so a change to either one alone fails
+// here. Comparing the default against hardcoded literals (as this did before)
+// could not catch a drifted TOML at all — and the TOML is the value production
+// actually enforces with.
 #[test]
 fn containment_default_scores_match_shipped_config() {
+    #[derive(serde::Deserialize)]
+    struct ShippedFile {
+        containment: Shipped,
+    }
+    #[derive(serde::Deserialize)]
+    struct Shipped {
+        network_score: f64,
+        process_score: f64,
+        shell_score: f64,
+    }
+    let path = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/filters/containment.toml"
+    ));
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let shipped = toml::from_str::<ShippedFile>(&raw)
+        .expect("containment.toml must parse")
+        .containment;
     let cfg = SessionContainmentConfig::default();
+
     assert_eq!(
-        cfg.network_score, 4.5,
-        "containment.toml ships network_score=4.5"
+        cfg.network_score, shipped.network_score,
+        "SessionContainmentConfig::default() and containment.toml disagree on \
+         network_score — production loads the TOML, so the default is a lie"
     );
     assert_eq!(
-        cfg.process_score, 4.0,
-        "containment.toml ships process_score=4.0"
+        cfg.process_score, shipped.process_score,
+        "default and containment.toml disagree on process_score"
     );
     assert_eq!(
-        cfg.shell_score, 3.5,
-        "containment.toml ships shell_score=3.5"
+        cfg.shell_score, shipped.shell_score,
+        "default and containment.toml disagree on shell_score"
+    );
+
+    // The invariant the scores must satisfy, whatever their values: containment
+    // alone must never be able to reach auto-deny. An outbound connect in a
+    // contained session always also carries operation-risk's net-connect
+    // baseline (0.5) and, for any destination off the egress allowlist,
+    // egress-policy's unknown-destination (3.5). See
+    // tests/contained_egress_not_autodenied.rs for the production incident.
+    assert!(
+        shipped.network_score + 0.5 + 3.5 <= 8.0,
+        "network_score {} lets a contained session auto-deny an undeclared \
+         destination with no prompt",
+        shipped.network_score
     );
 }

@@ -164,6 +164,7 @@ async fn simulate_tool_execution(
         )),
         spawn_provenance: None,
         listener_policy_match: None,
+        bind_protocol: None,
     };
 
     // 3. Evaluate through proxy

@@ -190,7 +190,11 @@ pub fn run_review_dialog(
                         result = Some(PermissionReviewAction::Deny);
                         break;
                     }
-                    KeyCode::Char('l') | KeyCode::Char('L') if !is_deny => {
+                    // Gated on the same flag the action row renders from: a
+                    // key the dialog does not offer must not still act.
+                    KeyCode::Char('l') | KeyCode::Char('L')
+                        if !is_deny && req.sticky_grant_available =>
+                    {
                         result = Some(PermissionReviewAction::ApproveAndLearn);
                         break;
                     }
@@ -617,7 +621,8 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent) -> bool {
             }
             state.modal = ModalState::None;
         }
-        KeyCode::Char('l') if matches!(state.modal, ModalState::PermissionDialog(_)) => {
+        KeyCode::Char('l') if matches!(state.modal, ModalState::PermissionDialog(ref r) if r.sticky_grant_available) =>
+        {
             if let ModalState::PermissionDialog(ref req) = state.modal {
                 review_digest_item(
                     state.digest_store.as_ref(),
@@ -702,6 +707,7 @@ fn check_pending_digest(state: &mut AppState) {
         item_number: 1,
         total_items: total,
         scope_enabled: false,
+        sticky_grant_available: true,
     }));
 }
 

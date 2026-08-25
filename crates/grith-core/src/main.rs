@@ -538,11 +538,53 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Load configuration
-    let mut cfg = config::GrithConfig::load(cli.config.as_deref())?;
+    // Warnings are carried to after logging init rather than emitted here:
+    // `logging::init` is a dozen lines below, so anything raised now is
+    // dropped. They must NOT go through `validate()` either - main bails on
+    // any issue it returns, so a stale key would lock an operator out of
+    // their own tool over a diagnostic.
+    let (mut cfg, config_key_warnings) =
+        config::GrithConfig::load_reporting_unknown(cli.config.as_deref())?;
 
     // CLI flag override for log level
     if let Some(level) = &cli.log_level {
         cfg.general.log_level = level.clone();
+    }
+
+    // Reported before `validate()`, and on stderr rather than through
+    // tracing: a key in the wrong section is a plausible REASON for an
+    // invalid config, so the operator must see it even on the path that
+    // bails. Logging is not initialised yet either, so a `warn!` here would
+    // be dropped.
+    //
+    // Never routed through `validate()` itself - main bails on any issue it
+    // returns, and locking an operator out of their own tool over a stale key
+    // is a worse failure than the key being ignored.
+    if !config_key_warnings.is_empty() {
+        // `grith exec` on a TTY and `grith setup` are the sessions run most
+        // often; a line per key would push the supervised tool down the
+        // screen on every launch. They get the count and the fix instead.
+        let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let terse =
+            (matches!(&cli.command, Some(Command::Exec { .. })) && stdout_is_tty && stdin_is_tty)
+                || matches!(&cli.command, Some(Command::Setup));
+        if terse {
+            let sources: std::collections::BTreeSet<&str> = config_key_warnings
+                .iter()
+                .map(|w| w.source.as_str())
+                .collect();
+            eprintln!(
+                "grith: {} setting(s) in {} are being ignored; run any other \
+                 grith command to list them",
+                config_key_warnings.len(),
+                sources.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        } else {
+            for warning in &config_key_warnings {
+                eprintln!("grith: {warning}");
+            }
+        }
     }
 
     // Validate configuration

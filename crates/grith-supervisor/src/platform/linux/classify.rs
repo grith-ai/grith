@@ -489,7 +489,7 @@ impl PtraceSupervisor {
                     Some((address, port, protocol)) => Ok(Some(SyscallKind::NetBind {
                         address,
                         port,
-                        protocol,
+                        protocol: self.bind_protocol(pid_u32, sockfd, protocol),
                         // PR 5 Phase D: forward the tracee-side
                         // sockaddr pointer so the supervisor's
                         // allow path can clamp the bind to loopback
@@ -1255,6 +1255,45 @@ impl PtraceSupervisor {
     ///
     /// Falls back to `Tcp` if the socket type cannot be determined (e.g.,
     /// process has already exited or fd is not a socket).
+    /// The transport of the socket a `bind(2)` is about to bind.
+    ///
+    /// [`Self::resolve_socket_protocol`] answers this by looking the fd's
+    /// inode up in `/proc/<pid>/net/udp{,6}`, but the kernel only inserts a
+    /// socket into those tables once it is **bound or connected**. At bind
+    /// *entry* the fd is in neither, so that lookup always misses and falls
+    /// back to its fail-closed `Tcp` default — which silently made every UDP
+    /// bind look like TCP.
+    ///
+    /// `dns_tracker` records the type from the `socket(2)` type argument for
+    /// every AF_INET/AF_INET6 socket and follows it across `dup`/`close`, so
+    /// it is the authoritative source here. This is the same registry, and
+    /// the same reasoning, that the `connect` path already relies on.
+    ///
+    /// Falls back to `parsed` whenever the tracker has nothing to say: an fd
+    /// created before the session attached, a socket family it does not
+    /// track, or a unix-domain bind (whose classifier is `UnixSocketClass`).
+    fn bind_protocol(&self, tid: u32, sockfd: i32, parsed: NetProtocol) -> NetProtocol {
+        if parsed == NetProtocol::Unix {
+            return parsed;
+        }
+        // The in-memory tid→tgid map first: it is maintained on every
+        // clone/exec event, so the `/proc` fallback only runs for an fd whose
+        // thread the supervisor has not seen register yet.
+        let Some(tgid) = self
+            .tid_tgids
+            .get(&tid)
+            .copied()
+            .or_else(|| Self::resolve_tgid(tid))
+        else {
+            return parsed;
+        };
+        match self.dns_tracker.socket_type(tgid, sockfd) {
+            Some(super::dns_socket_tracker::SocketType::Datagram) => NetProtocol::Udp,
+            Some(super::dns_socket_tracker::SocketType::Stream) => NetProtocol::Tcp,
+            Some(super::dns_socket_tracker::SocketType::Other) | None => parsed,
+        }
+    }
+
     fn resolve_socket_protocol(pid: u32, sockfd: i32) -> NetProtocol {
         // Step 1: resolve the socket fd to its inode via /proc/<pid>/fd/<fd>.
         let link_path = format!("/proc/{pid}/fd/{sockfd}");
@@ -2583,6 +2622,55 @@ mod tests {
             sup.classify_syscall(pid, &socket_regs(16, 12)).unwrap(),
             Some(SyscallKind::RawSocketCreate { .. })
         ));
+    }
+
+    /// A UDP `bind(2)` must classify as `NetProtocol::Udp`.
+    ///
+    /// The `/proc/<pid>/net/udp{,6}` lookup cannot answer this: the kernel
+    /// only inserts a socket into those tables once it is bound or connected,
+    /// so at bind *entry* the fd is in neither and the lookup falls back to
+    /// its `Tcp` default. Verified against the live kernel — an unbound
+    /// `SOCK_DGRAM` fd is absent from both tables — which is why the
+    /// `socket(2)`-exit registry is consulted instead. Without this, every
+    /// UDP bind reached the proxy labelled TCP and egress-policy's UDP
+    /// client-port carveout could never fire.
+    #[test]
+    fn bind_protocol_prefers_the_socket_type_registry() {
+        use crate::platform::linux::dns_socket_tracker::SocketType;
+        let mut sup = PtraceSupervisor::new();
+        sup.tid_tgids.insert(4242, 4242);
+        sup.dns_tracker
+            .observe_socket(4242, 7, SocketType::Datagram);
+        sup.dns_tracker.observe_socket(4242, 8, SocketType::Stream);
+
+        assert_eq!(
+            sup.bind_protocol(4242, 7, NetProtocol::Tcp),
+            NetProtocol::Udp,
+            "a datagram socket must not stay on read_sockaddr's Tcp default"
+        );
+        assert_eq!(
+            sup.bind_protocol(4242, 8, NetProtocol::Tcp),
+            NetProtocol::Tcp
+        );
+    }
+
+    /// Untracked fds and unix binds keep whatever `read_sockaddr` parsed, so
+    /// a registry miss can never *lower* the classification.
+    #[test]
+    fn bind_protocol_falls_back_when_the_registry_is_silent() {
+        let mut sup = PtraceSupervisor::new();
+        sup.tid_tgids.insert(4242, 4242);
+
+        // fd never seen by the socket(2) promote path.
+        assert_eq!(
+            sup.bind_protocol(4242, 9, NetProtocol::Tcp),
+            NetProtocol::Tcp
+        );
+        // A unix bind short-circuits before the registry is consulted.
+        assert_eq!(
+            sup.bind_protocol(4242, 9, NetProtocol::Unix),
+            NetProtocol::Unix
+        );
     }
 
     /// mmap with MAP_ANONYMOUS cleared even if fd looks valid → still anonymous

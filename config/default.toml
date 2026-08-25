@@ -85,13 +85,13 @@ risk_gated_burst = true
 # step" claim. Set false to disable the whole filter.
 enabled = true
 
+# NOTE: this section carries the `enabled` toggle only. The scores that used
+# to sit here were never read - the filter takes its domain sets from
+# config/filters/domains.toml (a path the loader hardcodes, so `domains_file`
+# was inert too) and its scores from compiled-in constants. The Beta
+# reputation system's own tunables live under `[reputation]` below.
 [proxy.filters.reputation]
 enabled = true
-domains_file = "config/filters/domains.toml"
-unknown_domain_score = 1.0
-malicious_domain_score = 4.0
-safe_domain_score = -1.0
-ip_address_score = 2.0
 
 [proxy.filters.behavioural]
 enabled = true
@@ -99,31 +99,55 @@ min_calls_for_baseline = 200
 mild_deviation_score = 1.0
 significant_deviation_score = 3.0
 
+# NOTE: `enabled` only. `sensitive_paths`, `high_risk_sinks` and
+# `medium_risk_sinks` were never read: the daemon builds the filter with
+# `TaintFilter::with_defaults()`, whose 21 compiled-in patterns are a superset
+# of the six that used to be listed here. They are removed rather than wired
+# up on purpose - honouring a narrower operator list would REDUCE taint
+# coverage on every machine that copied this file.
 [proxy.filters.taint]
 enabled = true
-sensitive_paths = [".env", ".env.local", "credentials.json", "secrets.yaml", "id_rsa", "id_ed25519"]
-high_risk_sinks = ["network", "shell"]
-medium_risk_sinks = ["file_write"]
 
 [proxy.filters.rate_limit]
+# NOTE: this section carries the `enabled` toggle only. The numeric knobs that
+# used to sit here (file_writes_per_minute, shell_execs_per_minute,
+# network_requests_per_minute, burst_multiplier, cooldown_seconds) were never
+# read - they deserialised into a struct that has one field - so they have been
+# removed rather than left to be copied into operator configs.
 enabled = true
-file_writes_per_minute = 30
-shell_execs_per_minute = 20
-network_requests_per_minute = 60
-burst_multiplier = 3.0
+
+# Volumetric egress signals. Every value below is pinned to the filter's own
+# defaults; changing one here changes live scoring.
+[proxy.filters.egress_rate]
+enabled = true
+# Delivered (not attempted) non-routine egress per minute.
+max_egress_per_minute = 30
+max_unique_destinations_per_minute = 10
+max_unique_ports_per_minute = 8
+burst_threshold = 8
+burst_window_seconds = 10
 cooldown_seconds = 30
+# Read-then-send correlation.
+read_spike_threshold = 10
+read_window_seconds = 15
+read_then_send_egress_threshold = 3
+# Distinct REFUSED destinations per minute. Measures enumeration, not
+# persistence: retries against one host are one destination. Saturating - the
+# max score is a ceiling, not a per-destination increment - so no volume of
+# refusal can drive a deny on its own.
+blocked_spread_notice_threshold = 3
+blocked_spread_warning_threshold = 6
+blocked_spread_max_score = 2.0
 
-[proxy.filters.semantic]
-enabled = false  # Stub in v1.5, requires local embedding model
-model = "all-MiniLM-L6-v2"
-
+# `config_file` removed: the loader resolves config/filters/egress.toml from a
+# fixed candidate list (cwd-relative, then repo-relative, then the copy
+# embedded in the binary), so the key never selected anything.
 [proxy.filters.egress]
 enabled = true
-config_file = "config/filters/egress.toml"
 
+# `config_file` removed for the same reason as egress above.
 [proxy.filters.session_containment]
 enabled = true
-config_file = "config/filters/containment.toml"
 
 [reputation]
 enabled = true

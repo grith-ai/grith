@@ -1042,7 +1042,15 @@ fn handle_input_event(
                             KeyCode::Char('d') | KeyCode::Char('D') => {
                                 Some(PermissionReviewAction::Deny)
                             }
-                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                            // Only when the dialog actually offered it: the
+                            // action row hides [l] for calls with no session
+                            // key, and a hidden key must not still act.
+                            KeyCode::Char('l') | KeyCode::Char('L')
+                                if state
+                                    .permission_dialog
+                                    .as_ref()
+                                    .is_some_and(|d| d.request.sticky_grant_available) =>
+                            {
                                 Some(PermissionReviewAction::ApproveAndLearn)
                             }
                             KeyCode::Char('t') | KeyCode::Char('T') => {
@@ -2659,6 +2667,7 @@ mod tests {
                 item_number: 1,
                 total_items: 1,
                 scope_enabled: true,
+                sticky_grant_available: true,
             },
             response_tx: tx,
             show_inspect: false,
@@ -2725,6 +2734,7 @@ mod tests {
                 item_number: 1,
                 total_items: 1,
                 scope_enabled: true,
+                sticky_grant_available: true,
             },
             response_tx: tx,
             show_inspect: false,

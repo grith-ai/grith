@@ -76,3 +76,86 @@ matched = true
 # now removed at the source — the weak `*credentials*` / `*secrets*` path-match
 # globs are deleted and `sensitive_path` prices a credential filename exactly
 # once — so there is nothing left to collapse.
+
+# ── Session-state redundancy ────────────────────────────────────────────────
+# `session-containment` and `taint` both answer the same question — "did this
+# session read something sensitive?" — because containment is *armed by* taint.
+# On an outbound connect they therefore both fire and are summed, charging the
+# session's history twice:
+#
+#   operation-risk  net-connect-baseline      0.5
+#   egress-policy   unknown-destination       3.5
+#   taint           tainted-network-sink      3.0
+#   session-containment  contained-network-egress  3.5
+#                                            ────
+#                                            10.5  → auto-deny at > 8.0
+#
+# That is the ordinary "read credentials from .env, then connect to the
+# database" workflow, and it was being denied silently with no prompt. The
+# supervised tool sees only EPERM, so it cannot tell the operator why.
+#
+# Collapsing the double-count lands it on 7.5: queued for approval, which is
+# the correct outcome for an ambiguous-but-plausible action. Auto-deny stays
+# reserved for evidence about THIS call rather than the session's history.
+#
+# Deliberately keyed to `tainted-network-sink` (Medium/Low taint) only. High
+# taint is a different rule — `high-taint-network-sink`, 5.0 — so genuine
+# exfiltration of an SSH key or similar still totals 12.5 and auto-denies.
+[[meta_rules]]
+id = "contained-egress-taint-redundancy"
+score_adjustment = -3.0
+message = "Session containment and taint restate the same session history"
+
+[[meta_rules.conditions]]
+filter = "session-containment"
+rule_id = "contained-network-egress"
+matched = true
+
+[[meta_rules.conditions]]
+filter = "taint"
+rule_id = "tainted-network-sink"
+matched = true
+
+# `egress-rate`'s volumetric burst signal is the third pricing of the same
+# session history, and it stacks on top of the pair above:
+#
+#   operation-risk       net-connect-baseline          0.5
+#   egress-policy        unknown-destination           3.5
+#   taint                tainted-network-sink          3.0
+#   session-containment  contained-network-egress      3.5
+#   egress-rate          egress-burst                  4.0
+#                        contained-egress-taint-redundancy  -3.0
+#                                                     ────
+#                                                     11.5  → auto-deny at > 8.0
+#
+# Recorded on 2026-08-25 in supervised codex session 433ba7c7: the tool
+# launched headless Chrome to render an artifact, the page load fanned out to
+# 48 outbound calls in 10s against a burst threshold of 8, and 40-odd of those
+# connections — accounts.google.com, claude.ai, www.google.com — were denied
+# with no prompt. Any browser page load crosses that threshold.
+#
+# Containment is already the strictly stronger control: it puts EVERY outbound
+# call in a contained session in front of the operator, where burst only does
+# so above a rate. Summing them cannot make the session more reviewed than
+# containment already makes it — it can only convert that review into a silent
+# deny. Collapsing burst to zero lands the call on 7.5, the same place the
+# non-bursty contained connect lands.
+#
+# Note this rule can only fire when `egress-burst` is `egress-rate`'s *top*
+# signal: the filter returns a single highest result, so the read-correlated
+# `read-then-send-spike` (5.0) — the discriminator for a genuine read-then-
+# exfiltrate spree — outranks burst and is not collapsed here.
+[[meta_rules]]
+id = "contained-egress-burst-redundancy"
+score_adjustment = -4.0
+message = "Session containment already reviews every outbound call in this session"
+
+[[meta_rules.conditions]]
+filter = "session-containment"
+rule_id = "contained-network-egress"
+matched = true
+
+[[meta_rules.conditions]]
+filter = "egress-rate"
+rule_id = "egress-burst"
+matched = true

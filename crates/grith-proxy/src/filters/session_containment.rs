@@ -54,7 +54,19 @@ impl Default for SessionContainmentConfig {
                 "nslookup ".into(),
                 " dig ".into(),
             ],
-            network_score: 4.5,
+            // 3.5, not 4.5: containment must never be able to reach
+            // auto-deny by itself. An outbound connect in a contained
+            // session always carries operation-risk's net-connect baseline
+            // (0.5) and, for any destination not on the egress allowlist,
+            // egress-policy's unknown-destination (3.5 in Review mode).
+            // At 4.5 that sum is 8.5 — past the 8.0 auto-deny threshold —
+            // so a contained session reaching an undeclared host was denied
+            // silently, with no prompt, before any evidence about THIS call
+            // was considered. 3.5 lands the same combination on 7.5: still
+            // High severity, still queued for the operator, never a silent
+            // deny. Reserve auto-deny for signals intrinsic to the call
+            // (a secret in the payload, a canary token, high taint).
+            network_score: 3.5,
             process_score: 4.0,
             shell_score: 3.5,
         }
@@ -269,7 +281,9 @@ impl SessionContainmentFilter {
             // past auto-deny in contained sessions (the v0.2.5 silent-deny
             // regression). 2.0 keeps the access visible and review-worthy
             // in aggregate without ever feeding an auto-deny — the same
-            // reasoning as the routine-spawn carveout below.
+            // reasoning as the routine-spawn carveout below, and the same
+            // rule now enforced for ordinary egress by network_score itself
+            // plus the `contained-egress-taint-redundancy` meta-rule.
             ToolCallType::NetConnect { .. }
                 if matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control)) =>
             {
@@ -454,7 +468,7 @@ mod tests {
                 .unwrap();
             assert!(result.matched, "{address} must stay contained");
             assert_eq!(result.rule_id, "contained-network-egress");
-            assert_eq!(result.score, 4.5, "{address} must keep network_score");
+            assert_eq!(result.score, 3.5, "{address} must keep network_score");
         }
     }
 

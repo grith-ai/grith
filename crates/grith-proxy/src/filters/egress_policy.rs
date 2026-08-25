@@ -5,7 +5,9 @@
 
 use crate::filters::{FilterPhase, SecurityFilter};
 use crate::scoring::severity_for;
-use crate::types::{FilterResult, Severity, ToolCallContext, ToolCallType, UnixSocketClass};
+use crate::types::{
+    BindProtocol, FilterResult, Severity, ToolCallContext, ToolCallType, UnixSocketClass,
+};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -972,6 +974,49 @@ impl SecurityFilter for EgressPolicyFilter {
                             ),
                         ));
                     }
+                    // UDP client-port carveout. The rule above keys on the
+                    // *kernel* assigning the port, but a client that wants an
+                    // unpredictable source port can equally pick one itself:
+                    // Chromium's `UDPSocketPosix::RandomBind` draws a random
+                    // port in [1024, 65535] for every DNS query it sends, so
+                    // its resolver produced a stream of `wildcard-bind-
+                    // undeclared` prompts (38 in one supervised codex session
+                    // on 2026-08-25, each followed 1ms later by the DnsQuery
+                    // on that socket).
+                    //
+                    // Widening the port-0 rule to "the ephemeral range" does
+                    // not work — over half of that session's ports were below
+                    // 32768. The protocol is the signal that does: a UDP
+                    // socket never calls `listen(2)`, so bind time is the only
+                    // point at which grith sees it, and the port is all we
+                    // have to say what the bind is *for*. On a non-service
+                    // port it is a source port for datagrams this process
+                    // sends; the reply path is the connected peer, and the
+                    // egress that would tell a stranger which port to aim at
+                    // is itself scored at connect/sendto. On a service port it
+                    // is a responder a stranger can reach cold — mDNS, SSDP,
+                    // LLMNR, STUN, DHCP — and keeps the full +5.0.
+                    //
+                    // Scored (audited) at +0.5 rather than allowed silently,
+                    // like the port-0 rule. TCP is deliberately untouched:
+                    // a TCP bind is a step towards an `accept()` loop, and
+                    // work/86 has the listen-gated design for it.
+                    if !declared
+                        && is_ip_bind
+                        && ctx.bind_protocol == Some(BindProtocol::Udp)
+                        && !is_udp_service_port(*port)
+                    {
+                        return Ok(FilterResult::matched(
+                            "egress-policy",
+                            "udp-client-port-bind",
+                            0.5,
+                            severity_for(0.5),
+                            format!(
+                                "UDP source-port bind on a non-service port \
+                                 (client-socket idiom): {address}:{port}"
+                            ),
+                        ));
+                    }
                     let (rule_id, msg) = if is_wildcard {
                         match policy_match {
                             Some(m) if m.allow_clamp => {
@@ -1496,6 +1541,49 @@ fn longest_base64_run(s: &str) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// UDP ports on which a `bind(2)` makes the process reachable by a peer that
+/// has no prior knowledge of it — the ports a UDP *server* listens on.
+///
+/// This is the discriminator for the client-port carveout below, so it is a
+/// **security-relevant curated list**: adding a port here makes binds to it
+/// prompt, removing one makes them pass at +0.5. Additions are cheap and
+/// safe; removals need security-team review.
+///
+/// Everything below 1024 is covered by the `port < 1024` arm and is not
+/// repeated here. Listed are the registered/dynamic-range UDP ports where an
+/// unsolicited inbound datagram is the normal protocol shape: multicast and
+/// broadcast discovery responders (a peer on the LAN sends to the group and
+/// every listener answers), NAT-traversal rendezvous, and the well-known
+/// unprivileged service ports.
+const UDP_SERVICE_PORTS: &[u16] = &[
+    1194,  // OpenVPN
+    1701,  // L2TP
+    1812,  // RADIUS auth
+    1813,  // RADIUS accounting
+    1900,  // SSDP / UPnP discovery
+    3478,  // STUN
+    3479,  // STUN (alt)
+    4500,  // IPsec NAT-T
+    5060,  // SIP
+    5061,  // SIP/TLS
+    5349,  // TURN over TLS
+    5353,  // mDNS
+    5355,  // LLMNR
+    6771,  // BitTorrent local peer discovery
+    11211, // memcached
+    27015, // Source engine query
+    51820, // WireGuard
+];
+
+/// Whether a UDP bind to `port` exposes a service a stranger can reach.
+///
+/// `< 1024` is the privileged range: binding there is a deliberate act that
+/// names a well-known service, never the by-product of opening a client
+/// socket. Above it, only the curated registry counts.
+fn is_udp_service_port(port: u16) -> bool {
+    port < 1024 || UDP_SERVICE_PORTS.contains(&port)
 }
 
 /// Returns `true` if the bind address is a loopback address that OpenClaw allows
@@ -2817,6 +2905,158 @@ mod tests {
         let result = filter.evaluate(&ctx).await.unwrap();
         assert_eq!(result.rule_id, "ephemeral-port-bind");
         assert!(result.score <= 0.5);
+    }
+
+    /// Chromium's `UDPSocketPosix::RandomBind` picks its own random source
+    /// port in [1024, 65535] for every DNS query, so its resolver walked
+    /// straight past the port-0 carveout: 38 `wildcard-bind-undeclared`
+    /// prompts in supervised codex session 433ba7c7 on 2026-08-25, each one
+    /// followed 1ms later by the DnsQuery on that socket. The exact ports
+    /// observed are replayed here — note how many fall below the kernel's
+    /// 32768 ephemeral floor, which is why a port-range heuristic could not
+    /// have fixed this.
+    #[tokio::test]
+    async fn udp_client_port_wildcard_bind_scores_low() {
+        let filter = EgressPolicyFilter::with_defaults();
+        for port in [3247u16, 7471, 8160, 9502, 12235, 20590, 34756, 62699, 65489] {
+            let mut ctx = make_ctx_with_profile(
+                ToolCallType::NetListen {
+                    address: "0.0.0.0".into(),
+                    port,
+                },
+                "codex",
+            );
+            ctx.bind_protocol = Some(BindProtocol::Udp);
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert!(result.matched, "0.0.0.0:{port} must still be audited");
+            assert_eq!(result.rule_id, "udp-client-port-bind", "port={port}");
+            assert!(
+                result.score <= 0.5,
+                "0.0.0.0:{port} must score at most 0.5, got {}",
+                result.score
+            );
+        }
+    }
+
+    /// The carveout is keyed on the protocol, not the port shape. A TCP bind
+    /// to the same random port is a step towards an `accept()` loop and keeps
+    /// the full +5.0 — work/86 holds the listen-gated design for TCP.
+    #[tokio::test]
+    async fn tcp_bind_on_same_port_still_queues() {
+        let filter = EgressPolicyFilter::with_defaults();
+        for protocol in [Some(BindProtocol::Tcp), None] {
+            let mut ctx = make_ctx_with_profile(
+                ToolCallType::NetListen {
+                    address: "0.0.0.0".into(),
+                    port: 62699,
+                },
+                "codex",
+            );
+            ctx.bind_protocol = protocol;
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert_eq!(
+                result.rule_id, "wildcard-bind-undeclared",
+                "protocol={protocol:?} must keep the full prompt"
+            );
+            assert!(result.score >= 5.0);
+        }
+    }
+
+    /// The UDP ports a stranger can reach cold — multicast/broadcast
+    /// discovery responders and NAT-traversal rendezvous — are the reason
+    /// this carveout is port-gated rather than protocol-gated. Binding one
+    /// stands up a service, and must still prompt.
+    #[tokio::test]
+    async fn udp_service_port_binds_still_queue() {
+        let filter = EgressPolicyFilter::with_defaults();
+        // 5353 mDNS, 5355 LLMNR, 1900 SSDP, 3478 STUN, 51820 WireGuard,
+        // 68 DHCP client (privileged range), 53 DNS server.
+        for port in [53u16, 68, 1900, 3478, 5353, 5355, 51820] {
+            let mut ctx = make_ctx_with_profile(
+                ToolCallType::NetListen {
+                    address: "0.0.0.0".into(),
+                    port,
+                },
+                "codex",
+            );
+            ctx.bind_protocol = Some(BindProtocol::Udp);
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert_eq!(
+                result.rule_id, "wildcard-bind-undeclared",
+                "UDP service port {port} must still be reviewed"
+            );
+            assert!(result.score >= 5.0, "port={port}");
+        }
+    }
+
+    /// A declaration wins over the heuristic in both directions, exactly as
+    /// it does for the port-0 rule: `allow_clamp = false` is the operator
+    /// asking to see the bind.
+    #[tokio::test]
+    async fn declared_no_clamp_udp_client_port_still_queues() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let mut ctx = make_ctx_with_profile(
+            ToolCallType::NetListen {
+                address: "0.0.0.0".into(),
+                port: 62699,
+            },
+            "codex",
+        );
+        ctx.bind_protocol = Some(BindProtocol::Udp);
+        ctx.listener_policy_match = Some(crate::types::ListenerPolicyMatch {
+            allow_clamp: false,
+            desc: "surface these".into(),
+        });
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "wildcard-bind-declared-no-clamp");
+        assert!(result.score >= 5.0);
+    }
+
+    /// A UDP bind to a specific non-loopback interface is the same client
+    /// idiom with an explicit source address — `curl --interface`, a VPN
+    /// split-tunnel, a multi-homed resolver picking its egress NIC.
+    #[tokio::test]
+    async fn udp_client_port_specific_iface_bind_scores_low() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let mut ctx = make_ctx_with_profile(
+            ToolCallType::NetListen {
+                address: "192.168.68.112".into(),
+                port: 41000,
+            },
+            "codex",
+        );
+        ctx.bind_protocol = Some(BindProtocol::Udp);
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_eq!(result.rule_id, "udp-client-port-bind");
+        assert!(result.score <= 0.5);
+    }
+
+    /// Loopback binds never reach the carveout — they are already unscored,
+    /// and the early return must not change that.
+    #[tokio::test]
+    async fn udp_loopback_bind_unaffected() {
+        let filter = EgressPolicyFilter::with_defaults();
+        let mut ctx = make_ctx_with_profile(
+            ToolCallType::NetListen {
+                address: "127.0.0.1".into(),
+                port: 41000,
+            },
+            "codex",
+        );
+        ctx.bind_protocol = Some(BindProtocol::Udp);
+        let result = filter.evaluate(&ctx).await.unwrap();
+        assert_ne!(result.rule_id, "udp-client-port-bind");
+        assert!(result.score < 0.5, "got {}", result.score);
+    }
+
+    #[test]
+    fn udp_service_port_registry_covers_the_privileged_range() {
+        assert!(is_udp_service_port(0));
+        assert!(is_udp_service_port(53));
+        assert!(is_udp_service_port(1023));
+        assert!(!is_udp_service_port(1024));
+        assert!(is_udp_service_port(5353));
+        assert!(!is_udp_service_port(5354));
     }
 
     /// A DECLARED port-0 entry with allow_clamp = false is the operator

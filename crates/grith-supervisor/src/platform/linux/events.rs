@@ -1334,7 +1334,7 @@ impl PtraceSupervisor {
     ///
     /// Returns `None` if the file cannot be read or parsed (e.g., the
     /// process has already exited).
-    fn resolve_tgid(tid: u32) -> Option<u32> {
+    pub(super) fn resolve_tgid(tid: u32) -> Option<u32> {
         let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
         for line in status.lines() {
             if let Some(value) = line.strip_prefix("Tgid:") {

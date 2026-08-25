@@ -22,6 +22,11 @@ pub struct SecurityProxy {
     allow_count: AtomicU64,
     queue_count: AtomicU64,
     deny_count: AtomicU64,
+    /// Evaluations that reported a final outcome. Compared against
+    /// `call_count` to surface outcome-wiring leaks as a number.
+    observed_count: AtomicU64,
+    observed_executed: AtomicU64,
+    observed_suppressed: AtomicU64,
 }
 
 impl SecurityProxy {
@@ -40,6 +45,9 @@ impl SecurityProxy {
             allow_count: AtomicU64::new(0),
             queue_count: AtomicU64::new(0),
             deny_count: AtomicU64::new(0),
+            observed_count: AtomicU64::new(0),
+            observed_executed: AtomicU64::new(0),
+            observed_suppressed: AtomicU64::new(0),
         }
     }
 
@@ -54,6 +62,51 @@ impl SecurityProxy {
         let removed = self.registry.evict_session_state(scope);
         crate::session_state::SessionStateRegistry::global().evict(scope);
         removed
+    }
+
+    /// Commit filter state for a call whose fate is final. Fans out exactly
+    /// like [`Self::evict_session_state`].
+    ///
+    /// The caller owns the exactly-once contract; the proxy deliberately does
+    /// not track outstanding evaluations, because a leaked one is already
+    /// fail-safe. `evaluate` is pure over filter state, so an evaluation that
+    /// never reaches here has staged nothing and commits nothing.
+    ///
+    /// The counters exist so that failure is a number rather than a silence:
+    /// `call_count - observed_count` is the running total of evaluations that
+    /// never reported a fate. A few are by design (the dashboard's test
+    /// endpoint, one-shot CLI evaluations), so the figure is a baseline to
+    /// watch for drift, not an assertion that it should be zero. A climbing
+    /// delta means outcome wiring has regressed and some stateful filter has
+    /// quietly stopped accumulating.
+    pub fn observe_outcome(
+        &self,
+        ctx: &ToolCallContext,
+        outcome: crate::types::CallOutcome,
+        attempt_age: std::time::Duration,
+    ) {
+        self.observed_count.fetch_add(1, Ordering::Relaxed);
+        if outcome.executed() {
+            self.observed_executed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.observed_suppressed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.registry.observe_outcome(ctx, outcome, attempt_age);
+    }
+
+    /// Evaluations that have reported a final outcome.
+    pub fn observed_count(&self) -> u64 {
+        self.observed_count.load(Ordering::Relaxed)
+    }
+
+    /// Observed calls the kernel actually ran.
+    pub fn observed_executed(&self) -> u64 {
+        self.observed_executed.load(Ordering::Relaxed)
+    }
+
+    /// Observed calls stopped before the kernel ran them.
+    pub fn observed_suppressed(&self) -> u64 {
+        self.observed_suppressed.load(Ordering::Relaxed)
     }
 
     /// Evaluate a tool call through the full filter pipeline.

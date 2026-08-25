@@ -75,6 +75,41 @@ pub trait SecurityFilter: Send + Sync {
     fn evict_session_state(&self, _scope: crate::types::SessionScopeKey) -> usize {
         0
     }
+
+    /// Commit session state for a call whose fate is now final.
+    ///
+    /// INVARIANT: a filter implementing this must keep [`Self::evaluate`] PURE
+    /// over its session state. `evaluate` reads committed history and treats
+    /// the in-flight call as a hypothetical; this hook is the only place a
+    /// filter may write. That split is what makes a signal describe what
+    /// happened rather than what was attempted - the egress-rate filter used to
+    /// record inside `evaluate`, so a refused `connect()` counted exactly like
+    /// a delivered one and a retry loop inflated the score refusing it.
+    ///
+    /// PAIRING: this pairs with `evaluate`, NOT with the caller's outcome
+    /// sites. A call that never reached `evaluate` never staged anything and
+    /// owes no observation, which is why the many early-return paths that skip
+    /// the pipeline entirely need no wiring.
+    ///
+    /// `attempt_age` is how long ago the paired `evaluate` ran. A queued call
+    /// can resolve minutes after its attempt - far longer than the windows any
+    /// filter here reads - so a filter with time-windowed state MUST stamp its
+    /// commit at `now - attempt_age`, never at `now`, or a queued-then-approved
+    /// call lands after the events it was supposed to correlate with.
+    ///
+    /// A missed call is a lost commit, never corrupt state: an evaluation that
+    /// leaks commits nothing, which can only under-count. Never the reverse.
+    ///
+    /// Synchronous by design, so an implementer can hold a `std::sync::Mutex`
+    /// without ever spanning an await, and the filters that will never
+    /// implement it pay no `async_trait` boxing.
+    fn observe_outcome(
+        &self,
+        _ctx: &ToolCallContext,
+        _outcome: crate::types::CallOutcome,
+        _attempt_age: std::time::Duration,
+    ) {
+    }
 }
 
 /// Canonicalise a filter name, mapping the legacy snake_case names (in use
@@ -200,6 +235,19 @@ impl FilterRegistry {
             .iter()
             .map(|f| f.evict_session_state(scope))
             .sum()
+    }
+
+    /// Fan a final call outcome out to every filter so the stateful ones can
+    /// commit. See [`SecurityFilter::observe_outcome`] for the contract.
+    pub fn observe_outcome(
+        &self,
+        ctx: &ToolCallContext,
+        outcome: crate::types::CallOutcome,
+        attempt_age: std::time::Duration,
+    ) {
+        for filter in &self.filters {
+            filter.observe_outcome(ctx, outcome, attempt_age);
+        }
     }
 
     /// Summary information about all registered filters.

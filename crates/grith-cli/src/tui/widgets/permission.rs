@@ -744,18 +744,24 @@ fn render_help_body(frame: &mut Frame, area: Rect, req: &PermissionRequest, is_d
         lines.push(help_line(
             "[a]",
             GREEN_HI,
-            "Allow this request; the exact target stays allowed for this session",
+            if req.sticky_grant_available {
+                "Allow this request; the exact target stays allowed for this session"
+            } else {
+                "Allow this request only; this kind of call is asked every time"
+            },
         ));
         lines.push(help_line(
             "[d]",
             RED,
             "Block this request; identical retries are blocked for a short window",
         ));
-        lines.push(help_line(
-            "[l]",
-            BLUE,
-            "Allow and save a permanent rule for this exact target",
-        ));
+        if req.sticky_grant_available {
+            lines.push(help_line(
+                "[l]",
+                BLUE,
+                "Allow and save a permanent rule for this exact target",
+            ));
+        }
         if ScopeDialogState::for_request(req).is_some() {
             lines.push(help_line(
                 "[s]",
@@ -777,7 +783,11 @@ fn render_help_body(frame: &mut Frame, area: Rect, req: &PermissionRequest, is_d
         lines.push(help_line("[esc]", TEXT_MID, "Deny this request"));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            " Nothing outlives the session unless saved with [l]; sensitive targets are never saved.",
+            if req.sticky_grant_available {
+                " Nothing outlives the session unless saved with [l]; sensitive targets are never saved."
+            } else {
+                " No answer to this request is remembered — it is a class grith asks about every time."
+            },
             Style::new().fg(TEXT_DIM),
         )));
     }
@@ -1781,9 +1791,15 @@ fn render_dialog_body(
             Span::styled("Approve   ", Style::new().fg(TEXT_MID)),
             Span::styled(" [d] ", Style::new().fg(RED)),
             Span::styled("Deny   ", Style::new().fg(TEXT_MID)),
-            Span::styled(" [l] ", Style::new().fg(BLUE)),
-            Span::styled("Always allow  ", Style::new().fg(TEXT_MID)),
         ];
+        // A call with no session-allowlist key cannot carry a grant, so
+        // offering [l] would promise something the supervisor discards.
+        if req.sticky_grant_available {
+            actions.extend([
+                Span::styled(" [l] ", Style::new().fg(BLUE)),
+                Span::styled("Always allow  ", Style::new().fg(TEXT_MID)),
+            ]);
+        }
         if ScopeDialogState::for_request(req).is_some() {
             actions.extend([
                 Span::styled(" [s] ", Style::new().fg(AMBER)),
@@ -2301,9 +2317,14 @@ fn render_panel_body(
             Span::styled("Approve  ", Style::new().fg(TEXT_MID)),
             Span::styled(" [d] ", Style::new().fg(RED)),
             Span::styled("Deny  ", Style::new().fg(TEXT_MID)),
-            Span::styled(" [l] ", Style::new().fg(BLUE)),
-            Span::styled("Always allow  ", Style::new().fg(TEXT_MID)),
         ];
+        // See the sibling action row: no key, no grant, no [l].
+        if req.sticky_grant_available {
+            actions.extend([
+                Span::styled(" [l] ", Style::new().fg(BLUE)),
+                Span::styled("Always allow  ", Style::new().fg(TEXT_MID)),
+            ]);
+        }
         if ScopeDialogState::for_request(req).is_some() {
             actions.extend([
                 Span::styled(" [s] ", Style::new().fg(AMBER)),
@@ -2578,6 +2599,7 @@ mod tests {
             item_number: 1,
             total_items: 2,
             scope_enabled: false,
+            sticky_grant_available: true,
         }
     }
 
@@ -2933,6 +2955,79 @@ mod tests {
         assert!(contents.contains("Back to the request"));
         // scope_enabled is false on the fixture — no [s] row.
         assert!(!contents.contains("[s]"));
+    }
+
+    /// A D-Bus method call has no session-allowlist key, so the supervisor
+    /// discards any grant recorded for it. Offering "[l] Always allow" there
+    /// tells the operator their answer will be remembered when it will not —
+    /// the shape of the `StartTransientUnit` prompts that re-asked after
+    /// every approval in supervised session 433ba7c7 (2026-08-25).
+    #[test]
+    fn dialog_hides_always_allow_when_no_grant_can_be_recorded() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut req = make_request(false);
+        req.tool = "DbusMethodCall(unix:/run/user/1000/bus org.freedesktop.systemd1 \
+             org.freedesktop.systemd1.Manager.StartTransientUnit)"
+            .to_string();
+        req.call_type = "DbusMethodCall".to_string();
+        req.sticky_grant_available = false;
+
+        terminal
+            .draw(|frame| render_permission_dialog(frame, &req, false, false))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(
+            contents.contains("[a]") && contents.contains("[d]"),
+            "approve and deny must still be offered"
+        );
+        assert!(
+            !contents.contains("Always allow"),
+            "a grant that cannot be recorded must not be offered: {contents}"
+        );
+    }
+
+    /// The default — anything with a key keeps the option.
+    #[test]
+    fn dialog_offers_always_allow_when_a_grant_sticks() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let req = make_request(false);
+        assert!(req.sticky_grant_available);
+
+        terminal
+            .draw(|frame| render_permission_dialog(frame, &req, false, false))
+            .unwrap();
+
+        assert!(buffer_contents(&terminal).contains("Always allow"));
+    }
+
+    /// The help overlay must not promise a durable answer either — including
+    /// the `[a]` line, which claims the target "stays allowed for this
+    /// session".
+    #[test]
+    fn help_panel_drops_the_permanence_promise_without_a_grant() {
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut req = make_request(false);
+        req.call_type = "DbusMethodCall".to_string();
+        req.sticky_grant_available = false;
+
+        terminal
+            .draw(|frame| render_permission_help_panel(frame, frame.area(), &req, false))
+            .unwrap();
+
+        let contents = buffer_contents(&terminal);
+        assert!(
+            !contents.contains("permanent rule"),
+            "no [l] row: {contents}"
+        );
+        assert!(
+            !contents.contains("stays allowed for this session"),
+            "[a] must not promise session persistence either: {contents}"
+        );
+        assert!(contents.contains("asked every time"), "{contents}");
     }
 
     #[test]

@@ -13,6 +13,10 @@
 //!   Wildcard declared + clamp → no rule fires (Phase D clamps).
 //!   Specific non-loopback     → `specific-iface-bind`,               +5.0 QUEUE
 //!
+//! Plus the UDP client-port carveout (2026-08-25): an undeclared, non-service
+//! UDP bind is a source port for datagrams the process sends, not a listener,
+//! and must ALLOW at +0.5 rather than queue.
+//!
 //! Coverage maps to the task list:
 //!   F3 → listener_loopback_silent
 //!   F4 → listener_wildcard_undeclared
@@ -294,4 +298,80 @@ async fn declared_clamp_match_silences_bind_regardless_of_port() {
         .filter_results
         .iter()
         .any(|r| r.matched && r.rule_id == "wildcard-bind-undeclared"));
+}
+
+// ---------------------------------------------------------------------------
+// UDP client-port carveout — Chromium's resolver flood, 2026-08-25
+// ---------------------------------------------------------------------------
+
+use grith_proxy::types::BindProtocol;
+
+fn udp_ctx(address: &str, port: u16) -> ToolCallContext {
+    let mut ctx = netlisten_ctx(address, port);
+    ctx.bind_protocol = Some(BindProtocol::Udp);
+    ctx
+}
+
+/// Chromium's `UDPSocketPosix::RandomBind` binds a self-chosen random source
+/// port for every DNS query. Through the whole proxy stack that must now
+/// ALLOW — not queue — or a supervised tool that launches a browser floods
+/// the operator with one prompt per name resolved.
+#[tokio::test]
+async fn udp_client_port_bind_allows_through_the_proxy() {
+    let proxy = proxy_with_egress();
+
+    // The exact ports recorded in supervised codex session 433ba7c7.
+    for port in [3247u16, 7471, 20590, 34756, 62699, 65489] {
+        for addr in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let ctx = udp_ctx(addr, port);
+            let decision = proxy.evaluate(&ctx).await;
+            let rule = decision
+                .filter_results
+                .iter()
+                .find(|r| r.matched && r.filter_name == "egress-policy")
+                .unwrap_or_else(|| panic!("{addr}:{port} should still be audited"));
+            assert_eq!(rule.rule_id, "udp-client-port-bind", "{addr}:{port}");
+            assert!(
+                matches!(decision.action, ProxyAction::Allow),
+                "{addr}:{port} must allow, got {:?} at {}",
+                decision.action,
+                decision.composite_score
+            );
+        }
+    }
+}
+
+/// The same bind on a UDP service port stands up a responder a stranger can
+/// reach cold, and must keep queueing.
+#[tokio::test]
+async fn udp_service_port_bind_still_queues_through_the_proxy() {
+    let proxy = proxy_with_egress();
+
+    for port in [53u16, 68, 1900, 3478, 5353, 5355, 51820] {
+        let ctx = udp_ctx("0.0.0.0", port);
+        let decision = proxy.evaluate(&ctx).await;
+        assert!(
+            matches!(decision.action, ProxyAction::Queue { .. }),
+            "UDP service port {port} must stay reviewable, got {:?}",
+            decision.action
+        );
+    }
+}
+
+/// A TCP bind on the same port keeps the full prompt — the carveout is keyed
+/// on the transport, and `None` (an unresolvable socket) is treated as TCP.
+#[tokio::test]
+async fn tcp_bind_on_a_client_shaped_port_still_queues() {
+    let proxy = proxy_with_egress();
+
+    for protocol in [Some(BindProtocol::Tcp), None] {
+        let mut ctx = netlisten_ctx("0.0.0.0", 62699);
+        ctx.bind_protocol = protocol;
+        let decision = proxy.evaluate(&ctx).await;
+        assert!(
+            matches!(decision.action, ProxyAction::Queue { .. }),
+            "protocol={protocol:?} must stay reviewable, got {:?}",
+            decision.action
+        );
+    }
 }
