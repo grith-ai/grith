@@ -73,7 +73,7 @@ Every release ships a static musl binary with a SHA-256 checksum, a cosign keyle
 
 ## What leaves your machine
 
-By default, nothing. The free tier runs entirely offline: no account, no telemetry, and the audit log stays in local SQLite. Paid tiers validate their licence against grith.ai roughly once a day, and sync audit records only until you turn that off with `general.audit_sync = false` (licence validation continues; air-gapped deployments disable it too).
+By default, nothing. The free tier runs entirely offline: no account, no telemetry, and the audit log stays in local SQLite. Paid tiers validate their licence against grith.ai roughly once a day, and sync aggregated analytics - counts, verdicts, risk and filter attribution, never commands, file paths, prompts or payloads - until you turn that off with `general.audit_sync = false` (licence validation continues; air-gapped deployments disable it too). The raw audit log never leaves your machine.
 
 Supervision-escape enforcement is **on by default** as of v0.2.5: spawning something that hands work to an unsupervised peer (`systemd-run`, `docker`, `tmux`) reaches the review queue rather than running unseen. Non-interactive sessions have no one to ask, so they fail safe and deny - if a CI script legitimately delegates, permit the binary in its profile or set `supervisor.enforce_authority_delegating_spawn = false`.
 
