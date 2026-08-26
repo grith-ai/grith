@@ -32,6 +32,12 @@
 //! The mirror is intentionally limited to fullscreen redrawers. Normal
 //! line-oriented output continues to use `vt100`'s native scrollback on
 //! the live parser.
+//!
+//! The overlap heuristic is a fallback, not the primary record. A tool that
+//! emits its transcript through a top-anchored scroll region (Codex — see
+//! `super::scroll_region`) hands us the exact rows as they leave the screen;
+//! once that starts, those rows are the history and the heuristic stands
+//! down.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -128,6 +134,11 @@ pub struct FullscreenScrollback {
     scan_tail: Vec<u8>,
     /// True after the mirror has been disabled (e.g. capacity == 0).
     enabled: bool,
+    /// True once a top-anchored scroll region has evicted a row. From that
+    /// point `lines` is an exact transcript record and the frame-overlap
+    /// heuristic is switched off — guessing at displacement could only
+    /// duplicate rows the eviction path already delivers precisely.
+    region_history_active: bool,
 }
 
 impl FullscreenScrollback {
@@ -148,6 +159,7 @@ impl FullscreenScrollback {
             in_alt_screen: false,
             scan_tail: Vec::with_capacity(SCAN_TAIL_MAX),
             enabled,
+            region_history_active: false,
         }
     }
 
@@ -165,7 +177,59 @@ impl FullscreenScrollback {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames_pushed == 0
+        self.frames_pushed == 0 && self.lines.is_empty()
+    }
+
+    /// True once rows have been recovered from a top-anchored scroll region.
+    pub fn region_history_active(&self) -> bool {
+        self.region_history_active
+    }
+
+    /// Commit rows that a top-anchored scroll region pushed off the screen.
+    ///
+    /// These are exact — the caller read them off the grid immediately before
+    /// the scrolling byte reached the parser — so they supersede anything the
+    /// frame-overlap heuristic inferred. The first eviction therefore drops
+    /// the heuristic's accumulated guesses: keeping them would duplicate rows
+    /// this path is about to deliver properly.
+    pub fn push_scrolled_out_rows<I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        if !self.enabled {
+            return;
+        }
+        if !self.region_history_active {
+            self.region_history_active = true;
+            self.lines.clear();
+        }
+        self.lines.extend(rows);
+        self.trim_to_capacity();
+    }
+
+    /// Replace the newest-screen rows with the live viewport. Used while
+    /// region history is authoritative, where the newest screen is simply
+    /// "what is on screen now" and needs no overlap analysis.
+    pub fn sync_live_frame(&mut self, screen: &vt100::Screen) {
+        if !self.enabled {
+            return;
+        }
+        let (_rows, cols) = screen.size();
+        self.current_frame = screen
+            .rows(0, cols)
+            .map(|row_text| row_text.trim_end().to_string())
+            .collect();
+        self.trim_to_capacity();
+    }
+
+    /// FIFO-evict committed history past the soft memory cap. The newest
+    /// screen counts toward the same budget.
+    fn trim_to_capacity(&mut self) {
+        while self.lines.len() + self.current_frame.len() > self.capacity {
+            if self.lines.pop_front().is_none() {
+                break;
+            }
+        }
     }
 
     /// Total reconstructed transcript lines: committed history plus the
@@ -352,13 +416,7 @@ impl FullscreenScrollback {
             .collect();
         self.merge_frame(next_frame);
 
-        // FIFO-evict past capacity, counting the current viewport toward the
-        // same soft memory cap.
-        while self.lines.len() + self.current_frame.len() > self.capacity {
-            if self.lines.pop_front().is_none() {
-                break;
-            }
-        }
+        self.trim_to_capacity();
 
         self.last_signature = Some(signature);
         self.last_capture_at = Some(now);
@@ -391,6 +449,12 @@ impl FullscreenScrollback {
     /// elapsed-time counters, input chrome) provide no positive displacement
     /// and therefore add no history.
     fn merge_frame(&mut self, next_frame: Vec<String>) {
+        if self.region_history_active {
+            // History is recorded exactly at eviction time; the newest screen
+            // is taken verbatim.
+            self.current_frame = next_frame;
+            return;
+        }
         if self.current_frame.is_empty() {
             self.current_frame = next_frame;
             return;
@@ -446,6 +510,7 @@ impl FullscreenScrollback {
         self.repaint_signal_score = 0;
         self.pending_repaint_signals = 0;
         self.scan_tail.clear();
+        self.region_history_active = false;
     }
 
     /// Most-recent capture time, for diagnostics / tests.
@@ -1161,5 +1226,84 @@ mod tests {
         let s = screen_from(b"x");
         sb.capture_if_boundary_reached(&s, Instant::now());
         assert_eq!(sb.frames_pushed(), 0);
+    }
+
+    #[test]
+    fn evicted_rows_are_recorded_verbatim_and_supersede_guesses() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+        capture_sync_frame(
+            &mut sb,
+            &["HEADER", "guessed row alpha", "guessed row beta"],
+        );
+        capture_sync_frame(&mut sb, &["HEADER", "guessed row beta", "newer row gamma"]);
+        assert!(
+            !sb.lines.is_empty(),
+            "the overlap heuristic should have committed something to displace"
+        );
+        assert!(!sb.region_history_active());
+
+        sb.push_scrolled_out_rows(["evicted one".to_string(), "evicted two".to_string()]);
+        assert!(sb.region_history_active());
+        assert_eq!(
+            sb.lines,
+            VecDeque::from(["evicted one".to_string(), "evicted two".to_string()]),
+            "the exact record replaces the heuristic's guesses"
+        );
+    }
+
+    #[test]
+    fn region_history_frames_are_taken_verbatim() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.observe_bytes(b"\x1b[2J\x1b[H\x1b[1;24r");
+        sb.push_scrolled_out_rows(["scrolled away".to_string()]);
+
+        // Two frames that overlap heavily. Without region history the merge
+        // heuristic would archive the displaced row; with it, history only
+        // ever grows at eviction time.
+        capture_sync_frame(&mut sb, &["row one", "row two", "row three"]);
+        capture_sync_frame(&mut sb, &["row two", "row three", "row four"]);
+
+        assert_eq!(sb.lines, VecDeque::from(["scrolled away".to_string()]));
+        let all = sb.visible_window(usize::MAX, 0);
+        assert_eq!(all.iter().filter(|line| **line == "row two").count(), 1);
+    }
+
+    #[test]
+    fn sync_live_frame_tracks_the_current_screen() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.push_scrolled_out_rows(["older".to_string()]);
+        sb.sync_live_frame(&screen_from_lines(&["live one", "live two"]));
+        let all = sb.visible_window(usize::MAX, 0);
+        assert_eq!(all[0], "older");
+        assert!(all.contains(&"live one"));
+        assert!(all.contains(&"live two"));
+
+        sb.sync_live_frame(&screen_from_lines(&["live three"]));
+        let all = sb.visible_window(usize::MAX, 0);
+        assert_eq!(all[0], "older");
+        assert!(
+            !all.contains(&"live one"),
+            "the newest screen replaces the previous one rather than stacking"
+        );
+    }
+
+    #[test]
+    fn evicted_rows_respect_the_capacity_cap() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.capacity = 4;
+        sb.push_scrolled_out_rows((0..10).map(|n| format!("row {n}")));
+        assert_eq!(sb.lines.len(), 4);
+        assert_eq!(sb.lines.front().map(String::as_str), Some("row 6"));
+    }
+
+    #[test]
+    fn clear_resets_region_history() {
+        let mut sb = FullscreenScrollback::with_default_capacity();
+        sb.push_scrolled_out_rows(["gone".to_string()]);
+        assert!(sb.region_history_active());
+        sb.clear();
+        assert!(!sb.region_history_active());
+        assert_eq!(sb.line_count(), 0);
     }
 }

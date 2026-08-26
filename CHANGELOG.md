@@ -10,6 +10,18 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 _Nothing yet._
 
+## [0.3.3] - 2026-08-26
+
+### Fixed
+
+- **Scrolling back in `grith exec codex` no longer showed the wrong thing.**
+  Codex writes its transcript by scrolling a region at the top of the screen,
+  a technique grith's terminal handling did not account for — rows it scrolled
+  away were destroyed, so scrolling back instead reconstructed startup
+  banners, menus, and the same paragraph two or three times over. Those rows
+  are now captured before they're lost, so scrollback shows the real,
+  in-order transcript.
+
 ## [0.3.2] - 2026-08-25
 
 ### Added

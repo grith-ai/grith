@@ -48,6 +48,7 @@ use crossbeam_channel::{unbounded, Receiver as CbReceiver, Select, TryRecvError}
 use grith_digest::PermissionReviewAction;
 
 use super::fullscreen_scrollback::FullscreenScrollback;
+use super::scroll_region::{Piece, ScrollRegionTracker};
 use super::theme::*;
 use super::widgets;
 
@@ -171,6 +172,10 @@ pub struct ExecState {
     /// machinery handles the actual scroll buffer. Active only when the
     /// supervised tool emits fullscreen repaint signals.
     fullscreen_scrollback: FullscreenScrollback,
+    /// DECSTBM tracker. `vt100` discards rows scrolled out of a top-anchored
+    /// scroll region, which is exactly how Codex-style tools emit their
+    /// transcript; this keeps them so they reach scrollback.
+    scroll_region: ScrollRegionTracker,
     /// Active permission dialog (None = no dialog open).
     permission_dialog: Option<PermissionDialog>,
     /// Pending permission requests waiting for the current dialog to close.
@@ -284,6 +289,7 @@ impl ExecState {
                 fs.resize_mirror(vterm_rows, cols);
                 fs
             },
+            scroll_region: ScrollRegionTracker::new(vterm_rows),
             permission_dialog: None,
             pending_permissions: Vec::new(),
             last_pty_activity: Instant::now(),
@@ -369,6 +375,12 @@ impl ExecState {
     /// least one captured snapshot — scrollback navigation should walk that
     /// ring instead of the (mostly empty) `vt100` scrollback grid.
     fn use_fullscreen_history(&self) -> bool {
+        // Rows evicted by a top-anchored scroll region are an exact record of
+        // what left the screen, not a reconstruction — always prefer them.
+        // vt100 never saw them, so its own scrollback has nothing to offer.
+        if self.fullscreen_scrollback.region_history_active() {
+            return true;
+        }
         // Claude Code prints its conversation as line-oriented output, which
         // lands in vt100's 10k-line scrollback (proven: scrolling it natively
         // shows the real transcript). It only trips `repaint_mode` because it
@@ -478,6 +490,7 @@ fn resize_exec_surface(state: &mut ExecState, pty_tx: &mpsc::Sender<PtyInput>, r
     state
         .fullscreen_scrollback
         .resize_mirror(rows, state.vterm_cols);
+    state.scroll_region.resize(rows);
     let _ = pty_tx.send(PtyInput::Resize {
         cols: state.vterm_cols,
         rows,
@@ -505,9 +518,8 @@ fn process_pty_bytes_resilient(state: &mut ExecState, bytes: &[u8]) {
         &mut state.vterm,
         vt100::Parser::new(state.vterm_rows, state.vterm_cols, 10_000),
     );
-    let bytes_vec = bytes.to_vec();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parser.process(&bytes_vec);
+        parser.process(bytes);
     }));
     match outcome {
         Ok(()) => {
@@ -522,11 +534,74 @@ fn process_pty_bytes_resilient(state: &mut ExecState, bytes: &[u8]) {
             tracing::error!(
                 rows = state.vterm_rows,
                 cols = state.vterm_cols,
-                dropped_bytes = bytes_vec.len(),
+                dropped_bytes = bytes.len(),
                 "vt100 parser panicked; reset to fresh parser (terminal content may be lost for this chunk)"
             );
         }
     }
+}
+
+/// Feed a PTY chunk to the parser, preserving the rows a top-anchored scroll
+/// region scrolls away.
+///
+/// Every real terminal saves a row that scrolls off the top of a region whose
+/// top margin is line 1 — that rule is the whole reason Codex (and other
+/// bottom-composer TUIs) emit their transcript by setting `CSI 1;N r` and
+/// newlining through it. `vt100` 0.15 implements no such rule and simply drops
+/// those rows, so under `grith exec` the transcript existed nowhere: scrollback
+/// could only show what the frame mirror managed to reconstruct from repaints.
+///
+/// The chunk is therefore split at each scrolling operation, and the rows about
+/// to leave the region are read off the screen just before the operation
+/// reaches the parser.
+fn feed_pty_bytes(state: &mut ExecState, bytes: &[u8]) {
+    let pieces = state.scroll_region.split(bytes);
+    // Overwhelmingly the common case: nothing in this chunk can scroll a row
+    // off the top, so hand it to the parser whole.
+    if let [Piece::Bytes(_)] = pieces.as_slice() {
+        process_pty_bytes_resilient(state, bytes);
+        return;
+    }
+    for piece in pieces {
+        match piece {
+            Piece::Bytes(range) => process_pty_bytes_resilient(state, &bytes[range]),
+            Piece::Scroll {
+                range,
+                lines,
+                needs_cursor_at_bottom,
+                region_bottom,
+            } => {
+                let evicted =
+                    rows_about_to_scroll_out(state, lines, needs_cursor_at_bottom, region_bottom);
+                process_pty_bytes_resilient(state, &bytes[range]);
+                if !evicted.is_empty() {
+                    state.fullscreen_scrollback.push_scrolled_out_rows(evicted);
+                }
+            }
+        }
+    }
+}
+
+/// Rows that the pending scroll operation will push off the top of the region.
+///
+/// A line-feed-shaped trigger only scrolls when the cursor already sits on the
+/// region's last row; anywhere else it just moves the cursor down and nothing
+/// is evicted.
+fn rows_about_to_scroll_out(
+    state: &ExecState,
+    lines: u16,
+    needs_cursor_at_bottom: bool,
+    region_bottom: u16,
+) -> Vec<String> {
+    let screen = state.vterm.screen();
+    if needs_cursor_at_bottom && screen.cursor_position().0 != region_bottom {
+        return Vec::new();
+    }
+    screen
+        .rows(0, state.vterm_cols)
+        .take(lines as usize)
+        .map(|row| row.trim_end().to_string())
+        .collect()
 }
 
 /// Run the exec TUI. Blocks until the supervised process exits or the user quits.
@@ -723,7 +798,7 @@ fn exec_event_loop(
                     }
                     state.fullscreen_scrollback.observe_bytes(&bytes);
                     let pre_alt = state.vterm.screen().alternate_screen();
-                    process_pty_bytes_resilient(state, &bytes);
+                    feed_pty_bytes(state, &bytes);
                     let post_alt = state.vterm.screen().alternate_screen();
                     if !pre_alt && post_alt {
                         entered_alt = true;
@@ -825,6 +900,16 @@ fn exec_event_loop(
             state
                 .fullscreen_scrollback
                 .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+
+            // With region history active the mirror's newest-screen slot is
+            // just the live viewport — sync it every pass so a scrolled view
+            // stitches history onto what is actually on screen right now,
+            // rather than onto the last repaint boundary.
+            if state.fullscreen_scrollback.region_history_active() {
+                state
+                    .fullscreen_scrollback
+                    .sync_live_frame(state.vterm.screen());
+            }
         }
 
         // Force redraw for animations (live dot, waiting dots) every ~360ms
@@ -3019,5 +3104,148 @@ mod tests {
             backed.contains("CLAUDE_TRANSCRIPT_23"),
             "Claude wheel must render native vt100 history, got:\n{backed}"
         );
+    }
+
+    /// Drive the real PTY-feed path with a Codex-shaped emitter and check the
+    /// reconstructed transcript is the source text, in order, exactly once.
+    ///
+    /// Codex pushes transcript history out through a top-anchored scroll
+    /// region (`CSI 1;N r`, then one newline per line). `vt100` discards every
+    /// row such a region scrolls away — before the scroll-region tracker the
+    /// transcript existed nowhere, and scrollback showed the frame mirror's
+    /// reconstruction of repeated repaints instead: startup banners, menus,
+    /// and the same paragraph two or three times over.
+    #[test]
+    fn codex_style_history_insert_reconstructs_the_whole_transcript() {
+        let total_rows = 30u16;
+        let mut state = ExecState::new("codex".into(), "codex".into(), 4242, total_rows, 80, 0);
+        state.screen_populated = true;
+
+        let transcript_rows = state.vterm_rows.saturating_sub(2);
+        let composer_row = state.vterm_rows;
+        let records: Vec<String> = (1..=400)
+            .map(|n| format!("[{n:04}] record marker checksum=R{n:04}"))
+            .collect();
+
+        for record in &records {
+            let mut batch = Vec::new();
+            batch.extend_from_slice(b"\x1b[?2026h");
+            // Region covers the transcript area only; the composer below it
+            // must not scroll.
+            batch.extend_from_slice(format!("\x1b[1;{transcript_rows}r").as_bytes());
+            // Park on the region's last row so the newline scrolls.
+            batch.extend_from_slice(format!("\x1b[{transcript_rows};1H").as_bytes());
+            batch.extend_from_slice(format!("\r\n\x1b[K{record}").as_bytes());
+            batch.extend_from_slice(b"\x1b[r");
+            batch.extend_from_slice(
+                format!("\x1b[{composer_row};1H\x1b[K> Ask Codex to do anything").as_bytes(),
+            );
+            batch.extend_from_slice(b"\x1b[?2026l");
+
+            state.fullscreen_scrollback.observe_bytes(&batch);
+            feed_pty_bytes(&mut state, &batch);
+            state
+                .fullscreen_scrollback
+                .capture_if_boundary_reached(state.vterm.screen(), state.last_pty_activity);
+            if state.fullscreen_scrollback.region_history_active() {
+                state
+                    .fullscreen_scrollback
+                    .sync_live_frame(state.vterm.screen());
+            }
+        }
+
+        assert!(
+            state.fullscreen_scrollback.region_history_active(),
+            "a top-anchored region scroll must be recorded"
+        );
+        assert!(
+            state.use_fullscreen_history(),
+            "recovered rows are the transcript; scrollback has to read them"
+        );
+
+        let reconstructed = state.fullscreen_scrollback.visible_window(usize::MAX, 0);
+        let seen: Vec<&str> = reconstructed
+            .into_iter()
+            .filter(|line| line.starts_with('['))
+            .collect();
+        assert_eq!(
+            seen.len(),
+            records.len(),
+            "every record must appear exactly once"
+        );
+        for (expected, actual) in records.iter().zip(seen) {
+            assert_eq!(expected, actual, "transcript order must be preserved");
+        }
+
+        // And it has to survive the render path, not just the store: scroll
+        // back far enough to leave the live screen entirely and the panel must
+        // show a contiguous, non-repeating run of older records.
+        state.scroll_offset = state.vterm_rows as usize * 4;
+        let panel = render_terminal_panel(&state);
+        let shown: Vec<usize> = panel
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix('['))
+            .filter_map(|rest| rest.get(..4)?.parse::<usize>().ok())
+            .collect();
+        assert!(
+            shown.len() >= 10,
+            "scrolled panel should be full of transcript rows, got:\n{panel}"
+        );
+        for pair in shown.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "scrolled view must be contiguous, got {shown:?}:\n{panel}"
+            );
+        }
+        assert!(
+            shown[shown.len() - 1] < records.len(),
+            "scrolled view must be showing older rows, got {shown:?}"
+        );
+    }
+
+    /// A row is recorded with the text it had at the instant it left the
+    /// screen — the whole point of splitting the chunk at the scrolling byte
+    /// rather than reading the grid afterwards, when the row is already gone.
+    #[test]
+    fn evicted_row_is_captured_before_the_parser_destroys_it() {
+        let mut state = ExecState::new("codex".into(), "codex".into(), 4242, 24, 80, 0);
+        state.screen_populated = true;
+
+        let region_rows = state.vterm_rows.saturating_sub(2);
+        // Fill the region, then push one more line through it.
+        let mut payload = format!("\x1b[1;{region_rows}r\x1b[1;1H");
+        for n in 0..region_rows {
+            payload.push_str(&format!("\x1b[K OLDEST_{n}\r\n"));
+        }
+        payload.push_str("\x1b[K NEWEST\x1b[r");
+        feed_pty_bytes(&mut state, payload.as_bytes());
+        state
+            .fullscreen_scrollback
+            .sync_live_frame(state.vterm.screen());
+
+        assert!(state.fullscreen_scrollback.region_history_active());
+        let all = state
+            .fullscreen_scrollback
+            .visible_window(usize::MAX, 0)
+            .join("\n");
+        assert!(
+            all.contains("OLDEST_0"),
+            "the row scrolled out of the region has to survive:\n{all}"
+        );
+        assert!(
+            !state.vterm.screen().contents().contains("OLDEST_0"),
+            "and vt100 has indeed lost it from the live grid"
+        );
+        for n in 0..region_rows {
+            assert_eq!(
+                all.lines()
+                    .filter(|l| l.trim() == format!("OLDEST_{n}"))
+                    .count(),
+                1,
+                "every row appears exactly once across history + live screen:\n{all}"
+            );
+        }
+        assert!(all.contains("NEWEST"));
     }
 }

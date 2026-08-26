@@ -10,6 +10,7 @@ pub mod fullscreen_scrollback;
 pub mod input_thread;
 pub(crate) mod osc52;
 pub mod render;
+pub mod scroll_region;
 pub mod state;
 pub mod theme;
 pub mod widgets;
