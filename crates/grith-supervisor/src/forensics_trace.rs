@@ -54,11 +54,15 @@ impl TraceSubject {
         match kind {
             SyscallKind::FileOpen { path, flags } => {
                 use crate::interceptor::OpenFlags;
+                // The trace names the act, so a directory open is neither a
+                // read nor a write. Folding it into the `else` would file
+                // every `find` traversal under FileWrite in the forensic
+                // record, which is worse than useless in an incident.
                 s.event_kind = Some(
-                    if matches!(flags, OpenFlags::ReadOnly) {
-                        "FileRead"
-                    } else {
-                        "FileWrite"
+                    match flags {
+                        OpenFlags::ReadOnly => "FileRead",
+                        OpenFlags::ReadOnlyDirectory => "DirList",
+                        _ => "FileWrite",
                     }
                     .into(),
                 );

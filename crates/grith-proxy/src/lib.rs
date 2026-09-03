@@ -19,6 +19,7 @@ pub mod paths;
 pub mod reputation;
 pub mod scoring;
 pub mod session_state;
+pub mod ssh_connect;
 pub mod types;
 
 pub use error::Error;

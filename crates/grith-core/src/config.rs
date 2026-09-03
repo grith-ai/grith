@@ -627,6 +627,13 @@ pub struct SupervisorCoreConfig {
     pub enabled: bool,
     pub default_profile: String,
     pub freeze_timeout_seconds: u64,
+    /// Consecutive review timeouts with no human answer before the
+    /// supervisor concludes nobody is at the keyboard and falls back to
+    /// `unattended_review_timeout_seconds`. `0` disables the fallback.
+    pub unattended_review_streak: u32,
+    /// Review window (seconds) used once the operator is judged absent.
+    /// An unanswered review still fails closed; only the wait shortens.
+    pub unattended_review_timeout_seconds: u64,
     /// Seconds an operator's deny keeps auto-denying identical retries
     /// without a fresh prompt. `0` disables replay.
     pub deny_replay_seconds: u64,
@@ -1288,6 +1295,8 @@ impl Default for SupervisorCoreConfig {
             enabled: true,
             default_profile: String::new(),
             freeze_timeout_seconds: 300,
+            unattended_review_streak: 2,
+            unattended_review_timeout_seconds: 5,
             deny_replay_seconds: 60,
             approve_replay_seconds: 60,
             max_concurrent_sessions: 64,
@@ -1692,6 +1701,8 @@ impl GrithConfig {
             parse("port")   "server.port"                       => server.port;
             parse("bool")   "supervisor.enabled"                => supervisor.enabled;
             parse("u64")    "supervisor.freeze_timeout_seconds" => supervisor.freeze_timeout_seconds;
+            parse("u32")    "supervisor.unattended_review_streak" => supervisor.unattended_review_streak;
+            parse("u64")    "supervisor.unattended_review_timeout_seconds" => supervisor.unattended_review_timeout_seconds;
             parse("u64")    "supervisor.deny_replay_seconds"    => supervisor.deny_replay_seconds;
             parse("u64")    "supervisor.approve_replay_seconds" => supervisor.approve_replay_seconds;
             parse("usize")  "supervisor.max_concurrent_sessions" => supervisor.max_concurrent_sessions;
@@ -2177,6 +2188,8 @@ fn apply_env_overrides(mut config: GrithConfig) -> GrithConfig {
     env_parse!(config, "GRITH_AUTO_OPEN_DASHBOARD"           => server.auto_open_dashboard);
     env_parse!(config, "GRITH_SUPERVISOR_ENABLED"            => supervisor.enabled);
     env_parse!(config, "GRITH_SUPERVISOR_TIMEOUT"            => supervisor.freeze_timeout_seconds);
+    env_parse!(config, "GRITH_SUPERVISOR_UNATTENDED_STREAK"  => supervisor.unattended_review_streak);
+    env_parse!(config, "GRITH_SUPERVISOR_UNATTENDED_TIMEOUT" => supervisor.unattended_review_timeout_seconds);
     env_parse!(config, "GRITH_SUPERVISOR_DNS_INSPECTION_ENABLED" => supervisor.dns_inspection.enabled);
     env_parse!(config, "GRITH_SUPERVISOR_DNS_CONNECTED_UDP_PROXY" => supervisor.dns_inspection.connected_udp_proxy);
     env_parse!(config, "GRITH_SUPERVISOR_DNS_ACCEPT_PROXY_NETWORK_AUTHORITY" => supervisor.dns_inspection.accept_proxy_network_authority);

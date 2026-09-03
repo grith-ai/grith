@@ -40,6 +40,14 @@ pub fn to_tool_call_type(kind: &SyscallKind) -> Option<ToolCallType> {
     match kind {
         SyscallKind::FileOpen { path, flags } => match flags {
             OpenFlags::ReadOnly => Some(ToolCallType::FileRead { path: path.clone() }),
+            // An `O_DIRECTORY` open is the first half of an enumeration, not a
+            // read: the kernel guarantees the fd yields directory entries and
+            // nothing else. Mapping it to `DirList` — the same call type
+            // `getdents` produces — means the whole pipeline judges it as what
+            // it is, and the credential rules in `config/filters/paths.toml`
+            // (`operations = ["read", "write", "delete"]`) stop firing on a
+            // traversal without any change to the rules themselves.
+            OpenFlags::ReadOnlyDirectory => Some(ToolCallType::DirList { path: path.clone() }),
             OpenFlags::WriteOnly | OpenFlags::Create | OpenFlags::Truncate => {
                 Some(ToolCallType::FileWrite {
                     path: path.clone(),
@@ -705,6 +713,25 @@ mod tests {
     }
 
     // ── FileOpen mappings ──────────────────────────────────────────
+
+    /// An `O_DIRECTORY` open is an enumeration, and must arrive at the proxy
+    /// as the same call type `getdents` produces. The credential rules in
+    /// `config/filters/paths.toml` are scoped to `["read", "write", "delete"]`,
+    /// so this is also what stops `~/.aws/*` being charged twice — once by
+    /// `path-match` and once by `sensitive-path-heuristic` — for a traversal.
+    #[test]
+    fn file_open_of_a_directory_maps_to_dir_list() {
+        let kind = SyscallKind::FileOpen {
+            path: "/home/dan/.gnupg/private-keys-v1.d".into(),
+            flags: OpenFlags::ReadOnlyDirectory,
+        };
+        assert_eq!(
+            to_tool_call_type(&kind),
+            Some(ToolCallType::DirList {
+                path: "/home/dan/.gnupg/private-keys-v1.d".into()
+            })
+        );
+    }
 
     #[test]
     fn file_open_read_only_maps_to_file_read() {

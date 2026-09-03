@@ -24,6 +24,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -401,6 +402,7 @@ impl Harness {
             freezer: Freezer::new(Duration::from_secs(self.config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: self.reviewer.clone(),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(self.session_allowed.clone())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),

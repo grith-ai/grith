@@ -551,6 +551,16 @@ pub enum OpenFlags {
     Create,
     /// `O_TRUNC`
     Truncate,
+    /// `O_RDONLY | O_DIRECTORY` — an open that can only succeed on a
+    /// directory, and whose fd can only be enumerated.
+    ///
+    /// Kept distinct from [`Self::ReadOnly`] because the kernel has already
+    /// settled the question the filters would otherwise have to guess at:
+    /// `read(2)` on the resulting fd returns `EISDIR`, so no file content can
+    /// come out of it. Folding it into `ReadOnly` priced `find -type d`
+    /// walking past `~/.gnupg/private-keys-v1.d` exactly like opening a
+    /// private key to read it.
+    ReadOnlyDirectory,
 }
 
 /// Network protocol family.
@@ -985,6 +995,7 @@ impl std::fmt::Display for OpenFlags {
             Self::Append => write!(f, "O_APPEND"),
             Self::Create => write!(f, "O_CREAT"),
             Self::Truncate => write!(f, "O_TRUNC"),
+            Self::ReadOnlyDirectory => write!(f, "O_RDONLY|O_DIRECTORY"),
         }
     }
 }

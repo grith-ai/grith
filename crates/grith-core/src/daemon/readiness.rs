@@ -59,7 +59,18 @@ pub enum DaemonUnready {
         port: u16,
     },
     /// The daemon is reachable but rejected our token.
-    TokenRejected { port: u16 },
+    TokenRejected {
+        port: u16,
+        /// The local process holding the socket, when we could identify it —
+        /// the only handle an operator has on a daemon with no PID file.
+        owner: Option<String>,
+    },
+    /// A Grith daemon answers the port, but the listening socket belongs to a
+    /// local process that is not grith: the port is forwarded from another
+    /// machine (VS Code Remote, `ssh -L`, `kubectl port-forward`, a published
+    /// container port). No local remedy applies, and restarting would target
+    /// someone else's daemon.
+    PortForwarded { port: u16, owner: String },
     /// The daemon started but never became authenticated-ready.
     NotReady { port: u16, waited: Duration },
     /// The daemon is up but its audit chain is quarantined, so it will not
@@ -101,11 +112,34 @@ impl DaemonUnready {
                  Run: grith dashboard restart\n\
                  Then retry the command."
             ),
-            Self::TokenRejected { port } => format!(
-                "Grith could not authenticate to the local daemon on 127.0.0.1:{port}.\n\n\
+            // Naming the owning process matters more than it looks: this
+            // failure is most often reached with no PID file at all, and
+            // `grith dashboard restart` cannot stop a daemon it cannot
+            // identify (it authenticates the shutdown with the very token
+            // that was just rejected). Without the PID the operator is left
+            // with a remedy that returns an error and no way forward.
+            Self::TokenRejected { port, owner } => match owner {
+                Some(owner) => format!(
+                    "Grith could not authenticate to the local daemon on 127.0.0.1:{port}.\n\
+                     The port is held by {owner}.\n\n\
+                     No supervised session was started.\n\
+                     Run: grith dashboard restart\n\
+                     If that reports it cannot identify the daemon, stop that process and retry."
+                ),
+                None => format!(
+                    "Grith could not authenticate to the local daemon on 127.0.0.1:{port}.\n\n\
+                     No supervised session was started.\n\
+                     Run: grith dashboard restart\n\
+                     Then retry the command."
+                ),
+            },
+            Self::PortForwarded { port, owner } => format!(
+                "A Grith daemon answers on 127.0.0.1:{port}, but the port is held by {owner} — \
+                 it is forwarded from another machine, not served by a daemon on this one.\n\
+                 Its IPC token lives on that machine, so this CLI cannot authenticate to it.\n\n\
                  No supervised session was started.\n\
-                 Run: grith dashboard restart\n\
-                 Then retry the command."
+                 Stop the port forward (in VS Code: the Ports panel), or give this machine its \
+                 own daemon by setting a free `server.port` in ~/.config/grith/config.toml."
             ),
             Self::NotReady { port, waited } => format!(
                 "The Grith daemon on 127.0.0.1:{port} did not become ready within {:.0}s.\n\n\
@@ -138,6 +172,7 @@ impl DaemonUnready {
             Self::PortOwnedByForeignProcess { .. } => "port_owned_by_foreign_process",
             Self::VersionMismatch { .. } => "version_mismatch",
             Self::TokenRejected { .. } => "token_rejected",
+            Self::PortForwarded { .. } => "port_forwarded",
             Self::NotReady { .. } => "not_ready",
             Self::AuditQuarantined(_) => "audit_quarantined",
             Self::AuditReadOnly(_) => "audit_read_only",
@@ -255,20 +290,27 @@ pub fn ensure_daemon_ready<F>(port: u16, spawn_daemon: F) -> Result<DaemonClient
 where
     F: FnMut() -> Result<(), String>,
 {
-    ensure_daemon_ready_with(DaemonClient::connect, port, spawn_daemon)
+    ensure_daemon_ready_with(
+        DaemonClient::connect,
+        super::listener::listener_locality,
+        port,
+        spawn_daemon,
+    )
 }
 
 /// Testable core of [`ensure_daemon_ready`]: the initial fast-path connect is
 /// injected because `DaemonClient::connect` reads the PID file for its port —
 /// a test passing a synthetic `port` would otherwise still connect to
 /// whatever daemon happens to be running on the developer's machine.
-fn ensure_daemon_ready_with<C, F>(
+fn ensure_daemon_ready_with<C, L, F>(
     mut connect: C,
+    mut locality: L,
     port: u16,
     mut spawn_daemon: F,
 ) -> Result<DaemonClient, DaemonUnready>
 where
     C: FnMut() -> Option<DaemonClient>,
+    L: FnMut(u16) -> super::listener::ListenerLocality,
     F: FnMut() -> Result<(), String>,
 {
     // Fast path: a compatible daemon is already up and our token works. Still
@@ -339,6 +381,41 @@ where
             ..
         } => {
             let version = version.clone();
+            // Before offering any local remedy, establish that the daemon
+            // answering the port actually runs here. A forwarded loopback
+            // port (VS Code Remote, `ssh -L`, a published container port)
+            // answers `/api/health` exactly like a local daemon, but its IPC
+            // token lives on the other machine — so authentication can never
+            // succeed, and both remedies below are wrong: there is nothing
+            // local to restart, and a restart that did land would kill
+            // someone else's daemon. The quarantine and read-only reports
+            // come after this for the same reason: they would describe the
+            // *remote* daemon's audit database.
+            let owner = match locality(port) {
+                super::listener::ListenerLocality::Forwarded(owner) => {
+                    // WARN, not INFO: this refuses to start a supervised
+                    // session, and INFO is below the default log level — a
+                    // user who hit it found nothing in the log the error
+                    // message told them to check. The exe path is logged
+                    // alongside the operator-facing name because the two can
+                    // disagree (`comm` is `grith`, the exe is not), and that
+                    // disagreement is the whole evidence for the verdict.
+                    tracing::warn!(
+                        event = "daemon_port_forwarded",
+                        port,
+                        owner = %owner.describe(),
+                        exe = ?owner.exe,
+                        "the port answers as a Grith daemon but is held by a \
+                         non-grith local process; treating it as forwarded"
+                    );
+                    return Err(DaemonUnready::PortForwarded {
+                        port,
+                        owner: owner.describe(),
+                    });
+                }
+                super::listener::ListenerLocality::LocalGrith(owner) => Some(owner.describe()),
+                super::listener::ListenerLocality::Unknown => None,
+            };
             // A quarantined daemon will refuse admission regardless of auth,
             // and restarting it would not clear a chain problem — report the
             // real cause rather than a token or version error.
@@ -362,7 +439,7 @@ where
                 // Same build, but our token was refused. Restarting would not
                 // obviously help and could disrupt another user's sessions, so
                 // report it rather than guessing.
-                return Err(DaemonUnready::TokenRejected { port });
+                return Err(DaemonUnready::TokenRejected { port, owner });
             }
 
             // Different build. This is the upgrade case, and it is common
@@ -626,7 +703,18 @@ mod tests {
                 cli_version: "0.2.1".into(),
                 port: 3141,
             },
-            DaemonUnready::TokenRejected { port: 3141 },
+            DaemonUnready::TokenRejected {
+                port: 3141,
+                owner: None,
+            },
+            DaemonUnready::TokenRejected {
+                port: 3141,
+                owner: Some("`grith` (pid 4321)".into()),
+            },
+            DaemonUnready::PortForwarded {
+                port: 3141,
+                owner: "`code` (pid 2433878)".into(),
+            },
             DaemonUnready::NotReady {
                 port: 3141,
                 waited: Duration::from_secs(10),
@@ -695,7 +783,12 @@ mod tests {
         // whole Result. The connect fast-path is stubbed out: the real one
         // reads the PID file, so this test would otherwise flip between pass
         // and fail with whatever daemon is running on the machine.
-        match ensure_daemon_ready_with(|| None, 1, || Err("exec format error".into())) {
+        match ensure_daemon_ready_with(
+            || None,
+            |_| crate::daemon::listener::ListenerLocality::Unknown,
+            1,
+            || Err("exec format error".into()),
+        ) {
             Ok(_) => panic!("expected SpawnFailed, got a connected client"),
             Err(DaemonUnready::SpawnFailed(e)) => assert!(e.contains("exec format error")),
             Err(other) => panic!("expected SpawnFailed, got {}", other.code()),
@@ -818,5 +911,71 @@ mod tests {
         assert!(super::super::identity::DaemonIdentity::protocol_compatible(
             super::super::identity::IPC_PROTOCOL_VERSION
         ));
+    }
+
+    /// The laptop-vs-desktop incident: VS Code Remote forwards the desktop's
+    /// 3141 to the laptop's loopback, so `/api/health` answers as a Grith
+    /// daemon of the *same* version whose token lives on the other machine.
+    /// Reporting that as a rejected token sent the operator to
+    /// `grith dashboard restart`, which cannot work — there is no local
+    /// daemon to restart, and the shutdown request it makes is authenticated
+    /// with the token that was just rejected.
+    #[test]
+    fn a_forwarded_port_is_reported_as_forwarded_not_as_a_token_problem() {
+        let forwarded = |_port: u16| {
+            super::super::listener::ListenerLocality::Forwarded(
+                super::super::listener::ListenerOwner {
+                    pid: Some(2_433_878),
+                    uid: 1000,
+                    exe: Some(std::path::PathBuf::from("/usr/share/code/code")),
+                    comm: Some("code".into()),
+                },
+            )
+        };
+        let msg = DaemonUnready::PortForwarded {
+            port: 3141,
+            owner: describe(&forwarded(3141)),
+        }
+        .user_message();
+        assert!(msg.contains("forwarded from another machine"), "{msg}");
+        assert!(msg.contains("`code` (pid 2433878)"), "{msg}");
+        // It must not send the operator at a local restart.
+        assert!(!msg.contains("grith dashboard restart"), "{msg}");
+        assert!(msg.contains("server.port"), "{msg}");
+    }
+
+    /// Test helper mirroring how the decision path renders an owner.
+    fn describe(locality: &super::super::listener::ListenerLocality) -> String {
+        match locality {
+            super::super::listener::ListenerLocality::Forwarded(o)
+            | super::super::listener::ListenerLocality::LocalGrith(o) => o.describe(),
+            super::super::listener::ListenerLocality::Unknown => String::new(),
+        }
+    }
+
+    /// A rejected token from a daemon we *can* identify must name the process,
+    /// because the restart path may still refuse to act on it (no PID file)
+    /// and the PID is then the operator's only handle.
+    #[test]
+    fn token_rejected_names_the_owning_process_when_known() {
+        let msg = DaemonUnready::TokenRejected {
+            port: 3141,
+            owner: Some("`grith` (pid 4321)".into()),
+        }
+        .user_message();
+        assert!(msg.contains("`grith` (pid 4321)"), "{msg}");
+    }
+
+    /// Fail toward the old behaviour: an owner we cannot resolve (no /proc,
+    /// another user's process) must not be reported as a forwarded port.
+    #[test]
+    fn an_unidentifiable_owner_does_not_claim_the_port_is_forwarded() {
+        let msg = DaemonUnready::TokenRejected {
+            port: 3141,
+            owner: None,
+        }
+        .user_message();
+        assert!(!msg.contains("forwarded"), "{msg}");
+        assert!(msg.contains("grith dashboard restart"), "{msg}");
     }
 }

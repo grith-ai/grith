@@ -62,6 +62,29 @@ fn analytics_error_response(error: &grith_audit::Error, surface: &str) -> axum::
     .into_response()
 }
 
+/// Bring the projection up to date before an analytics read, and hand back
+/// any heap the rebuild freed.
+///
+/// A day rebuild allocates one small object per event in the day and frees
+/// them all; glibc keeps those on the arena's free list, so a read that
+/// rebuilds a busy day permanently raises the resident size of whichever
+/// tokio worker served it. With one arena per worker thread that ratchet
+/// multiplies across the pool — the shape behind a daemon found holding
+/// 9.8 GB against a 150 MB target. Trimming only when a day was actually
+/// rebuilt keeps it off the common path, where reads rebuild nothing.
+fn catch_up_before_read(storage: &mut grith_audit::AuditStorage, surface: &str) {
+    if storage.is_read_only() {
+        return;
+    }
+    match storage.catch_up_analytics_bounded(CATCH_UP_MAX_BATCHES, CATCH_UP_MAX_DAYS) {
+        Ok((_, days)) if days > 0 => grith_audit::release_free_heap(),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, surface, "analytics v2 catch-up failed before read");
+        }
+    }
+}
+
 pub(crate) async fn analytics_v2_free(State(state): State<AppState>) -> impl IntoResponse {
     let pro_available = state
         .feature_gate
@@ -69,13 +92,7 @@ pub(crate) async fn analytics_v2_free(State(state): State<AppState>) -> impl Int
         .map(|gate| gate.allows("usage_analytics"))
         .unwrap_or(false);
     let mut storage = lock_audit!(state);
-    if !storage.is_read_only() {
-        if let Err(error) =
-            storage.catch_up_analytics_bounded(CATCH_UP_MAX_BATCHES, CATCH_UP_MAX_DAYS)
-        {
-            tracing::warn!(error = %error, "analytics v2 catch-up failed before Free read");
-        }
-    }
+    catch_up_before_read(&mut storage, "Free");
     match storage.local_free_analytics_response(chrono::Utc::now(), pro_available) {
         Ok(response) => Json(response).into_response(),
         Err(error) => analytics_error_response(&error, "Free"),
@@ -91,13 +108,7 @@ pub(crate) async fn analytics_v2_pro(State(state): State<AppState>) -> impl Into
         return response;
     }
     let mut storage = lock_audit!(state);
-    if !storage.is_read_only() {
-        if let Err(error) =
-            storage.catch_up_analytics_bounded(CATCH_UP_MAX_BATCHES, CATCH_UP_MAX_DAYS)
-        {
-            tracing::warn!(error = %error, "analytics v2 catch-up failed before Pro read");
-        }
-    }
+    catch_up_before_read(&mut storage, "Pro");
     match storage.local_pro_analytics_response(chrono::Utc::now()) {
         Ok(response) => Json(response).into_response(),
         Err(error) => analytics_error_response(&error, "Pro"),

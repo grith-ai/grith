@@ -923,15 +923,54 @@ mod tests {
 
     #[test]
     fn test_real_secret_corpus_builds_regex_set_with_full_count() {
-        // 1618 after S1 (2026-08-07) removed the two looser unanchored FaunaDB /
-        // Resend duplicates (`fauna-secret-bare`, `resend-api-key-bare`).
+        // 1617 after S1 (2026-08-07) removed the two looser unanchored FaunaDB /
+        // Resend duplicates (`fauna-secret-bare`, `resend-api-key-bare`) and the
+        // 2026-09-02 removal of `bitcoin-wif-private-key-v2` (an unanchored WIF
+        // regex whose Base58 class overlapped lowercase hex, so it matched inside
+        // sccache/git object-hash path segments - see wif_v2_style_regex... test).
         let patterns = load_real_secret_patterns();
-        assert_eq!(patterns.len(), 1618);
+        assert_eq!(patterns.len(), 1617);
 
         let filter = SecretScanFilter::new(patterns);
 
         assert!(matches!(filter.matcher, Matcher::Set { .. }));
-        assert_eq!(filter.pattern_count(), 1618);
+        assert_eq!(filter.pattern_count(), 1617);
+    }
+
+    /// Regression guard for the class of false positive removed on 2026-09-02:
+    /// an unanchored secret regex whose Base58/hex-overlapping character class
+    /// matches a substring of a longer hash-shaped token (sccache cache keys,
+    /// git object hashes, SHA-256 hex, UUIDs) that appears in a scanned path or
+    /// argument. `bitcoin-wif-private-key-v2` did this to every sccache atomic
+    /// rename (`~/.cache/sccache/<hex>`), queueing routine build churn. No
+    /// shipped pattern may match any of these non-secret hash shapes.
+    #[tokio::test]
+    async fn shipped_patterns_never_match_hash_shaped_nonsecrets() {
+        let filter = SecretScanFilter::new(load_real_patterns());
+        // Real values observed in the field plus canonical hash shapes.
+        let non_secrets = [
+            "/home/dan/.cache/sccache/preprocessor/b/6/e/b6eb65d7d1f153b62edd3e7a9e3ebce9cb26a38a239169738bc95fef16474ef3",
+            "/home/dan/.cache/sccache/0/7/078a755217424a9fff44c56b484686189ff94a9fe2948db927aa5c2d5edf5e63",
+            "/home/dan/.cache/sccache/5/2/52b59774af3f8bc942f55fe77fd3a946749d99351b7547cbbf16f0cc0db17cae",
+            // git object hash (SHA-1) and a SHA-256 blob id
+            "objects/9c/e8a01ed5628444560fca33a58d42460321784860",
+            "9ce8a01ed5628444560fca33a58d42460321784860c23d3fee57f4670ae12e60",
+            // UUID
+            "550e8400-e29b-41d4-a716-446655440000",
+        ];
+        for value in non_secrets {
+            // Scan it the way the supervisor would: as a rename destination path.
+            let ctx = make_ctx(ToolCallType::FileRename {
+                old_path: format!("{value}.tmp"),
+                new_path: value.to_string(),
+            });
+            let result = filter.evaluate(&ctx).await.unwrap();
+            assert!(
+                !result.matched,
+                "shipped secret pattern `{}` false-positived on hash-shaped non-secret `{}` (matched score {})",
+                result.rule_id, value, result.score
+            );
+        }
     }
 
     #[tokio::test]

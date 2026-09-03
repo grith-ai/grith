@@ -18,9 +18,9 @@ use crate::export::export_jsonl;
 use crate::storage::AuditStorage;
 use crate::types::{ArchiveBoundary, AuditRecord, LEGACY_HASH_VERSION};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Outcome of one prune-and-archive run.
@@ -167,31 +167,32 @@ pub fn prune_and_archive(
     //    archive reader tolerates that (see `read_zstd_jsonl`, concatenated
     //    frames), and duplicate archived rows are strictly safer than lost
     //    ones.
-    let mut by_date: BTreeMap<String, Vec<AuditRecord>> = BTreeMap::new();
+    //    The scan streams. It used to accumulate the whole prefix in a
+    //    `BTreeMap<String, Vec<AuditRecord>>` — a clone of every row eligible
+    //    for deletion, held at once, before a single byte was written. That
+    //    is unbounded in the one place it must not be: the coverage gate
+    //    below refuses to prune while any analytics day is dirty, so a
+    //    blocked projection lets the prefix grow for weeks and the pass that
+    //    finally runs would load all of it. Records arrive in
+    //    `chain_sequence` order, so a date's rows are contiguous in the
+    //    common case; [`BatchedArchiver`] flushes a bounded batch whenever
+    //    the date changes or the batch fills, and a date that reappears
+    //    simply gets another frame.
+    if cold_storage_enabled {
+        fs::create_dir_all(cold_dir)?;
+    }
+    let mut archiver = BatchedArchiver::new(cold_dir, cold_storage_enabled);
     let mut count = 0usize;
     storage.read_prefix_into(max_pruned_sequence, |record| {
         count += 1;
-        if cold_storage_enabled {
-            let date_key = record.timestamp.format("%Y-%m-%d").to_string();
-            by_date.entry(date_key).or_default().push(record.clone());
-        }
-        Ok(())
+        archiver.push(record)
     })?;
+    archiver.finish()?;
 
     if count == 0 {
         return Ok(PruneStats::default());
     }
-
-    let mut archive_files = 0usize;
-    if cold_storage_enabled && !by_date.is_empty() {
-        fs::create_dir_all(cold_dir)?;
-        for (date_key, records) in &by_date {
-            let path = cold_dir.join(format!("{date_key}.jsonl.zst"));
-            append_zstd_jsonl(&path, records)?;
-            prove_archived_records(&path, records)?;
-            archive_files += 1;
-        }
-    }
+    let archive_files = archiver.dates_written();
 
     // 4. Only now that the rows are durably archived, delete them and publish
     //    the boundary anchor.
@@ -205,14 +206,130 @@ pub fn prune_and_archive(
     })
 }
 
-/// Prove that every just-appended row can be read back from cold storage with
-/// the same stored hash and a valid record-content hash before any active row
-/// is deleted. Concatenated frames may contain older duplicates, so identity
-/// is keyed by event id rather than by file position.
-fn prove_archived_records(path: &Path, expected: &[AuditRecord]) -> Result<()> {
-    let restored = read_zstd_jsonl(path)?;
-    let by_id: std::collections::HashMap<_, _> =
-        restored.iter().map(|record| (record.id, record)).collect();
+/// How many records one archive frame holds before it is flushed.
+///
+/// The only bound on [`prune_and_archive`]'s resident cost. Small enough that
+/// a prefix of any size costs a fixed handful of megabytes; large enough that
+/// zstd still has a useful window and a normal prune writes one frame.
+const ARCHIVE_BATCH_RECORDS: usize = 2_000;
+
+/// Groups a streamed prefix by date and writes it out in bounded frames.
+///
+/// Holds at most [`ARCHIVE_BATCH_RECORDS`] records at a time. Every flush is
+/// appended and then proven before the caller deletes anything, so the
+/// archive-before-delete guarantee is unchanged: a crash mid-scan leaves rows
+/// in both the archive and the active database, and the next pass re-appends
+/// the remainder.
+struct BatchedArchiver<'a> {
+    cold_dir: &'a Path,
+    enabled: bool,
+    /// Date key of the records currently buffered, if any.
+    date: Option<String>,
+    buffer: Vec<AuditRecord>,
+    /// Distinct dates written, so `PruneStats::archive_files` still counts
+    /// files rather than flushes.
+    dates: BTreeSet<String>,
+}
+
+impl<'a> BatchedArchiver<'a> {
+    fn new(cold_dir: &'a Path, enabled: bool) -> Self {
+        Self {
+            cold_dir,
+            enabled,
+            date: None,
+            buffer: Vec::new(),
+            dates: BTreeSet::new(),
+        }
+    }
+
+    fn push(&mut self, record: &AuditRecord) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let date = record.timestamp.format("%Y-%m-%d").to_string();
+        if self.date.as_ref().is_some_and(|current| current != &date) {
+            self.flush()?;
+        }
+        self.date = Some(date);
+        self.buffer.push(record.clone());
+        if self.buffer.len() >= ARCHIVE_BATCH_RECORDS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let date = self
+            .date
+            .clone()
+            .expect("a non-empty buffer always has a date");
+        let path = self.cold_dir.join(format!("{date}.jsonl.zst"));
+        // Where our frame begins. Everything below this offset was written
+        // and proven by an earlier flush or an earlier pass.
+        let start = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        append_zstd_jsonl(&path, &self.buffer)?;
+        prove_archived_frame(&path, start, &self.buffer)?;
+        self.dates.insert(date);
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.flush()
+    }
+
+    fn dates_written(&self) -> usize {
+        self.dates.len()
+    }
+}
+
+/// Prove that the frame just appended at `start` reads back with the same
+/// stored hash and a valid record-content hash, before any active row is
+/// deleted.
+///
+/// Scoped to the appended frame rather than the whole file. That is what
+/// makes a batched flush affordable — re-reading and re-hashing a
+/// multi-gigabyte archive on every batch would be quadratic — but it is also
+/// the stronger proof. Reading the whole file and matching by event id, as
+/// this did before, could be satisfied by an *older* duplicate frame: an
+/// append that silently wrote nothing still "proved", and the rows were then
+/// deleted from the active database. Only bytes we just wrote can satisfy
+/// this one.
+fn prove_archived_frame(path: &Path, start: u64, expected: &[AuditRecord]) -> Result<()> {
+    // An append that wrote nothing leaves the file exactly as long as it was.
+    // Report that as what it is — the archive did not gain the records — and
+    // not as the "incomplete frame" I/O error a zero-byte region decodes to,
+    // which reads like archive corruption and would send an operator to the
+    // wrong place.
+    let len = fs::metadata(path)?.len();
+    if len <= start {
+        return Err(crate::error::Error::Analytics(format!(
+            "cold archive {} did not contain appended record {}: no frame was \
+             written at offset {start}",
+            path.display(),
+            expected
+                .first()
+                .map(|r| r.id.to_string())
+                .unwrap_or_default(),
+        )));
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let decoder = zstd::stream::Decoder::new(file)?;
+    let reader = std::io::BufReader::new(decoder);
+    let mut by_id: std::collections::HashMap<uuid::Uuid, AuditRecord> =
+        std::collections::HashMap::new();
+    for line in std::io::BufRead::lines(reader) {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: AuditRecord = serde_json::from_str(&line)?;
+        by_id.insert(record.id, record);
+    }
     for record in expected {
         let Some(cold) = by_id.get(&record.id) else {
             return Err(crate::error::Error::Analytics(format!(
@@ -1075,6 +1192,94 @@ mod tests {
         let restored_d2 = read_zstd_jsonl(&dir.path().join("2020-01-16.jsonl.zst")).unwrap();
         assert_eq!(restored_d1.len(), 2);
         assert_eq!(restored_d2.len(), 3);
+    }
+
+    /// A prefix bigger than one flush must still archive every row. The
+    /// batching exists so the pass never holds the whole prefix; the rows it
+    /// writes must be identical to what the buffer-everything version wrote.
+    #[test]
+    fn a_prefix_larger_than_one_batch_archives_every_row() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let day = Utc.with_ymd_and_hms(2020, 1, 15, 12, 0, 0).unwrap();
+        let rows = ARCHIVE_BATCH_RECORDS * 2 + 7;
+        for _ in 0..rows {
+            storage.insert_record(&record_at(day)).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let stats = prune_and_archive(&mut storage, cutoff, dir.path(), true, false).unwrap();
+
+        assert_eq!(stats.archived_rows, rows);
+        // Three flushes, but one date — `archive_files` counts files.
+        assert_eq!(stats.archive_files, 1);
+        let restored = read_zstd_jsonl(&dir.path().join("2020-01-15.jsonl.zst")).unwrap();
+        assert_eq!(restored.len(), rows);
+    }
+
+    /// Rows arrive in `chain_sequence` order, which is not guaranteed to be
+    /// date order: a clock adjustment can interleave two dates. Every row
+    /// must still land in its own date's file, and a date that reappears
+    /// must not be counted twice.
+    #[test]
+    fn interleaved_dates_each_land_in_their_own_archive() {
+        let mut storage = AuditStorage::open_in_memory().unwrap();
+        let day1 = Utc.with_ymd_and_hms(2020, 1, 15, 12, 0, 0).unwrap();
+        let day2 = Utc.with_ymd_and_hms(2020, 1, 16, 12, 0, 0).unwrap();
+        for i in 0..10 {
+            let day = if i % 2 == 0 { day1 } else { day2 };
+            storage.insert_record(&record_at(day)).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let stats = prune_and_archive(&mut storage, cutoff, dir.path(), true, false).unwrap();
+
+        assert_eq!(stats.archived_rows, 10);
+        assert_eq!(stats.archive_files, 2);
+        assert_eq!(
+            read_zstd_jsonl(&dir.path().join("2020-01-15.jsonl.zst"))
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            read_zstd_jsonl(&dir.path().join("2020-01-16.jsonl.zst"))
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    /// The proof must be satisfiable only by the frame just written.
+    ///
+    /// The previous whole-file proof matched by event id across every frame,
+    /// so an append that silently wrote nothing still passed as long as an
+    /// older frame happened to hold the same record — and the active rows
+    /// were then deleted. Proving from the append offset makes that
+    /// impossible.
+    #[test]
+    fn the_proof_is_scoped_to_the_frame_just_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("2020-01-15.jsonl.zst");
+        let day = Utc.with_ymd_and_hms(2020, 1, 15, 12, 0, 0).unwrap();
+        let mut record = record_at(day);
+        record.record_hash = Some(record.compute_record_hash());
+
+        append_zstd_jsonl(&path, std::slice::from_ref(&record)).unwrap();
+        let after_first = std::fs::metadata(&path).unwrap().len();
+        // The frame we just wrote proves itself.
+        prove_archived_frame(&path, 0, std::slice::from_ref(&record)).unwrap();
+
+        // A later append that wrote nothing leaves the offset at EOF. The
+        // record is still in the file, one frame earlier — and must not
+        // count.
+        let error = prove_archived_frame(&path, after_first, std::slice::from_ref(&record))
+            .expect_err("an empty frame must not be provable by an older copy");
+        let message = error.to_string();
+        assert!(
+            message.contains("did not contain appended record")
+                && message.contains("no frame was written"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

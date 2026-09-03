@@ -2279,14 +2279,18 @@ fn rebuild_day(
         "SELECT event_json FROM analytics_source_events
          WHERE source_epoch = ?1 AND day = ?2 ORDER BY occurred_at ASC, event_id ASC",
     )?;
-    let events = statement
-        .query_map(params![source_epoch, day.to_string()], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Stream the day's events; never materialize them all at once. This used
+    // to `.collect()` every `event_json` into a `Vec<String>` before parsing
+    // any of them, so one rebuild's floor was the day's entire JSON — 579 MB
+    // for the worst day observed on a developer machine (634,665 events), and
+    // the rebuild runs on every catch-up pass, not once. Rows are consumed
+    // one at a time now, so the resident cost is the accumulator alone.
+    let rows = statement.query_map(params![source_epoch, day.to_string()], |row| {
+        row.get::<_, String>(0)
+    })?;
     let mut accumulator = DayAccumulator::new(day);
-    for json in events {
-        let event: AnalyticsEvent = serde_json::from_str(&json)?;
+    for json in rows {
+        let event: AnalyticsEvent = serde_json::from_str(&json?)?;
         accumulator
             .ingest(&event)
             .map_err(|error| Error::Analytics(error.to_string()))?;

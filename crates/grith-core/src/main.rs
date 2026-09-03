@@ -519,6 +519,57 @@ fn should_check_updates(
         && command_supports_update_check(command)
 }
 
+/// Publish the PID file, IPC token and identity file for a dashboard hosted
+/// **in-process** by `grith run` / the REPL (rather than by a spawned daemon).
+///
+/// Returns whether all three landed: a partial publish is retracted here, so
+/// callers only ever see "this process is discoverable as the daemon" or
+/// "nothing was claimed".
+fn publish_in_process_daemon(
+    ipc_token: &str,
+    port: u16,
+    identity: &crate::daemon::identity::DaemonIdentity,
+) -> bool {
+    let pid = std::process::id();
+    if let Err(e) = daemon::write_dashboard_pid(pid, port) {
+        tracing::warn!(error = %e, "failed to write dashboard PID file");
+        return false;
+    }
+    if let Err(e) = crate::daemon::token::write_token(ipc_token) {
+        tracing::warn!(error = %e, "failed to write daemon IPC token");
+        let _ = daemon::remove_dashboard_pid();
+        return false;
+    }
+    if let Err(e) = crate::daemon::identity::publish(identity) {
+        // Same degradation `cmd_dashboard_start` accepts: the daemon is still
+        // reachable and authenticable, only the restart path's identity check
+        // falls back to "unidentified".
+        tracing::warn!(error = %e, "failed to publish the daemon identity file");
+    }
+    tracing::info!(event = "in_process_daemon_published", pid, port);
+    true
+}
+
+/// Retract what [`publish_in_process_daemon`] wrote.
+///
+/// Every removal is guarded on the artefact still being *ours*: a successor
+/// daemon that took the port while we were shutting down must keep its own
+/// identity, and deleting its token would lock out every session it is
+/// serving.
+fn retract_in_process_daemon(ipc_token: &str) {
+    let self_pid = std::process::id();
+    if crate::daemon::pid::read_dashboard_pid().is_some_and(|(pid, _)| pid == self_pid) {
+        let _ = daemon::remove_dashboard_pid();
+        daemon::remove_dashboard_opened();
+    }
+    if crate::daemon::token::read_token().is_some_and(|t| t == ipc_token) {
+        let _ = crate::daemon::token::remove_token();
+    }
+    if crate::daemon::identity::read().is_some_and(|id| id.pid == self_pid) {
+        crate::daemon::identity::remove();
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let enable_color = helpers::color_enabled(cli.no_color);
@@ -941,6 +992,7 @@ fn main() -> anyhow::Result<()> {
             .build()?;
 
         let server_config = to_server_config(&daemon.config.server);
+        let server_config_port = server_config.port;
         let sync_api_key = crate::license::load_credentials()
             .ok()
             .flatten()
@@ -968,11 +1020,43 @@ fn main() -> anyhow::Result<()> {
             sync_api_key: sync_api_key.clone(),
             sync_api_base_url: sync_api_base_url.clone(),
         };
+        // This process *is* the daemon for as long as it runs: it owns the
+        // audit writer lock and serves the same IPC routes a spawned daemon
+        // would. Until now it published nothing, so it was a listener no
+        // other grith process could authenticate to or identify — a
+        // `grith exec` in another terminal met a Grith daemon of the right
+        // version, found no PID file and no token on disk, and failed with
+        // `token_rejected` naming a `dashboard restart` that could not stop
+        // it either. Publish the same three artefacts `cmd_dashboard_start`
+        // does, on the same terms: only into a port nothing else owns, and
+        // before the listener starts, so a `grith exec` racing us finds a
+        // complete identity or none at all. (Publishing from the
+        // `on_listening` callback instead loses that race the other way: a
+        // short-lived `grith run` can finish before the server task is even
+        // polled, and would then leave the files behind unretracted.)
+        let identity = crate::daemon::identity::DaemonIdentity::new(
+            server_config_port,
+            env!("CARGO_PKG_VERSION"),
+            Some(
+                helpers::expand_user_path(&daemon.config.general.audit_dir)
+                    .join("audit.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        let published = matches!(
+            crate::daemon::readiness::probe_port(server_config_port),
+            crate::daemon::readiness::PortProbe::Vacant
+        ) && publish_in_process_daemon(&ipc_token, server_config_port, &identity);
         let server = grith_server::GrithServer::new(
             server_config,
             deps,
             env!("CARGO_PKG_VERSION"),
             daemon.subscribe_shutdown(),
+        )
+        .with_instance_identity(
+            identity.instance_id.to_string(),
+            crate::daemon::identity::IPC_PROTOCOL_VERSION,
         )
         .with_plan_tier(&daemon.config.general.plan_tier)
         .with_account_id(&daemon.account_id)
@@ -980,7 +1064,7 @@ fn main() -> anyhow::Result<()> {
         .with_license_valid_until(daemon.license_valid_until.clone())
         .with_billing_portal_url(daemon.billing_portal_url.clone())
         .with_refresh_state(daemon.refresh_state.clone())
-        .with_ipc_token(ipc_token)
+        .with_ipc_token(ipc_token.clone())
         .with_dashboard_token(dashboard_token.clone())
         .with_sync_api(sync_api_key, sync_api_base_url);
 
@@ -1000,9 +1084,20 @@ fn main() -> anyhow::Result<()> {
             daemon.register_notification_channels(Some(ws_tx.clone()));
         }
 
-        runtime.spawn(async move {
-            if let Err(e) = server.start().await {
-                tracing::error!(error = %e, "server failed");
+        runtime.spawn({
+            let ipc_token = ipc_token.clone();
+            async move {
+                if let Err(e) = server.start().await {
+                    // Most often EADDRINUSE from a listener that appeared
+                    // between our probe and the bind. We published a PID file
+                    // and token for a listener that does not exist, so take
+                    // them back rather than leaving the next `grith exec`
+                    // authenticating at nothing.
+                    tracing::error!(error = %e, "server failed");
+                    if published {
+                        retract_in_process_daemon(&ipc_token);
+                    }
+                }
             }
         });
 
@@ -1064,6 +1159,14 @@ fn main() -> anyhow::Result<()> {
         };
 
         daemon.shutdown();
+
+        // Retract what we published, so the next invocation does not chase a
+        // daemon that has gone. Guarded on the files still being ours: a
+        // successor daemon that took the port while we were shutting down
+        // must keep its own identity.
+        if published {
+            retract_in_process_daemon(&ipc_token);
+        }
 
         // Join background task handles to surface any panics rather than
         // silently swallowing them.
@@ -1433,6 +1536,8 @@ fn to_runtime_supervisor_config_with_audit(
         enabled: core.enabled,
         default_profile: core.default_profile.clone(),
         freeze_timeout_seconds: core.freeze_timeout_seconds,
+        unattended_review_streak: core.unattended_review_streak,
+        unattended_review_timeout_seconds: core.unattended_review_timeout_seconds,
         deny_replay_seconds: core.deny_replay_seconds,
         approve_replay_seconds: core.approve_replay_seconds,
         max_concurrent_sessions: core.max_concurrent_sessions,

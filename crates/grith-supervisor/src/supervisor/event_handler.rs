@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -496,6 +497,13 @@ pub(super) struct SupervisorLoopContext<'a> {
     pub(super) read_batch_tracker: Mutex<ReadBatchTracker>,
     /// Reviewer implementation for digest items awaiting human review.
     pub(super) reviewer: Arc<dyn QueueReviewer>,
+    /// Consecutive reviews that expired with no human answer.
+    ///
+    /// Reset to zero by any resolution a person is behind — a local answer, a
+    /// notification channel, or a scope grant. Read by [`queue_and_wait`] to
+    /// decide whether the operator is still at the keyboard; see
+    /// `SupervisorConfig::unattended_review_streak`.
+    pub(super) unanswered_reviews: Arc<AtomicU32>,
     /// Optional session-state sync target used to keep a shared registry up to date.
     pub(super) session_sync: Option<Arc<dyn SessionSync>>,
     /// Paths approved via "learn" during this session. Auto-allowed on
@@ -2422,8 +2430,11 @@ pub(super) async fn handle_syscall_event(
     // contamination egress checks via the read-only fast path.
     if loop_ctx.config.noise_reduction.ignore_read_only && !containment_active {
         let read_path: Option<&str> = match &event.kind {
+            // A directory open belongs here for the same reason `DirList`
+            // below does: it is read-only, and leaving it out would push every
+            // directory a traversal walks through the full proxy pipeline.
             SyscallKind::FileOpen {
-                flags: OpenFlags::ReadOnly,
+                flags: OpenFlags::ReadOnly | OpenFlags::ReadOnlyDirectory,
                 ref path,
             } => Some(path.as_str()),
             SyscallKind::FileRead {
@@ -2628,7 +2639,16 @@ pub(super) async fn handle_syscall_event(
             }
             _ => false,
         };
-    if !containment_active {
+    // A latched session-containment flag disables the broad session-allowlist
+    // short-circuit (PR 4 Phase H: post-contamination traffic must reach the
+    // proxy, not an earlier grant). The one exception: a NetConnect the operator
+    // explicitly approved at a prompt for a trusted `ssh` destination, marked by
+    // an `ssh-egress:` grant that only that approval path ever writes. Honouring
+    // it stops re-prompting on every reconnect to an already-approved ssh host,
+    // without re-opening the short-circuit for profile-routine `net:` seeds.
+    let containment_permits_operator_ssh = containment_active
+        && netconnect_operator_ssh_egress_grant(&call_type, &loop_ctx.session_allowed);
+    if !containment_active || containment_permits_operator_ssh {
         if let Some(key) = session_allowlist_key(&call_type) {
             if loop_ctx
                 .session_allowed
@@ -3815,6 +3835,89 @@ async fn enforce_decision(
 /// drains the rest of the backlog. Matches the polling reviewer's interval.
 const SCOPE_DRAIN_POLL: Duration = Duration::from_millis(250);
 
+/// The shortened review window to use when the operator looks absent, or
+/// `None` to use the configured `freeze_timeout_seconds`.
+///
+/// `unattended_review_streak == 0` disables the fallback.
+fn unattended_review_timeout(loop_ctx: &SupervisorLoopContext<'_>) -> Option<Duration> {
+    unattended_window(
+        loop_ctx.config.unattended_review_streak,
+        loop_ctx.unanswered_reviews.load(Ordering::Relaxed),
+        loop_ctx.config.unattended_review_timeout_seconds,
+    )
+}
+
+/// Pure form of [`unattended_review_timeout`], split out so the policy can be
+/// exercised without building a whole loop context.
+fn unattended_window(streak_limit: u32, unanswered: u32, fallback_secs: u64) -> Option<Duration> {
+    if streak_limit == 0 || unanswered < streak_limit {
+        return None;
+    }
+    Some(Duration::from_secs(fallback_secs))
+}
+
+/// Record how a review ended, so the next one knows whether anybody is there.
+///
+/// Only a timeout counts against the operator. Every other outcome means a
+/// decision was made — locally, remotely, or by a scope grant — and clears the
+/// streak, so someone who steps away and returns gets the full window back on
+/// their very next prompt.
+fn note_review_attendance(loop_ctx: &SupervisorLoopContext<'_>, outcome: ReviewOutcome) {
+    let streak_limit = loop_ctx.config.unattended_review_streak;
+    match note_attendance(streak_limit, &loop_ctx.unanswered_reviews, outcome) {
+        AttendanceChange::WentUnattended(unanswered) => tracing::warn!(
+            event = "review_operator_unattended",
+            unanswered,
+            fallback_seconds = loop_ctx.config.unattended_review_timeout_seconds,
+            "reviews are expiring unanswered; shortening the window so a \
+             queued call stops holding the session for one that is not coming"
+        ),
+        AttendanceChange::Returned(unanswered) => tracing::info!(
+            event = "review_operator_returned",
+            unanswered,
+            "a review was answered; restoring the full review window"
+        ),
+        AttendanceChange::Unchanged => {}
+    }
+}
+
+/// What [`note_attendance`] concluded, so the caller can log the transition
+/// once rather than on every review.
+#[derive(Debug, PartialEq, Eq)]
+enum AttendanceChange {
+    /// This timeout was the one that crossed the streak limit.
+    WentUnattended(u32),
+    /// A review was answered after the limit had been crossed.
+    Returned(u32),
+    Unchanged,
+}
+
+/// Pure form of [`note_review_attendance`]: fold one review outcome into the
+/// unanswered counter and report whether that crossed a boundary.
+fn note_attendance(
+    streak_limit: u32,
+    unanswered: &AtomicU32,
+    outcome: ReviewOutcome,
+) -> AttendanceChange {
+    if streak_limit == 0 {
+        return AttendanceChange::Unchanged;
+    }
+    if matches!(outcome, ReviewOutcome::TimedOut) {
+        let now = unanswered.fetch_add(1, Ordering::Relaxed) + 1;
+        return if now == streak_limit {
+            AttendanceChange::WentUnattended(now)
+        } else {
+            AttendanceChange::Unchanged
+        };
+    }
+    let previous = unanswered.swap(0, Ordering::Relaxed);
+    if previous >= streak_limit {
+        AttendanceChange::Returned(previous)
+    } else {
+        AttendanceChange::Unchanged
+    }
+}
+
 /// True when `call_type` would be auto-allowed by the session-allowlist
 /// short-circuit in [`handle_syscall_event`] if it were re-issued right now.
 /// The same predicate, evaluated live: not under containment, not an
@@ -4136,10 +4239,15 @@ async fn queue_and_wait(
         // prompt buys no security and stacks the queue. The digest status
         // is written BEFORE the reviewer is cancelled so a disconnected or
         // late reviewer cannot stomp it with an auto-deny.
-        let review = loop_ctx.reviewer.review(
-            &digest_item,
-            Duration::from_secs(config.freeze_timeout_seconds),
-        );
+        // A queued syscall holds this thread, and the supervisor's event loop
+        // awaits the review inline, so it holds the whole session behind it.
+        // Paying the full window is right while somebody is answering; once a
+        // run of reviews has expired untouched it is only stall, and the
+        // outcome (deny) is already decided. Shorten the wait until a human
+        // resolves something.
+        let review_timeout = unattended_review_timeout(loop_ctx)
+            .unwrap_or_else(|| Duration::from_secs(config.freeze_timeout_seconds));
+        let review = loop_ctx.reviewer.review(&digest_item, review_timeout);
         tokio::pin!(review);
         let (outcome, drained) = loop {
             tokio::select! {
@@ -4216,6 +4324,11 @@ async fn queue_and_wait(
                 }
             }
         };
+        // Every path out of the race lands here, so this is the one place
+        // that sees whether a person resolved the review or it simply ran
+        // out. Recorded before the early return below, which a scope drain
+        // takes.
+        note_review_attendance(loop_ctx, outcome);
         if drained {
             break (outcome, Some("scope_drain".to_string()), None, true);
         }
@@ -4424,6 +4537,26 @@ async fn queue_and_wait(
                 // its single entry.
                 let entries = approved_session_allowlist_entries(&ctx.call_type);
                 if !entries.is_empty() {
+                    // When the operator approves a connect whose connecting
+                    // process is a trusted system `ssh`, mint a port-scoped
+                    // `ssh-egress:<addr>:<port>` grant. That key is the only one
+                    // honoured by the session-allowlist short-circuit while
+                    // containment is latched, so the approval sticks across
+                    // reconnects instead of re-prompting — but ONLY for the exact
+                    // host:port the operator saw. Gated on the binary being real
+                    // `ssh` so the containment-surviving namespace can never
+                    // cover a profile-routine or arbitrary destination. Resolved
+                    // before taking the lock (it reads /proc/<pid>/exe).
+                    let ssh_egress_grant = match &ctx.call_type {
+                        grith_proxy::types::ToolCallType::NetConnect { address, port }
+                            if grith_proxy::ssh_connect::is_trusted_ssh_exe(u64::from(
+                                event_pid,
+                            )) =>
+                        {
+                            Some(ssh_egress_key(address, *port))
+                        }
+                        _ => None,
+                    };
                     if let Ok(mut allowed) = loop_ctx.session_allowed.lock() {
                         let is_learn = review_action.as_deref() == Some("approve_and_learn");
                         for key in &entries {
@@ -4433,6 +4566,13 @@ async fn queue_and_wait(
                                 tracing::info!(key, "session allowlist: approved");
                             }
                             allowed.insert(key.clone());
+                        }
+                        if let Some(grant) = &ssh_egress_grant {
+                            tracing::info!(
+                                key = grant,
+                                "session allowlist: ssh-egress grant (survives containment)"
+                            );
+                            allowed.insert(grant.clone());
                         }
 
                         // Approving a Control-class IPC socket additionally
@@ -6071,6 +6211,40 @@ fn delegating_approval_key(call_type: &grith_proxy::types::ToolCallType) -> Stri
 
 /// returns the address (without port) so that approving one connection to a
 /// host implicitly allows subsequent connections to the same host on any port.
+/// The `ssh-egress:` session-allowlist key for a NetConnect: `ssh-egress:<addr>:<port>`.
+///
+/// Deliberately **port-scoped**, unlike the portless `net:<address>` grant. The
+/// containment exception this key unlocks must be as narrow as the operator's
+/// actual decision: approving `ssh` to `host:22` must not also let a
+/// *contaminated* session reach `host:8080`. (The general `net:` connect grant
+/// stays portless and host-level, as designed — this narrower key only gates
+/// the containment-survival path.)
+fn ssh_egress_key(address: &str, port: u16) -> String {
+    format!("ssh-egress:{address}:{port}")
+}
+
+/// `true` iff `call_type` is a NetConnect whose exact destination+port carries an
+/// operator-minted `ssh-egress:` session grant.
+///
+/// That namespace is written ONLY by an operator approving a trusted-`ssh`
+/// connect at a prompt — [`SupervisorProfile::build_session_allowlist`] seeds
+/// `net:` / `listen:` / `exec:` / `dns:` / `projdir:` / `ro:` / `rw:` but never
+/// `ssh-egress:` — so its presence is proof of an explicit per-destination human
+/// decision. It lets an approved ssh destination survive the sticky
+/// session-containment flag WITHOUT re-opening the short-circuit for
+/// profile-declared routine destinations (which was the point of PR 4 Phase H).
+fn netconnect_operator_ssh_egress_grant(
+    call_type: &grith_proxy::types::ToolCallType,
+    session_allowed: &Arc<Mutex<HashSet<String>>>,
+) -> bool {
+    use grith_proxy::types::ToolCallType;
+    let ToolCallType::NetConnect { address, port } = call_type else {
+        return false;
+    };
+    let key = ssh_egress_key(address, *port);
+    session_allowed.lock().is_ok_and(|s| s.contains(&key))
+}
+
 fn session_allowlist_key(call_type: &grith_proxy::types::ToolCallType) -> Option<String> {
     use grith_proxy::types::ToolCallType;
     match call_type {
@@ -7531,6 +7705,109 @@ pub(super) fn build_ws_event(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod unattended_review_tests {
+    use super::*;
+
+    /// While reviews are being answered, the full window is used.
+    #[test]
+    fn an_attended_session_keeps_the_full_window() {
+        assert_eq!(unattended_window(2, 0, 5), None);
+        assert_eq!(unattended_window(2, 1, 5), None);
+    }
+
+    /// Once the streak is reached, the short window takes over. A queued
+    /// syscall holds the whole session behind it, so five minutes per call
+    /// for an answer nobody is giving is pure stall.
+    #[test]
+    fn an_unattended_session_falls_back_to_the_short_window() {
+        assert_eq!(unattended_window(2, 2, 5), Some(Duration::from_secs(5)));
+        assert_eq!(unattended_window(2, 41, 5), Some(Duration::from_secs(5)));
+    }
+
+    /// `0` is the documented off switch.
+    #[test]
+    fn a_zero_streak_disables_the_fallback() {
+        assert_eq!(unattended_window(0, 99, 5), None);
+    }
+
+    /// The streak counts only timeouts, and ANY resolution clears it — a
+    /// local answer, a notification channel, or a scope grant. An operator
+    /// who steps away and comes back gets the full window on their next
+    /// prompt, not a shortened one.
+    #[test]
+    fn any_answer_restores_the_full_window() {
+        let unanswered = AtomicU32::new(0);
+        let limit = 2u32;
+        let window = |unanswered: &AtomicU32| {
+            unattended_window(limit, unanswered.load(Ordering::Relaxed), 5)
+        };
+
+        note_attendance(limit, &unanswered, ReviewOutcome::TimedOut);
+        assert_eq!(window(&unanswered), None);
+
+        note_attendance(limit, &unanswered, ReviewOutcome::TimedOut);
+        assert_eq!(
+            window(&unanswered),
+            Some(Duration::from_secs(5)),
+            "two unanswered reviews mean nobody is there"
+        );
+
+        note_attendance(limit, &unanswered, ReviewOutcome::Approved);
+        assert_eq!(
+            window(&unanswered),
+            None,
+            "an approval proves somebody is at the keyboard"
+        );
+
+        note_attendance(limit, &unanswered, ReviewOutcome::TimedOut);
+        note_attendance(limit, &unanswered, ReviewOutcome::Denied);
+        assert_eq!(
+            window(&unanswered),
+            None,
+            "an explicit deny is an answer too"
+        );
+    }
+
+    /// The transition is reported once, not on every review, so the log says
+    /// "the operator went away" rather than repeating it 41 times.
+    #[test]
+    fn the_transition_is_reported_once() {
+        let unanswered = AtomicU32::new(0);
+        assert_eq!(
+            note_attendance(2, &unanswered, ReviewOutcome::TimedOut),
+            AttendanceChange::Unchanged
+        );
+        assert_eq!(
+            note_attendance(2, &unanswered, ReviewOutcome::TimedOut),
+            AttendanceChange::WentUnattended(2)
+        );
+        assert_eq!(
+            note_attendance(2, &unanswered, ReviewOutcome::TimedOut),
+            AttendanceChange::Unchanged
+        );
+        assert_eq!(
+            note_attendance(2, &unanswered, ReviewOutcome::Approved),
+            AttendanceChange::Returned(3)
+        );
+        assert_eq!(
+            note_attendance(2, &unanswered, ReviewOutcome::Approved),
+            AttendanceChange::Unchanged
+        );
+    }
+
+    /// With the fallback off, the counter is never touched at all.
+    #[test]
+    fn a_zero_streak_records_nothing() {
+        let unanswered = AtomicU32::new(0);
+        assert_eq!(
+            note_attendance(0, &unanswered, ReviewOutcome::TimedOut),
+            AttendanceChange::Unchanged
+        );
+        assert_eq!(unanswered.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -7542,6 +7819,58 @@ mod tests {
     use grith_proxy::types::ToolCallType;
     use std::collections::{HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
+
+    /// The containment gate exception opens ONLY for a NetConnect whose exact
+    /// destination AND port carry an operator-minted `ssh-egress:` grant — never
+    /// for a profile-seeded `net:` entry, a different host, or a different port.
+    #[test]
+    fn ssh_egress_grant_gates_only_operator_approved_destination() {
+        let connect = |addr: &str, port: u16| ToolCallType::NetConnect {
+            address: addr.to_string(),
+            port,
+        };
+        // Profile routine seed: net: only — the exception must stay shut.
+        let profile_seeded: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(
+            ["net:api.anthropic.com".to_string()].into_iter().collect(),
+        ));
+        assert!(!netconnect_operator_ssh_egress_grant(
+            &connect("api.anthropic.com", 443),
+            &profile_seeded
+        ));
+
+        // Operator-approved ssh destination: the port-scoped grant is present.
+        let approved: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(
+            [
+                "net:terminus.pelygo.com".to_string(),
+                "ssh-egress:terminus.pelygo.com:22".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        assert!(netconnect_operator_ssh_egress_grant(
+            &connect("terminus.pelygo.com", 22),
+            &approved
+        ));
+        // Same host, DIFFERENT port — the port-scoped grant must not cover it,
+        // even though the portless net: entry would.
+        assert!(!netconnect_operator_ssh_egress_grant(
+            &connect("terminus.pelygo.com", 8080),
+            &approved
+        ));
+        // A different host is not covered by that grant.
+        assert!(!netconnect_operator_ssh_egress_grant(
+            &connect("evil.example", 22),
+            &approved
+        ));
+        // Non-NetConnect never matches.
+        assert!(!netconnect_operator_ssh_egress_grant(
+            &ToolCallType::ProcessSpawn {
+                command: "/usr/bin/ssh".into(),
+                args: vec!["ssh".into(), "terminus.pelygo.com".into()],
+            },
+            &approved
+        ));
+    }
 
     /// `ToolCallType::supports_session_grant` is what the approval dialog
     /// renders "[l] Always allow" from; `session_allowlist_key` is what
@@ -9190,6 +9519,7 @@ mod tests {
             freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
@@ -9276,6 +9606,7 @@ mod tests {
             freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
@@ -9450,6 +9781,7 @@ mod tests {
             freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
@@ -9709,6 +10041,7 @@ mod tests {
             freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(HashSet::new())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
@@ -11443,6 +11776,7 @@ mod tests {
             freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(session_allowed_seed.into_iter().collect())),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
@@ -11913,6 +12247,7 @@ mod tests {
                 seen: seen.clone(),
                 cancelled: cancelled.clone(),
             }),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: session_allowed.clone(),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),
@@ -12034,6 +12369,7 @@ mod tests {
             freezer: Freezer::new(Duration::from_secs(config.freeze_timeout_seconds)),
             read_batch_tracker: Mutex::new(ReadBatchTracker::new(10)),
             reviewer: Arc::new(PanicReviewer),
+            unanswered_reviews: Arc::new(AtomicU32::new(0)),
             session_sync: None,
             session_allowed: Arc::new(Mutex::new(allowed)),
             dns_cache: Arc::new(Mutex::new(DnsCache::new())),

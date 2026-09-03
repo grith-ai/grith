@@ -323,6 +323,11 @@ impl SensitivePathHeuristicFilter {
         // not allocated — this runs on every scored file operation.
         let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         let destructive = matches!(op, "write" | "delete");
+        // Enumerating a directory yields the NAMES it contains and nothing
+        // else — the kernel will not read file content through a directory
+        // fd. That is reconnaissance, not credential access, and the read of
+        // any file the listing reveals is scored in full when it happens.
+        let enumerate = op == "list";
 
         // A#4: `~/.pki/nssdb` is the NSS *shared* certificate DB — an app cert
         // store that chrome/curl/other NSS consumers read and atomically rewrite
@@ -452,11 +457,37 @@ impl SensitivePathHeuristicFilter {
                 if marker == "/.ssh/" && ssh_metadata_read {
                     break;
                 }
+                // A listing is priced far below a read, and deliberately
+                // below the escalation band, so it is recorded and can still
+                // push a composite over the line alongside another signal
+                // without ever prompting on its own.
+                //
+                // Measured 2026-09-02: `find /home/dan -type d -name sqlglot`
+                // opened every credential directory on the machine. Each one
+                // scored 4.0 here, queued, and froze the tracee for the full
+                // 300s review timeout — 41 prompts in one session, every one
+                // of them auto-denied on timeout, and the searches silently
+                // returned incomplete results.
+                let (score, severity) = if destructive {
+                    (4.5, Severity::Error)
+                } else if enumerate {
+                    (0.5, Severity::Warning)
+                } else {
+                    (4.0, Severity::Error)
+                };
                 hits.push(HeuristicHit {
-                    rule_id: "credential-directory",
-                    score: if destructive { 4.5 } else { 4.0 },
-                    severity: Severity::Error,
-                    message: format!("{op} access to credential directory"),
+                    rule_id: if enumerate {
+                        "credential-directory-listing"
+                    } else {
+                        "credential-directory"
+                    },
+                    score,
+                    severity,
+                    message: if enumerate {
+                        "listed the names in a credential directory".to_string()
+                    } else {
+                        format!("{op} access to credential directory")
+                    },
                 });
                 break;
             }
@@ -970,6 +1001,94 @@ mod tests {
             "score {} must be elevated",
             result.score
         );
+    }
+
+    /// Walking past a credential directory is not reading one.
+    ///
+    /// These are the exact paths that flooded a supervised session on
+    /// 2026-09-02: `find /home/dan -type d -name sqlglot` opened each of them
+    /// with `O_DIRECTORY`, every one scored 4.0, queued, and froze the tracee
+    /// for the full 300s review timeout. Each must now sit below the
+    /// 3.0 auto-allow threshold so a traversal never prompts.
+    #[tokio::test]
+    async fn listing_a_credential_directory_stays_below_the_escalation_band() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for path in [
+            "/home/dan/.gnupg/private-keys-v1.d",
+            "/home/dan/.pki/nssdb",
+            "/home/dan/.aws/login",
+            "/home/dan/.ssh/config.d",
+            "/home/dan/.docker/buildx",
+        ] {
+            let result = filter
+                .evaluate(&make_ctx(ToolCallType::DirList {
+                    path: path.to_string(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                result.score < 3.0,
+                "listing {path} scored {} — a traversal must not prompt",
+                result.score
+            );
+            if result.matched {
+                assert_eq!(result.rule_id, "credential-directory-listing");
+            }
+        }
+    }
+
+    /// The downgrade is scoped to enumeration. Reading a file that lives in
+    /// the same directory is the act the rule exists for and is untouched.
+    #[tokio::test]
+    async fn reading_inside_a_credential_directory_is_unchanged() {
+        let filter = SensitivePathHeuristicFilter::new();
+        for path in [
+            "/home/dan/.aws/credentials",
+            "/home/dan/.gnupg/private-keys-v1.d/ABCDEF.key",
+            "/home/dan/.docker/config.json",
+        ] {
+            let result = filter
+                .evaluate(&make_ctx(ToolCallType::FileRead {
+                    path: path.to_string(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                result.matched && result.score >= 4.0,
+                "reading {path} scored {} ({}) — a credential read must still escalate",
+                result.score,
+                result.rule_id
+            );
+        }
+    }
+
+    /// A listing is recorded rather than dropped, so it can still combine
+    /// with other evidence and stays visible in the audit log.
+    #[tokio::test]
+    async fn a_credential_directory_listing_is_still_recorded() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let result = filter
+            .evaluate(&make_ctx(ToolCallType::DirList {
+                path: "/home/dan/.gnupg/private-keys-v1.d".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.matched, "the listing must not be silently dropped");
+        assert!(result.score > 0.0, "a dropped signal cannot combine");
+    }
+
+    /// Deleting inside a credential directory is destructive, not a listing,
+    /// and keeps the higher score.
+    #[tokio::test]
+    async fn deleting_in_a_credential_directory_is_unchanged() {
+        let filter = SensitivePathHeuristicFilter::new();
+        let result = filter
+            .evaluate(&make_ctx(ToolCallType::FileDelete {
+                path: "/home/dan/.ssh/id_rsa".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.matched && result.score >= 4.5, "{result:?}");
     }
 
     /// A file-shaped credential source is scored via the as-written candidate.

@@ -157,6 +157,28 @@ impl SecurityProxy {
         let mut score = scoring::aggregate(&all_results);
         score += self.meta_rules.evaluate(&all_results, ctx);
 
+        // SSH remote-shell connect carve: a genuine `ssh` connecting after
+        // reading its own key is scored as exfiltration by taint + containment
+        // even though pubkey auth never transmits the key. Clamp such a connect
+        // into the review band so the operator is prompted instead of silently
+        // denied — hash/path-anchored to the ssh binary, and only when nothing
+        // outside the routine key-read filter stack contributed. Never raises a
+        // score and never reaches allow. See ssh_connect module docs.
+        if let Some(clamped) = crate::ssh_connect::maybe_clamp_ssh_connect(
+            score,
+            allow_threshold,
+            deny_threshold,
+            &all_results,
+            ctx,
+        ) {
+            tracing::info!(
+                original_score = score,
+                clamped_score = clamped,
+                "ssh-connect-review-clamp: routine ssh connect routed to review instead of deny"
+            );
+            score = clamped;
+        }
+
         // Note: adaptive scoring is now handled by the reputation system
         // in the supervisor event handler, not in the proxy pipeline.
 

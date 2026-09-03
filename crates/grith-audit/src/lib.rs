@@ -11,6 +11,7 @@ pub mod compression;
 pub mod correlation;
 pub mod error;
 pub mod export;
+pub mod heap;
 pub mod logger;
 pub mod query;
 pub(crate) mod record_parser;
@@ -22,6 +23,7 @@ pub mod writer_lock;
 
 pub use correlation::CorrelationTracker;
 pub use error::Error;
+pub use heap::release_free_heap;
 pub use logger::AuditLogger;
 pub use query::AuditQuery;
 pub use stats::AuditStats;

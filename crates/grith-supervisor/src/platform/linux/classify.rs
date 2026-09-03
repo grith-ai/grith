@@ -131,7 +131,17 @@ impl PtraceSupervisor {
                                 "failed to read open_how at {how_ptr:#x} for pid {pid}: {e}"
                             ))
                         })?;
-                    Self::decode_open_flags(raw_flags)
+                    // Same reasoning as `resolve` above, applied to
+                    // `O_DIRECTORY`: this flags word lives in tracee-writable
+                    // memory, so a sibling thread can clear the bit between
+                    // this read and the kernel's own copy. Trusting it would
+                    // let a tracee claim "I am only enumerating a directory",
+                    // collect the cheap listing score, and have the kernel
+                    // open the credential FILE for reading. Mask it off and
+                    // score the worst case — a plain read. Nothing loses by
+                    // it: glibc's `opendir` uses `openat`, whose flags come
+                    // from a register on a thread we have stopped.
+                    Self::decode_open_flags(raw_flags & !(libc::O_DIRECTORY as u64))
                 };
 
                 // `resolve_at_path` treats an absolute path as absolute — the
@@ -1642,7 +1652,20 @@ impl PtraceSupervisor {
     pub(super) fn decode_open_flags(raw: u64) -> OpenFlags {
         let access_mode = (raw as i32) & libc::O_ACCMODE;
         if access_mode == libc::O_RDONLY {
-            OpenFlags::ReadOnly
+            // `O_DIRECTORY` is a promise from the kernel, not a hint: the open
+            // fails with ENOTDIR on anything else, and `read(2)` on what it
+            // does return fails with EISDIR. So this fd can be enumerated and
+            // nothing more, which is a different act from reading a file and
+            // is scored as one. Without it, `find -type d` walking $HOME
+            // opened every credential directory on the machine and each one
+            // priced as a credential read (measured 2026-09-02: one prompt per
+            // directory, each freezing the tracee for the full 300s review
+            // timeout).
+            if raw as i32 & libc::O_DIRECTORY != 0 {
+                OpenFlags::ReadOnlyDirectory
+            } else {
+                OpenFlags::ReadOnly
+            }
         } else if access_mode == libc::O_WRONLY {
             if raw as i32 & libc::O_APPEND != 0 {
                 OpenFlags::Append
@@ -2268,6 +2291,48 @@ mod tests {
     fn decode_open_flags_rdonly() {
         let flags = PtraceSupervisor::decode_open_flags(libc::O_RDONLY as u64);
         assert_eq!(flags, OpenFlags::ReadOnly);
+    }
+
+    #[test]
+    fn decode_open_flags_directory_is_not_a_read() {
+        assert_eq!(
+            PtraceSupervisor::decode_open_flags((libc::O_RDONLY | libc::O_DIRECTORY) as u64),
+            OpenFlags::ReadOnlyDirectory
+        );
+        // The flags `find` actually passes.
+        assert_eq!(
+            PtraceSupervisor::decode_open_flags(
+                (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64
+            ),
+            OpenFlags::ReadOnlyDirectory
+        );
+        // Without the flag nothing changes: this is still a file read.
+        assert_eq!(
+            PtraceSupervisor::decode_open_flags(libc::O_RDONLY as u64),
+            OpenFlags::ReadOnly
+        );
+        // A write is a write. The kernel rejects O_DIRECTORY with a write
+        // mode (EISDIR), but scoring it as a write if it ever arrived is the
+        // fail-safe reading.
+        assert_eq!(
+            PtraceSupervisor::decode_open_flags((libc::O_WRONLY | libc::O_DIRECTORY) as u64),
+            OpenFlags::WriteOnly
+        );
+    }
+
+    /// The directory bit is only trusted when it came from a register.
+    ///
+    /// `openat2` carries its flags in tracee memory, so the classifier masks
+    /// `O_DIRECTORY` off before decoding. This pins the masking itself: what
+    /// the openat2 arm passes in must never decode to the cheaper variant.
+    #[test]
+    fn a_memory_sourced_directory_flag_is_not_trusted() {
+        let raw = (libc::O_RDONLY | libc::O_DIRECTORY) as u64;
+        assert_eq!(
+            PtraceSupervisor::decode_open_flags(raw & !(libc::O_DIRECTORY as u64)),
+            OpenFlags::ReadOnly,
+            "a tracee that can flip the bit must be scored as a file read"
+        );
     }
 
     #[test]

@@ -1873,6 +1873,7 @@ fn summary_lines(req: &PermissionRequest) -> Vec<Line<'static>> {
                 Span::styled(value, Style::new().fg(TEXT_MID)),
             ]));
         }
+        push_process_target(&mut lines, provenance.process_target.as_ref());
         return lines;
     }
     if req.call_type != "NetListen" {
@@ -1892,6 +1893,12 @@ fn summary_lines(req: &PermissionRequest) -> Vec<Line<'static>> {
                 Span::styled(value, Style::new().fg(TEXT_MID)),
             ]));
         }
+        // The destination the process is reaching (e.g. "connecting to
+        // git@host") — the single most decision-relevant fact for a NetConnect
+        // prompt. Previously computed but only rendered in the REPL panel, so
+        // an operator answering the exec-TUI dialog could not see where ssh was
+        // going.
+        push_process_target(&mut lines, provenance.process_target.as_ref());
         return lines;
     }
 
@@ -1984,6 +1991,20 @@ struct ProvenanceLines {
     /// Short summary of what the process is doing, extracted from its args.
     /// E.g., "ssh git@github.com" or "curl https://api.example.com".
     process_target: Option<String>,
+}
+
+/// Push the `process_target` phrase ("connecting to <host>", "fetching <url>")
+/// as a `detail:` line when present. Shared by the exec-TUI dialog branches so
+/// the destination is visible wherever a supervised connect/spawn is reviewed.
+/// Takes the field by ref (not the whole struct) so it composes after the
+/// `process_line` / `parent_line` fields have been moved out.
+fn push_process_target(lines: &mut Vec<Line<'static>>, target: Option<&String>) {
+    if let Some(target) = target {
+        lines.push(Line::from(vec![
+            Span::styled("detail: ", Style::new().fg(TEXT_DIM)),
+            Span::styled(target.clone(), Style::new().fg(TEXT_MID)),
+        ]));
+    }
 }
 
 fn parse_provenance(raw_args: &str) -> ProvenanceLines {
@@ -3131,6 +3152,39 @@ mod tests {
         req.call_type = call_type.to_string();
         req.scope_enabled = true;
         req
+    }
+
+    /// The exec-TUI dialog must show WHERE a supervised connect is going, so an
+    /// operator can decide. Previously the destination was computed but rendered
+    /// only in the REPL panel, leaving the exec dialog showing just `process:
+    /// ssh (pid N)`.
+    #[test]
+    fn netconnect_dialog_shows_the_ssh_destination() {
+        let mut req = make_request(false);
+        req.tool = "NetConnect(terminus.pelygo.com:22)".to_string();
+        req.call_type = "NetConnect".to_string();
+        req.args = serde_json::json!({
+            "pid": 4242,
+            "process": "ssh",
+            "process_args": ["ssh", "git@terminus.pelygo.com"],
+            "address": "terminus.pelygo.com",
+            "port": 22,
+        })
+        .to_string();
+
+        let rendered: String = summary_lines(&req)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+
+        assert!(
+            rendered.contains("git@terminus.pelygo.com"),
+            "dialog must name the ssh destination; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("connecting to"),
+            "dialog should describe the connect intent; got: {rendered}"
+        );
     }
 
     // ---- work/85: block mode ------------------------------------------

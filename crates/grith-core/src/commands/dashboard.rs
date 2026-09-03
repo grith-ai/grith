@@ -53,10 +53,13 @@ pub fn cmd_dashboard_start(daemon: &daemon::Daemon) -> anyhow::Result<()> {
     // real daemon unidentifiable and the CLI unable to authenticate to it.
     match probe_port(port) {
         PortProbe::Vacant => {}
-        PortProbe::GrithDaemon { version, .. } => anyhow::bail!(
-            "a Grith daemon ({version}) is already listening on 127.0.0.1:{port}; \
-             replace it with: grith dashboard restart"
-        ),
+        PortProbe::GrithDaemon { version, .. } => match forwarded_listener(port) {
+            Some(owner) => anyhow::bail!(forwarded_listener_message(port, &owner)),
+            None => anyhow::bail!(
+                "a Grith daemon ({version}) is already listening on 127.0.0.1:{port}; \
+                 replace it with: grith dashboard restart"
+            ),
+        },
         PortProbe::Foreign => anyhow::bail!(
             "port {port} is already in use by a process that is not a Grith daemon; \
              free it or change `server.port`"
@@ -424,6 +427,30 @@ pub fn cmd_dashboard_stop(configured_port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Describe the process holding `port` when it answers as a Grith daemon but
+/// the socket belongs to a local process that is not grith — i.e. the port is
+/// forwarded from another machine (VS Code Remote, `ssh -L`, a published
+/// container port). `None` means the owner is our own daemon or could not be
+/// identified, and the caller keeps its ordinary local handling.
+fn forwarded_listener(port: u16) -> Option<String> {
+    match crate::daemon::listener::listener_locality(port) {
+        crate::daemon::listener::ListenerLocality::Forwarded(owner) => Some(owner.describe()),
+        crate::daemon::listener::ListenerLocality::LocalGrith(_)
+        | crate::daemon::listener::ListenerLocality::Unknown => None,
+    }
+}
+
+/// The operator-facing explanation for a forwarded daemon port. Shared by
+/// `status`, `restart` and `stop` so all three say the same thing.
+fn forwarded_listener_message(port: u16, owner: &str) -> String {
+    format!(
+        "A Grith daemon answers on 127.0.0.1:{port}, but the port is held by {owner} — \
+         it is forwarded from another machine, not served by a daemon on this one.\n\
+         Stop the port forward (in VS Code: the Ports panel), or set a free `server.port` \
+         in ~/.config/grith/config.toml to give this machine its own daemon."
+    )
+}
+
 /// Stop path when no PID file identifies a daemon. Probes the port so "not
 /// running" is only claimed when nothing is actually listening.
 fn stop_unidentified(port: u16) -> anyhow::Result<()> {
@@ -438,6 +465,12 @@ fn stop_unidentified(port: u16) -> anyhow::Result<()> {
             );
         }
         PortProbe::GrithDaemon { version, .. } => {
+            // A forwarded port has no local process to stop, and the shutdown
+            // request below would be aimed at someone else's daemon.
+            if let Some(owner) = forwarded_listener(port) {
+                println!("{}", forwarded_listener_message(port, &owner));
+                return Ok(());
+            }
             println!(
                 "Found a Grith daemon ({version}) on 127.0.0.1:{port}, but no PID file \
                  identifies its process — likely an orphan from an earlier install."
@@ -516,6 +549,10 @@ pub fn cmd_dashboard_restart(
         match probe_port(port) {
             PortProbe::Vacant => {}
             PortProbe::GrithDaemon { version, .. } => {
+                // Never "restart" a daemon that runs on another machine.
+                if let Some(owner) = forwarded_listener(port) {
+                    anyhow::bail!(forwarded_listener_message(port, &owner));
+                }
                 println!("Stopping an orphaned Grith daemon ({version}) on port {port}...");
                 if !(request_http_shutdown(port) && wait_for_port_release(port, STOP_WAIT)) {
                     anyhow::bail!(
@@ -552,12 +589,25 @@ pub fn cmd_dashboard_status(configured_port: u16) -> anyhow::Result<()> {
         }
         None => match probe_port(configured_port) {
             PortProbe::GrithDaemon { version, .. } => {
+                if let Some(owner) = forwarded_listener(configured_port) {
+                    println!("Dashboard is not running on this machine.");
+                    println!("{}", forwarded_listener_message(configured_port, &owner));
+                    return Ok(());
+                }
                 println!(
                     "A Grith daemon ({version}) is listening on 127.0.0.1:{configured_port}, \
                      but no PID file identifies its process."
                 );
                 if version != env!("CARGO_PKG_VERSION") {
                     println!("  This CLI is {}.", env!("CARGO_PKG_VERSION"));
+                }
+                if let Some(pid) = crate::daemon::listener::listener_owner(configured_port)
+                    .and_then(|owner| owner.pid)
+                {
+                    // `restart` refuses to signal a daemon it cannot identify
+                    // from the PID file, so give the operator the PID it will
+                    // not act on rather than only the command that fails.
+                    println!("  Its process is pid {pid}.");
                 }
                 println!("  Replace it with: grith dashboard restart");
             }

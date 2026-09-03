@@ -348,6 +348,8 @@ pub(crate) fn to_supervisor_config(
         enabled: core.enabled,
         default_profile: core.default_profile.clone(),
         freeze_timeout_seconds: core.freeze_timeout_seconds,
+        unattended_review_streak: core.unattended_review_streak,
+        unattended_review_timeout_seconds: core.unattended_review_timeout_seconds,
         deny_replay_seconds: core.deny_replay_seconds,
         approve_replay_seconds: core.approve_replay_seconds,
         max_concurrent_sessions: core.max_concurrent_sessions,
@@ -631,10 +633,11 @@ mod tests {
 
     #[test]
     fn test_load_secret_patterns_real_corpus_has_expected_count_and_is_deduplicated() {
-        // 1618 after S1 (2026-08-07) removed the two looser unanchored FaunaDB /
-        // Resend duplicates (`fauna-secret-bare`, `resend-api-key-bare`).
+        // 1617 after S1 (2026-08-07) removed the two looser unanchored FaunaDB /
+        // Resend duplicates and the 2026-09-02 removal of `bitcoin-wif-private-key-v2`
+        // (unanchored WIF regex that matched inside hex hash paths).
         let patterns = load_secret_patterns().expect("load real secret corpus");
-        assert_eq!(patterns.len(), 1618);
+        assert_eq!(patterns.len(), 1617);
 
         let ids = patterns
             .iter()

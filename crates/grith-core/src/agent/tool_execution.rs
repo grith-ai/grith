@@ -18,6 +18,14 @@ use super::telemetry::parse_shell_exec_args;
 /// commands produce very large output (e.g. `grep -r` on an entire codebase).
 const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 
+/// Upper bound on how long a queued call waits for review when NO reviewer is
+/// detectable (no tty, no dashboard, no notification channel). Long enough that
+/// a prompt external resolver still lands; short enough that a genuinely
+/// headless run (e.g. ssh queued in CI) fails in seconds, not the full
+/// review_timeout. The real timeout is `review_timeout.min(this)`, so a
+/// shorter configured timeout always wins.
+const NO_REVIEWER_GRACE: Duration = Duration::from_secs(15);
+
 /// Characters reserved for the truncation notice when trimming tool results.
 const TRUNCATION_KEEP_CHARS: usize = 200;
 
@@ -365,8 +373,41 @@ async fn handle_queued_call(
     // double-fire (and only ever covered the agent path), so it is intentionally
     // not done inline.
 
-    // Interactive inline review (shows detail + key prompt in terminal)
-    let outcome = grith_cli::run_inline_review(digest_queue, &digest_item, review_timeout).await;
+    // A queued call is resolved by a human through one of three routes we can
+    // see: the inline terminal prompt, the dashboard UI, or an approve-capable
+    // notification channel. When the session is non-interactive AND none of
+    // those is present, waiting out the full review_timeout usually just stalls
+    // (a queued ssh in CI hangs for the whole window) before the inevitable
+    // auto-deny. We can't be *certain* nobody is watching — an external process
+    // can resolve the queue directly (a dashboard server without the pid file, a
+    // custom integration) — so rather than deny immediately we cap the wait at a
+    // short grace window: a prompt external resolver still lands, but a genuinely
+    // headless run fails in seconds instead of minutes. Any detectable review
+    // route keeps the full timeout.
+    let has_review_route = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || crate::daemon::pid::is_dashboard_running().is_some()
+        || !notification_dispatcher
+            .registry()
+            .enabled_channel_ids()
+            .is_empty();
+
+    let effective_timeout = if has_review_route {
+        review_timeout
+    } else {
+        let grace = review_timeout.min(NO_REVIEWER_GRACE);
+        tracing::info!(
+            item_id = %digest_item.id,
+            score = decision.composite_score,
+            grace_secs = grace.as_secs(),
+            "no detectable reviewer (no tty, dashboard, or notification channel); \
+             capping the review wait at a short grace before auto-deny"
+        );
+        grace
+    };
+
+    // Interactive inline review (shows detail + key prompt in terminal), or a
+    // silent poll bounded by effective_timeout when there is no tty.
+    let outcome = grith_cli::run_inline_review(digest_queue, &digest_item, effective_timeout).await;
 
     // Notify resolution on configured channels
     if let Ok(resolved_item) = digest_queue.get_by_id(&digest_item.id) {

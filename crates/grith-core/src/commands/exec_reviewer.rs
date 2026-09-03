@@ -174,10 +174,15 @@ impl QueueReviewer for ExecTuiQueueReviewer {
                         // reviewer) and tell the TUI to drop the now-stale
                         // dialog so queued prompts surface instead of
                         // stacking behind a dead one.
+                        // `Expired`, not `Denied`: the operator never
+                        // answered. Both fail closed, and every consumer
+                        // already pairs the two for enforcement, but only the
+                        // record tells an operator afterwards whether anyone
+                        // was at the keyboard.
                         if let Ok(rt) = rt {
                             let _ = rt.block_on(digest_store.update_status(
                                 item_id,
-                                DigestStatus::Denied,
+                                DigestStatus::Expired,
                                 Some("auto_deny_timeout"),
                                 Some("auto denied after exec TUI review timeout"),
                             ));
@@ -493,7 +498,11 @@ mod tests {
         }
 
         let reviewed = queue.get_by_id(&item.id).unwrap();
-        assert_eq!(reviewed.status, grith_digest::DigestStatus::Denied);
+        // Expired, not Denied. Nobody answered; recording that as the
+        // operator's decision is what hid a session of 41 untouched reviews
+        // behind a wall of apparent denials (2026-09-02). Both fail closed,
+        // and every enforcement path already pairs the two.
+        assert_eq!(reviewed.status, grith_digest::DigestStatus::Expired);
         assert_eq!(reviewed.review_action.as_deref(), Some("auto_deny_timeout"));
     }
 

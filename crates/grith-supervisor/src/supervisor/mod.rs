@@ -785,6 +785,9 @@ pub async fn run_supervisor_loop(
         freezer,
         read_batch_tracker,
         reviewer,
+        // Per session: a fresh session always starts by assuming somebody is
+        // watching, however the last one ended.
+        unanswered_reviews: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         session_allowed,
         dns_cache,
         dns_inspection_enabled,

@@ -13,6 +13,8 @@
 //! enabled = true
 //! default_profile = "generic"
 //! freeze_timeout_seconds = 300
+//! unattended_review_streak = 2
+//! unattended_review_timeout_seconds = 5
 //! max_concurrent_sessions = 64
 //! pty_forwarding = true
 //!
@@ -48,6 +50,32 @@ pub struct SupervisorConfig {
     /// How long (in seconds) a frozen process waits for human approval
     /// before being automatically denied and killed.
     pub freeze_timeout_seconds: u64,
+
+    /// After this many review timeouts in a row with no human answer, treat
+    /// the operator as absent and fall back to
+    /// [`Self::unattended_review_timeout_seconds`] for subsequent reviews.
+    ///
+    /// A queued syscall holds the supervised thread — and, because the
+    /// supervisor's event loop awaits the review inline, the rest of the
+    /// session behind it — for the whole of `freeze_timeout_seconds`. When
+    /// somebody is at the keyboard that is the point. When nobody is, it is
+    /// five minutes of stall per call for an answer that is never coming:
+    /// observed 2026-09-02, 41 consecutive timeouts in one session, none of
+    /// them ever answered, the session unusable for two and a half hours.
+    ///
+    /// The streak resets the instant any review is resolved by a human —
+    /// locally, from a notification channel, or by a scope grant — so an
+    /// operator who steps away and comes back gets the full window again on
+    /// their next prompt. `0` disables the fallback entirely.
+    pub unattended_review_streak: u32,
+
+    /// Review window (in seconds) used once
+    /// [`Self::unattended_review_streak`] consecutive timeouts say nobody is
+    /// answering. Short, not zero: a returning operator can still catch a
+    /// prompt, and out-of-band resolution (dashboard, Telegram, a scope
+    /// grant) still has a window to land. The outcome is unchanged — an
+    /// unanswered review still fails closed.
+    pub unattended_review_timeout_seconds: u64,
 
     /// How long (in seconds) an operator's deny of a specific request keeps
     /// auto-denying identical retries without a fresh prompt. A tool that
@@ -410,6 +438,8 @@ impl Default for SupervisorConfig {
             enabled: true,
             default_profile: String::new(),
             freeze_timeout_seconds: 300,
+            unattended_review_streak: 2,
+            unattended_review_timeout_seconds: 5,
             deny_replay_seconds: 60,
             approve_replay_seconds: 60,
             max_concurrent_sessions: 64,
@@ -858,6 +888,8 @@ mod tests {
             enabled: false,
             default_profile: "aider".into(),
             freeze_timeout_seconds: 120,
+            unattended_review_streak: 3,
+            unattended_review_timeout_seconds: 7,
             deny_replay_seconds: 45,
             approve_replay_seconds: 30,
             max_concurrent_sessions: 2,

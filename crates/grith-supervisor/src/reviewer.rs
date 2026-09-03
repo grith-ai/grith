@@ -152,10 +152,16 @@ async fn poll_digest_status(
                 _ => {}
             }
             let now = chrono::Utc::now().to_rfc3339();
+            // `Expired`, not `Denied`. Both fail closed and every consumer
+            // already treats them alike for enforcement, but only one of them
+            // is true: nobody said no, nobody was there. Recording the
+            // operator's silence as their decision hid a session in which all
+            // 41 reviews expired untouched (2026-09-02) behind a wall of
+            // apparent denials.
             if let Err(e) = digest_store
                 .update_status(
                     item_id,
-                    DigestStatus::Denied,
+                    DigestStatus::Expired,
                     Some("auto_deny_timeout"),
                     Some(&format!("auto denied after timeout at {now}")),
                 )
@@ -164,7 +170,7 @@ async fn poll_digest_status(
                 tracing::error!(
                     error = %e,
                     item_id = %item_id,
-                    "failed to update digest status to Denied on timeout"
+                    "failed to update digest status to Expired on timeout"
                 );
             }
             return ReviewOutcome::TimedOut;

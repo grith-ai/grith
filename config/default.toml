@@ -186,6 +186,12 @@ model = "anthropic/claude-sonnet-4-5-20250514"
 enabled = true
 default_profile = "generic"
 freeze_timeout_seconds = 300
+# A queued call holds the supervised thread — and the session behind it — for
+# the whole window above. After this many reviews expire untouched in a row,
+# grith concludes nobody is at the keyboard and uses the shorter window below
+# instead; any answered review restores the full one. 0 disables the fallback.
+unattended_review_streak = 2
+unattended_review_timeout_seconds = 5
 max_concurrent_sessions = 4
 pty_forwarding = true
 require_sandbox = false

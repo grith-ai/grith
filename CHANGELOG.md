@@ -8,7 +8,82 @@ will adopt [Semantic Versioning](https://semver.org/) starting at 1.0.0.
 
 ## [Unreleased]
 
-_Nothing yet._
+## [0.3.4] - 2026-09-03
+
+### Added
+
+- **Connecting over SSH now asks instead of silently failing.** A supervised
+  tool that ran `ssh` was refused with no prompt and no explanation: reading
+  your SSH config and keys — which every `ssh` does before it connects
+  anything — was counted twice over, which pushed the connection past the
+  automatic-block threshold before a person could see it. `ssh` to a genuine
+  remote host now reaches an approval prompt, and approving it covers that
+  host and port for the rest of the session. A non-interactive session still
+  fails closed.
+
+### Fixed
+
+- **A directory search no longer produces a prompt per credential folder.**
+  Running `find`, or anything else that walks your home directory, opened
+  every credential folder on the machine in order to look inside it —
+  `~/.aws`, `~/.gnupg`, `~/.pki`, `~/.docker` — and each one was priced as
+  though a private key had been read out of it. One search produced dozens of
+  approval prompts, each freezing the tool for minutes, and the searches
+  quietly returned incomplete results. Opening a folder to walk past it is now
+  recognised for what it is: it is recorded, it still counts alongside other
+  signals, and it no longer stops anything on its own. Reading a file inside
+  one of those folders is unchanged.
+
+- **grith no longer holds a session waiting for an answer nobody is giving.**
+  An approval prompt held the whole supervised session — every process in it —
+  for the full five-minute review window. If you were away from the keyboard,
+  that was five minutes of stall per prompt for a decision that had already
+  been made. After two prompts expire untouched, grith concludes nobody is
+  there and stops waiting so long; answering any prompt restores the full
+  window immediately. An unanswered prompt is still refused, and is now
+  recorded as having expired rather than as something you denied.
+
+- **The daemon no longer reports its own port as belonging to another
+  machine.** Upgrading grith, or rebuilding it, replaces the binary underneath
+  the running daemon. From that moment the daemon looked like an unrelated
+  process to the next `grith exec`, which reported the port as forwarded from
+  somewhere else and suggested closing a tunnel that did not exist. Running
+  the command again usually worked, which made it look intermittent.
+
+- **A forwarded dashboard port is no longer mistaken for a local daemon.** If
+  something on your machine relays port 3141 to a grith daemon elsewhere — VS
+  Code Remote forwarding a dev box's ports to your laptop, `ssh -L`, a
+  published container port — then `grith exec` met a real daemon of the right
+  version whose credentials live on the other machine, reported it as a
+  rejected token, and prescribed `grith dashboard restart`, which could not
+  fix it. grith now checks which local process actually holds the port, says
+  it is forwarded, and names the process holding it. `dashboard status`,
+  `stop` and `restart` say the same rather than offering to restart a daemon
+  running on someone else's machine.
+
+- **`grith run` and the REPL now identify themselves as the daemon.** When
+  they host the dashboard in-process, they wrote no PID file, token or
+  identity — so a `grith exec` in another terminal found a daemon it could
+  neither authenticate to nor stop, and the session failed. They now publish
+  the same identity a background daemon does, and withdraw it on exit.
+
+- **Ordinary file contents no longer look like a cloud credential.** One
+  secret-detection pattern was broad enough to match any long run of
+  hexadecimal, so commit hashes, checksums and lockfile digests were reported
+  as leaked credentials.
+
+### Performance
+
+- **The daemon's memory no longer grows with the size of your audit history.**
+  On a long-lived install it had reached several gigabytes — enough that the
+  system's out-of-memory killer took the daemon down, and with it every
+  supervised session's name resolution. Two places were reading far more into
+  memory than they needed: the daily analytics rebuild loaded a whole day of
+  history at once and did so repeatedly, and the retention pass held every
+  record it was about to archive. Both now stream, and the memory they use is
+  returned to the system rather than held. Measured on a 9 GB audit database,
+  the daily rebuild went from 580 MB resident to 8 MB, and a retention pass
+  from 3.3 GB to 118 MB.
 
 ## [0.3.3] - 2026-08-26
 

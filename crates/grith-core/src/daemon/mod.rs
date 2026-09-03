@@ -14,6 +14,7 @@ mod filter_registry;
 mod health;
 pub mod identity;
 pub mod last_error;
+pub mod listener;
 mod notifications;
 pub(crate) mod pid;
 pub mod readiness;
@@ -888,6 +889,14 @@ impl Daemon {
                             }
                         }
                     }
+                    // The retention pass runs an unbounded analytics
+                    // catch-up before it can compute a deletion boundary
+                    // (`prune_and_archive` needs every day clean for the
+                    // coverage gate), so it rebuilds every dirty day in one
+                    // go — the single largest allocate-and-free burst the
+                    // daemon makes. Hand the pages back before sleeping for
+                    // hours on them.
+                    grith_audit::release_free_heap();
                     if interval_hours == 0 {
                         return;
                     }
@@ -910,16 +919,26 @@ impl Daemon {
             std::thread::Builder::new()
                 .name("grith-analytics-catchup".into())
                 .spawn(move || loop {
-                    let progressed = match storage.lock() {
+                    let (progressed, rebuilt_any) = match storage.lock() {
                         Ok(mut s) => match s.catch_up_analytics_bounded(4, 8) {
-                            Ok((records, days)) => records >= 4 * 512 || days >= 8,
+                            Ok((records, days)) => (records >= 4 * 512 || days >= 8, days > 0),
                             Err(e) => {
                                 tracing::warn!(error = %e, "analytics catch-up slice failed");
-                                false
+                                (false, false)
                             }
                         },
                         Err(_) => return,
                     };
+                    // A day rebuild allocates and frees one small object per
+                    // event in the day; glibc keeps those on the arena free
+                    // list, so without this the daemon's resident size
+                    // ratchets to the largest day it ever rebuilt, per
+                    // arena, and never comes back down. Outside the lock and
+                    // only after a pass that actually rebuilt something —
+                    // trimming a heap nothing was freed from is pure cost.
+                    if rebuilt_any {
+                        grith_audit::release_free_heap();
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(if progressed {
                         50
                     } else {
