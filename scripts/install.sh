@@ -25,6 +25,8 @@ BINARY_NAME="grith"
 INSTALL_DIR="${HOME}/.local/bin"
 VERSION=""
 GLOBAL_INSTALL=false
+# Set by check_path; the next-steps block prints an absolute path when false.
+ON_PATH=true
 # Test seams for local installer validation:
 # - GRITH_RELEASE_BASE_URL overrides the release asset base URL.
 # - GRITH_INSTALL_FORCE_TARGET bypasses platform detection when set.
@@ -319,6 +321,7 @@ check_path() {
             ;;
     esac
 
+    ON_PATH=false
     warn "${install_dir} is not in your PATH."
     printf "\n"
     printf "  Add it to your shell profile:\n"
@@ -343,6 +346,69 @@ check_path() {
             printf "    export PATH=\"%s:\$PATH\"\n" "${install_dir}"
             ;;
     esac
+    printf "\n"
+}
+
+# ---------------------------------------------------------------------------
+# Next steps
+# ---------------------------------------------------------------------------
+# The first command after install must be `grith exec <tool>`, not `grith
+# init` + `grith`. `grith exec` wraps an agent the developer already runs,
+# so it needs no model provider of its own - the wrapped tool brings its
+# own credentials. The built-in agent (`grith run`) does need a provider,
+# which is why steering new installs at it made the first run fail.
+#
+# Neither `grith init` nor a manually started daemon is a prerequisite:
+# config falls back to the embedded base layer when no file exists, and
+# `grith exec` auto-starts the daemon and shuts it down when the session
+# ends.
+
+# Echo the first supervised-agent CLI found on PATH, or nothing. Ordered
+# by how likely the reader is to be running it.
+detect_agent() {
+    for candidate in claude codex aider goose cline copilot; do
+        if command -v "${candidate}" >/dev/null 2>&1; then
+            printf "%s" "${candidate}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+print_next_steps() {
+    local install_dir="$1"
+
+    local grith_cmd
+    if [ "${ON_PATH}" = true ]; then
+        grith_cmd="grith"
+    else
+        grith_cmd="${install_dir}/grith"
+    fi
+
+    local agent
+    agent="$(detect_agent)"
+
+    printf "  Next step - supervise the agent you already use:\n"
+    printf "\n"
+    if [ -n "${agent}" ]; then
+        printf "    %s exec %s\n" "${grith_cmd}" "${agent}"
+    else
+        printf "    %s exec claude\n" "${grith_cmd}"
+        printf "    %s exec codex\n" "${grith_cmd}"
+    fi
+    printf "\n"
+    printf "  Your agent starts as normal. Routine work runs untouched,\n"
+    printf "  risky calls are scored, and anything ambiguous pauses for you.\n"
+    printf "  No API key needed - the wrapped tool brings its own.\n"
+    printf "\n"
+    printf "  Then:\n"
+    printf "    %s audit      read back what the agent did\n" "${grith_cmd}"
+    printf "    %s --version  confirm the build\n" "${grith_cmd}"
+    printf "\n"
+    printf "  Docs: https://docs.grith.ai\n"
+    printf "\n"
+    printf "  Prefer grith's own built-in agent? That one does need a model\n"
+    printf "  provider - run \`%s setup\` to configure it.\n" "${grith_cmd}"
     printf "\n"
 }
 
@@ -419,14 +485,9 @@ main() {
 
     # Success message
     printf "\n"
-    ok "grith v${version} installed successfully!"
+    ok "grith v${version} installed"
     printf "\n"
-    printf "  Next steps:\n"
-    printf "    1. Verify the installation:  grith --version\n"
-    printf "    2. Initialize a project:     grith init\n"
-    printf "    3. Start an interactive run: grith\n"
-    printf "    4. Read the docs:            https://docs.grith.ai\n"
-    printf "\n"
+    print_next_steps "${INSTALL_DIR}"
 }
 
 main "$@"

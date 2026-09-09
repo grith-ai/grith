@@ -31,7 +31,7 @@ function buildItems(s: OnboardingStatus): ChecklistItem[] {
     },
     {
       label: "Supervise your first tool",
-      hint: "grith exec -- claude-code \"…\"",
+      hint: "grith exec claude",
       done: s.active_sessions > 0,
       to: "/sessions",
     },

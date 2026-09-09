@@ -22,7 +22,7 @@ curl -fsSL https://grith.ai/install | sh
 Wrap the agent you already use:
 
 ```bash
-grith exec -- claude-code "fix the failing test"
+grith exec claude
 ```
 
 Or run grith's own agent, with the same filters in front of every tool call:
