@@ -48,6 +48,8 @@
       "minimatch": {
         "brace-expansion": "1.1.18"
       }
-    }
+    },
+    "browserslist": "^4.28.7",
+    "@humanfs/node": "^0.16.8"
   }
 }
