@@ -50,6 +50,7 @@
       }
     },
     "browserslist": "^4.28.7",
-    "@humanfs/node": "^0.16.8"
+    "@humanfs/node": "^0.16.8",
+    "js-yaml": "^4.3.2"
   }
 }
