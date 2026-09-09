@@ -1594,7 +1594,7 @@ fn is_udp_service_port(port: u16) -> bool {
 /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) so that
 /// `::ffff:127.0.0.1` (which the kernel binds to the v4 loopback)
 /// correctly classifies as loopback while `::ffff:0.0.0.0` does not.
-fn is_loopback_bind_address(addr: &str) -> bool {
+pub(crate) fn is_loopback_bind_address(addr: &str) -> bool {
     if addr.eq_ignore_ascii_case("localhost") {
         return true;
     }

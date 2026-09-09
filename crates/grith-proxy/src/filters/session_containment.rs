@@ -150,6 +150,12 @@ impl ContainmentTracker {
     }
 }
 
+/// Score for a destination that cannot leave the machine — local desktop IPC
+/// and loopback services. Below the escalation band on its own, so it is
+/// recorded and still additive with a taint hit, but a contained session
+/// talking to its own toolchain daemons is not stopped by it.
+const LOCAL_DESTINATION_SCORE: f64 = 2.0;
+
 pub struct SessionContainmentFilter {
     sensitive_sources: Vec<String>,
     outbound_command_tokens: Vec<String>,
@@ -290,9 +296,29 @@ impl SessionContainmentFilter {
                 FilterResult::matched(
                     "session-containment",
                     "contained-local-ipc-egress",
-                    2.0,
-                    severity_for(2.0),
+                    LOCAL_DESTINATION_SCORE,
+                    severity_for(LOCAL_DESTINATION_SCORE),
                     mk_message("local control-injection IPC"),
+                )
+            }
+            // A connect to loopback is not egress: it cannot leave the
+            // machine. Priced with the local-IPC arm above rather than the
+            // full network tier, for the same reason the routine local spawn
+            // below is not penalised at all — a contained session running a
+            // build talks to its own toolchain daemons constantly (a Gradle
+            // worker to its daemon on 127.0.0.1, 2026-09-03). Still recorded
+            // and still additive, so a loopback forwarder carrying data the
+            // connecting process actually read is caught by the taint filter
+            // alongside this.
+            ToolCallType::NetConnect { address, .. }
+                if crate::filters::egress_policy::is_loopback_bind_address(address) =>
+            {
+                FilterResult::matched(
+                    "session-containment",
+                    "contained-loopback-egress",
+                    LOCAL_DESTINATION_SCORE,
+                    severity_for(LOCAL_DESTINATION_SCORE),
+                    mk_message("loopback service"),
                 )
             }
             ToolCallType::HttpRequest { .. } | ToolCallType::NetConnect { .. } => {
@@ -426,6 +452,97 @@ mod tests {
             ctx.arguments = serde_json::json!({ UnixSocketClass::KEY: class });
         }
         ctx
+    }
+
+    fn tcp_connect(session: Uuid, address: &str, port: u16) -> ToolCallContext {
+        make_ctx(
+            session,
+            ToolCallType::NetConnect {
+                address: address.into(),
+                port,
+            },
+        )
+    }
+
+    /// A contained session running a build talks to its own toolchain daemons
+    /// constantly. Those connects go to loopback and cannot leave the machine,
+    /// so they take the local tier rather than the full network one — a Gradle
+    /// worker reaching its daemon on 127.0.0.1 was prompting under containment
+    /// (2026-09-03).
+    #[tokio::test]
+    async fn a_contained_loopback_connect_takes_the_local_tier() {
+        let (filter, _t) = SessionContainmentFilter::with_defaults();
+        let sid = Uuid::new_v4();
+        let now = Instant::now();
+        let _ = filter
+            .evaluate_at(
+                &make_ctx(
+                    sid,
+                    ToolCallType::FileRead {
+                        path: "/home/u/.ssh/id_rsa".into(),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+
+        for address in [
+            "localhost",
+            "127.0.0.1",
+            "127.0.0.53",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let result = filter
+                .evaluate_at(&tcp_connect(sid, address, 15002), later)
+                .unwrap();
+            assert!(result.matched, "{address} is still recorded");
+            assert_eq!(
+                result.rule_id, "contained-loopback-egress",
+                "{address} must take the local tier"
+            );
+            assert_eq!(result.score, 2.0, "{address}");
+        }
+    }
+
+    /// The carveout is loopback and nothing else. Anything that can actually
+    /// reach the network keeps the full containment score.
+    #[tokio::test]
+    async fn a_contained_remote_connect_is_unchanged() {
+        let (filter, _t) = SessionContainmentFilter::with_defaults();
+        let sid = Uuid::new_v4();
+        let now = Instant::now();
+        let _ = filter
+            .evaluate_at(
+                &make_ctx(
+                    sid,
+                    ToolCallType::FileRead {
+                        path: "/home/u/.ssh/id_rsa".into(),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let later = now + Duration::from_secs(1);
+
+        for address in [
+            "evil.example.com",
+            "10.0.0.5",
+            "192.168.1.10",
+            "0.0.0.0",
+            "::ffff:0.0.0.0",
+        ] {
+            let result = filter
+                .evaluate_at(&tcp_connect(sid, address, 443), later)
+                .unwrap();
+            assert!(result.matched, "{address}");
+            assert_eq!(
+                result.rule_id, "contained-network-egress",
+                "{address} must keep the full tier"
+            );
+            assert_eq!(result.score, 3.5, "{address}");
+        }
     }
 
     /// Arm containment, then: a Control-class connect takes the 2.0 local-IPC

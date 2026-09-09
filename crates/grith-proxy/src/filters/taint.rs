@@ -1713,17 +1713,39 @@ impl SecurityFilter for TaintFilter {
                 // session-level tiers below.
                 let control_class =
                     matches!(ctx.unix_socket_class(), Some(UnixSocketClass::Control));
-                let mut result = if control_class {
+                // A loopback destination is the same shape of thing as local
+                // desktop IPC: whatever crosses it has not left the machine.
+                // Build toolchains talk to their own daemons this way — a
+                // Gradle worker to its daemon on 127.0.0.1 was scored as a
+                // network sink purely because something ELSE in the session
+                // was tainted (2026-09-03). Held to the same bar as the
+                // Control class: the CONNECTING pid must itself have read
+                // tainted data, and it caps at 3.0. A loopback forwarder
+                // (`ssh -L`, a local proxy) carrying data the connecting pid
+                // really did read still scores, which is the case worth
+                // keeping.
+                let loopback = crate::filters::egress_policy::is_loopback_bind_address(address);
+                let mut result = if control_class || loopback {
                     match Self::pid_taint_level(&self.tainted_pids, ctx) {
-                        Some(level) if level != TaintLevel::None => FilterResult::matched(
-                            "taint",
-                            "tainted-local-ipc-sink",
-                            3.0,
-                            Severity::Warning,
-                            format!(
-                                "Tainted data flowing to local control-injection socket: {address}"
-                            ),
-                        ),
+                        Some(level) if level != TaintLevel::None => {
+                            FilterResult::matched(
+                                "taint",
+                                if loopback && !control_class {
+                                    "tainted-loopback-sink"
+                                } else {
+                                    "tainted-local-ipc-sink"
+                                },
+                                3.0,
+                                Severity::Warning,
+                                if loopback && !control_class {
+                                    format!("Tainted data flowing to a loopback service: {address}:{port}")
+                                } else {
+                                    format!(
+                                    "Tainted data flowing to local control-injection socket: {address}"
+                                )
+                                },
+                            )
+                        }
                         _ => FilterResult::no_match("taint"),
                     }
                 } else {
@@ -1976,6 +1998,89 @@ mod tests {
         );
         read_ctx.arguments = serde_json::json!({ "pid": pid });
         let _ = filter.evaluate(&read_ctx).await.unwrap();
+    }
+
+    fn tcp_connect_ctx(
+        session: Uuid,
+        address: &str,
+        port: u16,
+        pid: u64,
+    ) -> crate::types::ToolCallContext {
+        let mut ctx = make_ctx_in_session(
+            ToolCallType::NetConnect {
+                address: address.into(),
+                port,
+            },
+            session,
+        );
+        ctx.arguments = serde_json::json!({ "pid": pid });
+        ctx
+    }
+
+    /// A loopback destination is held to the same bar as local desktop IPC:
+    /// the CONNECTING pid must itself have read tainted data. Session taint
+    /// from an unrelated process must not score it.
+    ///
+    /// This is the Gradle shape (2026-09-03): a build worker connects to its
+    /// own daemon on 127.0.0.1 and was scored a network sink purely because
+    /// something else in the session was tainted.
+    #[tokio::test]
+    async fn loopback_sink_requires_connecting_pid_taint() {
+        let filter = TaintFilter::with_defaults();
+        let session = Uuid::new_v4();
+        taint_session_via_pid(&filter, session, 100).await;
+
+        let result = filter
+            .evaluate(&tcp_connect_ctx(session, "127.0.0.1", 15002, 200))
+            .await
+            .unwrap();
+        assert!(
+            !result.matched,
+            "untainted pid to a loopback service must not sink-score: {}",
+            result.message
+        );
+    }
+
+    /// The carveout is a bar, not an exemption. A loopback forwarder carrying
+    /// data the connecting process actually read still scores — capped at 3.0,
+    /// a human decision rather than an auto-deny.
+    #[tokio::test]
+    async fn a_tainted_pid_to_loopback_still_scores() {
+        let filter = TaintFilter::with_defaults();
+        let session = Uuid::new_v4();
+        taint_session_via_pid(&filter, session, 100).await;
+
+        let result = filter
+            .evaluate(&tcp_connect_ctx(session, "localhost", 15002, 100))
+            .await
+            .unwrap();
+        assert!(result.matched);
+        assert_eq!(result.rule_id, "tainted-loopback-sink");
+        assert_eq!(result.score, 3.0);
+        assert_eq!(result.severity, Severity::Warning);
+    }
+
+    /// A destination that can actually reach the network keeps the
+    /// session-level tiers, per-pid taint or not.
+    #[tokio::test]
+    async fn a_remote_sink_keeps_the_session_tier() {
+        let filter = TaintFilter::with_defaults();
+        let session = Uuid::new_v4();
+        taint_session_via_pid(&filter, session, 100).await;
+
+        let result = filter
+            .evaluate(&tcp_connect_ctx(session, "evil.example.com", 443, 200))
+            .await
+            .unwrap();
+        assert!(
+            result.matched,
+            "an unrelated pid reaching the network must still score under session taint"
+        );
+        assert!(
+            result.rule_id.ends_with("network-sink"),
+            "{}",
+            result.rule_id
+        );
     }
 
     /// Control-class sink requires per-pid data flow: session taint from

@@ -205,6 +205,58 @@ const BUILD_ARTIFACT_SEGMENTS: &[&str] = &[
     "/.next/",
 ];
 
+/// Shared package and build caches that live in the user's home directory,
+/// as `$HOME`-relative prefixes.
+///
+/// The module's premise above — "build/VCS/cache churn is in-tree or
+/// ephemeral" — holds for toolchains that keep their artifacts beside the
+/// source. It does not hold for the ones whose cache is a shared store under
+/// `$HOME`: a Gradle build deletes hundreds of stale entries from
+/// `~/.gradle/caches` as ordinary housekeeping, every one of them out-of-tree
+/// by the test above and none of them the user's data. Incident 2026-09-03:
+/// 1,207 escalations from one Java build, 909 distinct deletions under
+/// `~/.gradle/`, each call scored 1.0.
+///
+/// This is the same failure as the cargo incident that put `/target/debug/`
+/// in the list above — the next toolchain along — so the whole family is
+/// listed rather than the one that happened to bite.
+///
+/// Same discipline as `BUILD_ARTIFACT_SEGMENTS`: only stores a package
+/// manager owns and can regenerate from a lockfile or a remote. Deliberately
+/// NOT the tool's whole dot-directory — `~/.gradle/gradle.properties` and
+/// `~/.m2/settings.xml` hold credentials and are the user's, so only the
+/// cache subtrees are listed.
+const HOME_TOOLCHAIN_CACHES: &[&str] = &[
+    // JVM
+    ".gradle/caches/",
+    ".gradle/daemon/",
+    ".gradle/wrapper/dists/",
+    ".m2/repository/",
+    ".ivy2/cache/",
+    ".sbt/boot/",
+    ".konan/",
+    ".kotlin/",
+    // Rust — `~/.cache` already covers sccache, these do not live there
+    ".cargo/registry/",
+    ".cargo/git/",
+    // JavaScript
+    ".npm/_cacache/",
+    ".yarn/cache/",
+    ".yarn/berry/cache/",
+    ".pnpm-store/",
+    ".bun/install/cache/",
+    // Go — not a dot-directory, but unambiguously the module cache
+    "go/pkg/mod/",
+    // Others
+    ".nuget/packages/",
+    ".gem/",
+    ".pub-cache/",
+    ".stack/snapshots/",
+    ".stack/pantry/",
+    ".cpanm/",
+    ".composer/cache/",
+];
+
 fn is_ephemeral(target: &str) -> bool {
     if EPHEMERAL_ROOTS.iter().any(|p| target.starts_with(p)) {
         return true;
@@ -224,10 +276,35 @@ fn is_ephemeral(target: &str) -> bool {
             return true;
         }
     }
+    if home_toolchain_caches()
+        .iter()
+        .any(|prefix| target.starts_with(prefix.as_str()))
+    {
+        return true;
+    }
     false
 }
 
 /// `$HOME/.cache/`, cached once. `None` when `HOME` is unset.
+/// [`HOME_TOOLCHAIN_CACHES`] resolved against `$HOME`, cached once. Empty
+/// when `HOME` is unset, which simply leaves the signal as it was.
+fn home_toolchain_caches() -> &'static [String] {
+    static CACHES: OnceLock<Vec<String>> = OnceLock::new();
+    CACHES.get_or_init(|| {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        let mut home = home.to_string_lossy().into_owned();
+        if !home.ends_with('/') {
+            home.push('/');
+        }
+        HOME_TOOLCHAIN_CACHES
+            .iter()
+            .map(|suffix| format!("{home}{suffix}"))
+            .collect()
+    })
+}
+
 fn home_cache_prefix() -> Option<&'static str> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
     CACHE
@@ -300,6 +377,96 @@ pub(super) fn maybe_escalate(
         WINDOW.as_secs()
     );
     Some(count)
+}
+
+#[cfg(test)]
+mod toolchain_cache_tests {
+    use super::*;
+
+    fn home() -> String {
+        let mut h = std::env::var("HOME").expect("HOME");
+        if !h.ends_with('/') {
+            h.push('/');
+        }
+        h
+    }
+
+    /// The 2026-09-03 incident: one Java build produced 1,207 escalations
+    /// from 909 distinct deletions under `~/.gradle/`. A package manager
+    /// clearing its own shared cache is housekeeping, not a delete spree.
+    #[test]
+    fn a_toolchain_cache_is_not_the_users_valuable_data() {
+        let h = home();
+        for suffix in [
+            ".gradle/caches/8.14.4/kotlin-dsl/scripts/e7e3a11a/buildscript.jar",
+            ".gradle/caches/modules-2/files-2.1/org.jetbrains.kotlin/kotlin-stdlib/2.0/x.jar",
+            ".gradle/daemon/8.14.4/registry.bin",
+            ".m2/repository/org/springframework/spring-core/6.1.0/spring-core-6.1.0.jar",
+            ".cargo/registry/cache/index.crates.io-abc/serde-1.0.0.crate",
+            ".npm/_cacache/content-v2/sha512/ab/cd/ef",
+            ".yarn/cache/lodash-npm-4.17.21.zip",
+            ".pnpm-store/v3/files/00/abcdef",
+            "go/pkg/mod/cache/download/github.com/x/@v/v1.0.0.zip",
+            ".nuget/packages/newtonsoft.json/13.0.3/lib/net6.0/x.dll",
+        ] {
+            let target = format!("{h}{suffix}");
+            assert!(
+                !is_valuable_out_of_tree(&target, None, &[], &[], &[]),
+                "{target} must not count toward the signal"
+            );
+        }
+    }
+
+    /// The exemption is the cache subtree, not the tool's whole dot-directory:
+    /// `~/.gradle/gradle.properties` and `~/.m2/settings.xml` hold
+    /// credentials and are the user's files.
+    #[test]
+    fn a_toolchains_config_is_still_the_users_data() {
+        let h = home();
+        for suffix in [
+            ".gradle/gradle.properties",
+            ".m2/settings.xml",
+            ".cargo/credentials.toml",
+            ".npmrc",
+        ] {
+            let target = format!("{h}{suffix}");
+            assert!(
+                is_valuable_out_of_tree(&target, None, &[], &[], &[]),
+                "{target} must still count"
+            );
+        }
+    }
+
+    /// The prefixes are anchored at `$HOME`, so a lookalike elsewhere — or a
+    /// directory merely named after one — is not exempt.
+    #[test]
+    fn a_lookalike_path_is_not_exempt() {
+        let h = home();
+        for target in [
+            "/home/someone-else/.gradle/caches/x".to_string(),
+            "/srv/data/.m2/repository/x".to_string(),
+            format!("{h}projects/mine/.gradle-backup/caches/x"),
+            format!("{h}my.gradle/caches/x"),
+        ] {
+            assert!(
+                is_valuable_out_of_tree(&target, None, &[], &[], &[]),
+                "{target} must still count"
+            );
+        }
+    }
+
+    /// Ordinary documents next to a cache are unaffected.
+    #[test]
+    fn the_users_own_files_still_count() {
+        let h = home();
+        for suffix in ["Documents/tax-2025.pdf", "src/project/README.md"] {
+            let target = format!("{h}{suffix}");
+            assert!(
+                is_valuable_out_of_tree(&target, None, &[], &[], &[]),
+                "{target} must count"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# install.sh — Installer for grith (Zero Trust for AI Agents)
+# install.sh - Installer for grith (OS-level supervision for AI coding agents)
 #
 # Usage:
 #   curl -fsSL https://grith.ai/install | sh
@@ -387,7 +387,7 @@ main() {
 
     printf "\n"
     printf "  \033[1mgrith installer\033[0m\n"
-    printf "  Zero Trust for AI Agents\n"
+    printf "  OS-level supervision for AI coding agents\n"
     printf "\n"
 
     # Check basic requirements
